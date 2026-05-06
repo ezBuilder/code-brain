@@ -1,4 +1,5 @@
 /runtime/.venv/
+/runtime/.pytest_cache/
 /runtime/**/__pycache__/
 /runtime/**/*.pyc
 /cache/

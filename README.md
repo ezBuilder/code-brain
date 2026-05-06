@@ -74,7 +74,7 @@ Use `OPERATIONS.md` as the handoff runbook for daily health checks, queue recove
 | Observability | `ai obs log/metrics/slo` | local JSONL logs, metrics, SLO check |
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
 | Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration and local rollback backups |
-| Package | `scripts/package.sh`, `scripts/install-check.sh` | tarball + checksum + file manifest + install verification |
+| Package | `scripts/package.sh`, `scripts/install-check.sh` | tarball + checksum + manifest + SBOM + provenance + install verification |
 | Report | `ai report status/release-notes` | release state and generated notes |
 
 ## Release Gate

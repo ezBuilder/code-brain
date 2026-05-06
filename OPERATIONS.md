@@ -42,6 +42,8 @@ Install verification extracts the latest `dist/code-brain-<version>.tar.gz` into
 
 - archive checksum;
 - file manifest hashes when `dist/code-brain-<version>.manifest.json` exists;
+- SBOM lockfile and dependency package list when `dist/code-brain-<version>.sbom.json` exists;
+- provenance subjects when `dist/code-brain-<version>.provenance.json` exists;
 - `ai version`
 - `ai doctor --strict`
 - `.ai/bin/ai`
@@ -190,4 +192,4 @@ uv run --project .ai/runtime ai report status --json
 git status --short
 ```
 
-Attach `ai report release-notes` output, the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`, and `dist/code-brain-<version>.manifest.json`.
+Attach `ai report release-notes` output, the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`, `dist/code-brain-<version>.manifest.json`, `dist/code-brain-<version>.sbom.json`, and `dist/code-brain-<version>.provenance.json`.

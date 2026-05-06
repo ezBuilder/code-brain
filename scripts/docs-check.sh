@@ -24,7 +24,8 @@ for needle in \
   "./scripts/release-gate.sh" \
   "make env-check" \
   "make lint" \
-  "make release-gate"
+  "make release-gate" \
+  "release-notes.md"
 do
   if ! grep -Fq "$needle" OPERATIONS.md README.md RELEASE.md; then
     echo "documented operation missing: $needle" >&2

@@ -427,6 +427,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
         assert artifacts["sbom"]["valid"] is True
         assert artifacts["sbom"]["package_count"] > 0
         assert artifacts["provenance"]["valid"] is True
+        assert artifacts["release_notes"]["valid"] is True
         assert artifacts["all_valid"] is True
     else:
         assert artifacts["archive"]["archive_exists"] is False
@@ -435,3 +436,4 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
     assert "Code Brain 0.1.0 Release Notes" in notes_result.stdout
     assert "SBOM" in notes_result.stdout
     assert "./scripts/docs-check.sh" in notes_result.stdout
+    assert "./scripts/release-gate.sh" in notes_result.stdout

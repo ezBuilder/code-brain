@@ -37,7 +37,7 @@ uv run --project .ai/runtime ai report release-notes
 The release gate runs environment checks, bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
 It starts with `scripts/env-check.sh`, which reports bash, git, make, uv, uv-managed Python, and optional PowerShell status as JSON.
 It starts with `scripts/lint.sh`, which checks shell syntax, Python compilation, Makefile dry-runs, and PowerShell parsing when PowerShell is available.
-It also runs artifact tamper checks so checksum, manifest, SBOM, and provenance corruption must be rejected before release.
+It also runs artifact tamper checks so checksum, manifest, SBOM, provenance, and release notes corruption must be rejected before release.
 Use `scripts/verify-artifacts.sh` when you need to validate downloaded release artifacts before running package code.
 CI uses the same Makefile targets as local release verification; write-heavy smoke/docs flows run only inside temporary repositories with CI policy explicitly cleared.
 
@@ -60,6 +60,7 @@ Artifact verification checks release files without executing package code:
 - file manifest hashes when `dist/code-brain-<version>.manifest.json` exists;
 - SBOM lockfile and dependency package list when `dist/code-brain-<version>.sbom.json` exists;
 - provenance subjects when `dist/code-brain-<version>.provenance.json` exists;
+- release notes contents and provenance subject when `dist/code-brain-<version>.release-notes.md` exists.
 
 Install verification then extracts the latest `dist/code-brain-<version>.tar.gz` into a temporary directory and verifies:
 
@@ -217,4 +218,4 @@ uv run --project .ai/runtime ai report status --json
 git status --short
 ```
 
-Attach `ai report release-notes` output, the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`, `dist/code-brain-<version>.manifest.json`, `dist/code-brain-<version>.sbom.json`, and `dist/code-brain-<version>.provenance.json`.
+Attach `dist/code-brain-<version>.release-notes.md`, the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`, `dist/code-brain-<version>.manifest.json`, `dist/code-brain-<version>.sbom.json`, and `dist/code-brain-<version>.provenance.json`.

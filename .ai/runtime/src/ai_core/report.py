@@ -56,6 +56,7 @@ def release_notes(root: Path) -> str:
             f"- Manifest: `{report['release_artifacts']['manifest']['path']}`",
             f"- SBOM: `{report['release_artifacts']['sbom']['path']}`",
             f"- Provenance: `{report['release_artifacts']['provenance']['path']}`",
+            f"- Release notes: `{report['release_artifacts']['release_notes']['path']}`",
             "",
             "## Recent Commits",
             "",
@@ -67,10 +68,15 @@ def release_notes(root: Path) -> str:
             "",
             "```bash",
             "./bootstrap.sh",
+            "./scripts/env-check.sh",
+            "./scripts/lint.sh",
             "./scripts/smoke.sh",
             "./scripts/docs-check.sh",
             "./scripts/package.sh",
+            "./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz",
             "./scripts/install-check.sh",
+            "./scripts/artifact-tamper-check.sh dist/code-brain-0.1.0.tar.gz",
+            "./scripts/release-gate.sh",
             "uv run --project .ai/runtime ai doctor --strict --json",
             "uv run --project .ai/runtime ai report status --json",
             "git status --short",
@@ -117,6 +123,7 @@ def release_artifacts(root: Path) -> dict[str, Any]:
     manifest = root / "dist" / f"code-brain-{__version__}.manifest.json"
     sbom = root / "dist" / f"code-brain-{__version__}.sbom.json"
     provenance = root / "dist" / f"code-brain-{__version__}.provenance.json"
+    release_notes = root / "dist" / f"code-brain-{__version__}.release-notes.md"
 
     archive_entry = {
         "archive": archive.relative_to(root).as_posix(),
@@ -129,12 +136,16 @@ def release_artifacts(root: Path) -> dict[str, Any]:
     }
     manifest_entry = artifact_entry(root, manifest) | manifest_summary(manifest)
     sbom_entry = artifact_entry(root, sbom) | sbom_summary(root, sbom)
-    provenance_entry = artifact_entry(root, provenance) | provenance_summary(archive, manifest, sbom, provenance)
+    provenance_entry = artifact_entry(root, provenance) | provenance_summary(archive, manifest, sbom, provenance, release_notes)
+    release_notes_entry = artifact_entry(root, release_notes) | release_notes_summary(
+        archive, manifest, sbom, provenance, release_notes
+    )
     return {
         "archive": archive_entry,
         "manifest": manifest_entry,
         "sbom": sbom_entry,
         "provenance": provenance_entry,
+        "release_notes": release_notes_entry,
         "all_present": all(
             (
                 archive.exists(),
@@ -142,6 +153,7 @@ def release_artifacts(root: Path) -> dict[str, Any]:
                 manifest.exists(),
                 sbom.exists(),
                 provenance.exists(),
+                release_notes.exists(),
             )
         ),
         "all_valid": all(
@@ -150,6 +162,7 @@ def release_artifacts(root: Path) -> dict[str, Any]:
                 manifest_entry["valid"],
                 sbom_entry["valid"],
                 provenance_entry["valid"],
+                release_notes_entry["valid"],
             )
         ),
     }
@@ -190,15 +203,30 @@ def sbom_summary(root: Path, path: Path) -> dict[str, Any]:
     }
 
 
-def provenance_summary(archive: Path, manifest: Path, sbom: Path, provenance: Path) -> dict[str, Any]:
+def provenance_summary(archive: Path, manifest: Path, sbom: Path, provenance: Path, release_notes: Path) -> dict[str, Any]:
     payload = json_payload(provenance)
     if payload is None:
         return {"valid": False, "git": {}, "subjects_valid": False}
     subjects = payload.get("subjects", {})
-    required = [archive, manifest, sbom]
+    required = [archive, manifest, sbom, release_notes]
     subjects_valid = isinstance(subjects, dict) and all(subjects.get(path.name) == file_sha256(path) for path in required)
     return {
         "valid": subjects_valid and isinstance(payload.get("git"), dict),
         "git": payload.get("git", {}),
         "subjects_valid": subjects_valid,
     }
+
+
+def release_notes_summary(archive: Path, manifest: Path, sbom: Path, provenance: Path, release_notes: Path) -> dict[str, Any]:
+    if not release_notes.exists():
+        return {"valid": False}
+    text = release_notes.read_text(encoding="utf-8")
+    required = [
+        f"# Code Brain {__version__} Release Notes",
+        file_sha256(archive) or "",
+        manifest.name,
+        sbom.name,
+        provenance.name,
+        "./scripts/release-gate.sh",
+    ]
+    return {"valid": all(needle and needle in text for needle in required)}

@@ -10,11 +10,12 @@ ARCHIVE="$OUT_DIR/${NAME}.tar.gz"
 MANIFEST="$OUT_DIR/${NAME}.manifest.json"
 SBOM="$OUT_DIR/${NAME}.sbom.json"
 PROVENANCE="$OUT_DIR/${NAME}.provenance.json"
+RELEASE_NOTES="$OUT_DIR/${NAME}.release-notes.md"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$OUT_DIR"
-rm -f "$ARCHIVE" "$ARCHIVE.sha256" "$MANIFEST" "$SBOM" "$PROVENANCE"
+rm -f "$ARCHIVE" "$ARCHIVE.sha256" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES"
 mkdir -p "$TMP/$NAME"
 
 tar \
@@ -30,7 +31,7 @@ tar \
 
 tar -C "$TMP" -czf "$ARCHIVE" "$NAME"
 
-python - "$ROOT" "$ARCHIVE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$VERSION" <<'PY'
+python - "$ROOT" "$ARCHIVE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES" "$VERSION" <<'PY'
 import json
 import hashlib
 import pathlib
@@ -45,7 +46,8 @@ archive = pathlib.Path(sys.argv[2])
 manifest_path = pathlib.Path(sys.argv[3])
 sbom_path = pathlib.Path(sys.argv[4])
 provenance_path = pathlib.Path(sys.argv[5])
-version = sys.argv[6]
+release_notes_path = pathlib.Path(sys.argv[6])
+version = sys.argv[7]
 archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
 archive.with_suffix(archive.suffix + ".sha256").write_text(f"{archive_digest}  {archive.name}\n", encoding="utf-8")
 
@@ -119,6 +121,58 @@ def git_output(*args: str) -> str | None:
     except Exception:
         return None
 
+git_branch = git_output("branch", "--show-current")
+git_head = git_output("rev-parse", "--short=12", "HEAD")
+git_status = git_output("status", "--short") or ""
+commits = git_output("log", "--oneline", "--decorate", "-12") or ""
+
+release_notes = "\n".join(
+    [
+        f"# Code Brain {version} Release Notes",
+        "",
+        "## Status",
+        "",
+        f"- Runtime version: `{version}`",
+        "- Protocol version: `1`",
+        f"- Git HEAD: `{git_head or ''}`",
+        f"- Git status: `{'clean' if not git_status else 'dirty'}`",
+        f"- Archive: `{archive.name}`",
+        f"- Archive SHA-256: `{archive_digest}`",
+        f"- Manifest: `{manifest_path.name}`",
+        f"- Manifest SHA-256: `{manifest_digest}`",
+        f"- SBOM: `{sbom_path.name}`",
+        f"- SBOM SHA-256: `{sbom_digest}`",
+        f"- Provenance: `{provenance_path.name}`",
+        "",
+        "## Recent Commits",
+        "",
+        "```text",
+        commits,
+        "```",
+        "",
+        "## Verification",
+        "",
+        "```bash",
+        "./scripts/env-check.sh",
+        "./scripts/lint.sh",
+        "./bootstrap.sh",
+        "./scripts/smoke.sh",
+        "./scripts/docs-check.sh",
+        "./scripts/package.sh",
+        f"./scripts/verify-artifacts.sh dist/code-brain-{version}.tar.gz",
+        f"./scripts/install-check.sh dist/code-brain-{version}.tar.gz",
+        f"./scripts/artifact-tamper-check.sh dist/code-brain-{version}.tar.gz",
+        "./scripts/release-gate.sh",
+        "uv run --project .ai/runtime ai doctor --strict --json",
+        "uv run --project .ai/runtime ai report status --json",
+        "git status --short",
+        "```",
+        "",
+    ]
+)
+release_notes_path.write_text(release_notes, encoding="utf-8")
+release_notes_digest = hashlib.sha256(release_notes_path.read_bytes()).hexdigest()
+
 provenance = {
     "schema_version": 1,
     "name": "code-brain",
@@ -129,14 +183,15 @@ provenance = {
         "python": sys.version.split()[0],
     },
     "git": {
-        "branch": git_output("branch", "--show-current"),
-        "head": git_output("rev-parse", "--short=12", "HEAD"),
-        "status_short": git_output("status", "--short") or "",
+        "branch": git_branch,
+        "head": git_head,
+        "status_short": git_status,
     },
     "subjects": {
         archive.name: archive_digest,
         manifest_path.name: manifest_digest,
         sbom_path.name: sbom_digest,
+        release_notes_path.name: release_notes_digest,
     },
 }
 provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -146,4 +201,5 @@ print(archive.with_suffix(archive.suffix + ".sha256"))
 print(manifest_path)
 print(sbom_path)
 print(provenance_path)
+print(release_notes_path)
 PY

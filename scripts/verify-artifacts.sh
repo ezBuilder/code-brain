@@ -18,10 +18,11 @@ SHA_FILE="$ARCHIVE.sha256"
 MANIFEST="${ARCHIVE%.tar.gz}.manifest.json"
 SBOM="${ARCHIVE%.tar.gz}.sbom.json"
 PROVENANCE="${ARCHIVE%.tar.gz}.provenance.json"
+RELEASE_NOTES="${ARCHIVE%.tar.gz}.release-notes.md"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-python - "$ARCHIVE" "$SHA_FILE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$TMP" <<'PY'
+python - "$ARCHIVE" "$SHA_FILE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES" "$TMP" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -34,7 +35,8 @@ sha_file = pathlib.Path(sys.argv[2])
 manifest_path = pathlib.Path(sys.argv[3])
 sbom_path = pathlib.Path(sys.argv[4])
 provenance_path = pathlib.Path(sys.argv[5])
-tmp = pathlib.Path(sys.argv[6])
+release_notes_path = pathlib.Path(sys.argv[6])
+tmp = pathlib.Path(sys.argv[7])
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -106,6 +108,8 @@ if sbom.get("package_count") != len(sbom_packages):
     raise SystemExit("SBOM package_count mismatch")
 
 provenance = load_json(provenance_path)
+if not release_notes_path.is_file():
+    raise SystemExit(f"artifact missing: {release_notes_path}")
 subjects = provenance.get("subjects", {})
 if not isinstance(subjects, dict):
     raise SystemExit("provenance subjects missing")
@@ -113,12 +117,26 @@ required_subjects = {
     archive.name: actual_archive_sha,
     manifest_path.name: sha256(manifest_path),
     sbom_path.name: sha256(sbom_path),
+    release_notes_path.name: sha256(release_notes_path),
 }
 for name, digest in required_subjects.items():
     if subjects.get(name) != digest:
         raise SystemExit(f"provenance subject mismatch: {name}")
 if provenance.get("git", {}).get("status_short") is None:
     raise SystemExit("provenance git status missing")
+
+release_notes = release_notes_path.read_text(encoding="utf-8")
+required_notes = [
+    f"# Code Brain {manifest.get('version')} Release Notes",
+    actual_archive_sha,
+    manifest_path.name,
+    sbom_path.name,
+    provenance_path.name,
+    "./scripts/release-gate.sh",
+]
+for needle in required_notes:
+    if needle not in release_notes:
+        raise SystemExit(f"release notes missing required text: {needle}")
 
 print(
     json.dumps(
@@ -127,6 +145,7 @@ print(
             "archive": archive.name,
             "archive_sha256": actual_archive_sha,
             "manifest_file_count": len(files),
+            "release_notes_sha256": sha256(release_notes_path),
             "sbom_package_count": len(sbom_packages),
             "provenance_git_head": provenance.get("git", {}).get("head"),
         },

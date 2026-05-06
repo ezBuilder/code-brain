@@ -23,7 +23,7 @@ copy_artifacts() {
   local target="$1"
   mkdir -p "$target/dist"
   cp "$ARCHIVE" "$target/dist/$BASE"
-  for suffix in ".tar.gz.sha256" ".manifest.json" ".sbom.json" ".provenance.json"; do
+  for suffix in ".tar.gz.sha256" ".manifest.json" ".sbom.json" ".provenance.json" ".release-notes.md"; do
     local source
     if [[ "$suffix" == ".tar.gz.sha256" ]]; then
       source="$ARCHIVE.sha256"
@@ -103,9 +103,21 @@ path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="
 PY
 }
 
+tamper_release_notes() {
+  local dir="$1"
+  python - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+path.write_text(text.replace("Release Notes", "Release Log", 1), encoding="utf-8")
+PY
+}
+
 expect_install_check_failure checksum tamper_checksum
 expect_install_check_failure manifest tamper_manifest
 expect_install_check_failure sbom tamper_sbom
 expect_install_check_failure provenance tamper_provenance
+expect_install_check_failure release_notes tamper_release_notes
 
 echo "artifact tamper check ok"

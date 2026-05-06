@@ -58,6 +58,7 @@ expected_archive_sha = sha_file.read_text(encoding="utf-8").split()[0]
 actual_archive_sha = sha256(archive)
 if expected_archive_sha != actual_archive_sha:
     raise SystemExit(f"checksum mismatch: expected {expected_archive_sha}, got {actual_archive_sha}")
+expected_root = archive.name.removesuffix(".tar.gz")
 
 with tarfile.open(archive, "r:gz") as tar:
     members = tar.getmembers()
@@ -70,6 +71,8 @@ with tarfile.open(archive, "r:gz") as tar:
     roots = {pathlib.PurePosixPath(member.name).parts[0] for member in members if member.name and pathlib.PurePosixPath(member.name).parts}
     if len(roots) != 1:
         raise SystemExit(f"archive must contain exactly one package root, got: {sorted(roots)}")
+    if roots != {expected_root}:
+        raise SystemExit(f"archive root mismatch: expected {expected_root}, got {next(iter(roots))}")
     tar.extractall(tmp)
 
 pkg_name = next(iter(roots))

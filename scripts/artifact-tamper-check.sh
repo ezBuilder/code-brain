@@ -209,6 +209,44 @@ PY
   fi
 }
 
+expect_root_mismatch_failure() {
+  local dir="$TMP/root_mismatch"
+  local payload="$TMP/root-mismatch-payload"
+  local bad_root="not-$PREFIX"
+  mkdir -p "$dir/dist" "$payload/$bad_root"
+  printf 'ok\n' >"$payload/$bad_root/README.txt"
+  python - "$dir/dist/$BASE" "$payload" "$bad_root" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+archive = pathlib.Path(sys.argv[1])
+payload = pathlib.Path(sys.argv[2])
+bad_root = sys.argv[3]
+with tarfile.open(archive, "w:gz") as tar:
+    tar.add(payload / bad_root / "README.txt", arcname=f"{bad_root}/README.txt")
+PY
+  cp "$ARCHIVE.sha256" "$dir/dist/$BASE.sha256"
+  cp "$(dirname "$ARCHIVE")/$PREFIX.manifest.json" "$dir/dist/$PREFIX.manifest.json"
+  cp "$(dirname "$ARCHIVE")/$PREFIX.sbom.json" "$dir/dist/$PREFIX.sbom.json"
+  cp "$(dirname "$ARCHIVE")/$PREFIX.provenance.json" "$dir/dist/$PREFIX.provenance.json"
+  cp "$(dirname "$ARCHIVE")/$PREFIX.release-notes.md" "$dir/dist/$PREFIX.release-notes.md"
+  python - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+archive = pathlib.Path(sys.argv[1])
+sha_file = pathlib.Path(sys.argv[2])
+sha_file.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n", encoding="utf-8")
+PY
+  if "$ROOT/scripts/verify-artifacts.sh" "$dir/dist/$BASE" >"$TMP/root-mismatch.out" 2>"$TMP/root-mismatch.err"; then
+    echo "expected artifact verifier failure for tamper case: root_mismatch" >&2
+    cat "$TMP/root-mismatch.out" >&2
+    exit 1
+  fi
+}
+
 expect_install_check_failure checksum tamper_checksum
 expect_install_check_failure manifest tamper_manifest
 expect_install_check_failure sbom tamper_sbom
@@ -217,5 +255,6 @@ expect_install_check_failure dirty_provenance tamper_dirty_provenance
 expect_install_check_failure release_notes tamper_release_notes
 expect_unsafe_archive_failure
 expect_unsafe_member_type_failure
+expect_root_mismatch_failure
 
 echo "artifact tamper check ok"

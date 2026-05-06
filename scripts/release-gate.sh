@@ -9,6 +9,7 @@ cd "$ROOT"
 ./scripts/docs-check.sh
 ./scripts/package.sh >/tmp/code-brain-package.txt
 ./scripts/install-check.sh "$(head -n 1 /tmp/code-brain-package.txt)"
+./scripts/artifact-tamper-check.sh "$(head -n 1 /tmp/code-brain-package.txt)"
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
 uv run --project .ai/runtime ai report status --json >/dev/null
 

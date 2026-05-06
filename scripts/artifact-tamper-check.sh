@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export COPYFILE_DISABLE=1
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+ARCHIVE="${1:-}"
+if [[ -z "$ARCHIVE" ]]; then
+  ARCHIVE="$(ls -t "$ROOT"/dist/code-brain-*.tar.gz | head -n 1)"
+fi
+
+if [[ ! -f "$ARCHIVE" ]]; then
+  echo "archive not found: $ARCHIVE" >&2
+  exit 2
+fi
+
+BASE="$(basename "$ARCHIVE")"
+PREFIX="${BASE%.tar.gz}"
+
+copy_artifacts() {
+  local target="$1"
+  mkdir -p "$target/dist"
+  cp "$ARCHIVE" "$target/dist/$BASE"
+  for suffix in ".tar.gz.sha256" ".manifest.json" ".sbom.json" ".provenance.json"; do
+    local source
+    if [[ "$suffix" == ".tar.gz.sha256" ]]; then
+      source="$ARCHIVE.sha256"
+    else
+      source="$(dirname "$ARCHIVE")/$PREFIX$suffix"
+    fi
+    if [[ -f "$source" ]]; then
+      cp "$source" "$target/dist/$(basename "$source")"
+    fi
+  done
+}
+
+expect_install_check_failure() {
+  local name="$1"
+  local dir="$TMP/$name"
+  copy_artifacts "$dir"
+  shift
+  "$@" "$dir"
+  if "$ROOT/scripts/install-check.sh" "$dir/dist/$BASE" >/tmp/code-brain-tamper-$name.out 2>/tmp/code-brain-tamper-$name.err; then
+    echo "expected install-check failure for tamper case: $name" >&2
+    cat "/tmp/code-brain-tamper-$name.out" >&2
+    exit 1
+  fi
+}
+
+tamper_checksum() {
+  local dir="$1"
+  python - "$dir/dist/$BASE.sha256" <<'PY'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8").split(maxsplit=1)
+path.write_text("0" * 64 + "  " + text[1], encoding="utf-8")
+PY
+}
+
+tamper_manifest() {
+  local dir="$1"
+  python - "$dir/dist/$PREFIX.manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["files"][0]["sha256"] = "0" * 64
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+tamper_sbom() {
+  local dir="$1"
+  python - "$dir/dist/$PREFIX.sbom.json" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["lockfile_sha256"] = "0" * 64
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+tamper_provenance() {
+  local dir="$1"
+  python - "$dir/dist/$PREFIX.provenance.json" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+subjects = payload.setdefault("subjects", {})
+for key in list(subjects):
+    if key.endswith(".tar.gz"):
+        subjects[key] = "0" * 64
+        break
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+expect_install_check_failure checksum tamper_checksum
+expect_install_check_failure manifest tamper_manifest
+expect_install_check_failure sbom tamper_sbom
+expect_install_check_failure provenance tamper_provenance
+
+echo "artifact tamper check ok"

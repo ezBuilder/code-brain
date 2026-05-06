@@ -23,6 +23,8 @@ uv run --project .ai/runtime ai trust init --name "$(hostname)" --json
 uv run --project .ai/runtime ai render
 printf '{"reason":"need outbound"}' | uv run --project .ai/runtime ai inbox request --gate remote_enable --summary "Enable outbound adapter" --json
 printf '{"summary":"hello"}' | uv run --project .ai/runtime ai notify enqueue --channel telegram --json
+uv run --project .ai/runtime ai obs metrics --json
+uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
 ```
 
 ## Locked Rules
@@ -53,3 +55,5 @@ printf '{"summary":"hello"}' | uv run --project .ai/runtime ai notify enqueue --
 | Secrets | `ai secrets status` | key source status without exposing plaintext |
 | Inbox | `ai inbox request/list/approve/reject` | narrow 5-gate approval records, redacted |
 | Notify | `ai notify enqueue` | P3 outbound adapter jobs, no hot-path network |
+| Observability | `ai obs log/metrics/slo` | local JSONL logs, metrics, SLO check |
+| Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |

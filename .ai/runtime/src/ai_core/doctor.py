@@ -35,6 +35,7 @@ def run_checks(root: Path) -> list[Check]:
         check_trust(root),
         check_jsonl(root),
         check_secret_scan(root),
+        check_diagnostics(root),
     ]
     return checks
 
@@ -136,6 +137,16 @@ def check_jsonl(root: Path) -> Check:
 def check_secret_scan(root: Path) -> Check:
     hits = list(secret_hits(root))
     return Check("secret_scan", not hits, "ok" if not hits else "hits: " + ", ".join(hits[:10]))
+
+
+def check_diagnostics(root: Path) -> Check:
+    try:
+        from .obs import diagnostics
+
+        payload = diagnostics(root, dry_run=True)
+    except Exception as exc:
+        return Check("diagnostics_dry_run", False, str(exc))
+    return Check("diagnostics_dry_run", bool(payload.get("ok")), "ok" if payload.get("ok") else "failed")
 
 
 def secret_hits(root: Path) -> Iterable[str]:

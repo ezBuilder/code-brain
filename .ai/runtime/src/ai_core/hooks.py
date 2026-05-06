@@ -24,8 +24,8 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
     start = time.perf_counter()
     effective_hook = hook_name or payload.get("hook") or payload.get("event") or "unknown"
     event = {"hook": effective_hook, **payload}
-    if is_ci():
-        mode = "ci-fast-path"
+    if is_ci() or payload.get("dry") is True:
+        mode = "ci-fast-path" if is_ci() else "local-dry-fast-path"
         persisted = False
     else:
         append_event(root, event)
@@ -47,4 +47,3 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
 def build_context(hook_name: str, payload: dict[str, Any]) -> str:
     agent = payload.get("agent", "unknown")
     return f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={'off' if is_ci() else 'worker-local'}."
-

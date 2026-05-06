@@ -64,6 +64,8 @@ def copy_repo(tmp_path: Path) -> Path:
         ".ai/memory/audit/*.jsonl",
         ".ai/memory/events/*.jsonl",
         ".ai/memory/inbox/*.json",
+        ".ai/cache/logs/*.jsonl",
+        ".ai/cache/diagnostics/*",
     ):
         for path in target.glob(pattern):
             path.unlink()
@@ -328,3 +330,47 @@ def test_inbox_rejects_non_gate(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     result = run_ai_input("inbox", "request", "--gate", "trust_change", "--summary", "bad", stdin="{}", cwd=repo)
     assert result.returncode == 1
+
+
+def test_obs_log_metrics_slo_and_diagnostics(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    secret_value = "secret=" + "abcdefghijklmnopqrstuv" + "wxyz"
+    log_result = run_ai_input(
+        "obs",
+        "log",
+        "--event",
+        "test.event",
+        "--json",
+        stdin=json.dumps({"token": secret_value}),
+        cwd=repo,
+    )
+    assert log_result.returncode == 0, log_result.stdout + log_result.stderr
+    log_payload = json.loads(log_result.stdout)
+    assert secret_value not in log_result.stdout
+    assert "[REDACTED]" in log_result.stdout
+    assert (repo / log_payload["path"]).exists()
+    metrics_result = run_ai("obs", "metrics", "--json", cwd=repo)
+    assert metrics_result.returncode == 0, metrics_result.stdout + metrics_result.stderr
+    assert json.loads(metrics_result.stdout)["queue"]["pending"] == 0
+    slo_result = run_ai("obs", "slo", "--iterations", "2", "--json", cwd=repo)
+    assert slo_result.returncode == 0, slo_result.stdout + slo_result.stderr
+    assert json.loads(slo_result.stdout)["target_ms"] == 200
+    assert not (repo / ".ai" / "memory" / "events" / "events.jsonl").exists()
+    dry_result = run_ai("diagnostics", "bundle", "--dry-run", "--json", cwd=repo)
+    assert dry_result.returncode == 0, dry_result.stdout + dry_result.stderr
+    assert json.loads(dry_result.stdout)["dry_run"] is True
+    bundle_result = run_ai("diagnostics", "bundle", "--json", cwd=repo)
+    assert bundle_result.returncode == 0, bundle_result.stdout + bundle_result.stderr
+    assert (repo / json.loads(bundle_result.stdout)["path"]).exists()
+
+
+def test_ci_diagnostics_write_rejected_but_dry_run_allowed(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    metrics_result = run_ai("obs", "metrics", "--json", env={"CI": "true"}, cwd=repo)
+    assert metrics_result.returncode == 0, metrics_result.stdout + metrics_result.stderr
+    log_result = run_ai_input("obs", "log", "--event", "ci", stdin="{}", env={"CI": "true"}, cwd=repo)
+    assert log_result.returncode == 16
+    dry_result = run_ai("diagnostics", "bundle", "--dry-run", "--json", env={"CI": "true"}, cwd=repo)
+    assert dry_result.returncode == 0, dry_result.stdout + dry_result.stderr
+    write_result = run_ai("diagnostics", "bundle", "--json", env={"CI": "true"}, cwd=repo)
+    assert write_result.returncode == 16

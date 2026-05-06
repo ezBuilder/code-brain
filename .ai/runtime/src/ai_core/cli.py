@@ -12,6 +12,7 @@ from .inbox import decide, list_approvals, request_approval
 from .memory import append_audit, append_event
 from .mcp_server import handle_request, serve_stdio
 from .notify import enqueue_notification
+from .obs import diagnostics, metrics, prune_diagnostics, slo_bench, write_log
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, reject_ci_write
 from .render import render
@@ -102,6 +103,25 @@ def build_parser() -> argparse.ArgumentParser:
     notify_enqueue = notify_sub.add_parser("enqueue")
     notify_enqueue.add_argument("--channel", required=True)
     notify_enqueue.add_argument("--json", action="store_true", dest="command_json")
+    obs = sub.add_parser("obs")
+    obs_sub = obs.add_subparsers(dest="obs_command", required=True)
+    obs_log = obs_sub.add_parser("log")
+    obs_log.add_argument("--level", default="info")
+    obs_log.add_argument("--event", required=True)
+    obs_log.add_argument("--json", action="store_true", dest="command_json")
+    obs_metrics = obs_sub.add_parser("metrics")
+    obs_metrics.add_argument("--json", action="store_true", dest="command_json")
+    obs_slo = obs_sub.add_parser("slo")
+    obs_slo.add_argument("--iterations", type=int, default=10)
+    obs_slo.add_argument("--json", action="store_true", dest="command_json")
+    diagnostics_parser = sub.add_parser("diagnostics")
+    diagnostics_sub = diagnostics_parser.add_subparsers(dest="diagnostics_command", required=True)
+    diagnostics_bundle = diagnostics_sub.add_parser("bundle")
+    diagnostics_bundle.add_argument("--dry-run", action="store_true")
+    diagnostics_bundle.add_argument("--json", action="store_true", dest="command_json")
+    diagnostics_prune = diagnostics_sub.add_parser("prune")
+    diagnostics_prune.add_argument("--keep-days", type=int, default=30)
+    diagnostics_prune.add_argument("--json", action="store_true", dest="command_json")
     hook_parser = sub.add_parser("hook")
     hook_parser.add_argument("hook_name", nargs="?")
     hook_parser.add_argument("--json", action="store_true", dest="command_json")
@@ -234,6 +254,29 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "notify" and args.notify_command == "enqueue":
             payload = enqueue_notification(root, args.channel, read_payload())
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "obs" and args.obs_command == "log":
+            reject_ci_write("obs_write")
+            payload = write_log(root, args.level, args.event, read_payload())
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "obs" and args.obs_command == "metrics":
+            payload = metrics(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "obs" and args.obs_command == "slo":
+            payload = slo_bench(root, iterations=args.iterations)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "diagnostics" and args.diagnostics_command == "bundle":
+            reject_ci_write("diagnostics_write", dry_run=args.dry_run)
+            payload = diagnostics(root, dry_run=args.dry_run)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "diagnostics" and args.diagnostics_command == "prune":
+            reject_ci_write("diagnostics_write")
+            payload = prune_diagnostics(root, keep_days=args.keep_days)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "hook":

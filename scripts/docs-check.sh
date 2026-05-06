@@ -22,6 +22,7 @@ for needle in \
   "ai upgrade plan --target-version" \
   "exit code \`16\`" \
   "./scripts/release-gate.sh" \
+  "make env-check" \
   "make lint" \
   "make release-gate"
 do
@@ -41,6 +42,8 @@ uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
+./scripts/env-check.sh >/dev/null
+make -n env-check >/dev/null
 make -n lint >/dev/null
 make -n quick >/dev/null
 make -n package >/dev/null

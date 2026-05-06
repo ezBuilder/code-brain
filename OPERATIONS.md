@@ -50,6 +50,7 @@ Install verification extracts the latest `dist/code-brain-<version>.tar.gz` into
 - `ai doctor --strict`
 - `.ai/bin/ai`
 - `.ai/bin/ai-hook`
+- `.ai/bin/ai.ps1` and `.ai/bin/ai-hook.ps1` when PowerShell is available
 - runtime tests
 
 ## Daily Health Check

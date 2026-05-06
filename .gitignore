@@ -1,0 +1,7 @@
+.ai/cache/
+.ai/runtime/.venv/
+.ai/runtime/.pytest_cache/
+__pycache__/
+*.pyc
+dist/
+

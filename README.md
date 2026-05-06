@@ -29,6 +29,8 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 ```bash
 ./bootstrap.sh
 ./scripts/smoke.sh
+./scripts/package.sh
+./scripts/install-check.sh
 ```
 
 `scripts/smoke.sh` copies the repository to a temporary directory before running write-heavy flows such as queue, trust, inbox, notify, diagnostics bundle, and upgrade rollback. The working tree stays clean.
@@ -64,6 +66,7 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 | Observability | `ai obs log/metrics/slo` | local JSONL logs, metrics, SLO check |
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
 | Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration and local rollback backups |
+| Package | `scripts/package.sh`, `scripts/install-check.sh` | tarball + checksum + install verification |
 
 ## Release Gate
 
@@ -72,6 +75,8 @@ Before tagging a release:
 ```bash
 ./bootstrap.sh
 ./scripts/smoke.sh
+./scripts/package.sh
+./scripts/install-check.sh
 git status --short
 ```
 

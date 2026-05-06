@@ -18,16 +18,20 @@ printf '{"agent":"codex"}' | uv run --project .ai/runtime ai hook SessionStart -
 uv run --project .ai/runtime ai worker health --json
 uv run --project .ai/runtime ai index rebuild --json
 uv run --project .ai/runtime ai code query "worker IPC" --json
-printf '{"task":"rebuild"}' | uv run --project .ai/runtime ai queue enqueue --priority P2 --kind index --json
-uv run --project .ai/runtime ai trust init --name "$(hostname)" --json
-uv run --project .ai/runtime ai render
-printf '{"reason":"need outbound"}' | uv run --project .ai/runtime ai inbox request --gate remote_enable --summary "Enable outbound adapter" --json
-printf '{"summary":"hello"}' | uv run --project .ai/runtime ai notify enqueue --channel telegram --json
 uv run --project .ai/runtime ai obs metrics --json
 uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
 uv run --project .ai/runtime ai migrate --dry-run --json
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 ```
+
+## Full Local Verification
+
+```bash
+./bootstrap.sh
+./scripts/smoke.sh
+```
+
+`scripts/smoke.sh` copies the repository to a temporary directory before running write-heavy flows such as queue, trust, inbox, notify, diagnostics bundle, and upgrade rollback. The working tree stays clean.
 
 ## Locked Rules
 
@@ -60,3 +64,15 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 | Observability | `ai obs log/metrics/slo` | local JSONL logs, metrics, SLO check |
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
 | Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration and local rollback backups |
+
+## Release Gate
+
+Before tagging a release:
+
+```bash
+./bootstrap.sh
+./scripts/smoke.sh
+git status --short
+```
+
+Expected result: tests pass, `ai doctor --strict` is green, smoke completes in a temporary copy, and `git status --short` is empty.

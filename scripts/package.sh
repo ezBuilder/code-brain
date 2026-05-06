@@ -33,6 +33,12 @@ mkdir -p "$TMP/$NAME"
 tar \
   --exclude './.git' \
   --exclude './dist' \
+  --exclude './.DS_Store' \
+  --exclude './*/.DS_Store' \
+  --exclude './__MACOSX' \
+  --exclude './*/__MACOSX' \
+  --exclude './._*' \
+  --exclude './*/._*' \
   --exclude './.ai/cache' \
   --exclude './.ai/runtime/.venv' \
   --exclude './.ai/runtime/.pytest_cache' \

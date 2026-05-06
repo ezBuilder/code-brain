@@ -66,6 +66,8 @@ with tarfile.open(archive, "r:gz") as tar:
         path = pathlib.PurePosixPath(member.name)
         if path.is_absolute() or ".." in path.parts:
             raise SystemExit(f"unsafe archive path: {member.name}")
+        if "__MACOSX" in path.parts or ".DS_Store" in path.parts or any(part.startswith("._") for part in path.parts):
+            raise SystemExit(f"unsafe archive metadata path: {member.name}")
         if not (member.isfile() or member.isdir()):
             raise SystemExit(f"unsafe archive member type: {member.name}")
     roots = {pathlib.PurePosixPath(member.name).parts[0] for member in members if member.name and pathlib.PurePosixPath(member.name).parts}

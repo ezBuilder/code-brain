@@ -34,6 +34,7 @@ def run_checks(root: Path) -> list[Check]:
         check_manifest(root),
         check_trust(root),
         check_jsonl(root),
+        check_audit_index(root),
         check_secret_scan(root),
         check_diagnostics(root),
     ]
@@ -132,6 +133,53 @@ def check_jsonl(root: Path) -> Check:
             except json.JSONDecodeError:
                 bad.append(f"{path.relative_to(root)}:{line_no}")
     return Check("jsonl", not bad, "ok" if not bad else "invalid: " + ", ".join(bad))
+
+
+def read_jsonl(path: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    if not path.exists():
+        return records
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            loaded = json.loads(line)
+            if isinstance(loaded, dict):
+                records.append(loaded)
+    return records
+
+
+def audit_key(record: dict[str, object], path: str | None = None) -> tuple[object, object, object, object]:
+    return (record.get("ts"), record.get("action"), record.get("category"), path or record.get("path"))
+
+
+def check_audit_index(root: Path) -> Check:
+    audit_root = root / ".ai" / "memory" / "audit"
+    index_path = root / ".ai" / "memory" / "audit-index.jsonl"
+    bad: list[str] = []
+    index_records = read_jsonl(index_path)
+    index_keys = {audit_key(record) for record in index_records}
+
+    for record in index_records:
+        rel_path = record.get("path")
+        if not isinstance(rel_path, str):
+            bad.append("audit-index:path")
+            continue
+        target = root / rel_path
+        if not target.exists() or target.parent != audit_root or target.suffix != ".jsonl":
+            bad.append(rel_path)
+
+    audit_keys: set[tuple[object, object, object, object]] = set()
+    for path in sorted(audit_root.glob("*.jsonl")):
+        rel_path = path.relative_to(root).as_posix()
+        for record in read_jsonl(path):
+            key = audit_key(record, rel_path)
+            audit_keys.add(key)
+            if key not in index_keys:
+                bad.append(f"{rel_path}:missing-index:{record.get('ts')}")
+
+    for key in sorted(index_keys - audit_keys, key=str):
+        bad.append(f"audit-index:orphan:{key[0]}")
+
+    return Check("audit_index", not bad, "ok" if not bad else "invalid: " + ", ".join(bad[:10]))
 
 
 def check_secret_scan(root: Path) -> Check:

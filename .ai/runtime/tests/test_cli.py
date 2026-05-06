@@ -361,6 +361,49 @@ def test_ci_memory_and_audit_writes_rejected(tmp_path: Path) -> None:
     assert audit_result.returncode == 16
 
 
+def test_audit_append_updates_index_consistently(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = run_ai_input(
+        "audit",
+        "append",
+        "--action",
+        "test.audit",
+        "--category",
+        "test",
+        "--json",
+        stdin='{"note":"audit payload"}',
+        cwd=repo,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = json.loads(result.stdout)
+    index_records = [
+        json.loads(line)
+        for line in (repo / ".ai" / "memory" / "audit-index.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert index_records[-1]["ts"] == record["ts"]
+    assert index_records[-1]["action"] == "test.audit"
+    assert index_records[-1]["category"] == "test"
+    assert index_records[-1]["path"].startswith(".ai/memory/audit/")
+    doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    assert doctor_result.returncode == 0, doctor_result.stdout + doctor_result.stderr
+
+
+def test_doctor_rejects_audit_index_mismatch(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = run_ai_input("audit", "append", "--action", "test.audit", "--json", stdin="{}", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    (repo / ".ai" / "memory" / "audit-index.jsonl").write_text(
+        '{"ts":"2099-01-01T00:00:00Z","action":"wrong","category":"manual","path":".ai/memory/audit/2099.jsonl"}\n',
+        encoding="utf-8",
+    )
+    doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    assert doctor_result.returncode == 10
+    payload = json.loads(doctor_result.stdout)
+    audit_check = next(check for check in payload["checks"] if check["name"] == "audit_index")
+    assert audit_check["ok"] is False
+
+
 def test_trust_init_render_and_revoke(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     init_result = run_ai("trust", "init", "--name", "local-test", "--json", cwd=repo)

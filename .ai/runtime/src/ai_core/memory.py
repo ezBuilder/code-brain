@@ -20,22 +20,25 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
         handle.write(line + "\n")
 
 
-def audit_path(root: Path) -> Path:
-    return root / ".ai" / "memory" / "audit" / f"{datetime.now(timezone.utc).year}.jsonl"
+def audit_path(root: Path, *, at: datetime | None = None) -> Path:
+    effective = at or datetime.now(timezone.utc)
+    return root / ".ai" / "memory" / "audit" / f"{effective.year}.jsonl"
 
 
 def append_audit(root: Path, *, action: str, category: str, payload: dict[str, Any]) -> dict[str, Any]:
+    timestamp = datetime.now(timezone.utc)
+    path = audit_path(root, at=timestamp)
     record = {
-        "ts": now_iso(),
+        "ts": timestamp.isoformat().replace("+00:00", "Z"),
         "monotonic_ns": time.monotonic_ns(),
         "action": action,
         "category": category,
         "payload": redact_value(payload),
     }
-    append_jsonl(audit_path(root), record)
+    append_jsonl(path, record)
     append_jsonl(
         root / ".ai" / "memory" / "audit-index.jsonl",
-        {"ts": record["ts"], "category": category, "action": action, "path": audit_path(root).relative_to(root).as_posix()},
+        {"ts": record["ts"], "category": category, "action": action, "path": path.relative_to(root).as_posix()},
     )
     return record
 
@@ -51,4 +54,3 @@ def append_event(root: Path, event: dict[str, Any]) -> dict[str, Any]:
     append_jsonl(root / ".ai" / "memory" / "events" / "events.jsonl", record)
     append_audit(root, action="event.append", category="memory", payload={"kind": record["kind"], "agent": record["agent"]})
     return record
-

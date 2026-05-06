@@ -6,6 +6,7 @@ This runbook is for operating Code Brain after handoff. It assumes a repo-local 
 
 ```bash
 cd code-brain
+make quick
 ./bootstrap.sh
 uv run --project .ai/runtime ai doctor --strict --json
 uv run --project .ai/runtime ai report status --json
@@ -25,6 +26,7 @@ Run the full gate before tagging, shipping an archive, or handing a build to ano
 
 ```bash
 ./scripts/release-gate.sh
+make release-gate
 uv run --project .ai/runtime ai report release-notes
 ```
 
@@ -40,6 +42,9 @@ Build and verify the archive:
 ./scripts/package.sh
 ./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/install-check.sh
+make package
+make verify-artifacts
+make install-check
 ```
 
 Artifact verification checks release files without executing package code:
@@ -198,6 +203,7 @@ Before handing the repository to another operator:
 ./scripts/release-gate.sh
 ./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/artifact-tamper-check.sh
+make release-gate
 uv run --project .ai/runtime ai report status --json
 git status --short
 ```

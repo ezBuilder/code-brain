@@ -11,6 +11,7 @@ This implementation follows the Claude-authored PRD and MVP implementation plan 
 
 ```bash
 cd code-brain
+make quick
 uv run --project .ai/runtime ai version
 uv run --project .ai/runtime ai render --dry-run
 uv run --project .ai/runtime ai doctor --strict
@@ -36,12 +37,14 @@ uv run --project .ai/runtime ai report status --json
 ./scripts/install-check.sh
 ./scripts/artifact-tamper-check.sh
 ./scripts/release-gate.sh
+make release-gate
 ```
 
 `scripts/smoke.sh` copies the repository to a temporary directory before running write-heavy flows such as queue, trust, inbox, notify, diagnostics bundle, and upgrade rollback. The working tree stays clean.
 `scripts/docs-check.sh` verifies the operator runbook commands and CI write-denial behavior.
 `scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, and provenance without executing package code.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, and provenance artifacts are rejected.
+`Makefile` provides operator shortcuts such as `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
 
 ## Operations
 
@@ -94,6 +97,7 @@ Before tagging a release:
 ./scripts/install-check.sh
 ./scripts/artifact-tamper-check.sh
 ./scripts/release-gate.sh
+make release-gate
 git status --short
 ```
 

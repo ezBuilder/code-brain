@@ -20,7 +20,8 @@ for needle in \
   "ai queue recover-expired --json" \
   "ai upgrade plan --target-version" \
   "exit code \`16\`" \
-  "./scripts/release-gate.sh"
+  "./scripts/release-gate.sh" \
+  "make release-gate"
 do
   if ! grep -Fq "$needle" OPERATIONS.md README.md RELEASE.md; then
     echo "documented operation missing: $needle" >&2
@@ -38,6 +39,12 @@ uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
+make -n quick >/dev/null
+make -n package >/dev/null
+make -n verify-artifacts >/dev/null
+make -n install-check >/dev/null
+make -n tamper-check >/dev/null
+make -n release-gate >/dev/null
 
 CI=true uv run --project .ai/runtime ai obs metrics --json >/dev/null
 CI=true uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null

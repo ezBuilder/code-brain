@@ -13,6 +13,8 @@ PYTHON = sys.executable
 
 def run_ai(*args: str, env: dict[str, str] | None = None, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
     merged = os.environ.copy()
+    merged.pop("CI", None)
+    merged.pop("GITHUB_ACTIONS", None)
     merged["PYTHONPATH"] = str(ROOT / ".ai" / "runtime" / "src")
     if env:
         merged.update(env)
@@ -34,6 +36,8 @@ def run_ai_input(
     cwd: Path = ROOT,
 ) -> subprocess.CompletedProcess[str]:
     merged = os.environ.copy()
+    merged.pop("CI", None)
+    merged.pop("GITHUB_ACTIONS", None)
     merged["PYTHONPATH"] = str(ROOT / ".ai" / "runtime" / "src")
     if env:
         merged.update(env)

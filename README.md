@@ -45,6 +45,7 @@ make release-gate
 `scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, and provenance without executing package code.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, and provenance artifacts are rejected.
 `Makefile` provides operator shortcuts such as `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
+GitHub Actions uses the same Makefile targets as local release verification.
 
 ## Operations
 

@@ -33,6 +33,7 @@ uv run --project .ai/runtime ai report release-notes
 The release gate runs bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
 It also runs artifact tamper checks so checksum, manifest, SBOM, and provenance corruption must be rejected before release.
 Use `scripts/verify-artifacts.sh` when you need to validate downloaded release artifacts before running package code.
+CI uses the same Makefile targets as local release verification; write-heavy smoke/docs flows run only inside temporary repositories with CI policy explicitly cleared.
 
 ## Install From Archive
 

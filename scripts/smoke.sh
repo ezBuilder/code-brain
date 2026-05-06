@@ -20,6 +20,7 @@ tar \
   -C "$ROOT" -cf - . | tar -C "$COPY" -xf -
 
 cd "$COPY"
+unset CI GITHUB_ACTIONS
 
 uv run --project .ai/runtime python -m pytest .ai/runtime/tests
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null

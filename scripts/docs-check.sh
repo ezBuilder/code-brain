@@ -22,6 +22,7 @@ for needle in \
   "ai upgrade plan --target-version" \
   "exit code \`16\`" \
   "CI_READ_ONLY" \
+  "release_ready" \
   "queue status" \
   "worker health" \
   "./scripts/release-gate.sh" \

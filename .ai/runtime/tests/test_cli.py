@@ -504,7 +504,9 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
     assert payload["runtime_version"] == "0.1.0"
     assert payload["protocol_version"] == 1
     assert payload["doctor"]["ok"] is True
+    assert isinstance(payload["release_ready"], bool)
     artifacts = payload["release_artifacts"]
+    assert isinstance(artifacts["all_current"], bool)
     if artifacts["all_present"]:
         assert artifacts["archive"]["checksum_valid"] is True
         assert artifacts["manifest"]["valid"] is True
@@ -512,6 +514,8 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
         assert artifacts["sbom"]["valid"] is True
         assert artifacts["sbom"]["package_count"] > 0
         assert artifacts["provenance"]["valid"] is True
+        assert "current" in artifacts["provenance"]
+        assert "git_head_matches" in artifacts["provenance"]
         assert artifacts["release_notes"]["valid"] is True
         assert artifacts["all_valid"] is True
     else:

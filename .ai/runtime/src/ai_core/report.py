@@ -21,16 +21,19 @@ def git_output(root: Path, *args: str) -> str:
 
 def status_report(root: Path) -> dict[str, Any]:
     doctor = as_payload(run_checks(root))
-    artifacts = release_artifacts(root)
+    git = {
+        "branch": git_output(root, "branch", "--show-current"),
+        "head": git_output(root, "rev-parse", "--short", "HEAD"),
+        "head_12": git_output(root, "rev-parse", "--short=12", "HEAD"),
+        "status_short": git_output(root, "status", "--short"),
+    }
+    artifacts = release_artifacts(root, git=git)
     return {
         "ok": bool(doctor["ok"]),
+        "release_ready": bool(doctor["ok"] and artifacts["all_present"] and artifacts["all_valid"] and artifacts["all_current"]),
         "runtime_version": __version__,
         "protocol_version": PROTOCOL_VERSION,
-        "git": {
-            "branch": git_output(root, "branch", "--show-current"),
-            "head": git_output(root, "rev-parse", "--short", "HEAD"),
-            "status_short": git_output(root, "status", "--short"),
-        },
+        "git": git,
         "doctor": doctor,
         "metrics": metrics(root),
         "release_artifact": artifacts["archive"],
@@ -51,6 +54,7 @@ def release_notes(root: Path) -> str:
             f"- Protocol version: `{PROTOCOL_VERSION}`",
             f"- Git HEAD: `{report['git']['head']}`",
             f"- Doctor: `{'ok' if report['doctor']['ok'] else 'failed'}`",
+            f"- Release ready: `{'yes' if report['release_ready'] else 'no'}`",
             f"- Archive: `{report['release_artifact']['archive']}`",
             f"- SHA-256: `{report['release_artifact']['sha256'] or 'missing'}`",
             f"- Manifest: `{report['release_artifacts']['manifest']['path']}`",
@@ -117,7 +121,7 @@ def artifact_entry(root: Path, path: Path) -> dict[str, Any]:
     }
 
 
-def release_artifacts(root: Path) -> dict[str, Any]:
+def release_artifacts(root: Path, *, git: dict[str, str] | None = None) -> dict[str, Any]:
     archive = root / "dist" / f"code-brain-{__version__}.tar.gz"
     checksum = archive.with_suffix(archive.suffix + ".sha256")
     manifest = root / "dist" / f"code-brain-{__version__}.manifest.json"
@@ -136,7 +140,9 @@ def release_artifacts(root: Path) -> dict[str, Any]:
     }
     manifest_entry = artifact_entry(root, manifest) | manifest_summary(manifest)
     sbom_entry = artifact_entry(root, sbom) | sbom_summary(root, sbom)
-    provenance_entry = artifact_entry(root, provenance) | provenance_summary(archive, manifest, sbom, provenance, release_notes)
+    provenance_entry = artifact_entry(root, provenance) | provenance_summary(
+        archive, manifest, sbom, provenance, release_notes, git=git
+    )
     release_notes_entry = artifact_entry(root, release_notes) | release_notes_summary(
         archive, manifest, sbom, provenance, release_notes
     )
@@ -165,6 +171,7 @@ def release_artifacts(root: Path) -> dict[str, Any]:
                 release_notes_entry["valid"],
             )
         ),
+        "all_current": bool(provenance_entry["current"]),
     }
 
 
@@ -203,17 +210,37 @@ def sbom_summary(root: Path, path: Path) -> dict[str, Any]:
     }
 
 
-def provenance_summary(archive: Path, manifest: Path, sbom: Path, provenance: Path, release_notes: Path) -> dict[str, Any]:
+def provenance_summary(
+    archive: Path,
+    manifest: Path,
+    sbom: Path,
+    provenance: Path,
+    release_notes: Path,
+    *,
+    git: dict[str, str] | None = None,
+) -> dict[str, Any]:
     payload = json_payload(provenance)
     if payload is None:
-        return {"valid": False, "git": {}, "subjects_valid": False}
+        return {"valid": False, "git": {}, "subjects_valid": False, "current": False, "git_head_matches": False}
     subjects = payload.get("subjects", {})
     required = [archive, manifest, sbom, release_notes]
     subjects_valid = isinstance(subjects, dict) and all(subjects.get(path.name) == file_sha256(path) for path in required)
+    provenance_git = payload.get("git", {})
+    current_head = (git or {}).get("head_12", "")
+    current_status = (git or {}).get("status_short", "")
+    provenance_head = provenance_git.get("head") if isinstance(provenance_git, dict) else None
+    provenance_status = provenance_git.get("status_short") if isinstance(provenance_git, dict) else None
+    git_head_matches = bool(current_head and provenance_head == current_head)
+    git_status_clean = provenance_status == ""
+    current_git_clean = current_status == ""
     return {
-        "valid": subjects_valid and isinstance(payload.get("git"), dict),
-        "git": payload.get("git", {}),
+        "valid": subjects_valid and isinstance(provenance_git, dict),
+        "git": provenance_git if isinstance(provenance_git, dict) else {},
         "subjects_valid": subjects_valid,
+        "git_head_matches": git_head_matches,
+        "git_status_clean": git_status_clean,
+        "current_git_clean": current_git_clean,
+        "current": bool(git_head_matches and git_status_clean and current_git_clean),
     }
 
 

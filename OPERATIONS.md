@@ -18,6 +18,7 @@ Expected result:
 
 - `doctor.ok` is `true`.
 - `release_artifacts.all_present` and `release_artifacts.all_valid` are `true` after packaging.
+- `release_ready` is `true` only when doctor is green, release artifacts are present/valid, and provenance matches the current clean git HEAD.
 - `report.status.ok` is `true`.
 - `git.status_short` is empty for tracked files.
 - Runtime artifacts appear only in ignored paths such as `.ai/cache/`, `.ai/runtime/.venv/`, `.ai/runtime/.pytest_cache/`, `__pycache__/`, and `dist/`.

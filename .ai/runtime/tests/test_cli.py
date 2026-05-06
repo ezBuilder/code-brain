@@ -264,6 +264,27 @@ def test_ci_queue_write_rejected() -> None:
     assert result.returncode == 16
 
 
+def test_ci_mutation_commands_rejected(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    commands = [
+        ("render",),
+        ("queue", "lease", "--worker-id", "ci"),
+        ("queue", "recover-expired"),
+        ("queue", "archive-dead", "--older-than-days", "0"),
+        ("trust", "revoke", "missing"),
+        ("inbox", "approve", "missing"),
+        ("inbox", "reject", "missing"),
+        ("diagnostics", "prune", "--keep-days", "1"),
+        ("migrate",),
+        ("upgrade", "rollback", "--backup-path", ".ai/cache/upgrade/missing.json"),
+        ("upgrade", "clean-cache"),
+        ("index", "rebuild"),
+    ]
+    for command in commands:
+        result = run_ai(*command, env={"CI": "true"}, cwd=repo)
+        assert result.returncode == 16, command + (result.stdout, result.stderr)
+
+
 def test_ci_read_only_commands_allowed(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     commands = [
@@ -276,6 +297,14 @@ def test_ci_read_only_commands_allowed(tmp_path: Path) -> None:
     for command in commands:
         result = run_ai(*command, env={"CI": "true"}, cwd=repo)
         assert result.returncode == 0, command + (result.stdout, result.stderr)
+
+
+def test_github_actions_write_policy_matches_ci(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    write_result = run_ai("render", env={"GITHUB_ACTIONS": "true"}, cwd=repo)
+    assert write_result.returncode == 16
+    read_result = run_ai("queue", "status", "--json", env={"GITHUB_ACTIONS": "true"}, cwd=repo)
+    assert read_result.returncode == 0, read_result.stdout + read_result.stderr
 
 
 def test_ci_memory_and_audit_writes_rejected(tmp_path: Path) -> None:

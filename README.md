@@ -32,6 +32,7 @@ uv run --project .ai/runtime ai report status --json
 ./scripts/smoke.sh
 ./scripts/docs-check.sh
 ./scripts/package.sh
+./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/install-check.sh
 ./scripts/artifact-tamper-check.sh
 ./scripts/release-gate.sh
@@ -39,6 +40,7 @@ uv run --project .ai/runtime ai report status --json
 
 `scripts/smoke.sh` copies the repository to a temporary directory before running write-heavy flows such as queue, trust, inbox, notify, diagnostics bundle, and upgrade rollback. The working tree stays clean.
 `scripts/docs-check.sh` verifies the operator runbook commands and CI write-denial behavior.
+`scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, and provenance without executing package code.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, and provenance artifacts are rejected.
 
 ## Operations
@@ -88,6 +90,7 @@ Before tagging a release:
 ./scripts/smoke.sh
 ./scripts/docs-check.sh
 ./scripts/package.sh
+./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/install-check.sh
 ./scripts/artifact-tamper-check.sh
 ./scripts/release-gate.sh

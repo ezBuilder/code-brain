@@ -30,6 +30,7 @@ uv run --project .ai/runtime ai report release-notes
 
 The release gate runs bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
 It also runs artifact tamper checks so checksum, manifest, SBOM, and provenance corruption must be rejected before release.
+Use `scripts/verify-artifacts.sh` when you need to validate downloaded release artifacts before running package code.
 
 ## Install From Archive
 
@@ -37,15 +38,19 @@ Build and verify the archive:
 
 ```bash
 ./scripts/package.sh
+./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/install-check.sh
 ```
 
-Install verification extracts the latest `dist/code-brain-<version>.tar.gz` into a temporary directory and verifies:
+Artifact verification checks release files without executing package code:
 
 - archive checksum;
 - file manifest hashes when `dist/code-brain-<version>.manifest.json` exists;
 - SBOM lockfile and dependency package list when `dist/code-brain-<version>.sbom.json` exists;
 - provenance subjects when `dist/code-brain-<version>.provenance.json` exists;
+
+Install verification then extracts the latest `dist/code-brain-<version>.tar.gz` into a temporary directory and verifies:
+
 - `ai version`
 - `ai doctor --strict`
 - `.ai/bin/ai`
@@ -191,6 +196,7 @@ Before handing the repository to another operator:
 ```bash
 ./scripts/docs-check.sh
 ./scripts/release-gate.sh
+./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/artifact-tamper-check.sh
 uv run --project .ai/runtime ai report status --json
 git status --short

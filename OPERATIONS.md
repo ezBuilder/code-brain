@@ -6,6 +6,7 @@ This runbook is for operating Code Brain after handoff. It assumes a repo-local 
 
 ```bash
 cd code-brain
+make lint
 make quick
 ./bootstrap.sh
 uv run --project .ai/runtime ai doctor --strict --json
@@ -26,11 +27,13 @@ Run the full gate before tagging, shipping an archive, or handing a build to ano
 
 ```bash
 ./scripts/release-gate.sh
+make lint
 make release-gate
 uv run --project .ai/runtime ai report release-notes
 ```
 
 The release gate runs bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
+It starts with `scripts/lint.sh`, which checks shell syntax, Python compilation, Makefile dry-runs, and PowerShell parsing when PowerShell is available.
 It also runs artifact tamper checks so checksum, manifest, SBOM, and provenance corruption must be rejected before release.
 Use `scripts/verify-artifacts.sh` when you need to validate downloaded release artifacts before running package code.
 CI uses the same Makefile targets as local release verification; write-heavy smoke/docs flows run only inside temporary repositories with CI policy explicitly cleared.
@@ -202,6 +205,7 @@ Before handing the repository to another operator:
 ```bash
 ./scripts/docs-check.sh
 ./scripts/release-gate.sh
+make lint
 ./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/artifact-tamper-check.sh
 make release-gate

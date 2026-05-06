@@ -3,11 +3,12 @@ SHELL := /usr/bin/env bash
 
 LATEST_ARCHIVE := $(shell ls -t dist/code-brain-*.tar.gz 2>/dev/null | head -n 1)
 
-.PHONY: help bootstrap test doctor quick smoke docs-check package verify-artifacts install-check tamper-check release-gate report release-notes clean-cache
+.PHONY: help lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check tamper-check release-gate report release-notes clean-cache
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
+		'  make lint              Run static script and Python compile checks' \
 		'  make quick             Run fast local health checks' \
 		'  make package           Build release artifacts under dist/' \
 		'  make verify-artifacts  Verify checksum, manifest, SBOM, provenance' \
@@ -15,6 +16,9 @@ help:
 		'  make tamper-check      Verify corrupted artifacts are rejected' \
 		'  make release-gate      Run the full release gate' \
 		'  make report            Print release status JSON'
+
+lint:
+	./scripts/lint.sh
 
 bootstrap:
 	./bootstrap.sh
@@ -25,7 +29,7 @@ test:
 doctor:
 	uv run --project .ai/runtime ai doctor --strict --json
 
-quick: doctor test
+quick: lint doctor test
 	uv run --project .ai/runtime ai report status --json >/dev/null
 
 smoke:

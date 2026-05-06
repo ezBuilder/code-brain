@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+./scripts/lint.sh
 ./bootstrap.sh
 ./scripts/smoke.sh
 ./scripts/docs-check.sh

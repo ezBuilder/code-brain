@@ -11,6 +11,7 @@ This implementation follows the Claude-authored PRD and MVP implementation plan 
 
 ```bash
 cd code-brain
+make lint
 make quick
 uv run --project .ai/runtime ai version
 uv run --project .ai/runtime ai render --dry-run
@@ -30,6 +31,7 @@ uv run --project .ai/runtime ai report status --json
 
 ```bash
 ./bootstrap.sh
+./scripts/lint.sh
 ./scripts/smoke.sh
 ./scripts/docs-check.sh
 ./scripts/package.sh
@@ -37,6 +39,7 @@ uv run --project .ai/runtime ai report status --json
 ./scripts/install-check.sh
 ./scripts/artifact-tamper-check.sh
 ./scripts/release-gate.sh
+make lint
 make release-gate
 ```
 
@@ -44,7 +47,7 @@ make release-gate
 `scripts/docs-check.sh` verifies the operator runbook commands and CI write-denial behavior.
 `scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, and provenance without executing package code.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, and provenance artifacts are rejected.
-`Makefile` provides operator shortcuts such as `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
+`Makefile` provides operator shortcuts such as `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
 GitHub Actions uses the same Makefile targets as local release verification.
 
 ## Operations
@@ -91,6 +94,7 @@ Before tagging a release:
 
 ```bash
 ./bootstrap.sh
+./scripts/lint.sh
 ./scripts/smoke.sh
 ./scripts/docs-check.sh
 ./scripts/package.sh
@@ -98,6 +102,7 @@ Before tagging a release:
 ./scripts/install-check.sh
 ./scripts/artifact-tamper-check.sh
 ./scripts/release-gate.sh
+make lint
 make release-gate
 git status --short
 ```

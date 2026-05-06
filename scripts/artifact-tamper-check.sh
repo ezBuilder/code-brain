@@ -155,11 +155,53 @@ PY
   fi
 }
 
+expect_unsafe_member_type_failure() {
+  local dir="$TMP/unsafe_member_type"
+  local payload="$TMP/unsafe-member-payload"
+  mkdir -p "$dir/dist" "$payload/$PREFIX"
+  printf 'ok\n' >"$payload/$PREFIX/README.txt"
+  python - "$dir/dist/$BASE" "$payload" "$PREFIX" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+archive = pathlib.Path(sys.argv[1])
+payload = pathlib.Path(sys.argv[2])
+prefix = sys.argv[3]
+with tarfile.open(archive, "w:gz") as tar:
+    tar.add(payload / prefix / "README.txt", arcname=f"{prefix}/README.txt")
+    link = tarfile.TarInfo(f"{prefix}/link-out")
+    link.type = tarfile.SYMTYPE
+    link.linkname = "/tmp/code-brain-escape"
+    tar.addfile(link)
+PY
+  cp "$ARCHIVE.sha256" "$dir/dist/$BASE.sha256"
+  cp "$(dirname "$ARCHIVE")/$PREFIX.manifest.json" "$dir/dist/$PREFIX.manifest.json"
+  cp "$(dirname "$ARCHIVE")/$PREFIX.sbom.json" "$dir/dist/$PREFIX.sbom.json"
+  cp "$(dirname "$ARCHIVE")/$PREFIX.provenance.json" "$dir/dist/$PREFIX.provenance.json"
+  cp "$(dirname "$ARCHIVE")/$PREFIX.release-notes.md" "$dir/dist/$PREFIX.release-notes.md"
+  python - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+archive = pathlib.Path(sys.argv[1])
+sha_file = pathlib.Path(sys.argv[2])
+sha_file.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n", encoding="utf-8")
+PY
+  if "$ROOT/scripts/verify-artifacts.sh" "$dir/dist/$BASE" >"$TMP/unsafe-member.out" 2>"$TMP/unsafe-member.err"; then
+    echo "expected artifact verifier failure for tamper case: unsafe_member_type" >&2
+    cat "$TMP/unsafe-member.out" >&2
+    exit 1
+  fi
+}
+
 expect_install_check_failure checksum tamper_checksum
 expect_install_check_failure manifest tamper_manifest
 expect_install_check_failure sbom tamper_sbom
 expect_install_check_failure provenance tamper_provenance
 expect_install_check_failure release_notes tamper_release_notes
 expect_unsafe_archive_failure
+expect_unsafe_member_type_failure
 
 echo "artifact tamper check ok"

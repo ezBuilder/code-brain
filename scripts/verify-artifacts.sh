@@ -65,6 +65,8 @@ with tarfile.open(archive, "r:gz") as tar:
         path = pathlib.PurePosixPath(member.name)
         if path.is_absolute() or ".." in path.parts:
             raise SystemExit(f"unsafe archive path: {member.name}")
+        if not (member.isfile() or member.isdir()):
+            raise SystemExit(f"unsafe archive member type: {member.name}")
     roots = {pathlib.PurePosixPath(member.name).parts[0] for member in members if member.name and pathlib.PurePosixPath(member.name).parts}
     if len(roots) != 1:
         raise SystemExit(f"archive must contain exactly one package root, got: {sorted(roots)}")

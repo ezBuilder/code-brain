@@ -21,9 +21,11 @@ make -n tamper-check >/dev/null
 make -n release-gate >/dev/null
 
 if command -v pwsh >/dev/null 2>&1; then
+  pwsh -NoProfile -NonInteractive -Command "[scriptblock]::Create((Get-Content -Raw 'bootstrap.ps1')) | Out-Null"
   pwsh -NoProfile -NonInteractive -Command "[scriptblock]::Create((Get-Content -Raw '.ai/bin/ai.ps1')) | Out-Null"
   pwsh -NoProfile -NonInteractive -Command "[scriptblock]::Create((Get-Content -Raw '.ai/bin/ai-hook.ps1')) | Out-Null"
 elif command -v powershell >/dev/null 2>&1; then
+  powershell -NoProfile -NonInteractive -Command "[scriptblock]::Create((Get-Content -Raw 'bootstrap.ps1')) | Out-Null"
   powershell -NoProfile -NonInteractive -Command "[scriptblock]::Create((Get-Content -Raw '.ai/bin/ai.ps1')) | Out-Null"
   powershell -NoProfile -NonInteractive -Command "[scriptblock]::Create((Get-Content -Raw '.ai/bin/ai-hook.ps1')) | Out-Null"
 fi

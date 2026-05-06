@@ -14,25 +14,22 @@ if [[ ! -f "$ARCHIVE" ]]; then
   exit 2
 fi
 
-SHA_FILE="$ARCHIVE.sha256"
-MANIFEST="${ARCHIVE%.tar.gz}.manifest.json"
-SBOM="${ARCHIVE%.tar.gz}.sbom.json"
-PROVENANCE="${ARCHIVE%.tar.gz}.provenance.json"
-
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 "$ROOT/scripts/verify-artifacts.sh" "$ARCHIVE" >/dev/null
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 tar -C "$TMP" -xzf "$ARCHIVE"
-PKG_DIR="$(find "$TMP" -maxdepth 1 -type d -name 'code-brain-*' | head -n 1)"
+PACKAGE_DIRS="$TMP/package-dirs.txt"
+find "$TMP" -maxdepth 1 -type d -name 'code-brain-*' | sort >"$PACKAGE_DIRS"
+PACKAGE_DIR_COUNT="$(wc -l <"$PACKAGE_DIRS" | tr -d ' ')"
 
-if [[ -z "$PKG_DIR" ]]; then
-  echo "package directory not found in archive" >&2
+if [[ "$PACKAGE_DIR_COUNT" -ne 1 ]]; then
+  printf 'package archive must contain exactly one code-brain-* root, got %s\n' "$PACKAGE_DIR_COUNT" >&2
   exit 2
 fi
 
+PKG_DIR="$(head -n 1 "$PACKAGE_DIRS")"
 cd "$PKG_DIR"
 
 uv run --project .ai/runtime ai --json version >/dev/null

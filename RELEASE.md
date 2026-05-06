@@ -26,7 +26,7 @@ git status --short
 - All tests pass.
 - Environment check passes for bash, git, make, uv, and uv-managed Python; PowerShell is reported as optional.
 - Direct bootstrap starts with the environment check; bash and PowerShell bootstrap render with `--dry-run` under CI/GitHub Actions.
-- Lint passes for shell scripts, Python compilation, Makefile dry-runs, and PowerShell parsing when PowerShell is available.
+- Lint passes for shell scripts, Python compilation, Makefile dry-runs, and PowerShell bootstrap/shim parsing when PowerShell is available.
 - Doctor is green.
 - Smoke test completes in a temporary repository copy.
 - Operator runbook examples pass through `scripts/docs-check.sh`.

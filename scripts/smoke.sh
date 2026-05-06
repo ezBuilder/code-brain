@@ -5,6 +5,10 @@ export COPYFILE_DISABLE=1
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+JOB_OUTPUT="$TMP/job.json"
+LEASE_OUTPUT="$TMP/lease.json"
+APPROVAL_OUTPUT="$TMP/approval.json"
+PACKAGE_OUTPUT="$TMP/package.txt"
 
 COPY="$TMP/code-brain"
 mkdir -p "$COPY"
@@ -28,15 +32,15 @@ uv run --project .ai/runtime ai render --dry-run --json >/dev/null
 uv run --project .ai/runtime ai index rebuild --json >/dev/null
 uv run --project .ai/runtime ai code query worker --json >/dev/null
 printf '{"agent":"codex"}' | uv run --project .ai/runtime ai hook SessionStart --json >/dev/null
-printf '{"task":"smoke"}' | uv run --project .ai/runtime ai queue enqueue --priority P2 --kind smoke --json >/tmp/code-brain-smoke-job.json
-JOB_ID="$(python -c 'import json; print(json.load(open("/tmp/code-brain-smoke-job.json"))["job"]["id"])')"
-uv run --project .ai/runtime ai queue lease --worker-id smoke --json >/tmp/code-brain-smoke-lease.json
-LEASE_ID="$(python -c 'import json; print(json.load(open("/tmp/code-brain-smoke-lease.json"))["job"]["lease_id"])')"
+printf '{"task":"smoke"}' | uv run --project .ai/runtime ai queue enqueue --priority P2 --kind smoke --json >"$JOB_OUTPUT"
+JOB_ID="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["job"]["id"])' "$JOB_OUTPUT")"
+uv run --project .ai/runtime ai queue lease --worker-id smoke --json >"$LEASE_OUTPUT"
+LEASE_ID="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["job"]["lease_id"])' "$LEASE_OUTPUT")"
 uv run --project .ai/runtime ai queue complete --job-id "$JOB_ID" --lease-id "$LEASE_ID" --json >/dev/null
 uv run --project .ai/runtime ai trust init --name smoke --json >/dev/null
 uv run --project .ai/runtime ai render --json >/dev/null
-printf '{"reason":"smoke"}' | uv run --project .ai/runtime ai inbox request --gate remote_enable --summary smoke --json >/tmp/code-brain-smoke-approval.json
-APPROVAL_ID="$(python -c 'import json; print(json.load(open("/tmp/code-brain-smoke-approval.json"))["approval"]["approval_id"])')"
+printf '{"reason":"smoke"}' | uv run --project .ai/runtime ai inbox request --gate remote_enable --summary smoke --json >"$APPROVAL_OUTPUT"
+APPROVAL_ID="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["approval"]["approval_id"])' "$APPROVAL_OUTPUT")"
 uv run --project .ai/runtime ai inbox approve "$APPROVAL_ID" --json >/dev/null
 printf '{"summary":"smoke"}' | uv run --project .ai/runtime ai notify enqueue --channel stdout --json >/dev/null
 uv run --project .ai/runtime ai obs metrics --json >/dev/null
@@ -44,8 +48,13 @@ uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai report status --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
-./scripts/package.sh >/tmp/code-brain-smoke-package.txt
-ARCHIVE="$(head -n 1 /tmp/code-brain-smoke-package.txt)"
+./scripts/package.sh >"$PACKAGE_OUTPUT"
+ARCHIVE="$(head -n 1 "$PACKAGE_OUTPUT")"
+if [[ -z "$ARCHIVE" || ! -f "$ARCHIVE" ]]; then
+  cat "$PACKAGE_OUTPUT" >&2
+  echo "smoke failed: package script did not emit an archive path" >&2
+  exit 1
+fi
 ./scripts/install-check.sh "$ARCHIVE" >/dev/null
 
 CI=true uv run --project .ai/runtime ai obs metrics --json >/dev/null

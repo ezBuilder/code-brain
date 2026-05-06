@@ -12,7 +12,7 @@ help:
 		'  make lint              Run static script and Python compile checks' \
 		'  make quick             Run fast local health checks' \
 		'  make package           Build release artifacts under dist/' \
-		'  make verify-artifacts  Verify checksum, manifest, SBOM, provenance' \
+		'  make verify-artifacts  Verify checksum, manifest, SBOM, provenance, release notes' \
 		'  make install-check     Verify extracted package execution' \
 		'  make tamper-check      Verify corrupted artifacts are rejected' \
 		'  make release-gate      Run the full release gate' \

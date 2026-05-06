@@ -19,6 +19,7 @@ from .render import render
 from .search import context_pack, query, rebuild
 from .secrets_store import status as secrets_status
 from .trust import init_machine, list_machines, revoke_machine
+from .upgrade import clean_upgrade_cache, migrate, rollback, upgrade_apply, upgrade_plan
 from .worker.ipc import IpcError, health, parse_envelope
 from .worker.scheduler import archive_dead, complete, enqueue, fail, lease_next, recover_expired, status as queue_status
 
@@ -122,6 +123,23 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostics_prune = diagnostics_sub.add_parser("prune")
     diagnostics_prune.add_argument("--keep-days", type=int, default=30)
     diagnostics_prune.add_argument("--json", action="store_true", dest="command_json")
+    migrate_parser = sub.add_parser("migrate")
+    migrate_parser.add_argument("--dry-run", action="store_true")
+    migrate_parser.add_argument("--json", action="store_true", dest="command_json")
+    upgrade = sub.add_parser("upgrade")
+    upgrade_sub = upgrade.add_subparsers(dest="upgrade_command", required=True)
+    upgrade_plan_parser = upgrade_sub.add_parser("plan")
+    upgrade_plan_parser.add_argument("--target-version", required=True)
+    upgrade_plan_parser.add_argument("--json", action="store_true", dest="command_json")
+    upgrade_apply_parser = upgrade_sub.add_parser("apply")
+    upgrade_apply_parser.add_argument("--target-version", required=True)
+    upgrade_apply_parser.add_argument("--dry-run", action="store_true")
+    upgrade_apply_parser.add_argument("--json", action="store_true", dest="command_json")
+    upgrade_rollback = upgrade_sub.add_parser("rollback")
+    upgrade_rollback.add_argument("--backup-path", required=True)
+    upgrade_rollback.add_argument("--json", action="store_true", dest="command_json")
+    upgrade_clean = upgrade_sub.add_parser("clean-cache")
+    upgrade_clean.add_argument("--json", action="store_true", dest="command_json")
     hook_parser = sub.add_parser("hook")
     hook_parser.add_argument("hook_name", nargs="?")
     hook_parser.add_argument("--json", action="store_true", dest="command_json")
@@ -277,6 +295,30 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "diagnostics" and args.diagnostics_command == "prune":
             reject_ci_write("diagnostics_write")
             payload = prune_diagnostics(root, keep_days=args.keep_days)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "migrate":
+            reject_ci_write("migrate", dry_run=args.dry_run)
+            payload = migrate(root, dry_run=args.dry_run)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "upgrade" and args.upgrade_command == "plan":
+            payload = upgrade_plan(root, target_version=args.target_version)
+            emit(payload, as_json=as_json)
+            return OK if payload["ok"] else GENERIC_ERROR
+        if args.command == "upgrade" and args.upgrade_command == "apply":
+            reject_ci_write("upgrade", dry_run=args.dry_run)
+            payload = upgrade_apply(root, target_version=args.target_version, dry_run=args.dry_run)
+            emit(payload, as_json=as_json)
+            return OK if payload["ok"] else GENERIC_ERROR
+        if args.command == "upgrade" and args.upgrade_command == "rollback":
+            reject_ci_write("upgrade")
+            payload = rollback(root, backup_path=args.backup_path)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "upgrade" and args.upgrade_command == "clean-cache":
+            reject_ci_write("upgrade")
+            payload = clean_upgrade_cache(root)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "hook":

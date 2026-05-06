@@ -374,3 +374,34 @@ def test_ci_diagnostics_write_rejected_but_dry_run_allowed(tmp_path: Path) -> No
     assert dry_result.returncode == 0, dry_result.stdout + dry_result.stderr
     write_result = run_ai("diagnostics", "bundle", "--json", env={"CI": "true"}, cwd=repo)
     assert write_result.returncode == 16
+
+
+def test_migrate_and_upgrade_plan_apply_rollback(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    migrate_result = run_ai("migrate", "--dry-run", "--json", cwd=repo)
+    assert migrate_result.returncode == 0, migrate_result.stdout + migrate_result.stderr
+    migrate_payload = json.loads(migrate_result.stdout)
+    assert migrate_payload["schema_version"] == 1
+    plan_result = run_ai("upgrade", "plan", "--target-version", "0.1.1", "--json", cwd=repo)
+    assert plan_result.returncode == 0, plan_result.stdout + plan_result.stderr
+    assert json.loads(plan_result.stdout)["compatible"] is True
+    apply_result = run_ai("upgrade", "apply", "--target-version", "0.1.1", "--json", cwd=repo)
+    assert apply_result.returncode == 0, apply_result.stdout + apply_result.stderr
+    backup_path = json.loads(apply_result.stdout)["backup_path"]
+    assert (repo / backup_path).exists()
+    rollback_result = run_ai("upgrade", "rollback", "--backup-path", backup_path, "--json", cwd=repo)
+    assert rollback_result.returncode == 0, rollback_result.stdout + rollback_result.stderr
+    incompatible_result = run_ai("upgrade", "plan", "--target-version", "9.0.0", "--json", cwd=repo)
+    assert incompatible_result.returncode == 1
+
+
+def test_ci_migrate_upgrade_write_policy(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    dry_migrate = run_ai("migrate", "--dry-run", "--json", env={"CI": "true"}, cwd=repo)
+    assert dry_migrate.returncode == 0, dry_migrate.stdout + dry_migrate.stderr
+    migrate_write = run_ai("migrate", "--json", env={"CI": "true"}, cwd=repo)
+    assert migrate_write.returncode == 16
+    dry_upgrade = run_ai("upgrade", "apply", "--target-version", "0.1.1", "--dry-run", "--json", env={"CI": "true"}, cwd=repo)
+    assert dry_upgrade.returncode == 0, dry_upgrade.stdout + dry_upgrade.stderr
+    upgrade_write = run_ai("upgrade", "apply", "--target-version", "0.1.1", "--json", env={"CI": "true"}, cwd=repo)
+    assert upgrade_write.returncode == 16

@@ -25,6 +25,8 @@ printf '{"reason":"need outbound"}' | uv run --project .ai/runtime ai inbox requ
 printf '{"summary":"hello"}' | uv run --project .ai/runtime ai notify enqueue --channel telegram --json
 uv run --project .ai/runtime ai obs metrics --json
 uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
+uv run --project .ai/runtime ai migrate --dry-run --json
+uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 ```
 
 ## Locked Rules
@@ -57,3 +59,4 @@ uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
 | Notify | `ai notify enqueue` | P3 outbound adapter jobs, no hot-path network |
 | Observability | `ai obs log/metrics/slo` | local JSONL logs, metrics, SLO check |
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
+| Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration and local rollback backups |

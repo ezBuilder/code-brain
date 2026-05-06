@@ -1,0 +1,15 @@
+version: 1
+project_name: code-brain
+worker:
+  idle_ttl_seconds: 1800
+hot_path:
+  target_ms: 200
+features:
+  embeddings: false
+  remote_llm: false
+  external_notifications: false
+cache:
+  sqlite_path: .ai/cache/code.sqlite
+manifest:
+  path: .ai/generated/manifest.json
+

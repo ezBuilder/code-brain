@@ -1,0 +1,17 @@
+name: doctor
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv run --project .ai/runtime python -m pytest .ai/runtime/tests
+      - run: uv run --project .ai/runtime ai doctor --strict

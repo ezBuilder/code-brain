@@ -1,0 +1,51 @@
+{
+  "artifacts": [
+    {
+      "action": "shim",
+      "path": "AGENTS.md",
+      "source_sha": "6d04c1d07ac4a36fd51e5f4ff700074e51c26b8f97996d00dff20d07975dca2f"
+    },
+    {
+      "action": "shim",
+      "path": "CLAUDE.md",
+      "source_sha": "6d04c1d07ac4a36fd51e5f4ff700074e51c26b8f97996d00dff20d07975dca2f"
+    }
+  ],
+  "chunker": {
+    "version": 1
+  },
+  "embedding": {
+    "dim": null,
+    "enabled": false,
+    "hash": null,
+    "model": null
+  },
+  "generator": {
+    "name": "code-brain-runtime",
+    "version": "0.1.0"
+  },
+  "git": {
+    "attributes_hash": "ac10ed2ddfd8800eddbbdec84d3a525752497f206a2c8c812b415a6e088ed6de",
+    "eol_policy": "lf",
+    "root_hash": null,
+    "root_id_normalized": null
+  },
+  "processor": {
+    "versions": {
+      "runtime": "0.1.0"
+    }
+  },
+  "schema_version": 1,
+  "sqlite_vec": {
+    "version": null
+  },
+  "summarizer": {
+    "mode": "extractive",
+    "model": null,
+    "prompt_version": null,
+    "version": 1
+  },
+  "trust": {
+    "machines_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

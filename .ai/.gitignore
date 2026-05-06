@@ -1,0 +1,11 @@
+/runtime/.venv/
+/cache/
+/tools/
+/memory/queue/*.json
+/memory/queue/.tmp/*
+/memory/queue/processing/*
+/memory/queue/dead/*
+!/memory/queue/.tmp/.gitkeep
+!/memory/queue/processing/.gitkeep
+!/memory/queue/dead/.gitkeep
+

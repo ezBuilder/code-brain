@@ -81,6 +81,13 @@ if not pkg_dir.is_dir():
     raise SystemExit(f"package root missing after extract: {pkg_name}")
 
 manifest = load_json(manifest_path)
+if manifest.get("name") != "code-brain":
+    raise SystemExit("manifest name mismatch")
+version = manifest.get("version")
+if not isinstance(version, str) or not version:
+    raise SystemExit("manifest version missing")
+if expected_root != f"code-brain-{version}":
+    raise SystemExit("manifest version does not match archive root")
 if manifest.get("archive") != archive.name:
     raise SystemExit("manifest archive name mismatch")
 if manifest.get("archive_sha256") != actual_archive_sha:
@@ -103,6 +110,10 @@ for item in files:
         raise SystemExit(f"manifest file size mismatch: {path}")
 
 sbom = load_json(sbom_path)
+if sbom.get("name") != manifest.get("name"):
+    raise SystemExit("SBOM name mismatch")
+if sbom.get("version") != version:
+    raise SystemExit("SBOM version mismatch")
 lock_path = pkg_dir / ".ai" / "runtime" / "uv.lock"
 if not lock_path.is_file():
     raise SystemExit("SBOM lockfile target missing")
@@ -117,6 +128,10 @@ if sbom.get("package_count") != len(sbom_packages):
     raise SystemExit("SBOM package_count mismatch")
 
 provenance = load_json(provenance_path)
+if provenance.get("name") != manifest.get("name"):
+    raise SystemExit("provenance name mismatch")
+if provenance.get("version") != version:
+    raise SystemExit("provenance version mismatch")
 if not release_notes_path.is_file():
     raise SystemExit(f"artifact missing: {release_notes_path}")
 subjects = provenance.get("subjects", {})

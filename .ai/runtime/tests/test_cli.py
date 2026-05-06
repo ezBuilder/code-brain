@@ -415,6 +415,19 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
     assert payload["runtime_version"] == "0.1.0"
     assert payload["protocol_version"] == 1
     assert payload["doctor"]["ok"] is True
+    artifacts = payload["release_artifacts"]
+    if artifacts["all_present"]:
+        assert artifacts["archive"]["checksum_valid"] is True
+        assert artifacts["manifest"]["valid"] is True
+        assert artifacts["manifest"]["file_count"] > 0
+        assert artifacts["sbom"]["valid"] is True
+        assert artifacts["sbom"]["package_count"] > 0
+        assert artifacts["provenance"]["valid"] is True
+        assert artifacts["all_valid"] is True
+    else:
+        assert artifacts["archive"]["archive_exists"] is False
     notes_result = run_ai("report", "release-notes", cwd=repo)
     assert notes_result.returncode == 0, notes_result.stdout + notes_result.stderr
     assert "Code Brain 0.1.0 Release Notes" in notes_result.stdout
+    assert "SBOM" in notes_result.stdout
+    assert "./scripts/docs-check.sh" in notes_result.stdout

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -19,8 +21,7 @@ def git_output(root: Path, *args: str) -> str:
 
 def status_report(root: Path) -> dict[str, Any]:
     doctor = as_payload(run_checks(root))
-    archive = root / "dist" / f"code-brain-{__version__}.tar.gz"
-    checksum = archive.with_suffix(archive.suffix + ".sha256")
+    artifacts = release_artifacts(root)
     return {
         "ok": bool(doctor["ok"]),
         "runtime_version": __version__,
@@ -32,13 +33,8 @@ def status_report(root: Path) -> dict[str, Any]:
         },
         "doctor": doctor,
         "metrics": metrics(root),
-        "release_artifact": {
-            "archive": archive.relative_to(root).as_posix(),
-            "archive_exists": archive.exists(),
-            "checksum": checksum.relative_to(root).as_posix(),
-            "checksum_exists": checksum.exists(),
-            "sha256": read_checksum(checksum),
-        },
+        "release_artifact": artifacts["archive"],
+        "release_artifacts": artifacts,
     }
 
 
@@ -57,6 +53,9 @@ def release_notes(root: Path) -> str:
             f"- Doctor: `{'ok' if report['doctor']['ok'] else 'failed'}`",
             f"- Archive: `{report['release_artifact']['archive']}`",
             f"- SHA-256: `{report['release_artifact']['sha256'] or 'missing'}`",
+            f"- Manifest: `{report['release_artifacts']['manifest']['path']}`",
+            f"- SBOM: `{report['release_artifacts']['sbom']['path']}`",
+            f"- Provenance: `{report['release_artifacts']['provenance']['path']}`",
             "",
             "## Recent Commits",
             "",
@@ -69,9 +68,11 @@ def release_notes(root: Path) -> str:
             "```bash",
             "./bootstrap.sh",
             "./scripts/smoke.sh",
+            "./scripts/docs-check.sh",
             "./scripts/package.sh",
             "./scripts/install-check.sh",
             "uv run --project .ai/runtime ai doctor --strict --json",
+            "uv run --project .ai/runtime ai report status --json",
             "git status --short",
             "```",
             "",
@@ -85,3 +86,119 @@ def read_checksum(path: Path) -> str | None:
     text = path.read_text(encoding="utf-8").strip()
     return text.split()[0] if text else None
 
+
+def file_sha256(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def json_payload(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def artifact_entry(root: Path, path: Path) -> dict[str, Any]:
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "exists": path.exists(),
+        "sha256": file_sha256(path),
+    }
+
+
+def release_artifacts(root: Path) -> dict[str, Any]:
+    archive = root / "dist" / f"code-brain-{__version__}.tar.gz"
+    checksum = archive.with_suffix(archive.suffix + ".sha256")
+    manifest = root / "dist" / f"code-brain-{__version__}.manifest.json"
+    sbom = root / "dist" / f"code-brain-{__version__}.sbom.json"
+    provenance = root / "dist" / f"code-brain-{__version__}.provenance.json"
+
+    archive_entry = {
+        "archive": archive.relative_to(root).as_posix(),
+        "archive_exists": archive.exists(),
+        "checksum": checksum.relative_to(root).as_posix(),
+        "checksum_exists": checksum.exists(),
+        "sha256": read_checksum(checksum),
+        "computed_sha256": file_sha256(archive),
+        "checksum_valid": checksum_matches(archive, checksum),
+    }
+    manifest_entry = artifact_entry(root, manifest) | manifest_summary(manifest)
+    sbom_entry = artifact_entry(root, sbom) | sbom_summary(root, sbom)
+    provenance_entry = artifact_entry(root, provenance) | provenance_summary(archive, manifest, sbom, provenance)
+    return {
+        "archive": archive_entry,
+        "manifest": manifest_entry,
+        "sbom": sbom_entry,
+        "provenance": provenance_entry,
+        "all_present": all(
+            (
+                archive.exists(),
+                checksum.exists(),
+                manifest.exists(),
+                sbom.exists(),
+                provenance.exists(),
+            )
+        ),
+        "all_valid": all(
+            (
+                archive_entry["checksum_valid"],
+                manifest_entry["valid"],
+                sbom_entry["valid"],
+                provenance_entry["valid"],
+            )
+        ),
+    }
+
+
+def checksum_matches(archive: Path, checksum: Path) -> bool:
+    expected = read_checksum(checksum)
+    actual = file_sha256(archive)
+    return bool(expected and actual and expected == actual)
+
+
+def manifest_summary(path: Path) -> dict[str, Any]:
+    payload = json_payload(path)
+    if payload is None:
+        return {"valid": False, "file_count": None, "archive_sha256": None}
+    files = payload.get("files")
+    file_count = payload.get("file_count")
+    return {
+        "valid": isinstance(files, list) and file_count == len(files),
+        "file_count": file_count,
+        "archive_sha256": payload.get("archive_sha256"),
+    }
+
+
+def sbom_summary(root: Path, path: Path) -> dict[str, Any]:
+    payload = json_payload(path)
+    lock_path = root / ".ai" / "runtime" / "uv.lock"
+    if payload is None:
+        return {"valid": False, "package_count": None, "lockfile_sha256": None, "lockfile_valid": False}
+    packages = payload.get("packages")
+    package_count = payload.get("package_count")
+    lockfile_sha = payload.get("lockfile_sha256")
+    return {
+        "valid": isinstance(packages, list) and package_count == len(packages) and lockfile_sha == file_sha256(lock_path),
+        "package_count": package_count,
+        "lockfile_sha256": lockfile_sha,
+        "lockfile_valid": lockfile_sha == file_sha256(lock_path),
+    }
+
+
+def provenance_summary(archive: Path, manifest: Path, sbom: Path, provenance: Path) -> dict[str, Any]:
+    payload = json_payload(provenance)
+    if payload is None:
+        return {"valid": False, "git": {}, "subjects_valid": False}
+    subjects = payload.get("subjects", {})
+    required = [archive, manifest, sbom]
+    subjects_valid = isinstance(subjects, dict) and all(subjects.get(path.name) == file_sha256(path) for path in required)
+    return {
+        "valid": subjects_valid and isinstance(payload.get("git"), dict),
+        "git": payload.get("git", {}),
+        "subjects_valid": subjects_valid,
+    }

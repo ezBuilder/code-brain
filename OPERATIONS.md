@@ -14,6 +14,7 @@ uv run --project .ai/runtime ai report status --json
 Expected result:
 
 - `doctor.ok` is `true`.
+- `release_artifacts.all_present` and `release_artifacts.all_valid` are `true` after packaging.
 - `report.status.ok` is `true`.
 - `git.status_short` is empty for tracked files.
 - Runtime artifacts appear only in ignored paths such as `.ai/cache/`, `.ai/runtime/.venv/`, `.ai/runtime/.pytest_cache/`, `__pycache__/`, and `dist/`.

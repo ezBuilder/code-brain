@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import hashlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -122,7 +123,40 @@ def test_worker_health_rejects_bad_envelope() -> None:
     result = run_ai("worker", "health", "--envelope-json", "{\"protocol_version\":1}")
     assert result.returncode == 1
     payload = json.loads(result.stdout)
-    assert payload["error"] == "INVALID_REQUEST"
+    assert payload["error"] == "UNAUTHORIZED"
+
+
+def test_worker_health_envelope_error_matrix(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    seed_result = run_ai("worker", "health", "--json", cwd=repo)
+    assert seed_result.returncode == 0, seed_result.stdout + seed_result.stderr
+    token = (repo / ".ai" / "cache" / "run" / "worker.token").read_text(encoding="utf-8").strip()
+    envelope = {
+        "protocol_version": 1,
+        "token": token,
+        "root_id": repo.name,
+        "root_hash": hashlib.sha256(repo.resolve().as_posix().encode("utf-8")).hexdigest(),
+        "machine_id_hash": hashlib.sha256(b"").hexdigest(),
+        "request_id": "matrix",
+    }
+    cases = [
+        ("protocol_version", None, "INCOMPATIBLE_VERSION"),
+        ("protocol_version", 999, "INCOMPATIBLE_VERSION"),
+        ("token", None, "UNAUTHORIZED"),
+        ("token", "wrong", "UNAUTHORIZED"),
+        ("root_hash", None, "UNAUTHORIZED"),
+        ("root_hash", "wrong", "UNAUTHORIZED"),
+        ("request_id", None, "INVALID_REQUEST"),
+    ]
+    for key, value, expected in cases:
+        candidate = dict(envelope)
+        if value is None:
+            candidate.pop(key)
+        else:
+            candidate[key] = value
+        result = run_ai("worker", "health", "--envelope-json", json.dumps(candidate), cwd=repo)
+        assert result.returncode == 1, (key, result.stdout, result.stderr)
+        assert json.loads(result.stdout)["error"] == expected
 
 
 def test_ci_worker_health_does_not_create_token(tmp_path: Path) -> None:

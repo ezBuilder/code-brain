@@ -69,15 +69,21 @@ def build_envelope(root: Path, *, request_id: str = "health") -> dict[str, Any]:
 
 
 def validate_envelope(root: Path, envelope: dict[str, Any]) -> None:
+    if "protocol_version" not in envelope:
+        raise IpcError("INCOMPATIBLE_VERSION", "missing protocol version")
+    if envelope["protocol_version"] != PROTOCOL_VERSION:
+        raise IpcError("INCOMPATIBLE_VERSION", "protocol major mismatch")
+    if "token" not in envelope:
+        raise IpcError("UNAUTHORIZED", "missing worker token")
+    if "root_hash" not in envelope:
+        raise IpcError("UNAUTHORIZED", "missing root hash")
     missing = sorted(REQUIRED_ENVELOPE - set(envelope))
     if missing:
         raise IpcError("INVALID_REQUEST", "missing envelope fields: " + ", ".join(missing))
-    if envelope["protocol_version"] != PROTOCOL_VERSION:
-        raise IpcError("INCOMPATIBLE_VERSION", "protocol major mismatch")
     if envelope["token"] != get_or_create_token(root):
         raise IpcError("UNAUTHORIZED", "worker token mismatch")
     if envelope["root_hash"] != root_hash(root):
-        raise IpcError("INVALID_ROOT", "root hash mismatch")
+        raise IpcError("UNAUTHORIZED", "root hash mismatch")
 
 
 def health(root: Path, envelope: dict[str, Any] | None = None) -> dict[str, Any]:

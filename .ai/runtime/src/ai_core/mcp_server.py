@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .redact import redact_value
 from .search import context_pack, query, rebuild
 from .worker.ipc import health
 
@@ -23,10 +24,11 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any]:
         elif method == "ai_request_rebuild":
             result = rebuild(root)
         else:
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "method not found"}}
-        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+            response = {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "method not found"}}
+            return redact_value(response)
+        return redact_value({"jsonrpc": "2.0", "id": request_id, "result": result})
     except Exception as exc:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}}
+        return redact_value({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}})
 
 
 def serve_stdio(root: Path) -> int:
@@ -36,4 +38,3 @@ def serve_stdio(root: Path) -> int:
         response = handle_request(root, json.loads(line))
         print(json.dumps(response, ensure_ascii=False, sort_keys=True), flush=True)
     return 0
-

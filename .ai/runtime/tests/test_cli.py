@@ -195,6 +195,13 @@ def test_context_pack_and_mcp_once(tmp_path: Path) -> None:
     assert response["jsonrpc"] == "2.0"
     assert response["result"]["results"]
 
+    secret_value = "secret=" + "abcdefghijklmnopqrstuv" + "wxyz"
+    bad_request = {"jsonrpc": "2.0", "id": 2, "method": "code_query", "params": {"query": "manifest", "limit": secret_value}}
+    bad_result = run_ai("mcp", "--once-json", json.dumps(bad_request), cwd=repo)
+    assert bad_result.returncode == 0, bad_result.stdout + bad_result.stderr
+    assert secret_value not in bad_result.stdout
+    assert "[REDACTED]" in bad_result.stdout
+
 
 def test_ci_index_rebuild_rejected() -> None:
     result = run_ai("index", "rebuild", env={"CI": "true"})

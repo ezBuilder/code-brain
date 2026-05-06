@@ -62,6 +62,11 @@ path.write_text("0" * 64 + "  " + text[1], encoding="utf-8")
 PY
 }
 
+tamper_missing_checksum() {
+  local dir="$1"
+  rm -f "$dir/dist/$BASE.sha256"
+}
+
 tamper_manifest() {
   local dir="$1"
   python - "$dir/dist/$PREFIX.manifest.json" <<'PY'
@@ -75,6 +80,11 @@ path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="
 PY
 }
 
+tamper_missing_manifest() {
+  local dir="$1"
+  rm -f "$dir/dist/$PREFIX.manifest.json"
+}
+
 tamper_sbom() {
   local dir="$1"
   python - "$dir/dist/$PREFIX.sbom.json" <<'PY'
@@ -86,6 +96,11 @@ payload = json.loads(path.read_text(encoding="utf-8"))
 payload["lockfile_sha256"] = "0" * 64
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+}
+
+tamper_missing_sbom() {
+  local dir="$1"
+  rm -f "$dir/dist/$PREFIX.sbom.json"
 }
 
 tamper_provenance() {
@@ -103,6 +118,11 @@ for key in list(subjects):
         break
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+}
+
+tamper_missing_provenance() {
+  local dir="$1"
+  rm -f "$dir/dist/$PREFIX.provenance.json"
 }
 
 tamper_dirty_provenance() {
@@ -129,6 +149,11 @@ payload = json.loads(path.read_text(encoding="utf-8"))
 payload["version"] = "9.9.9"
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+}
+
+tamper_missing_release_notes() {
+  local dir="$1"
+  rm -f "$dir/dist/$PREFIX.release-notes.md"
 }
 
 tamper_release_notes() {
@@ -261,12 +286,17 @@ PY
 }
 
 expect_install_check_failure checksum tamper_checksum
+expect_install_check_failure missing_checksum tamper_missing_checksum
 expect_install_check_failure manifest tamper_manifest
+expect_install_check_failure missing_manifest tamper_missing_manifest
 expect_install_check_failure sbom tamper_sbom
+expect_install_check_failure missing_sbom tamper_missing_sbom
 expect_install_check_failure provenance tamper_provenance
+expect_install_check_failure missing_provenance tamper_missing_provenance
 expect_install_check_failure dirty_provenance tamper_dirty_provenance
 expect_install_check_failure metadata_version tamper_metadata_version
 expect_install_check_failure release_notes tamper_release_notes
+expect_install_check_failure missing_release_notes tamper_missing_release_notes
 expect_unsafe_archive_failure
 expect_unsafe_member_type_failure
 expect_root_mismatch_failure

@@ -46,6 +46,7 @@ git status --short
 - Protocol version is `1`.
 - `ai upgrade plan --target-version <version>` must be compatible before `ai upgrade apply`.
 - CI must reject write commands with exit `16`.
+- CI JSON write rejection must include `CI_READ_ONLY`.
 - CI must allow read-only status/list/report/metrics commands.
 - CI worker health must remain read-only and must not create `.ai/cache/run/worker.token`.
 

@@ -14,7 +14,7 @@ from .mcp_server import handle_request, serve_stdio
 from .notify import enqueue_notification
 from .obs import diagnostics, metrics, prune_diagnostics, slo_bench, write_log
 from .paths import find_repo_root
-from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, reject_ci_write
+from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, PolicyDenied, reject_ci_write
 from .report import release_notes, status_report
 from .render import render
 from .search import context_pack, query, rebuild
@@ -384,6 +384,9 @@ def main(argv: list[str] | None = None) -> int:
     except IpcError as exc:
         emit({"ok": False, "error": exc.code, "detail": exc.message}, as_json=True)
         return GENERIC_ERROR
+    except PolicyDenied as exc:
+        emit({"ok": False, "error": "CI_READ_ONLY", "command": exc.command, "exit_code": PERMISSION_DENIED}, as_json=True)
+        return PERMISSION_DENIED
     except SystemExit as exc:
         raise exc
     except Exception as exc:

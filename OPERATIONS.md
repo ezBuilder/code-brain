@@ -95,7 +95,7 @@ CI=true uv run --project .ai/runtime ai render
 ```
 
 The first two commands should pass. The final command must fail with exit code `16`.
-Write commands such as render, queue mutation, trust mutation, inbox mutation, notify enqueue, memory append, audit append, diagnostics write, migration, upgrade apply, and index rebuild are denied in CI. Read-only commands such as `queue status`, `trust list`, `secrets status`, `inbox list`, reports, metrics, and `worker health` remain allowed; `worker health` does not create a worker token when CI/GitHub Actions is set.
+Write commands such as render, queue mutation, trust mutation, inbox mutation, notify enqueue, memory append, audit append, diagnostics write, migration, upgrade apply, and index rebuild are denied in CI with exit `16` and a `CI_READ_ONLY` JSON error when JSON output is requested. Read-only commands such as `queue status`, `trust list`, `secrets status`, `inbox list`, reports, metrics, and `worker health` remain allowed; `worker health` does not create a worker token when CI/GitHub Actions is set.
 
 ## Queue Operations
 

@@ -30,13 +30,19 @@ WRITE_COMMANDS = {
 }
 
 
+class PolicyDenied(RuntimeError):
+    def __init__(self, command: str) -> None:
+        super().__init__(f"CI read-only policy denied write command: {command}")
+        self.command = command
+
+
 def is_ci() -> bool:
     return os.environ.get("CI", "").lower() in {"1", "true", "yes"} or bool(os.environ.get("GITHUB_ACTIONS"))
 
 
 def reject_ci_write(command: str, *, dry_run: bool = False) -> None:
     if is_ci() and command in WRITE_COMMANDS and not dry_run:
-        raise SystemExit(PERMISSION_DENIED)
+        raise PolicyDenied(command)
 
 
 def allow_no_redact(yes: bool) -> bool:

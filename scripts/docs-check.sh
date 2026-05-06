@@ -21,6 +21,7 @@ for needle in \
   "ai queue recover-expired --json" \
   "ai upgrade plan --target-version" \
   "exit code \`16\`" \
+  "CI_READ_ONLY" \
   "queue status" \
   "worker health" \
   "./scripts/release-gate.sh" \

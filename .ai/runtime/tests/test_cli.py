@@ -93,8 +93,11 @@ def test_render_dry_run_json() -> None:
 
 
 def test_ci_write_rejected_before_render() -> None:
-    result = run_ai("render", env={"CI": "true"})
+    result = run_ai("render", "--json", env={"CI": "true"})
     assert result.returncode == 16
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "CI_READ_ONLY"
+    assert payload["command"] == "render"
 
 
 def test_doctor_strict_passes_after_render() -> None:
@@ -260,8 +263,19 @@ def test_queue_fail_and_archive(tmp_path: Path) -> None:
 
 
 def test_ci_queue_write_rejected() -> None:
-    result = run_ai_input("queue", "enqueue", "--priority", "P1", "--kind", "test", stdin="{}", env={"CI": "true"})
+    result = run_ai_input(
+        "queue",
+        "enqueue",
+        "--priority",
+        "P1",
+        "--kind",
+        "test",
+        "--json",
+        stdin="{}",
+        env={"CI": "true"},
+    )
     assert result.returncode == 16
+    assert json.loads(result.stdout)["error"] == "CI_READ_ONLY"
 
 
 def test_ci_mutation_commands_rejected(tmp_path: Path) -> None:
@@ -301,8 +315,9 @@ def test_ci_read_only_commands_allowed(tmp_path: Path) -> None:
 
 def test_github_actions_write_policy_matches_ci(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
-    write_result = run_ai("render", env={"GITHUB_ACTIONS": "true"}, cwd=repo)
+    write_result = run_ai("render", "--json", env={"GITHUB_ACTIONS": "true"}, cwd=repo)
     assert write_result.returncode == 16
+    assert json.loads(write_result.stdout)["error"] == "CI_READ_ONLY"
     read_result = run_ai("queue", "status", "--json", env={"GITHUB_ACTIONS": "true"}, cwd=repo)
     assert read_result.returncode == 0, read_result.stdout + read_result.stderr
 

@@ -40,6 +40,8 @@ Build and verify the archive:
 
 Install verification extracts the latest `dist/code-brain-<version>.tar.gz` into a temporary directory and verifies:
 
+- archive checksum;
+- file manifest hashes when `dist/code-brain-<version>.manifest.json` exists;
 - `ai version`
 - `ai doctor --strict`
 - `.ai/bin/ai`
@@ -188,4 +190,4 @@ uv run --project .ai/runtime ai report status --json
 git status --short
 ```
 
-Attach `ai report release-notes` output and the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`.
+Attach `ai report release-notes` output, the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`, and `dist/code-brain-<version>.manifest.json`.

@@ -9,9 +9,11 @@ from .config import load_config
 from .doctor import as_payload, run_checks
 from .hooks import handle_hook, read_payload
 from .memory import append_audit, append_event
+from .mcp_server import handle_request, serve_stdio
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, reject_ci_write
 from .render import render
+from .search import context_pack, query, rebuild
 from .worker.ipc import IpcError, health, parse_envelope
 
 
@@ -48,7 +50,24 @@ def build_parser() -> argparse.ArgumentParser:
     audit_append.add_argument("--action", required=True)
     audit_append.add_argument("--category", default="manual")
     audit_append.add_argument("--json", action="store_true", dest="command_json")
-    sub.add_parser("mcp")
+    index = sub.add_parser("index")
+    index_sub = index.add_subparsers(dest="index_command", required=True)
+    index_rebuild = index_sub.add_parser("rebuild")
+    index_rebuild.add_argument("--json", action="store_true", dest="command_json")
+    code = sub.add_parser("code")
+    code_sub = code.add_subparsers(dest="code_command", required=True)
+    code_query = code_sub.add_parser("query")
+    code_query.add_argument("query")
+    code_query.add_argument("--limit", type=int, default=5)
+    code_query.add_argument("--json", action="store_true", dest="command_json")
+    context = sub.add_parser("context")
+    context_sub = context.add_subparsers(dest="context_command", required=True)
+    context_pack_parser = context_sub.add_parser("pack")
+    context_pack_parser.add_argument("query")
+    context_pack_parser.add_argument("--limit", type=int, default=5)
+    context_pack_parser.add_argument("--json", action="store_true", dest="command_json")
+    mcp = sub.add_parser("mcp")
+    mcp.add_argument("--once-json")
     return parser
 
 
@@ -100,9 +119,24 @@ def main(argv: list[str] | None = None) -> int:
             payload = append_audit(root, action=args.action, category=args.category, payload=read_payload())
             emit(payload, as_json=as_json)
             return OK
-        if args.command in {"mcp"}:
-            emit({"ok": False, "error": "not implemented in M1 scaffold"}, as_json=True)
-            return GENERIC_ERROR
+        if args.command == "index" and args.index_command == "rebuild":
+            reject_ci_write("index")
+            payload = rebuild(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "code" and args.code_command == "query":
+            payload = query(root, args.query, limit=args.limit)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "context" and args.context_command == "pack":
+            payload = context_pack(root, args.query, limit=args.limit)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "mcp":
+            if args.once_json:
+                emit(handle_request(root, json.loads(args.once_json)), as_json=True)
+                return OK
+            return serve_stdio(root)
     except IpcError as exc:
         emit({"ok": False, "error": exc.code, "detail": exc.message}, as_json=True)
         return GENERIC_ERROR

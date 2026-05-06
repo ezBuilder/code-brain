@@ -16,6 +16,8 @@ uv run --project .ai/runtime ai render --dry-run
 uv run --project .ai/runtime ai doctor --strict
 printf '{"agent":"codex"}' | uv run --project .ai/runtime ai hook SessionStart --json
 uv run --project .ai/runtime ai worker health --json
+uv run --project .ai/runtime ai index rebuild --json
+uv run --project .ai/runtime ai code query "worker IPC" --json
 ```
 
 ## Locked Rules
@@ -39,4 +41,5 @@ uv run --project .ai/runtime ai worker health --json
 | Hooks | `ai hook <HookName> --json` with JSON stdin | fast-path, redacted, append-only outside CI |
 | Memory | `ai memory append-event` | append-only JSONL |
 | Audit | `ai audit append --action ...` | yearly audit JSONL + audit index |
-
+| Search | `ai index rebuild`, `ai code query` | single `.ai/cache/code.sqlite` with FTS5 |
+| MCP | `ai mcp` / `ai mcp --once-json ...` | read tools and rebuild request over JSON-RPC |

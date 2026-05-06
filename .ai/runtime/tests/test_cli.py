@@ -133,3 +133,38 @@ def test_hook_ci_fast_path_does_not_persist(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["mode"] == "ci-fast-path"
     assert payload["persisted"] is False
+
+
+def test_index_rebuild_and_code_query(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = run_ai("index", "rebuild", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["db_path"] == ".ai/cache/code.sqlite"
+    assert payload["indexed"] > 0
+    query_result = run_ai("code", "query", "worker", "--json", cwd=repo)
+    assert query_result.returncode == 0, query_result.stdout + query_result.stderr
+    query_payload = json.loads(query_result.stdout)
+    assert query_payload["ok"] is True
+    assert query_payload["results"]
+    provenance = query_payload["results"][0]["provenance"]
+    assert {"processor", "model_hash", "prompt_version", "chunker_version", "confidence"} <= set(provenance)
+
+
+def test_context_pack_and_mcp_once(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    assert run_ai("index", "rebuild", cwd=repo).returncode == 0
+    context_result = run_ai("context", "pack", "manifest", "--json", cwd=repo)
+    assert context_result.returncode == 0, context_result.stdout + context_result.stderr
+    assert json.loads(context_result.stdout)["additionalContext"]
+    request = {"jsonrpc": "2.0", "id": 1, "method": "code_query", "params": {"query": "manifest", "limit": 2}}
+    mcp_result = run_ai("mcp", "--once-json", json.dumps(request), cwd=repo)
+    assert mcp_result.returncode == 0, mcp_result.stdout + mcp_result.stderr
+    response = json.loads(mcp_result.stdout)
+    assert response["jsonrpc"] == "2.0"
+    assert response["result"]["results"]
+
+
+def test_ci_index_rebuild_rejected() -> None:
+    result = run_ai("index", "rebuild", env={"CI": "true"})
+    assert result.returncode == 16

@@ -14,7 +14,7 @@ WORKER_UNAVAILABLE = 14
 INCOMPATIBLE_VERSION = 15
 PERMISSION_DENIED = 16
 
-WRITE_COMMANDS = {"render", "trust", "secrets", "upgrade", "migrate"}
+WRITE_COMMANDS = {"render", "trust", "secrets", "upgrade", "migrate", "index"}
 
 
 def is_ci() -> bool:
@@ -28,4 +28,3 @@ def reject_ci_write(command: str, *, dry_run: bool = False) -> None:
 
 def allow_no_redact(yes: bool) -> bool:
     return bool(yes and sys.stdout.isatty() and sys.stdin.isatty())
-

@@ -47,6 +47,8 @@ make release-gate
 ```
 
 `scripts/smoke.sh` copies the repository to a temporary directory before running write-heavy flows such as queue, trust, inbox, notify, diagnostics bundle, and upgrade rollback. The working tree stays clean.
+`bootstrap.sh` starts with the same environment check used by the release gate, then renders with `--dry-run` under CI/GitHub Actions.
+`bootstrap.ps1` follows the same CI dry-run render policy for PowerShell operators.
 `scripts/docs-check.sh` verifies the operator runbook commands and CI write-denial behavior.
 `scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, provenance, and release notes without executing package code.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.

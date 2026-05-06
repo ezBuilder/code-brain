@@ -37,6 +37,7 @@ uv run --project .ai/runtime ai report release-notes
 The release gate runs environment checks, bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
 It starts with `scripts/env-check.sh`, which reports bash, git, make, uv, uv-managed Python, and optional PowerShell status as JSON.
 It starts with `scripts/lint.sh`, which checks shell syntax, Python compilation, Makefile dry-runs, and PowerShell parsing when PowerShell is available.
+Direct `bootstrap.sh` runs also start with `scripts/env-check.sh`; `bootstrap.sh` and `bootstrap.ps1` render with `--dry-run` under CI/GitHub Actions.
 It also runs artifact tamper checks so checksum, manifest, SBOM, provenance, and release notes corruption must be rejected before release.
 Use `scripts/verify-artifacts.sh` when you need to validate downloaded release artifacts before running package code.
 CI uses the same Makefile targets as local release verification; write-heavy smoke/docs flows run only inside temporary repositories with CI policy explicitly cleared.

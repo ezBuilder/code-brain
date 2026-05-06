@@ -25,6 +25,7 @@ for needle in \
   "make env-check" \
   "make lint" \
   "make release-gate" \
+  "bootstrap.ps1" \
   "release-notes.md"
 do
   if ! grep -Fq "$needle" OPERATIONS.md README.md RELEASE.md; then

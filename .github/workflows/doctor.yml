@@ -16,6 +16,7 @@ jobs:
       - run: uv run --project .ai/runtime python -m pytest .ai/runtime/tests
       - run: uv run --project .ai/runtime ai doctor --strict
       - run: ./scripts/smoke.sh
+      - run: ./scripts/docs-check.sh
       - run: ./scripts/package.sh
       - run: ./scripts/install-check.sh
       - run: uv run --project .ai/runtime ai report status --json

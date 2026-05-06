@@ -1,0 +1,191 @@
+# Operations Runbook
+
+This runbook is for operating Code Brain after handoff. It assumes a repo-local install where `.ai/` is the only source of agent runtime state.
+
+## First Run
+
+```bash
+cd code-brain
+./bootstrap.sh
+uv run --project .ai/runtime ai doctor --strict --json
+uv run --project .ai/runtime ai report status --json
+```
+
+Expected result:
+
+- `doctor.ok` is `true`.
+- `report.status.ok` is `true`.
+- `git.status_short` is empty for tracked files.
+- Runtime artifacts appear only in ignored paths such as `.ai/cache/`, `.ai/runtime/.venv/`, `.ai/runtime/.pytest_cache/`, `__pycache__/`, and `dist/`.
+
+## Release Gate
+
+Run the full gate before tagging, shipping an archive, or handing a build to another machine:
+
+```bash
+./scripts/release-gate.sh
+uv run --project .ai/runtime ai report release-notes
+```
+
+The release gate runs bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
+
+## Install From Archive
+
+Build and verify the archive:
+
+```bash
+./scripts/package.sh
+./scripts/install-check.sh
+```
+
+Install verification extracts the latest `dist/code-brain-<version>.tar.gz` into a temporary directory and verifies:
+
+- `ai version`
+- `ai doctor --strict`
+- `.ai/bin/ai`
+- `.ai/bin/ai-hook`
+- runtime tests
+
+## Daily Health Check
+
+```bash
+uv run --project .ai/runtime ai doctor --strict --json
+uv run --project .ai/runtime ai obs metrics --json
+uv run --project .ai/runtime ai obs slo --json
+uv run --project .ai/runtime ai queue status --json
+uv run --project .ai/runtime ai report status --json
+```
+
+Treat a strict doctor failure as a release blocker. Metrics and SLO output are read-only and allowed in CI.
+
+## CI Policy
+
+CI is read-only. Write commands are rejected before worker contact unless the command is explicitly dry-run safe.
+
+```bash
+CI=true uv run --project .ai/runtime ai obs metrics --json
+CI=true uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
+CI=true uv run --project .ai/runtime ai render
+```
+
+The first two commands should pass. The final command must fail with exit code `16`.
+
+## Queue Operations
+
+Inspect queue state:
+
+```bash
+uv run --project .ai/runtime ai queue status --json
+```
+
+Recover expired leases:
+
+```bash
+uv run --project .ai/runtime ai queue recover-expired --json
+```
+
+Archive old dead-letter jobs:
+
+```bash
+uv run --project .ai/runtime ai queue archive-dead --older-than-days 30 --json
+```
+
+The queue uses P0-P3 priorities and stores jobs under `.ai/memory/queue/`. Dead-letter files stay local until archived.
+
+## Trust And Secrets
+
+Initialize a trusted machine:
+
+```bash
+uv run --project .ai/runtime ai trust init --name "$(hostname -s)" --json
+uv run --project .ai/runtime ai render --json
+uv run --project .ai/runtime ai doctor --strict --json
+```
+
+The private identity is ignored under `.ai/cache/identity/`. The tracked public trust record lives under `.ai/trust/machines/`. Re-render after trust changes so `.ai/generated/manifest.json` reflects the new trust hash.
+
+Check secret status without exposing values:
+
+```bash
+uv run --project .ai/runtime ai secrets status --json
+```
+
+Do not commit plaintext secrets. The doctor secret scan treats tracked source secrets as a blocker.
+
+## Diagnostics
+
+Generate a dry-run bundle preview:
+
+```bash
+uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
+```
+
+Generate a local bundle for incident handoff:
+
+```bash
+uv run --project .ai/runtime ai diagnostics bundle --json
+```
+
+Prune old bundles:
+
+```bash
+uv run --project .ai/runtime ai diagnostics prune --keep-days 30 --json
+```
+
+Diagnostics payloads are redacted and written under `.ai/cache/diagnostics/`. Share the generated zip only after checking that the receiving party is authorized for repository metadata.
+
+## Upgrade And Rollback
+
+Plan before applying:
+
+```bash
+uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
+uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json
+```
+
+Apply only after the plan is compatible:
+
+```bash
+uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --json
+uv run --project .ai/runtime ai doctor --strict --json
+```
+
+Rollback uses the backup path returned by `upgrade apply`:
+
+```bash
+uv run --project .ai/runtime ai upgrade rollback --backup-path .ai/cache/upgrade/rollback-<stamp>.json --json
+uv run --project .ai/runtime ai doctor --strict --json
+```
+
+Clean local rollback cache only after the release is stable:
+
+```bash
+uv run --project .ai/runtime ai upgrade clean-cache --json
+```
+
+## Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| `doctor` reports manifest drift | Generated manifest is stale after config or trust changes | Run `uv run --project .ai/runtime ai render --json`, then rerun doctor |
+| `doctor` reports secret scan failure | A tracked file contains a token-like value | Remove the secret, rotate it outside this repo, rerun doctor |
+| `doctor` reports trust failure | Public machine record is malformed or has an invalid status | Fix or recreate the file with `ai trust init`, then render |
+| SQLite FTS5 or JSON1 check fails | Python SQLite was built without required extensions | Use the bundled `uv` Python environment or rebuild Python with FTS5 and JSON1 |
+| Queue has stuck processing jobs | Worker lease expired or worker exited mid-job | Run `ai queue recover-expired --json`, then inspect `ai queue status --json` |
+| Dead-letter count grows | Jobs are failing repeatedly | Inspect dead-letter JSON locally, fix the producer or worker, then archive old dead jobs |
+| CI write command fails with exit `16` | Read-only CI policy is working | Use dry-run commands in CI or run write commands locally |
+| Install check cannot find archive | Package was not built first | Run `./scripts/package.sh`, then `./scripts/install-check.sh` |
+| Release gate leaves ignored artifacts | Expected cache, venv, package, or pytest output | Verify `git status --short` is empty; ignored artifacts are acceptable |
+
+## Handoff Checklist
+
+Before handing the repository to another operator:
+
+```bash
+./scripts/docs-check.sh
+./scripts/release-gate.sh
+uv run --project .ai/runtime ai report status --json
+git status --short
+```
+
+Attach `ai report release-notes` output and the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`.

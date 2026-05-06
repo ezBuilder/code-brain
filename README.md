@@ -30,12 +30,18 @@ uv run --project .ai/runtime ai report status --json
 ```bash
 ./bootstrap.sh
 ./scripts/smoke.sh
+./scripts/docs-check.sh
 ./scripts/package.sh
 ./scripts/install-check.sh
 ./scripts/release-gate.sh
 ```
 
 `scripts/smoke.sh` copies the repository to a temporary directory before running write-heavy flows such as queue, trust, inbox, notify, diagnostics bundle, and upgrade rollback. The working tree stays clean.
+`scripts/docs-check.sh` verifies the operator runbook commands and CI write-denial behavior.
+
+## Operations
+
+Use `OPERATIONS.md` as the handoff runbook for daily health checks, queue recovery, trust setup, diagnostics bundles, upgrades, rollback, and troubleshooting.
 
 ## Locked Rules
 
@@ -78,6 +84,7 @@ Before tagging a release:
 ```bash
 ./bootstrap.sh
 ./scripts/smoke.sh
+./scripts/docs-check.sh
 ./scripts/package.sh
 ./scripts/install-check.sh
 ./scripts/release-gate.sh

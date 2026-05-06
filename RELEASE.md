@@ -5,6 +5,7 @@
 ```bash
 ./bootstrap.sh
 ./scripts/smoke.sh
+./scripts/docs-check.sh
 ./scripts/package.sh
 ./scripts/install-check.sh
 ./scripts/release-gate.sh
@@ -18,6 +19,7 @@ git status --short
 - All tests pass.
 - Doctor is green.
 - Smoke test completes in a temporary repository copy.
+- Operator runbook examples pass through `scripts/docs-check.sh`.
 - Runtime artifacts remain ignored under `.ai/cache/`, `.ai/runtime/.venv/`, `.ai/runtime/.pytest_cache/`, and `__pycache__/`.
 - Release archives are written to ignored `dist/` with `.sha256` checksums.
 - Install check verifies the tarball in a temporary directory, including `.ai/bin/ai` and `.ai/bin/ai-hook`.

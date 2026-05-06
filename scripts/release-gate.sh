@@ -6,6 +6,7 @@ cd "$ROOT"
 
 ./bootstrap.sh
 ./scripts/smoke.sh
+./scripts/docs-check.sh
 ./scripts/package.sh >/tmp/code-brain-package.txt
 ./scripts/install-check.sh "$(head -n 1 /tmp/code-brain-package.txt)"
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null

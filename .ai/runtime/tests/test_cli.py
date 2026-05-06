@@ -405,3 +405,16 @@ def test_ci_migrate_upgrade_write_policy(tmp_path: Path) -> None:
     assert dry_upgrade.returncode == 0, dry_upgrade.stdout + dry_upgrade.stderr
     upgrade_write = run_ai("upgrade", "apply", "--target-version", "0.1.1", "--json", env={"CI": "true"}, cwd=repo)
     assert upgrade_write.returncode == 16
+
+
+def test_report_status_and_release_notes(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    status_result = run_ai("report", "status", "--json", cwd=repo)
+    assert status_result.returncode == 0, status_result.stdout + status_result.stderr
+    payload = json.loads(status_result.stdout)
+    assert payload["runtime_version"] == "0.1.0"
+    assert payload["protocol_version"] == 1
+    assert payload["doctor"]["ok"] is True
+    notes_result = run_ai("report", "release-notes", cwd=repo)
+    assert notes_result.returncode == 0, notes_result.stdout + notes_result.stderr
+    assert "Code Brain 0.1.0 Release Notes" in notes_result.stdout

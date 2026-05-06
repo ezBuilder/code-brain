@@ -40,6 +40,8 @@ printf '{"summary":"smoke"}' | uv run --project .ai/runtime ai notify enqueue --
 uv run --project .ai/runtime ai obs metrics --json >/dev/null
 uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
+uv run --project .ai/runtime ai report status --json >/dev/null
+uv run --project .ai/runtime ai report release-notes >/dev/null
 ./scripts/package.sh >/tmp/code-brain-smoke-package.txt
 ARCHIVE="$(head -n 1 /tmp/code-brain-smoke-package.txt)"
 ./scripts/install-check.sh "$ARCHIVE" >/dev/null

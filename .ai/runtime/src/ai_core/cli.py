@@ -15,6 +15,7 @@ from .notify import enqueue_notification
 from .obs import diagnostics, metrics, prune_diagnostics, slo_bench, write_log
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, reject_ci_write
+from .report import release_notes, status_report
 from .render import render
 from .search import context_pack, query, rebuild
 from .secrets_store import status as secrets_status
@@ -25,7 +26,10 @@ from .worker.scheduler import archive_dead, complete, enqueue, fail, lease_next,
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ai")
+    parser = argparse.ArgumentParser(
+        prog="ai",
+        description="Code Brain repo-local AI agent infrastructure CLI.",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("version")
@@ -171,6 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
     context_pack_parser.add_argument("--json", action="store_true", dest="command_json")
     mcp = sub.add_parser("mcp")
     mcp.add_argument("--once-json")
+    report = sub.add_parser("report")
+    report_sub = report.add_subparsers(dest="report_command", required=True)
+    report_status = report_sub.add_parser("status")
+    report_status.add_argument("--json", action="store_true", dest="command_json")
+    report_sub.add_parser("release-notes")
     return parser
 
 
@@ -351,6 +360,13 @@ def main(argv: list[str] | None = None) -> int:
                 emit(handle_request(root, json.loads(args.once_json)), as_json=True)
                 return OK
             return serve_stdio(root)
+        if args.command == "report" and args.report_command == "status":
+            payload = status_report(root)
+            emit(payload, as_json=as_json)
+            return OK if payload["ok"] else GENERIC_ERROR
+        if args.command == "report" and args.report_command == "release-notes":
+            print(release_notes(root))
+            return OK
     except IpcError as exc:
         emit({"ok": False, "error": exc.code, "detail": exc.message}, as_json=True)
         return GENERIC_ERROR

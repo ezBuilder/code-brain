@@ -22,6 +22,7 @@ uv run --project .ai/runtime ai obs metrics --json
 uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
 uv run --project .ai/runtime ai migrate --dry-run --json
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
+uv run --project .ai/runtime ai report status --json
 ```
 
 ## Full Local Verification
@@ -31,6 +32,7 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 ./scripts/smoke.sh
 ./scripts/package.sh
 ./scripts/install-check.sh
+./scripts/release-gate.sh
 ```
 
 `scripts/smoke.sh` copies the repository to a temporary directory before running write-heavy flows such as queue, trust, inbox, notify, diagnostics bundle, and upgrade rollback. The working tree stays clean.
@@ -67,6 +69,7 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
 | Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration and local rollback backups |
 | Package | `scripts/package.sh`, `scripts/install-check.sh` | tarball + checksum + install verification |
+| Report | `ai report status/release-notes` | release state and generated notes |
 
 ## Release Gate
 
@@ -77,6 +80,7 @@ Before tagging a release:
 ./scripts/smoke.sh
 ./scripts/package.sh
 ./scripts/install-check.sh
+./scripts/release-gate.sh
 git status --short
 ```
 

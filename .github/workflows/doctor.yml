@@ -18,3 +18,4 @@ jobs:
       - run: ./scripts/smoke.sh
       - run: ./scripts/package.sh
       - run: ./scripts/install-check.sh
+      - run: uv run --project .ai/runtime ai report status --json

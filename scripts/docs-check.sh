@@ -28,6 +28,7 @@ for needle in \
   "make env-check" \
   "make lint" \
   "make release-gate" \
+  "make clean-all" \
   "bootstrap.ps1" \
   "release-notes.md"
 do
@@ -56,6 +57,9 @@ make -n verify-artifacts >/dev/null
 make -n install-check >/dev/null
 make -n tamper-check >/dev/null
 make -n release-gate >/dev/null
+make -n clean-cache >/dev/null
+make -n clean-artifacts >/dev/null
+make -n clean-all >/dev/null
 
 CI=true uv run --project .ai/runtime ai obs metrics --json >/dev/null
 CI=true uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null

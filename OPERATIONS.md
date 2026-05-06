@@ -190,6 +190,14 @@ Clean local rollback cache only after the release is stable:
 uv run --project .ai/runtime ai upgrade clean-cache --json
 ```
 
+Clean ignored runtime and release artifacts:
+
+```bash
+make clean-cache
+make clean-artifacts
+make clean-all
+```
+
 ## Troubleshooting
 
 | Symptom | Likely Cause | Fix |

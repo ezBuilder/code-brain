@@ -3,7 +3,7 @@ SHELL := /usr/bin/env bash
 
 LATEST_ARCHIVE := $(shell ls -t dist/code-brain-*.tar.gz 2>/dev/null | head -n 1)
 
-.PHONY: help env-check lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check tamper-check release-gate report release-notes clean-cache
+.PHONY: help env-check lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check tamper-check release-gate report release-notes clean-cache clean-artifacts clean-all
 
 help:
 	@printf '%s\n' \
@@ -16,7 +16,10 @@ help:
 		'  make install-check     Verify extracted package execution' \
 		'  make tamper-check      Verify corrupted artifacts are rejected' \
 		'  make release-gate      Run the full release gate' \
-		'  make report            Print release status JSON'
+		'  make report            Print release status JSON' \
+		'  make clean-cache       Remove ignored runtime cache files' \
+		'  make clean-artifacts   Remove dist/ release artifacts' \
+		'  make clean-all         Remove cache, venv, and dist artifacts'
 
 env-check:
 	./scripts/env-check.sh
@@ -77,3 +80,9 @@ release-notes:
 
 clean-cache:
 	rm -rf .ai/cache .ai/runtime/.pytest_cache .ai/runtime/src/ai_core/__pycache__ .ai/runtime/src/ai_core/worker/__pycache__ .ai/runtime/tests/__pycache__
+
+clean-artifacts:
+	rm -rf dist
+
+clean-all: clean-cache clean-artifacts
+	rm -rf .ai/runtime/.venv

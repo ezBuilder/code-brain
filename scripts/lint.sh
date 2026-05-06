@@ -19,6 +19,9 @@ make -n verify-artifacts >/dev/null
 make -n install-check >/dev/null
 make -n tamper-check >/dev/null
 make -n release-gate >/dev/null
+make -n clean-cache >/dev/null
+make -n clean-artifacts >/dev/null
+make -n clean-all >/dev/null
 
 if command -v pwsh >/dev/null 2>&1; then
   pwsh -NoProfile -NonInteractive -Command "[scriptblock]::Create((Get-Content -Raw 'bootstrap.ps1')) | Out-Null"

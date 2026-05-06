@@ -42,9 +42,11 @@ expect_install_check_failure() {
   copy_artifacts "$dir"
   shift
   "$@" "$dir"
-  if "$ROOT/scripts/verify-artifacts.sh" "$dir/dist/$BASE" >/tmp/code-brain-tamper-$name.out 2>/tmp/code-brain-tamper-$name.err; then
+  local stdout="$TMP/tamper-$name.out"
+  local stderr="$TMP/tamper-$name.err"
+  if "$ROOT/scripts/verify-artifacts.sh" "$dir/dist/$BASE" >"$stdout" 2>"$stderr"; then
     echo "expected artifact verifier failure for tamper case: $name" >&2
-    cat "/tmp/code-brain-tamper-$name.out" >&2
+    cat "$stdout" >&2
     exit 1
   fi
 }

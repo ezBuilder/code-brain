@@ -53,6 +53,7 @@ make release-gate
 `scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, provenance, and release notes without executing package code.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.
 `Makefile` provides operator shortcuts such as `make env-check`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
+Use `make clean-cache` for ignored runtime cache files, `make clean-artifacts` for `dist/`, and `make clean-all` for cache, virtualenv, and release artifacts.
 GitHub Actions uses the same Makefile targets as local release verification.
 
 ## Operations

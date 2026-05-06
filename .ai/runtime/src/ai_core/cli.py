@@ -199,7 +199,6 @@ def main(argv: list[str] | None = None) -> int:
     as_json = bool(args.json or getattr(args, "command_json", False))
     try:
         root = find_repo_root()
-        reject_ci_write(args.command, dry_run=getattr(args, "dry_run", False))
         if args.command == "version":
             emit({"version": __version__, "protocol_version": 1}, as_json=as_json)
             return OK
@@ -207,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             emit(load_config(root), as_json=as_json)
             return OK
         if args.command == "render":
+            reject_ci_write("render", dry_run=args.dry_run)
             result = render(root, dry_run=args.dry_run, no_overwrite=args.no_overwrite)
             emit(result, as_json=as_json)
             return OK
@@ -220,26 +220,32 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "enqueue":
+            reject_ci_write("queue")
             payload = enqueue(root, args.priority, args.kind, read_payload())
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "lease":
+            reject_ci_write("queue")
             payload = lease_next(root, args.worker_id, priority=args.priority)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "complete":
+            reject_ci_write("queue")
             payload = complete(root, args.job_id, args.lease_id)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "fail":
+            reject_ci_write("queue")
             payload = fail(root, args.job_id, args.lease_id, args.reason)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "recover-expired":
+            reject_ci_write("queue")
             payload = recover_expired(root)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "archive-dead":
+            reject_ci_write("queue")
             payload = archive_dead(root, older_than_days=args.older_than_days)
             emit(payload, as_json=as_json)
             return OK
@@ -248,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK
         if args.command == "trust" and args.trust_command == "init":
+            reject_ci_write("trust")
             payload = init_machine(root, name=args.name)
             emit(payload, as_json=as_json)
             return OK
@@ -256,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK
         if args.command == "trust" and args.trust_command == "revoke":
+            reject_ci_write("trust")
             payload = revoke_machine(root, args.machine_id_hash)
             emit(payload, as_json=as_json)
             return OK
@@ -264,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK
         if args.command == "inbox" and args.inbox_command == "request":
+            reject_ci_write("inbox")
             payload = request_approval(root, args.gate, args.summary, read_payload(), ttl_hours=args.ttl_hours)
             emit(payload, as_json=as_json)
             return OK
@@ -272,14 +281,17 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK
         if args.command == "inbox" and args.inbox_command == "approve":
+            reject_ci_write("inbox")
             payload = decide(root, args.approval_id, "approved")
             emit(payload, as_json=as_json)
             return OK
         if args.command == "inbox" and args.inbox_command == "reject":
+            reject_ci_write("inbox")
             payload = decide(root, args.approval_id, "rejected")
             emit(payload, as_json=as_json)
             return OK
         if args.command == "notify" and args.notify_command == "enqueue":
+            reject_ci_write("notify")
             payload = enqueue_notification(root, args.channel, read_payload())
             emit(payload, as_json=as_json)
             return OK
@@ -335,10 +347,12 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=True)
             return OK
         if args.command == "memory" and args.memory_command == "append-event":
+            reject_ci_write("memory")
             payload = append_event(root, read_payload())
             emit(payload, as_json=as_json)
             return OK
         if args.command == "audit" and args.audit_command == "append":
+            reject_ci_write("audit")
             payload = append_audit(root, action=args.action, category=args.category, payload=read_payload())
             emit(payload, as_json=as_json)
             return OK

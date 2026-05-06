@@ -17,7 +17,6 @@ PERMISSION_DENIED = 16
 WRITE_COMMANDS = {
     "render",
     "trust",
-    "secrets",
     "upgrade",
     "migrate",
     "index",

@@ -264,6 +264,20 @@ def test_ci_queue_write_rejected() -> None:
     assert result.returncode == 16
 
 
+def test_ci_read_only_commands_allowed(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    commands = [
+        ("queue", "status", "--json"),
+        ("trust", "list", "--json"),
+        ("secrets", "status", "--json"),
+        ("inbox", "list", "--json"),
+        ("report", "status", "--json"),
+    ]
+    for command in commands:
+        result = run_ai(*command, env={"CI": "true"}, cwd=repo)
+        assert result.returncode == 0, command + (result.stdout, result.stderr)
+
+
 def test_ci_memory_and_audit_writes_rejected(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     memory_result = run_ai_input("memory", "append-event", "--json", stdin='{"kind":"ci"}', env={"CI": "true"}, cwd=repo)

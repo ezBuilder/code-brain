@@ -1,4 +1,6 @@
 /runtime/.venv/
+/runtime/**/__pycache__/
+/runtime/**/*.pyc
 /cache/
 /tools/
 /memory/queue/*.json
@@ -8,4 +10,3 @@
 !/memory/queue/.tmp/.gitkeep
 !/memory/queue/processing/.gitkeep
 !/memory/queue/dead/.gitkeep
-

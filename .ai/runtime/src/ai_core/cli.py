@@ -14,6 +14,8 @@ from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, reject_ci_write
 from .render import render
 from .search import context_pack, query, rebuild
+from .secrets_store import status as secrets_status
+from .trust import init_machine, list_machines, revoke_machine
 from .worker.ipc import IpcError, health, parse_envelope
 from .worker.scheduler import archive_dead, complete, enqueue, fail, lease_next, recover_expired, status as queue_status
 
@@ -64,6 +66,20 @@ def build_parser() -> argparse.ArgumentParser:
     queue_archive.add_argument("--json", action="store_true", dest="command_json")
     queue_status_parser = queue_sub.add_parser("status")
     queue_status_parser.add_argument("--json", action="store_true", dest="command_json")
+    trust = sub.add_parser("trust")
+    trust_sub = trust.add_subparsers(dest="trust_command", required=True)
+    trust_init = trust_sub.add_parser("init")
+    trust_init.add_argument("--name", required=True)
+    trust_init.add_argument("--json", action="store_true", dest="command_json")
+    trust_list = trust_sub.add_parser("list")
+    trust_list.add_argument("--json", action="store_true", dest="command_json")
+    trust_revoke = trust_sub.add_parser("revoke")
+    trust_revoke.add_argument("machine_id_hash")
+    trust_revoke.add_argument("--json", action="store_true", dest="command_json")
+    secrets_parser = sub.add_parser("secrets")
+    secrets_sub = secrets_parser.add_subparsers(dest="secrets_command", required=True)
+    secrets_status_parser = secrets_sub.add_parser("status")
+    secrets_status_parser.add_argument("--json", action="store_true", dest="command_json")
     hook_parser = sub.add_parser("hook")
     hook_parser.add_argument("hook_name", nargs="?")
     hook_parser.add_argument("--json", action="store_true", dest="command_json")
@@ -160,6 +176,22 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "queue" and args.queue_command == "status":
             payload = queue_status(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "trust" and args.trust_command == "init":
+            payload = init_machine(root, name=args.name)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "trust" and args.trust_command == "list":
+            payload = list_machines(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "trust" and args.trust_command == "revoke":
+            payload = revoke_machine(root, args.machine_id_hash)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "secrets" and args.secrets_command == "status":
+            payload = secrets_status(root)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "hook":

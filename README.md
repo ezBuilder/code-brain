@@ -19,6 +19,8 @@ uv run --project .ai/runtime ai worker health --json
 uv run --project .ai/runtime ai index rebuild --json
 uv run --project .ai/runtime ai code query "worker IPC" --json
 printf '{"task":"rebuild"}' | uv run --project .ai/runtime ai queue enqueue --priority P2 --kind index --json
+uv run --project .ai/runtime ai trust init --name "$(hostname)" --json
+uv run --project .ai/runtime ai render
 ```
 
 ## Locked Rules
@@ -45,3 +47,5 @@ printf '{"task":"rebuild"}' | uv run --project .ai/runtime ai queue enqueue --pr
 | Search | `ai index rebuild`, `ai code query` | single `.ai/cache/code.sqlite` with FTS5 |
 | MCP | `ai mcp` / `ai mcp --once-json ...` | read tools and rebuild request over JSON-RPC |
 | Queue | `ai queue enqueue/lease/complete/fail/status` | P0-P3 file queue with lease and dead-letter |
+| Trust | `ai trust init/list/revoke` | local age-like identity and tracked machine public record |
+| Secrets | `ai secrets status` | key source status without exposing plaintext |

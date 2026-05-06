@@ -245,3 +245,33 @@ def test_queue_fail_and_archive(tmp_path: Path) -> None:
 def test_ci_queue_write_rejected() -> None:
     result = run_ai_input("queue", "enqueue", "--priority", "P1", "--kind", "test", stdin="{}", env={"CI": "true"})
     assert result.returncode == 16
+
+
+def test_trust_init_render_and_revoke(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_result = run_ai("trust", "init", "--name", "local-test", "--json", cwd=repo)
+    assert init_result.returncode == 0, init_result.stdout + init_result.stderr
+    init_payload = json.loads(init_result.stdout)
+    assert init_payload["machine_id_hash"]
+    assert (repo / init_payload["private_key_path"]).exists()
+    assert (repo / init_payload["trust_file"]).exists()
+    render_result = run_ai("render", cwd=repo)
+    assert render_result.returncode == 0, render_result.stdout + render_result.stderr
+    doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    assert doctor_result.returncode == 0, doctor_result.stdout + doctor_result.stderr
+    list_result = run_ai("trust", "list", "--json", cwd=repo)
+    machines = json.loads(list_result.stdout)["machines"]
+    assert machines[0]["status"] == "trusted"
+    revoke_result = run_ai("trust", "revoke", init_payload["machine_id_hash"], "--json", cwd=repo)
+    assert revoke_result.returncode == 0, revoke_result.stdout + revoke_result.stderr
+    assert json.loads(revoke_result.stdout)["status"] == "revoked"
+
+
+def test_secrets_status_and_ci_trust_rejected() -> None:
+    status_result = run_ai("secrets", "status", "--json")
+    assert status_result.returncode == 0, status_result.stdout + status_result.stderr
+    payload = json.loads(status_result.stdout)
+    assert payload["ok"] is True
+    assert payload["plaintext_tracked"] is False
+    ci_result = run_ai("trust", "init", "--name", "ci", env={"CI": "true"})
+    assert ci_result.returncode == 16

@@ -9,6 +9,7 @@ from typing import Iterable
 
 from .config import load_config
 from .render import build_manifest
+from .trust import parse_simple_toml
 
 SECRET_PATTERNS = [
     re.compile(r"AKIA[0-9A-Z]{16}"),
@@ -31,6 +32,7 @@ def run_checks(root: Path) -> list[Check]:
         check_gitattributes(root),
         check_sqlite_features(),
         check_manifest(root),
+        check_trust(root),
         check_jsonl(root),
         check_secret_scan(root),
     ]
@@ -105,6 +107,19 @@ def check_manifest(root: Path) -> Check:
     return Check("manifest", not drift_fields, "ok" if not drift_fields else "drift: " + ", ".join(drift_fields))
 
 
+def check_trust(root: Path) -> Check:
+    bad = []
+    for path in sorted((root / ".ai" / "trust" / "machines").glob("*.pub.toml")):
+        data = parse_simple_toml(path.read_text(encoding="utf-8"))
+        public_key = data.get("public_key", "")
+        expected_hash = __import__("hashlib").sha256(public_key.strip().encode("utf-8")).hexdigest()
+        if data.get("machine_id_hash") != expected_hash:
+            bad.append(path.relative_to(root).as_posix())
+        if data.get("status") not in {"trusted", "revoked"}:
+            bad.append(path.relative_to(root).as_posix() + ":status")
+    return Check("trust", not bad, "ok" if not bad else "invalid: " + ", ".join(bad))
+
+
 def check_jsonl(root: Path) -> Check:
     bad: list[str] = []
     for path in root.joinpath(".ai", "memory").rglob("*.jsonl"):
@@ -130,6 +145,8 @@ def secret_hits(root: Path) -> Iterable[str]:
         if path.is_dir() or rel_parts & ignored_parts:
             continue
         if path.suffix in {".png", ".sqlite", ".db"}:
+            continue
+        if path.name.endswith(".enc.yaml") or path.name.endswith(".enc.yml"):
             continue
         try:
             text = path.read_text(encoding="utf-8")

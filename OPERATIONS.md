@@ -95,6 +95,7 @@ CI=true uv run --project .ai/runtime ai render
 ```
 
 The first two commands should pass. The final command must fail with exit code `16`.
+Write commands such as render, queue, trust, inbox, notify, memory append, audit append, diagnostics write, migration, upgrade apply, and index rebuild are denied in CI. `worker health` remains read-only and does not create a worker token when CI/GitHub Actions is set.
 
 ## Queue Operations
 

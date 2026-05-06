@@ -122,6 +122,16 @@ def test_worker_health_rejects_bad_envelope() -> None:
     assert payload["error"] == "INVALID_REQUEST"
 
 
+def test_ci_worker_health_does_not_create_token(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    token_path = repo / ".ai" / "cache" / "run" / "worker.token"
+    if token_path.exists():
+        token_path.unlink()
+    result = run_ai("worker", "health", "--json", env={"CI": "true"}, cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not token_path.exists()
+
+
 def test_hook_appends_redacted_event(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     event_path = repo / ".ai" / "memory" / "events" / "events.jsonl"
@@ -252,6 +262,23 @@ def test_queue_fail_and_archive(tmp_path: Path) -> None:
 def test_ci_queue_write_rejected() -> None:
     result = run_ai_input("queue", "enqueue", "--priority", "P1", "--kind", "test", stdin="{}", env={"CI": "true"})
     assert result.returncode == 16
+
+
+def test_ci_memory_and_audit_writes_rejected(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    memory_result = run_ai_input("memory", "append-event", "--json", stdin='{"kind":"ci"}', env={"CI": "true"}, cwd=repo)
+    assert memory_result.returncode == 16
+    audit_result = run_ai_input(
+        "audit",
+        "append",
+        "--action",
+        "ci.audit",
+        "--json",
+        stdin="{}",
+        env={"CI": "true"},
+        cwd=repo,
+    )
+    assert audit_result.returncode == 16
 
 
 def test_trust_init_render_and_revoke(tmp_path: Path) -> None:

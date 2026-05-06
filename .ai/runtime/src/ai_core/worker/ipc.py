@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from ai_core import __version__
+from ai_core.policy import is_ci
 
 PROTOCOL_VERSION = 1
+CI_READONLY_TOKEN = "__ci_readonly_no_worker_token__"
 REQUIRED_ENVELOPE = {
     "protocol_version",
     "token",
@@ -34,6 +36,8 @@ def get_or_create_token(root: Path) -> str:
     path = token_path(root)
     if path.exists():
         return path.read_text(encoding="utf-8").strip()
+    if is_ci():
+        return CI_READONLY_TOKEN
     path.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_hex(32)
     path.write_text(token + "\n", encoding="utf-8")
@@ -91,4 +95,3 @@ def parse_envelope(raw: str | None) -> dict[str, Any] | None:
     if raw is None:
         return None
     return json.loads(raw)
-

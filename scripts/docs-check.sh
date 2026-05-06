@@ -21,6 +21,7 @@ for needle in \
   "ai queue recover-expired --json" \
   "ai upgrade plan --target-version" \
   "exit code \`16\`" \
+  "worker health" \
   "./scripts/release-gate.sh" \
   "make env-check" \
   "make lint" \

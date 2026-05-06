@@ -26,6 +26,8 @@ WRITE_COMMANDS = {
     "notify",
     "obs_write",
     "diagnostics_write",
+    "memory",
+    "audit",
 }
 
 

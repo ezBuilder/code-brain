@@ -9,6 +9,7 @@ JOB_OUTPUT="$TMP/job.json"
 LEASE_OUTPUT="$TMP/lease.json"
 APPROVAL_OUTPUT="$TMP/approval.json"
 PACKAGE_OUTPUT="$TMP/package.txt"
+PACKAGE_ERROR="$TMP/package.err"
 
 COPY="$TMP/code-brain"
 mkdir -p "$COPY"
@@ -48,14 +49,15 @@ uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai report status --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
-./scripts/package.sh >"$PACKAGE_OUTPUT"
-ARCHIVE="$(head -n 1 "$PACKAGE_OUTPUT")"
-if [[ -z "$ARCHIVE" || ! -f "$ARCHIVE" ]]; then
-  cat "$PACKAGE_OUTPUT" >&2
-  echo "smoke failed: package script did not emit an archive path" >&2
+if ./scripts/package.sh >"$PACKAGE_OUTPUT" 2>"$PACKAGE_ERROR"; then
+  echo "smoke failed: package script unexpectedly succeeded without git metadata" >&2
   exit 1
 fi
-./scripts/install-check.sh "$ARCHIVE" >/dev/null
+if ! grep -Fq "package failed: git HEAD unavailable" "$PACKAGE_ERROR"; then
+  cat "$PACKAGE_ERROR" >&2
+  echo "smoke failed: package script did not report missing git metadata" >&2
+  exit 1
+fi
 
 CI=true uv run --project .ai/runtime ai obs metrics --json >/dev/null
 if CI=true uv run --project .ai/runtime ai render >/dev/null 2>&1; then

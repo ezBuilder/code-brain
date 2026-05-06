@@ -128,8 +128,15 @@ required_subjects = {
 for name, digest in required_subjects.items():
     if subjects.get(name) != digest:
         raise SystemExit(f"provenance subject mismatch: {name}")
-if provenance.get("git", {}).get("status_short") is None:
+git = provenance.get("git", {})
+if not isinstance(git, dict):
+    raise SystemExit("provenance git metadata missing")
+if not git.get("head"):
+    raise SystemExit("provenance git head missing")
+if git.get("status_short") is None:
     raise SystemExit("provenance git status missing")
+if git.get("status_short") != "":
+    raise SystemExit("provenance git status is not clean")
 
 release_notes = release_notes_path.read_text(encoding="utf-8")
 required_notes = [

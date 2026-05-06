@@ -14,6 +14,18 @@ RELEASE_NOTES="$OUT_DIR/${NAME}.release-notes.md"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+GIT_HEAD="$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || true)"
+if [[ -z "$GIT_HEAD" ]]; then
+  echo "package failed: git HEAD unavailable" >&2
+  exit 1
+fi
+GIT_STATUS="$(git -C "$ROOT" status --short)"
+if [[ -n "$GIT_STATUS" ]]; then
+  echo "package failed: tracked working tree is dirty" >&2
+  git -C "$ROOT" status --short >&2
+  exit 1
+fi
+
 mkdir -p "$OUT_DIR"
 rm -f "$ARCHIVE" "$ARCHIVE.sha256" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES"
 mkdir -p "$TMP/$NAME"

@@ -105,6 +105,19 @@ path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="
 PY
 }
 
+tamper_dirty_provenance() {
+  local dir="$1"
+  python - "$dir/dist/$PREFIX.provenance.json" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload.setdefault("git", {})["status_short"] = " M RELEASE.md"
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
 tamper_release_notes() {
   local dir="$1"
   python - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
@@ -200,6 +213,7 @@ expect_install_check_failure checksum tamper_checksum
 expect_install_check_failure manifest tamper_manifest
 expect_install_check_failure sbom tamper_sbom
 expect_install_check_failure provenance tamper_provenance
+expect_install_check_failure dirty_provenance tamper_dirty_provenance
 expect_install_check_failure release_notes tamper_release_notes
 expect_unsafe_archive_failure
 expect_unsafe_member_type_failure

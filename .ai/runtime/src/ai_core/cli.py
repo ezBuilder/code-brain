@@ -7,6 +7,8 @@ import sys
 from . import __version__
 from .config import load_config
 from .doctor import as_payload, run_checks
+from .hooks import handle_hook, read_payload
+from .memory import append_audit, append_event
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, reject_ci_write
 from .render import render
@@ -33,7 +35,19 @@ def build_parser() -> argparse.ArgumentParser:
     worker_health = worker_sub.add_parser("health")
     worker_health.add_argument("--json", action="store_true", dest="command_json")
     worker_health.add_argument("--envelope-json")
-    sub.add_parser("hook")
+    hook_parser = sub.add_parser("hook")
+    hook_parser.add_argument("hook_name", nargs="?")
+    hook_parser.add_argument("--json", action="store_true", dest="command_json")
+    memory = sub.add_parser("memory")
+    memory_sub = memory.add_subparsers(dest="memory_command", required=True)
+    memory_append_event = memory_sub.add_parser("append-event")
+    memory_append_event.add_argument("--json", action="store_true", dest="command_json")
+    audit = sub.add_parser("audit")
+    audit_sub = audit.add_subparsers(dest="audit_command", required=True)
+    audit_append = audit_sub.add_parser("append")
+    audit_append.add_argument("--action", required=True)
+    audit_append.add_argument("--category", default="manual")
+    audit_append.add_argument("--json", action="store_true", dest="command_json")
     sub.add_parser("mcp")
     return parser
 
@@ -74,7 +88,19 @@ def main(argv: list[str] | None = None) -> int:
             payload = health(root, parse_envelope(args.envelope_json))
             emit(payload, as_json=as_json)
             return OK
-        if args.command in {"hook", "mcp"}:
+        if args.command == "hook":
+            payload = handle_hook(root, args.hook_name, read_payload())
+            emit(payload, as_json=True)
+            return OK
+        if args.command == "memory" and args.memory_command == "append-event":
+            payload = append_event(root, read_payload())
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "audit" and args.audit_command == "append":
+            payload = append_audit(root, action=args.action, category=args.category, payload=read_payload())
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command in {"mcp"}:
             emit({"ok": False, "error": "not implemented in M1 scaffold"}, as_json=True)
             return GENERIC_ERROR
     except IpcError as exc:

@@ -63,6 +63,7 @@ def copy_repo(tmp_path: Path) -> Path:
         ".ai/memory/queue/dead/*.json",
         ".ai/memory/audit/*.jsonl",
         ".ai/memory/events/*.jsonl",
+        ".ai/memory/inbox/*.json",
     ):
         for path in target.glob(pattern):
             path.unlink()
@@ -275,3 +276,55 @@ def test_secrets_status_and_ci_trust_rejected() -> None:
     assert payload["plaintext_tracked"] is False
     ci_result = run_ai("trust", "init", "--name", "ci", env={"CI": "true"})
     assert ci_result.returncode == 16
+
+
+def test_inbox_approval_lifecycle_and_redaction(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    secret_value = "secret=" + "abcdefghijklmnopqrstuv" + "wxyz"
+    request_result = run_ai_input(
+        "inbox",
+        "request",
+        "--gate",
+        "remote_enable",
+        "--summary",
+        "Enable outbound adapter",
+        "--json",
+        stdin=json.dumps({"token": secret_value}),
+        cwd=repo,
+    )
+    assert request_result.returncode == 0, request_result.stdout + request_result.stderr
+    approval = json.loads(request_result.stdout)["approval"]
+    assert approval["gate"] == "remote_enable"
+    assert secret_value not in request_result.stdout
+    list_result = run_ai("inbox", "list", "--json", cwd=repo)
+    assert json.loads(list_result.stdout)["approvals"][0]["status"] == "pending"
+    approve_result = run_ai("inbox", "approve", approval["approval_id"], "--json", cwd=repo)
+    assert approve_result.returncode == 0, approve_result.stdout + approve_result.stderr
+    assert json.loads(approve_result.stdout)["approval"]["status"] == "approved"
+
+
+def test_notify_enqueue_is_p3_redacted_and_ci_rejected(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    secret_value = "secret=" + "abcdefghijklmnopqrstuv" + "wxyz"
+    result = run_ai_input(
+        "notify",
+        "enqueue",
+        "--channel",
+        "telegram",
+        "--json",
+        stdin=json.dumps({"summary": "hello", "body": secret_value}),
+        cwd=repo,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["queued"]["priority"] == "P3"
+    assert secret_value not in result.stdout
+    assert "[REDACTED]" in result.stdout
+    ci_result = run_ai_input("notify", "enqueue", "--channel", "telegram", stdin="{}", env={"CI": "true"}, cwd=repo)
+    assert ci_result.returncode == 16
+
+
+def test_inbox_rejects_non_gate(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = run_ai_input("inbox", "request", "--gate", "trust_change", "--summary", "bad", stdin="{}", cwd=repo)
+    assert result.returncode == 1

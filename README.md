@@ -21,6 +21,8 @@ uv run --project .ai/runtime ai code query "worker IPC" --json
 printf '{"task":"rebuild"}' | uv run --project .ai/runtime ai queue enqueue --priority P2 --kind index --json
 uv run --project .ai/runtime ai trust init --name "$(hostname)" --json
 uv run --project .ai/runtime ai render
+printf '{"reason":"need outbound"}' | uv run --project .ai/runtime ai inbox request --gate remote_enable --summary "Enable outbound adapter" --json
+printf '{"summary":"hello"}' | uv run --project .ai/runtime ai notify enqueue --channel telegram --json
 ```
 
 ## Locked Rules
@@ -49,3 +51,5 @@ uv run --project .ai/runtime ai render
 | Queue | `ai queue enqueue/lease/complete/fail/status` | P0-P3 file queue with lease and dead-letter |
 | Trust | `ai trust init/list/revoke` | local age-like identity and tracked machine public record |
 | Secrets | `ai secrets status` | key source status without exposing plaintext |
+| Inbox | `ai inbox request/list/approve/reject` | narrow 5-gate approval records, redacted |
+| Notify | `ai notify enqueue` | P3 outbound adapter jobs, no hot-path network |

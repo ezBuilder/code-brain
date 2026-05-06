@@ -8,8 +8,10 @@ from . import __version__
 from .config import load_config
 from .doctor import as_payload, run_checks
 from .hooks import handle_hook, read_payload
+from .inbox import decide, list_approvals, request_approval
 from .memory import append_audit, append_event
 from .mcp_server import handle_request, serve_stdio
+from .notify import enqueue_notification
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, reject_ci_write
 from .render import render
@@ -80,6 +82,26 @@ def build_parser() -> argparse.ArgumentParser:
     secrets_sub = secrets_parser.add_subparsers(dest="secrets_command", required=True)
     secrets_status_parser = secrets_sub.add_parser("status")
     secrets_status_parser.add_argument("--json", action="store_true", dest="command_json")
+    inbox = sub.add_parser("inbox")
+    inbox_sub = inbox.add_subparsers(dest="inbox_command", required=True)
+    inbox_request = inbox_sub.add_parser("request")
+    inbox_request.add_argument("--gate", required=True)
+    inbox_request.add_argument("--summary", required=True)
+    inbox_request.add_argument("--ttl-hours", type=int, default=24)
+    inbox_request.add_argument("--json", action="store_true", dest="command_json")
+    inbox_list = inbox_sub.add_parser("list")
+    inbox_list.add_argument("--json", action="store_true", dest="command_json")
+    inbox_approve = inbox_sub.add_parser("approve")
+    inbox_approve.add_argument("approval_id")
+    inbox_approve.add_argument("--json", action="store_true", dest="command_json")
+    inbox_reject = inbox_sub.add_parser("reject")
+    inbox_reject.add_argument("approval_id")
+    inbox_reject.add_argument("--json", action="store_true", dest="command_json")
+    notify = sub.add_parser("notify")
+    notify_sub = notify.add_subparsers(dest="notify_command", required=True)
+    notify_enqueue = notify_sub.add_parser("enqueue")
+    notify_enqueue.add_argument("--channel", required=True)
+    notify_enqueue.add_argument("--json", action="store_true", dest="command_json")
     hook_parser = sub.add_parser("hook")
     hook_parser.add_argument("hook_name", nargs="?")
     hook_parser.add_argument("--json", action="store_true", dest="command_json")
@@ -192,6 +214,26 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "secrets" and args.secrets_command == "status":
             payload = secrets_status(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "inbox" and args.inbox_command == "request":
+            payload = request_approval(root, args.gate, args.summary, read_payload(), ttl_hours=args.ttl_hours)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "inbox" and args.inbox_command == "list":
+            payload = list_approvals(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "inbox" and args.inbox_command == "approve":
+            payload = decide(root, args.approval_id, "approved")
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "inbox" and args.inbox_command == "reject":
+            payload = decide(root, args.approval_id, "rejected")
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "notify" and args.notify_command == "enqueue":
+            payload = enqueue_notification(root, args.channel, read_payload())
             emit(payload, as_json=as_json)
             return OK
         if args.command == "hook":

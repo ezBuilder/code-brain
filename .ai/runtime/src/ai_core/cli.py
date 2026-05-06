@@ -15,6 +15,7 @@ from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, reject
 from .render import render
 from .search import context_pack, query, rebuild
 from .worker.ipc import IpcError, health, parse_envelope
+from .worker.scheduler import archive_dead, complete, enqueue, fail, lease_next, recover_expired, status as queue_status
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +38,32 @@ def build_parser() -> argparse.ArgumentParser:
     worker_health = worker_sub.add_parser("health")
     worker_health.add_argument("--json", action="store_true", dest="command_json")
     worker_health.add_argument("--envelope-json")
+    queue = sub.add_parser("queue")
+    queue_sub = queue.add_subparsers(dest="queue_command", required=True)
+    queue_enqueue = queue_sub.add_parser("enqueue")
+    queue_enqueue.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], required=True)
+    queue_enqueue.add_argument("--kind", required=True)
+    queue_enqueue.add_argument("--json", action="store_true", dest="command_json")
+    queue_lease = queue_sub.add_parser("lease")
+    queue_lease.add_argument("--worker-id", required=True)
+    queue_lease.add_argument("--priority", choices=["P0", "P1", "P2", "P3"])
+    queue_lease.add_argument("--json", action="store_true", dest="command_json")
+    queue_complete = queue_sub.add_parser("complete")
+    queue_complete.add_argument("--job-id", required=True)
+    queue_complete.add_argument("--lease-id", required=True)
+    queue_complete.add_argument("--json", action="store_true", dest="command_json")
+    queue_fail = queue_sub.add_parser("fail")
+    queue_fail.add_argument("--job-id", required=True)
+    queue_fail.add_argument("--lease-id", required=True)
+    queue_fail.add_argument("--reason", required=True)
+    queue_fail.add_argument("--json", action="store_true", dest="command_json")
+    queue_recover = queue_sub.add_parser("recover-expired")
+    queue_recover.add_argument("--json", action="store_true", dest="command_json")
+    queue_archive = queue_sub.add_parser("archive-dead")
+    queue_archive.add_argument("--older-than-days", type=int, default=30)
+    queue_archive.add_argument("--json", action="store_true", dest="command_json")
+    queue_status_parser = queue_sub.add_parser("status")
+    queue_status_parser.add_argument("--json", action="store_true", dest="command_json")
     hook_parser = sub.add_parser("hook")
     hook_parser.add_argument("hook_name", nargs="?")
     hook_parser.add_argument("--json", action="store_true", dest="command_json")
@@ -105,6 +132,34 @@ def main(argv: list[str] | None = None) -> int:
             return OK if payload["ok"] or not args.strict else CONFIG_INVALID
         if args.command == "worker" and args.worker_command == "health":
             payload = health(root, parse_envelope(args.envelope_json))
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "queue" and args.queue_command == "enqueue":
+            payload = enqueue(root, args.priority, args.kind, read_payload())
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "queue" and args.queue_command == "lease":
+            payload = lease_next(root, args.worker_id, priority=args.priority)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "queue" and args.queue_command == "complete":
+            payload = complete(root, args.job_id, args.lease_id)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "queue" and args.queue_command == "fail":
+            payload = fail(root, args.job_id, args.lease_id, args.reason)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "queue" and args.queue_command == "recover-expired":
+            payload = recover_expired(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "queue" and args.queue_command == "archive-dead":
+            payload = archive_dead(root, older_than_days=args.older_than_days)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "queue" and args.queue_command == "status":
+            payload = queue_status(root)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "hook":

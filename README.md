@@ -18,6 +18,7 @@ printf '{"agent":"codex"}' | uv run --project .ai/runtime ai hook SessionStart -
 uv run --project .ai/runtime ai worker health --json
 uv run --project .ai/runtime ai index rebuild --json
 uv run --project .ai/runtime ai code query "worker IPC" --json
+printf '{"task":"rebuild"}' | uv run --project .ai/runtime ai queue enqueue --priority P2 --kind index --json
 ```
 
 ## Locked Rules
@@ -43,3 +44,4 @@ uv run --project .ai/runtime ai code query "worker IPC" --json
 | Audit | `ai audit append --action ...` | yearly audit JSONL + audit index |
 | Search | `ai index rebuild`, `ai code query` | single `.ai/cache/code.sqlite` with FTS5 |
 | MCP | `ai mcp` / `ai mcp --once-json ...` | read tools and rebuild request over JSON-RPC |
+| Queue | `ai queue enqueue/lease/complete/fail/status` | P0-P3 file queue with lease and dead-letter |

@@ -14,7 +14,7 @@ WORKER_UNAVAILABLE = 14
 INCOMPATIBLE_VERSION = 15
 PERMISSION_DENIED = 16
 
-WRITE_COMMANDS = {"render", "trust", "secrets", "upgrade", "migrate", "index"}
+WRITE_COMMANDS = {"render", "trust", "secrets", "upgrade", "migrate", "index", "queue"}
 
 
 def is_ci() -> bool:

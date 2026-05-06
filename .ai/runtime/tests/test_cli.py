@@ -56,6 +56,17 @@ def copy_repo(tmp_path: Path) -> Path:
         target,
         ignore=shutil.ignore_patterns(".git", ".venv", ".pytest_cache", "__pycache__", "cache"),
     )
+    for pattern in (
+        ".ai/memory/queue/*.json",
+        ".ai/memory/queue/.tmp/*.json*",
+        ".ai/memory/queue/processing/*.json",
+        ".ai/memory/queue/dead/*.json",
+        ".ai/memory/audit/*.jsonl",
+        ".ai/memory/events/*.jsonl",
+    ):
+        for path in target.glob(pattern):
+            path.unlink()
+    (target / ".ai" / "memory" / "audit-index.jsonl").write_text("\n", encoding="utf-8")
     return target
 
 
@@ -167,4 +178,70 @@ def test_context_pack_and_mcp_once(tmp_path: Path) -> None:
 
 def test_ci_index_rebuild_rejected() -> None:
     result = run_ai("index", "rebuild", env={"CI": "true"})
+    assert result.returncode == 16
+
+
+def test_queue_lifecycle_complete(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    enqueue_result = run_ai_input(
+        "queue",
+        "enqueue",
+        "--priority",
+        "P2",
+        "--kind",
+        "index",
+        "--json",
+        stdin='{"target":"all"}',
+        cwd=repo,
+    )
+    assert enqueue_result.returncode == 0, enqueue_result.stdout + enqueue_result.stderr
+    job = json.loads(enqueue_result.stdout)["job"]
+    lease_result = run_ai("queue", "lease", "--worker-id", "worker-1", "--json", cwd=repo)
+    assert lease_result.returncode == 0, lease_result.stdout + lease_result.stderr
+    leased = json.loads(lease_result.stdout)["job"]
+    assert leased["id"] == job["id"]
+    complete_result = run_ai(
+        "queue",
+        "complete",
+        "--job-id",
+        leased["id"],
+        "--lease-id",
+        leased["lease_id"],
+        "--json",
+        cwd=repo,
+    )
+    assert complete_result.returncode == 0, complete_result.stdout + complete_result.stderr
+    status_result = run_ai("queue", "status", "--json", cwd=repo)
+    status = json.loads(status_result.stdout)
+    assert status["pending"] == 0
+    assert status["processing"] == 0
+    assert status["dead"] == 0
+
+
+def test_queue_fail_and_archive(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    enqueue_result = run_ai_input("queue", "enqueue", "--priority", "P3", "--kind", "notify", "--json", stdin="{}", cwd=repo)
+    assert enqueue_result.returncode == 0
+    lease_result = run_ai("queue", "lease", "--worker-id", "worker-1", "--json", cwd=repo)
+    leased = json.loads(lease_result.stdout)["job"]
+    fail_result = run_ai(
+        "queue",
+        "fail",
+        "--job-id",
+        leased["id"],
+        "--lease-id",
+        leased["lease_id"],
+        "--reason",
+        "boom",
+        "--json",
+        cwd=repo,
+    )
+    assert fail_result.returncode == 0, fail_result.stdout + fail_result.stderr
+    archive_result = run_ai("queue", "archive-dead", "--older-than-days", "0", "--json", cwd=repo)
+    assert archive_result.returncode == 0, archive_result.stdout + archive_result.stderr
+    assert json.loads(archive_result.stdout)["archived"] == 1
+
+
+def test_ci_queue_write_rejected() -> None:
+    result = run_ai_input("queue", "enqueue", "--priority", "P1", "--kind", "test", stdin="{}", env={"CI": "true"})
     assert result.returncode == 16

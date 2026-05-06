@@ -37,7 +37,11 @@ class PolicyDenied(RuntimeError):
 
 
 def is_ci() -> bool:
-    return os.environ.get("CI", "").lower() in {"1", "true", "yes"} or bool(os.environ.get("GITHUB_ACTIONS"))
+    truthy = {"1", "true", "yes", "on"}
+    return any(
+        os.environ.get(name, "").lower() in truthy
+        for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI")
+    )
 
 
 def reject_ci_write(command: str, *, dry_run: bool = False) -> None:

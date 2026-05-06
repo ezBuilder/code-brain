@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from . import __version__
@@ -10,19 +11,15 @@ from .doctor import as_payload, run_checks
 from .hooks import handle_hook, read_payload
 from .inbox import decide, list_approvals, request_approval
 from .memory import append_audit, append_event
-from .mcp_server import handle_request, serve_stdio
-from .notify import enqueue_notification
 from .obs import diagnostics, metrics, prune_diagnostics, slo_bench, write_log
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, PolicyDenied, reject_ci_write
-from .report import release_notes, status_report
 from .render import render
 from .search import context_pack, query, rebuild
 from .secrets_store import status as secrets_status
 from .trust import init_machine, list_machines, revoke_machine
-from .upgrade import clean_upgrade_cache, migrate, rollback, upgrade_apply, upgrade_plan
-from .worker.ipc import IpcError, health, parse_envelope
-from .worker.scheduler import archive_dead, complete, enqueue, fail, lease_next, recover_expired, status as queue_status
+
+RUNTIME_PROTOCOL_VERSION = 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Code Brain repo-local AI agent infrastructure CLI.",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument("--ci", action="store_true", help="force CI read-only policy")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("version")
     config = sub.add_parser("config")
@@ -198,9 +196,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     as_json = bool(args.json or getattr(args, "command_json", False))
     try:
+        if args.ci:
+            os.environ["AI_CI"] = "1"
         root = find_repo_root()
         if args.command == "version":
-            emit({"version": __version__, "protocol_version": 1}, as_json=as_json)
+            emit({"version": __version__, "protocol_version": RUNTIME_PROTOCOL_VERSION}, as_json=as_json)
             return OK
         if args.command == "config" and args.config_command == "show":
             emit(load_config(root), as_json=as_json)
@@ -216,40 +216,56 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK if payload["ok"] or not args.strict else CONFIG_INVALID
         if args.command == "worker" and args.worker_command == "health":
+            from .worker.ipc import health, parse_envelope
+
             payload = health(root, parse_envelope(args.envelope_json))
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "enqueue":
             reject_ci_write("queue")
+            from .worker.scheduler import enqueue
+
             payload = enqueue(root, args.priority, args.kind, read_payload())
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "lease":
             reject_ci_write("queue")
+            from .worker.scheduler import lease_next
+
             payload = lease_next(root, args.worker_id, priority=args.priority)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "complete":
             reject_ci_write("queue")
+            from .worker.scheduler import complete
+
             payload = complete(root, args.job_id, args.lease_id)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "fail":
             reject_ci_write("queue")
+            from .worker.scheduler import fail
+
             payload = fail(root, args.job_id, args.lease_id, args.reason)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "recover-expired":
             reject_ci_write("queue")
+            from .worker.scheduler import recover_expired
+
             payload = recover_expired(root)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "archive-dead":
             reject_ci_write("queue")
+            from .worker.scheduler import archive_dead
+
             payload = archive_dead(root, older_than_days=args.older_than_days)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "status":
+            from .worker.scheduler import status as queue_status
+
             payload = queue_status(root)
             emit(payload, as_json=as_json)
             return OK
@@ -292,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "notify" and args.notify_command == "enqueue":
             reject_ci_write("notify")
+            from .notify import enqueue_notification
+
             payload = enqueue_notification(root, args.channel, read_payload())
             emit(payload, as_json=as_json)
             return OK
@@ -320,25 +338,35 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "migrate":
             reject_ci_write("migrate", dry_run=args.dry_run)
+            from .upgrade import migrate
+
             payload = migrate(root, dry_run=args.dry_run)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "upgrade" and args.upgrade_command == "plan":
+            from .upgrade import upgrade_plan
+
             payload = upgrade_plan(root, target_version=args.target_version)
             emit(payload, as_json=as_json)
             return OK if payload["ok"] else GENERIC_ERROR
         if args.command == "upgrade" and args.upgrade_command == "apply":
             reject_ci_write("upgrade", dry_run=args.dry_run)
+            from .upgrade import upgrade_apply
+
             payload = upgrade_apply(root, target_version=args.target_version, dry_run=args.dry_run)
             emit(payload, as_json=as_json)
             return OK if payload["ok"] else GENERIC_ERROR
         if args.command == "upgrade" and args.upgrade_command == "rollback":
             reject_ci_write("upgrade")
+            from .upgrade import rollback
+
             payload = rollback(root, backup_path=args.backup_path)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "upgrade" and args.upgrade_command == "clean-cache":
             reject_ci_write("upgrade")
+            from .upgrade import clean_upgrade_cache
+
             payload = clean_upgrade_cache(root)
             emit(payload, as_json=as_json)
             return OK
@@ -370,26 +398,32 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK
         if args.command == "mcp":
+            from .mcp_server import handle_request, serve_stdio
+
             if args.once_json:
                 emit(handle_request(root, json.loads(args.once_json)), as_json=True)
                 return OK
             return serve_stdio(root)
         if args.command == "report" and args.report_command == "status":
+            from .report import status_report
+
             payload = status_report(root)
             emit(payload, as_json=as_json)
             return OK if payload["ok"] else GENERIC_ERROR
         if args.command == "report" and args.report_command == "release-notes":
+            from .report import release_notes
+
             print(release_notes(root))
             return OK
-    except IpcError as exc:
-        emit({"ok": False, "error": exc.code, "detail": exc.message}, as_json=True)
-        return GENERIC_ERROR
     except PolicyDenied as exc:
         emit({"ok": False, "error": "CI_READ_ONLY", "command": exc.command, "exit_code": PERMISSION_DENIED}, as_json=True)
         return PERMISSION_DENIED
     except SystemExit as exc:
         raise exc
     except Exception as exc:
+        if hasattr(exc, "code") and hasattr(exc, "message"):
+            emit({"ok": False, "error": exc.code, "detail": exc.message}, as_json=True)
+            return GENERIC_ERROR
         emit({"ok": False, "error": str(exc)}, as_json=True)
         return GENERIC_ERROR
     return PERMISSION_DENIED

@@ -13,8 +13,8 @@ PYTHON = sys.executable
 
 def run_ai(*args: str, env: dict[str, str] | None = None, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
     merged = os.environ.copy()
-    merged.pop("CI", None)
-    merged.pop("GITHUB_ACTIONS", None)
+    for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI"):
+        merged.pop(name, None)
     merged["PYTHONPATH"] = str(ROOT / ".ai" / "runtime" / "src")
     if env:
         merged.update(env)
@@ -36,8 +36,8 @@ def run_ai_input(
     cwd: Path = ROOT,
 ) -> subprocess.CompletedProcess[str]:
     merged = os.environ.copy()
-    merged.pop("CI", None)
-    merged.pop("GITHUB_ACTIONS", None)
+    for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI"):
+        merged.pop(name, None)
     merged["PYTHONPATH"] = str(ROOT / ".ai" / "runtime" / "src")
     if env:
         merged.update(env)
@@ -320,6 +320,28 @@ def test_github_actions_write_policy_matches_ci(tmp_path: Path) -> None:
     assert json.loads(write_result.stdout)["error"] == "CI_READ_ONLY"
     read_result = run_ai("queue", "status", "--json", env={"GITHUB_ACTIONS": "true"}, cwd=repo)
     assert read_result.returncode == 0, read_result.stdout + read_result.stderr
+
+
+def test_ci_vendor_and_flag_matrix_reject_writes_before_worker_token(tmp_path: Path) -> None:
+    for index, (args, env) in enumerate(
+        [
+            (("render", "--json"), {"CI": "1"}),
+            (("render", "--json"), {"GITHUB_ACTIONS": "true"}),
+            (("render", "--json"), {"GITLAB_CI": "true"}),
+            (("render", "--json"), {"AI_CI": "true"}),
+            (("--ci", "render", "--json"), {}),
+        ]
+    ):
+        repo = copy_repo(tmp_path / f"repo-{index}")
+        token_path = repo / ".ai" / "cache" / "run" / "worker.token"
+        if token_path.exists():
+            token_path.unlink()
+        result = run_ai(*args, env=env, cwd=repo)
+        assert result.returncode == 16, result.stdout + result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["error"] == "CI_READ_ONLY"
+        assert payload["command"] == "render"
+        assert not token_path.exists()
 
 
 def test_ci_memory_and_audit_writes_rejected(tmp_path: Path) -> None:

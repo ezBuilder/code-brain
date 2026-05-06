@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 PACKAGE_OUTPUT="$(mktemp)"
-trap 'rm -f "$PACKAGE_OUTPUT"' EXIT
+REPORT_OUTPUT="$(mktemp)"
+trap 'rm -f "$PACKAGE_OUTPUT" "$REPORT_OUTPUT"' EXIT
 
 ./scripts/env-check.sh >/dev/null
 ./scripts/lint.sh
@@ -22,7 +23,23 @@ fi
 ./scripts/install-check.sh "$ARCHIVE"
 ./scripts/artifact-tamper-check.sh "$ARCHIVE"
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
-uv run --project .ai/runtime ai report status --json >/dev/null
+uv run --project .ai/runtime ai report status --json >"$REPORT_OUTPUT"
+python - "$REPORT_OUTPUT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+artifacts = payload.get("release_artifacts", {})
+if payload.get("release_ready") is not True:
+    print("release gate failed: release_ready is not true", file=sys.stderr)
+    print(json.dumps({"release_ready": payload.get("release_ready"), "release_artifacts": artifacts}, indent=2), file=sys.stderr)
+    raise SystemExit(1)
+if artifacts.get("all_current") is not True:
+    print("release gate failed: release artifacts are not current", file=sys.stderr)
+    print(json.dumps(artifacts, indent=2), file=sys.stderr)
+    raise SystemExit(1)
+PY
 
 if [[ -n "$(git status --short)" ]]; then
   git status --short

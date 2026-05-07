@@ -61,6 +61,67 @@ def metrics(root: Path) -> dict[str, Any]:
     }
 
 
+def health_summary(root: Path) -> dict[str, Any]:
+    from .worker.lock import lock_status
+    from .worker.scheduler import QUEUE_PENDING_AGE_STALE_SECONDS, QUEUE_PROCESSING_AGE_STALE_SECONDS, status as queue_status
+
+    doctor = as_payload(run_checks(root))
+    failed_checks = [check["name"] for check in doctor.get("checks", []) if not check.get("ok")]
+    worker = lock_status(root)
+    queue = queue_status(root)
+    pending_age = int(queue.get("oldest_pending_age_seconds", 0) or 0)
+    processing_age = int(queue.get("oldest_processing_age_seconds", 0) or 0)
+    payload = {
+        "ok": bool(
+            doctor.get("ok")
+            and not worker.get("stale")
+            and not worker.get("cross_host")
+            and pending_age <= QUEUE_PENDING_AGE_STALE_SECONDS
+            and processing_age <= QUEUE_PROCESSING_AGE_STALE_SECONDS
+        ),
+        "doctor": {"ok": bool(doctor.get("ok")), "failed": failed_checks},
+        "worker": {
+            "locked": bool(worker.get("locked")),
+            "stale": bool(worker.get("stale")),
+            "cross_host": bool(worker.get("cross_host")),
+            "reason": worker.get("reason"),
+            "pid": worker.get("pid"),
+        },
+        "queue": {
+            "pending": int(queue.get("pending", 0) or 0),
+            "processing": int(queue.get("processing", 0) or 0),
+            "dead": int(queue.get("dead", 0) or 0),
+            "expired_processing": int(queue.get("expired_processing", 0) or 0),
+            "oldest_pending_age_seconds": pending_age,
+            "oldest_processing_age_seconds": processing_age,
+            "age_stats_skipped": int(queue.get("age_stats_skipped", 0) or 0),
+        },
+        "release_artifacts": release_artifact_summary(root),
+    }
+    return redact_value(payload)
+
+
+def release_artifact_summary(root: Path) -> dict[str, Any]:
+    summary_path = root / "dist" / "release-gate.summary.json"
+    if not summary_path.exists():
+        return {
+            "summary_path": None,
+            "release_ready": None,
+            "all_present": None,
+            "all_valid": None,
+            "all_current": None,
+        }
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    artifacts = summary.get("release_artifacts", {}) if isinstance(summary, dict) else {}
+    return {
+        "summary_path": summary_path.relative_to(root).as_posix(),
+        "release_ready": summary.get("release_ready") if isinstance(summary, dict) else None,
+        "all_present": artifacts.get("all_present") if isinstance(artifacts, dict) else None,
+        "all_valid": artifacts.get("all_valid") if isinstance(artifacts, dict) else None,
+        "all_current": artifacts.get("all_current") if isinstance(artifacts, dict) else None,
+    }
+
+
 def slo_bench(root: Path, iterations: int = 10) -> dict[str, Any]:
     from .hooks import handle_hook
 

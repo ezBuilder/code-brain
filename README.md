@@ -24,6 +24,7 @@ uv run --project .ai/runtime ai worker status --json
 uv run --project .ai/runtime ai index rebuild --json
 uv run --project .ai/runtime ai code query "worker IPC" --json
 uv run --project .ai/runtime ai obs metrics --json
+uv run --project .ai/runtime ai obs health-summary --json
 uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
 uv run --project .ai/runtime ai migrate --dry-run --json
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
@@ -95,7 +96,7 @@ Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for c
 | Secrets | `ai secrets status` | key source status without exposing plaintext |
 | Inbox | `ai inbox request/list/approve/reject` | narrow 5-gate approval records, redacted |
 | Notify | `ai notify enqueue` | P3 outbound adapter jobs, no hot-path network |
-| Observability | `ai obs log/metrics/slo` | local JSONL logs, metrics, SLO check |
+| Observability | `ai obs log/metrics/slo/health-summary` | local JSONL logs, metrics, SLO check, and read-only health rollup |
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
 | Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration and local rollback backups |
 | Package | `scripts/package.sh`, `scripts/install-check.sh` | tarball + checksum + manifest + SBOM + provenance + release notes + bash/PowerShell install verification |

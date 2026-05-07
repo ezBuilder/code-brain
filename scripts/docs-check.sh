@@ -20,6 +20,7 @@ for needle in \
   "ai diagnostics bundle --dry-run --json" \
   "ai queue recover-expired --json" \
   "ai queue dead --json" \
+  "ai obs health-summary --json" \
   "ai upgrade plan --target-version" \
   "exit code \`16\`" \
   "CI_READ_ONLY" \
@@ -54,6 +55,7 @@ uv run --project .ai/runtime ai version >/dev/null
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
 uv run --project .ai/runtime ai report status --json >/dev/null
 uv run --project .ai/runtime ai obs metrics --json >/dev/null
+uv run --project .ai/runtime ai obs health-summary --json >/dev/null
 uv run --project .ai/runtime ai obs slo --json >/dev/null
 uv run --project .ai/runtime ai queue status --json >/dev/null
 uv run --project .ai/runtime ai queue dead --json --limit 1 >/dev/null
@@ -79,6 +81,7 @@ make -n clean-artifacts >/dev/null
 make -n clean-all >/dev/null
 
 CI=true uv run --project .ai/runtime ai obs metrics --json >/dev/null
+CI=true uv run --project .ai/runtime ai obs health-summary --json >/dev/null
 CI=true uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
 
 set +e

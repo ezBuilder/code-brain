@@ -820,6 +820,106 @@ def test_queue_age_processing_stale_fails_doctor(tmp_path: Path) -> None:
     assert "processing" in check["detail"]
 
 
+def test_obs_health_summary_clean_returns_ok_true(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = run_ai("obs", "health-summary", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["doctor"]["ok"] is True
+    assert payload["doctor"]["failed"] == []
+    assert payload["worker"]["locked"] is False
+    assert payload["queue"]["oldest_pending_age_seconds"] == 0
+    assert payload["queue"]["oldest_processing_age_seconds"] == 0
+
+
+def test_obs_health_summary_reflects_stale_worker_lock_but_exits_zero(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    lock_file = repo / ".ai" / "cache" / "run" / "worker.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text(
+        json.dumps(
+            {
+                "pid": 99999999,
+                "owner": "dead",
+                "hostname": __import__("socket").gethostname(),
+                "acquired_at": "2026-01-01T00:00:00Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = run_ai("obs", "health-summary", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["doctor"]["ok"] is False
+    assert "worker_singleton_lock" in payload["doctor"]["failed"]
+    assert payload["worker"]["stale"] is True
+    assert payload["worker"]["reason"] == "stale_dead_pid"
+
+
+def test_obs_health_summary_reflects_aged_queue_without_release_summary(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    (repo / "dist" / "release-gate.summary.json").unlink(missing_ok=True)
+    enqueue_result = run_ai_input("queue", "enqueue", "--priority", "P2", "--kind", "index", "--json", stdin="{}", cwd=repo)
+    assert enqueue_result.returncode == 0
+    job = json.loads(enqueue_result.stdout)["job"]
+    pending_path = repo / ".ai" / "memory" / "queue" / f"{job['id']}.json"
+    payload = json.loads(pending_path.read_text(encoding="utf-8"))
+    payload["created_at"] = "2000-01-01T00:00:00Z"
+    pending_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    result = run_ai("obs", "health-summary", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = json.loads(result.stdout)
+    assert summary["ok"] is False
+    assert summary["queue"]["oldest_pending_age_seconds"] >= 86400
+    assert summary["release_artifacts"] == {
+        "summary_path": None,
+        "release_ready": None,
+        "all_present": None,
+        "all_valid": None,
+        "all_current": None,
+    }
+
+
+def test_obs_health_summary_release_artifacts_are_redacted_and_informational(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    summary_path = repo / "dist" / "release-gate.summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        json.dumps(
+            {
+                "release_ready": False,
+                "release_artifacts": {
+                    "all_present": True,
+                    "all_valid": True,
+                    "all_current": False,
+                    "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.0.release-notes.md"},
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = run_ai("obs", "health-summary", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "/Users/" not in result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["release_artifacts"] == {
+        "summary_path": "dist/release-gate.summary.json",
+        "release_ready": False,
+        "all_present": True,
+        "all_valid": True,
+        "all_current": False,
+    }
+
+
 def test_doctor_rejects_expired_processing_lease(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     enqueue_result = run_ai_input("queue", "enqueue", "--priority", "P2", "--kind", "index", "--json", stdin="{}", cwd=repo)

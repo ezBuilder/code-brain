@@ -34,7 +34,7 @@ This backlog tracks remaining commercial-readiness work after the current releas
 
 - Keep diagnostics redacted and zip contents whitelisted.
 - Add log volume and retention checks once real operator logs exist.
-- Add `ai obs health-summary --json` only if it summarizes existing doctor, queue, worker, and artifact state without new writes.
+- Keep `ai obs health-summary --json` as a read-only rollup of existing doctor, queue, worker, and artifact state.
 - Keep absolute local paths redacted in external-facing diagnostics and CI summaries.
 - Add runbook examples for common doctor failures as they appear in real operation.
 

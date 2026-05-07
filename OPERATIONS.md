@@ -85,14 +85,16 @@ Install verification then extracts the latest `dist/code-brain-<version>.tar.gz`
 ```bash
 uv run --project .ai/runtime ai doctor --strict --json
 uv run --project .ai/runtime ai obs metrics --json
+uv run --project .ai/runtime ai obs health-summary --json
 uv run --project .ai/runtime ai obs slo --json
 uv run --project .ai/runtime ai queue status --json
 uv run --project .ai/runtime ai worker status --json
 uv run --project .ai/runtime ai report status --json
 ```
 
-Treat a strict doctor failure as a release blocker. Metrics and SLO output are read-only and allowed in CI.
+Treat a strict doctor failure as a release blocker. Metrics, health summary, and SLO output are read-only and allowed in CI.
 `queue status` and `obs metrics` include `oldest_pending_age_seconds`, `oldest_processing_age_seconds`, and matching job ids so operators can spot backlog drift before leases expire.
+`obs health-summary` rolls up doctor failures, singleton worker lock state, queue age, and the latest `dist/release-gate.summary.json` artifact booleans; it exits `0` for status reporting even when `"ok": false`.
 
 ## CI Policy
 
@@ -100,6 +102,7 @@ CI is read-only. Write commands are rejected before worker contact unless the co
 
 ```bash
 CI=true uv run --project .ai/runtime ai obs metrics --json
+CI=true uv run --project .ai/runtime ai obs health-summary --json
 CI=true uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
 CI=true uv run --project .ai/runtime ai render
 ```

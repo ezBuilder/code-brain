@@ -11,7 +11,7 @@ from .doctor import as_payload, run_checks
 from .hooks import handle_hook, read_payload
 from .inbox import decide, list_approvals, request_approval
 from .memory import append_audit, append_event
-from .obs import diagnostics, metrics, prune_diagnostics, slo_bench, write_log
+from .obs import diagnostics, health_summary, metrics, prune_diagnostics, slo_bench, write_log
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, PolicyDenied, WORKER_UNAVAILABLE, reject_ci_write
 from .render import render
@@ -128,6 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
     obs_slo = obs_sub.add_parser("slo")
     obs_slo.add_argument("--iterations", type=int, default=10)
     obs_slo.add_argument("--json", action="store_true", dest="command_json")
+    obs_health = obs_sub.add_parser("health-summary")
+    obs_health.add_argument("--json", action="store_true", dest="command_json")
     diagnostics_parser = sub.add_parser("diagnostics")
     diagnostics_sub = diagnostics_parser.add_subparsers(dest="diagnostics_command", required=True)
     diagnostics_bundle = diagnostics_sub.add_parser("bundle")
@@ -358,6 +360,10 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "obs" and args.obs_command == "slo":
             payload = slo_bench(root, iterations=args.iterations)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "obs" and args.obs_command == "health-summary":
+            payload = health_summary(root)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "diagnostics" and args.diagnostics_command == "bundle":

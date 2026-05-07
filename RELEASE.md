@@ -32,6 +32,7 @@ git status --short
 - Lint passes for shell scripts, Python compilation, Makefile dry-runs, and PowerShell bootstrap/shim parsing when PowerShell is available.
 - Doctor is green.
 - Queue age is release-safe: `queue_age` is green, `oldest_pending_age_seconds` is at or below 86400, and `oldest_processing_age_seconds` is at or below 600.
+- Health summary is green through `ai obs health-summary --json`; stale worker locks and old queue work are resolved before packaging.
 - Smoke test completes in a temporary repository copy.
 - Operator runbook examples pass through `scripts/docs-check.sh`.
 - Runtime artifacts remain ignored under `.ai/cache/`, `.ai/runtime/.venv/`, `.ai/runtime/.pytest_cache/`, and `__pycache__/`.

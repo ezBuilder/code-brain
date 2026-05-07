@@ -14,6 +14,7 @@ from ai_core.worker.lock import queue_lock
 
 PRIORITIES = {"P0", "P1", "P2", "P3"}
 LEASE_TTL_SECONDS = 300
+DEFAULT_MAX_ATTEMPTS = 3
 
 
 def now() -> datetime:
@@ -46,6 +47,7 @@ def enqueue(root: Path, priority: str, kind: str, payload: dict[str, Any]) -> di
             "payload": redact_value(payload),
             "status": "pending",
             "attempts": 0,
+            "max_attempts": DEFAULT_MAX_ATTEMPTS,
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
@@ -112,19 +114,35 @@ def fail(root: Path, job_id: str, lease_id: str, reason: str) -> dict[str, Any]:
 def recover_expired(root: Path) -> dict[str, Any]:
     with queue_lock(root):
         recovered = 0
+        dead_lettered = 0
         current = now()
         for path in sorted((queue_root(root) / "processing").glob("*.json")):
             job = read_job(path)
             expires = parse_iso(str(job.get("lease_expires_at", "")))
             if expires and expires < current:
-                job.update({"status": "pending", "lease_id": None, "worker_id": None, "updated_at": now_iso()})
-                target = queue_root(root) / path.name
-                write_job(target, job)
+                attempts = int(job.get("attempts", 0) or 0)
+                max_attempts = int(job.get("max_attempts", DEFAULT_MAX_ATTEMPTS) or DEFAULT_MAX_ATTEMPTS)
+                if attempts >= max_attempts:
+                    job.update(
+                        {
+                            "status": "dead",
+                            "failed_at": now_iso(),
+                            "failure_reason": "lease expired after max attempts",
+                            "updated_at": now_iso(),
+                        }
+                    )
+                    target = queue_root(root) / "dead" / path.name
+                    write_job(target, job)
+                    dead_lettered += 1
+                else:
+                    job.update({"status": "pending", "lease_id": None, "worker_id": None, "updated_at": now_iso()})
+                    target = queue_root(root) / path.name
+                    write_job(target, job)
+                    recovered += 1
                 path.unlink()
-                recovered += 1
-        if recovered:
-            append_audit(root, action="queue.recover_expired", category="queue", payload={"recovered": recovered})
-        return {"ok": True, "recovered": recovered}
+        if recovered or dead_lettered:
+            append_audit(root, action="queue.recover_expired", category="queue", payload={"recovered": recovered, "dead_lettered": dead_lettered})
+        return {"ok": True, "recovered": recovered, "dead_lettered": dead_lettered}
 
 
 def archive_dead(root: Path, *, older_than_days: int = 30) -> dict[str, Any]:
@@ -147,12 +165,36 @@ def archive_dead(root: Path, *, older_than_days: int = 30) -> dict[str, Any]:
 
 def status(root: Path) -> dict[str, Any]:
     ensure_queue_dirs(root)
+    expired_processing = expired_processing_jobs(root)
     return {
         "ok": True,
         "pending": len(list(queue_root(root).glob("*.json"))),
         "processing": len(list((queue_root(root) / "processing").glob("*.json"))),
         "dead": len(list((queue_root(root) / "dead").glob("*.json"))),
+        "expired_processing": len(expired_processing),
     }
+
+
+def expired_processing_jobs(root: Path) -> list[dict[str, Any]]:
+    current = now()
+    expired: list[dict[str, Any]] = []
+    processing = queue_root(root) / "processing"
+    if not processing.exists():
+        return expired
+    for path in sorted(processing.glob("*.json")):
+        job = read_job(path)
+        expires = parse_iso(str(job.get("lease_expires_at", "")))
+        if expires and expires < current:
+            expired.append(
+                {
+                    "id": job.get("id"),
+                    "attempts": int(job.get("attempts", 0) or 0),
+                    "max_attempts": int(job.get("max_attempts", DEFAULT_MAX_ATTEMPTS) or DEFAULT_MAX_ATTEMPTS),
+                    "lease_expires_at": job.get("lease_expires_at"),
+                    "path": path.relative_to(root).as_posix(),
+                }
+            )
+    return expired
 
 
 def find_processing(root: Path, job_id: str) -> Path:

@@ -36,6 +36,7 @@ def run_checks(root: Path) -> list[Check]:
         check_redaction_self_test(),
         check_bootstrap_preflight(root),
         check_worker_singleton_lock(root),
+        check_queue_lease_recovery(root),
         check_diagnostics(root),
     ]
     return checks
@@ -251,6 +252,13 @@ def check_worker_singleton_lock(root: Path) -> Check:
     if status.get("stale"):
         return Check("worker_singleton_lock", False, json.dumps(status, sort_keys=True))
     return Check("worker_singleton_lock", status.get("ok") is True, "ok" if status.get("ok") is True else json.dumps(status, sort_keys=True))
+
+
+def check_queue_lease_recovery(root: Path) -> Check:
+    from .worker.scheduler import expired_processing_jobs
+
+    expired = expired_processing_jobs(root)
+    return Check("queue_lease_recovery", not expired, "ok" if not expired else "expired processing jobs: " + json.dumps(expired[:5], sort_keys=True))
 
 
 def check_diagnostics(root: Path) -> Check:

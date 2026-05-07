@@ -677,6 +677,80 @@ def test_queue_status_counts_expired_processing(tmp_path: Path) -> None:
     assert status["recovery"]["expired_processing"] == 1
 
 
+def test_queue_age_empty_returns_zero(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    status_result = run_ai("queue", "status", "--json", cwd=repo)
+    assert status_result.returncode == 0, status_result.stdout + status_result.stderr
+    status = json.loads(status_result.stdout)
+    assert status["oldest_pending_age_seconds"] == 0
+    assert status["oldest_pending_job_id"] is None
+    assert status["oldest_processing_age_seconds"] == 0
+    assert status["oldest_processing_job_id"] is None
+    assert status["age_stats_skipped"] == 0
+
+    metrics_result = run_ai("obs", "metrics", "--json", cwd=repo)
+    assert metrics_result.returncode == 0, metrics_result.stdout + metrics_result.stderr
+    metrics = json.loads(metrics_result.stdout)["queue"]
+    assert metrics["oldest_pending_age_seconds"] == 0
+    assert metrics["oldest_processing_age_seconds"] == 0
+
+    doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    assert doctor_result.returncode == 0, doctor_result.stdout + doctor_result.stderr
+    check = next(check for check in json.loads(doctor_result.stdout)["checks"] if check["name"] == "queue_age")
+    assert check["ok"] is True
+
+
+def test_queue_age_pending_stale_fails_doctor_and_skips_corrupt_jobs(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    enqueue_result = run_ai_input("queue", "enqueue", "--priority", "P2", "--kind", "index", "--json", stdin="{}", cwd=repo)
+    assert enqueue_result.returncode == 0
+    job = json.loads(enqueue_result.stdout)["job"]
+    queue_dir = repo / ".ai" / "memory" / "queue"
+    pending_path = queue_dir / f"{job['id']}.json"
+    payload = json.loads(pending_path.read_text(encoding="utf-8"))
+    payload["created_at"] = "2000-01-01T00:00:00Z"
+    pending_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    (queue_dir / "p2-corrupt.json").write_text("{not-json\n", encoding="utf-8")
+
+    status_result = run_ai("queue", "status", "--json", cwd=repo)
+    assert status_result.returncode == 0, status_result.stdout + status_result.stderr
+    status = json.loads(status_result.stdout)
+    assert status["oldest_pending_age_seconds"] >= 86400
+    assert status["oldest_pending_job_id"] == job["id"]
+    assert status["age_stats_skipped"] == 1
+
+    doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    assert doctor_result.returncode == 10
+    check = next(check for check in json.loads(doctor_result.stdout)["checks"] if check["name"] == "queue_age")
+    assert check["ok"] is False
+    assert job["id"] in check["detail"]
+
+
+def test_queue_age_processing_stale_fails_doctor(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    enqueue_result = run_ai_input("queue", "enqueue", "--priority", "P2", "--kind", "index", "--json", stdin="{}", cwd=repo)
+    assert enqueue_result.returncode == 0
+    lease_result = run_ai("queue", "lease", "--worker-id", "worker-1", "--json", cwd=repo)
+    leased = json.loads(lease_result.stdout)["job"]
+    processing_path = repo / ".ai" / "memory" / "queue" / "processing" / f"{leased['id']}.json"
+    job = json.loads(processing_path.read_text(encoding="utf-8"))
+    job["leased_at"] = "2000-01-01T00:00:00Z"
+    job["lease_expires_at"] = "2999-01-01T00:00:00Z"
+    processing_path.write_text(json.dumps(job, sort_keys=True) + "\n", encoding="utf-8")
+
+    status_result = run_ai("queue", "status", "--json", cwd=repo)
+    assert status_result.returncode == 0, status_result.stdout + status_result.stderr
+    status = json.loads(status_result.stdout)
+    assert status["oldest_processing_age_seconds"] >= 600
+    assert status["oldest_processing_job_id"] == leased["id"]
+
+    doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    assert doctor_result.returncode == 10
+    check = next(check for check in json.loads(doctor_result.stdout)["checks"] if check["name"] == "queue_age")
+    assert check["ok"] is False
+    assert "processing" in check["detail"]
+
+
 def test_doctor_rejects_expired_processing_lease(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     enqueue_result = run_ai_input("queue", "enqueue", "--priority", "P2", "--kind", "index", "--json", stdin="{}", cwd=repo)

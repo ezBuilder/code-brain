@@ -92,6 +92,7 @@ uv run --project .ai/runtime ai report status --json
 ```
 
 Treat a strict doctor failure as a release blocker. Metrics and SLO output are read-only and allowed in CI.
+`queue status` and `obs metrics` include `oldest_pending_age_seconds`, `oldest_processing_age_seconds`, and matching job ids so operators can spot backlog drift before leases expire.
 
 ## CI Policy
 
@@ -135,6 +136,8 @@ Inspect queue state:
 ```bash
 uv run --project .ai/runtime ai queue status --json
 ```
+
+Investigate old queue work before release. Strict doctor fails `queue_age` when the oldest pending job is older than 86400 seconds or the oldest processing job is older than 600 seconds. `age_stats_skipped` reports malformed job files ignored by read-only age metrics.
 
 Recover expired leases:
 

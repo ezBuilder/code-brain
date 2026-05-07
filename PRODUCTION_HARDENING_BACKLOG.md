@@ -26,7 +26,7 @@ This backlog tracks remaining commercial-readiness work after the current releas
 - Do not auto-clear cross-host worker locks.
 - Keep `queue_lock` around every queue mutation.
 - Add a worker-loop integration only when there is an actual daemon lifecycle, systemd unit, or supervisor contract.
-- Add queue age metrics for oldest pending job and oldest processing job.
+- Keep queue age metrics and doctor thresholds visible for oldest pending and oldest processing jobs.
 - Add a dead-letter inspection command before adding any dead-letter replay command.
 - Keep dead-letter replay gated by an explicit operator action.
 

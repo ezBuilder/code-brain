@@ -27,6 +27,8 @@ for needle in \
   "release-gate.summary.json" \
   "ai report release-gate-summary" \
   "queue status" \
+  "oldest_pending_age_seconds" \
+  "oldest_processing_age_seconds" \
   "worker stop --force" \
   "worker health" \
   "PRODUCTION_HARDENING_BACKLOG.md" \

@@ -30,6 +30,7 @@ git status --short
 - Direct bootstrap starts with the environment check; bash and PowerShell bootstrap render with `--dry-run` under CI/GitHub Actions.
 - Lint passes for shell scripts, Python compilation, Makefile dry-runs, and PowerShell bootstrap/shim parsing when PowerShell is available.
 - Doctor is green.
+- Queue age is release-safe: `queue_age` is green, `oldest_pending_age_seconds` is at or below 86400, and `oldest_processing_age_seconds` is at or below 600.
 - Smoke test completes in a temporary repository copy.
 - Operator runbook examples pass through `scripts/docs-check.sh`.
 - Runtime artifacts remain ignored under `.ai/cache/`, `.ai/runtime/.venv/`, `.ai/runtime/.pytest_cache/`, and `__pycache__/`.

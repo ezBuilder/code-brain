@@ -18,6 +18,8 @@ DEFAULT_MAX_ATTEMPTS = 3
 MAX_ATTEMPTS_LIMIT = 50
 RECOVERY_SWEEP_INTERVAL_SECONDS = 60
 RECOVERY_STALE_SECONDS = 3600
+QUEUE_PENDING_AGE_STALE_SECONDS = 86400
+QUEUE_PROCESSING_AGE_STALE_SECONDS = LEASE_TTL_SECONDS * 2
 
 
 def now() -> datetime:
@@ -213,6 +215,7 @@ def status(root: Path) -> dict[str, Any]:
     ensure_queue_dirs(root)
     expired_processing = expired_processing_jobs(root)
     recovery = recovery_status(root)
+    ages = queue_age_stats(root)
     return {
         "ok": True,
         "pending": len(list(queue_root(root).glob("*.json"))),
@@ -220,6 +223,7 @@ def status(root: Path) -> dict[str, Any]:
         "dead": len(list((queue_root(root) / "dead").glob("*.json"))),
         "expired_processing": len(expired_processing),
         "recovery": recovery,
+        **ages,
     }
 
 
@@ -316,8 +320,11 @@ def expired_processing_jobs(root: Path) -> list[dict[str, Any]]:
     if not processing.exists():
         return expired
     for path in sorted(processing.glob("*.json")):
-        job = read_job(path)
-        expires = parse_iso(str(job.get("lease_expires_at", "")))
+        try:
+            job = read_job(path)
+            expires = parse_iso(str(job.get("lease_expires_at", "")))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
         if expires and expires < current:
             expired.append(
                 {
@@ -329,6 +336,51 @@ def expired_processing_jobs(root: Path) -> list[dict[str, Any]]:
                 }
             )
     return expired
+
+
+def queue_age_stats(root: Path) -> dict[str, Any]:
+    ensure_queue_dirs(root)
+    current = now()
+    skipped = 0
+    pending_age, pending_id, pending_path, skipped_pending = oldest_age(
+        sorted(queue_root(root).glob("*.json")), "created_at", current=current, root=root
+    )
+    processing_age, processing_id, processing_path, skipped_processing = oldest_age(
+        sorted((queue_root(root) / "processing").glob("*.json")), "leased_at", current=current, root=root
+    )
+    skipped += skipped_pending + skipped_processing
+    return {
+        "oldest_pending_age_seconds": pending_age,
+        "oldest_pending_job_id": pending_id,
+        "oldest_pending_job_path": pending_path,
+        "oldest_processing_age_seconds": processing_age,
+        "oldest_processing_job_id": processing_id,
+        "oldest_processing_job_path": processing_path,
+        "age_stats_skipped": skipped,
+    }
+
+
+def oldest_age(paths: list[Path], timestamp_field: str, *, current: datetime, root: Path) -> tuple[int, str | None, str | None, int]:
+    oldest_seconds = 0
+    oldest_id: str | None = None
+    oldest_path: str | None = None
+    skipped = 0
+    for path in paths:
+        try:
+            job = read_job(path)
+            stamp = parse_iso(str(job.get(timestamp_field, "")))
+        except (OSError, ValueError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        if not stamp:
+            skipped += 1
+            continue
+        age = max(0, int((current - stamp).total_seconds()))
+        if age >= oldest_seconds:
+            oldest_seconds = age
+            oldest_id = str(job.get("id") or path.stem)
+            oldest_path = path.relative_to(root).as_posix()
+    return oldest_seconds, oldest_id, oldest_path, skipped
 
 
 def find_processing(root: Path, job_id: str) -> Path:

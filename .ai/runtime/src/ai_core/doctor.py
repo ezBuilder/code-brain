@@ -37,6 +37,7 @@ def run_checks(root: Path) -> list[Check]:
         check_bootstrap_preflight(root),
         check_worker_singleton_lock(root),
         check_queue_lease_recovery(root),
+        check_queue_age(root),
         check_diagnostics(root),
     ]
     return checks
@@ -268,6 +269,32 @@ def check_queue_lease_recovery(root: Path) -> Check:
         return Check("queue_lease_recovery", False, f"recovery state stale lag={lag}s")
     detail = "ok" if lag is None else f"ok lag={lag}s"
     return Check("queue_lease_recovery", True, detail)
+
+
+def check_queue_age(root: Path) -> Check:
+    from .worker.scheduler import QUEUE_PENDING_AGE_STALE_SECONDS, QUEUE_PROCESSING_AGE_STALE_SECONDS, queue_age_stats
+
+    stats = queue_age_stats(root)
+    pending_age = int(stats["oldest_pending_age_seconds"])
+    processing_age = int(stats["oldest_processing_age_seconds"])
+    failures = []
+    if pending_age > QUEUE_PENDING_AGE_STALE_SECONDS:
+        failures.append(
+            "oldest pending job "
+            f"{stats.get('oldest_pending_job_id')} age={pending_age}s threshold={QUEUE_PENDING_AGE_STALE_SECONDS}s"
+        )
+    if processing_age > QUEUE_PROCESSING_AGE_STALE_SECONDS:
+        failures.append(
+            "oldest processing job "
+            f"{stats.get('oldest_processing_job_id')} age={processing_age}s threshold={QUEUE_PROCESSING_AGE_STALE_SECONDS}s"
+        )
+    if failures:
+        return Check("queue_age", False, "; ".join(failures))
+    skipped = int(stats.get("age_stats_skipped", 0))
+    detail = f"ok pending_age={pending_age}s processing_age={processing_age}s"
+    if skipped:
+        detail += f" skipped={skipped}"
+    return Check("queue_age", True, detail)
 
 
 def check_diagnostics(root: Path) -> Check:

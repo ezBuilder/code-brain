@@ -44,6 +44,7 @@ uv run --project .ai/runtime ai report release-gate-summary --json
 ./scripts/package.sh
 ./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/install-check.sh
+./scripts/reproducibility-check.sh
 ./scripts/artifact-tamper-check.sh
 ./scripts/rollback-drill.sh
 ./scripts/bootstrap-idempotency.sh
@@ -60,6 +61,7 @@ make release-gate
 `bootstrap.ps1` follows the same CI dry-run render policy for PowerShell operators.
 `scripts/docs-check.sh` verifies the operator runbook commands and CI write-denial behavior.
 `scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, provenance, and release notes without executing package code.
+`scripts/reproducibility-check.sh` rebuilds the package into a temporary directory and fails if the archive SHA-256 differs.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.
 `Makefile` provides operator shortcuts such as `make env-check`, `make preflight`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
 Use `make clean-cache` for ignored runtime cache files, `make clean-artifacts` for `dist/`, and `make clean-all` for cache, virtualenv, and release artifacts.
@@ -104,7 +106,7 @@ Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for c
 | Observability | `ai obs log/metrics/slo/health-summary` | local JSONL logs, metrics, SLO check, and read-only health rollup |
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
 | Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration, bootstrap, and local rollback backups |
-| Package | `scripts/package.sh`, `scripts/install-check.sh` | tarball + checksum + manifest + SBOM + provenance + release notes + bash/PowerShell install verification |
+| Package | `scripts/package.sh`, `scripts/install-check.sh`, `scripts/reproducibility-check.sh` | deterministic tarball + checksum + manifest + SBOM + provenance + release notes + bash/PowerShell install verification |
 | Advisory | `scripts/dep-advisory.sh` | read-only dependency vulnerability advisory at `dist/dep-advisory.json` |
 | Report | `ai report status/release-notes/release-gate-summary` | release state, artifact integrity, CI summary, and generated notes |
 

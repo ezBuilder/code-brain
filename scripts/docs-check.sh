@@ -47,6 +47,7 @@ for needle in \
   "make clean-all" \
   "bootstrap.ps1" \
   "bootstrap-idempotency.sh" \
+  "reproducibility-check.sh" \
   "release-notes.md"
 do
   if ! grep -Fq "$needle" OPERATIONS.md README.md RELEASE.md; then
@@ -79,6 +80,7 @@ make -n quick >/dev/null
 make -n package >/dev/null
 make -n verify-artifacts >/dev/null
 make -n install-check >/dev/null
+make -n reproducibility-check >/dev/null
 make -n tamper-check >/dev/null
 make -n rollback-drill >/dev/null
 make -n bootstrap-idempotency >/dev/null

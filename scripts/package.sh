@@ -4,7 +4,7 @@ export COPYFILE_DISABLE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="$("$ROOT/.ai/bin/ai" --json version | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
-OUT_DIR="$ROOT/dist"
+OUT_DIR="${DIST_OVERRIDE:-$ROOT/dist}"
 NAME="code-brain-${VERSION}"
 ARCHIVE="$OUT_DIR/${NAME}.tar.gz"
 MANIFEST="$OUT_DIR/${NAME}.manifest.json"
@@ -28,30 +28,12 @@ fi
 
 mkdir -p "$OUT_DIR"
 rm -f "$ARCHIVE" "$ARCHIVE.sha256" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES"
-mkdir -p "$TMP/$NAME"
+COMMIT_TIME="$(git -C "$ROOT" log -1 --format=%ct)"
 
-tar \
-  --exclude './.git' \
-  --exclude './dist' \
-  --exclude './.DS_Store' \
-  --exclude './*/.DS_Store' \
-  --exclude './__MACOSX' \
-  --exclude './*/__MACOSX' \
-  --exclude './._*' \
-  --exclude './*/._*' \
-  --exclude './.ai/cache' \
-  --exclude './.ai/runtime/.venv' \
-  --exclude './.ai/runtime/.pytest_cache' \
-  --exclude './.ai/runtime/src/ai_core/__pycache__' \
-  --exclude './.ai/runtime/src/ai_core/worker/__pycache__' \
-  --exclude './.ai/runtime/tests/__pycache__' \
-  -C "$ROOT" -cf - . | tar -C "$TMP/$NAME" -xf -
-
-tar -C "$TMP" -czf "$ARCHIVE" "$NAME"
-
-python - "$ROOT" "$ARCHIVE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES" "$VERSION" <<'PY'
+python - "$ROOT" "$ARCHIVE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES" "$VERSION" "$NAME" "$COMMIT_TIME" <<'PY'
 import json
 import hashlib
+import gzip
 import pathlib
 import subprocess
 import sys
@@ -66,6 +48,78 @@ sbom_path = pathlib.Path(sys.argv[4])
 provenance_path = pathlib.Path(sys.argv[5])
 release_notes_path = pathlib.Path(sys.argv[6])
 version = sys.argv[7]
+package_root = sys.argv[8]
+commit_time = int(sys.argv[9])
+
+
+def excluded(path: pathlib.Path) -> bool:
+    parts = path.parts
+    if not parts:
+        return False
+    if parts[0] in {".git", "dist"}:
+        return True
+    if ".DS_Store" in parts or "__MACOSX" in parts or "__pycache__" in parts:
+        return True
+    if any(part.startswith("._") for part in parts):
+        return True
+    if parts[:2] == (".ai", "cache"):
+        return True
+    if parts[:3] == (".ai", "runtime", ".venv"):
+        return True
+    if parts[:3] == (".ai", "runtime", ".pytest_cache"):
+        return True
+    return False
+
+
+def archive_name(path: pathlib.Path) -> str:
+    return pathlib.PurePosixPath(package_root, path.as_posix()).as_posix()
+
+
+def normalized_info(path: pathlib.Path, arcname: str) -> tarfile.TarInfo:
+    source = root / path
+    info = tarfile.TarInfo(arcname)
+    info.mtime = commit_time
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    if source.is_dir():
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        info.size = 0
+    elif source.is_file():
+        info.type = tarfile.REGTYPE
+        info.mode = 0o755 if source.stat().st_mode & 0o111 else 0o644
+        info.size = source.stat().st_size
+    else:
+        raise SystemExit(f"unsupported archive member type: {path.as_posix()}")
+    return info
+
+
+def build_archive() -> None:
+    paths = [path.relative_to(root) for path in root.rglob("*") if not excluded(path.relative_to(root))]
+    members = sorted(paths, key=lambda item: item.as_posix())
+    with archive.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+                root_info = tarfile.TarInfo(package_root)
+                root_info.type = tarfile.DIRTYPE
+                root_info.mode = 0o755
+                root_info.mtime = commit_time
+                root_info.uid = 0
+                root_info.gid = 0
+                root_info.uname = ""
+                root_info.gname = ""
+                tar.addfile(root_info)
+                for path in members:
+                    if (root / path).is_dir():
+                        tar.addfile(normalized_info(path, archive_name(path)))
+                    else:
+                        with (root / path).open("rb") as handle:
+                            tar.addfile(normalized_info(path, archive_name(path)), handle)
+
+
+build_archive()
 archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
 archive.with_suffix(archive.suffix + ".sha256").write_text(f"{archive_digest}  {archive.name}\n", encoding="utf-8")
 

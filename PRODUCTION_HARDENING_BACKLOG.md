@@ -42,6 +42,7 @@ This backlog tracks remaining commercial-readiness work after the current releas
 ## Artifact And Supply Chain
 
 - Keep package verification before install verification.
+- Keep release archive reproducibility checks in the release gate.
 - Keep artifact tamper checks covering checksum, manifest, SBOM, provenance, and release notes.
 - Add archive extraction path traversal tests if package contents expand beyond the current controlled file list.
 - Keep dependency vulnerability scanning as a read-only advisory gate unless the operator approves a hard fail policy.

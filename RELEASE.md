@@ -36,9 +36,10 @@ git status --short
 - Smoke test completes in a temporary repository copy.
 - Operator runbook examples pass through `scripts/docs-check.sh`.
 - Runtime artifacts remain ignored under `.ai/cache/`, `.ai/runtime/.venv/`, `.ai/runtime/.pytest_cache/`, and `__pycache__/`.
-- Release archives are written to ignored `dist/` with `.sha256` checksums, `.manifest.json` file manifests, `.sbom.json` dependency inventories, `.provenance.json` build attestations, and `.release-notes.md` handoff notes.
+- Release archives are deterministic and written to ignored `dist/` with `.sha256` checksums, `.manifest.json` file manifests, `.sbom.json` dependency inventories, `.provenance.json` build attestations, and `.release-notes.md` handoff notes.
 - Artifact verification checks checksum, manifest, SBOM, provenance, and release notes before package code execution.
 - Install check verifies the tarball in a temporary directory, including `.ai/bin/ai`, `.ai/bin/ai-hook`, and PowerShell shims when PowerShell is available.
+- Reproducibility check rebuilds the archive in a temporary directory and verifies the archive SHA-256 is identical.
 - Artifact tamper check verifies corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.
 - Rollback drill verifies upgrade backup and rollback restore the generated manifest byte-for-byte in a temporary copy.
 - Bootstrap idempotency drill runs `bootstrap.sh` twice in a temporary git copy and verifies tracked source plus `.ai/generated/manifest.json` stay stable.

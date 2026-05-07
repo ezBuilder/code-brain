@@ -3,7 +3,7 @@ SHELL := /usr/bin/env bash
 
 LATEST_ARCHIVE := $(shell ls -t dist/code-brain-*.tar.gz 2>/dev/null | head -n 1)
 
-.PHONY: help env-check preflight lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
+.PHONY: help env-check preflight lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check reproducibility-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
 
 help:
 	@printf '%s\n' \
@@ -15,6 +15,7 @@ help:
 		'  make package           Build release artifacts under dist/' \
 		'  make verify-artifacts  Verify checksum, manifest, SBOM, provenance, release notes' \
 		'  make install-check     Verify extracted package execution' \
+		'  make reproducibility-check Verify repeated package build produces the same archive' \
 		'  make tamper-check      Verify corrupted artifacts are rejected' \
 		'  make rollback-drill    Verify upgrade backup rollback in a temporary copy' \
 		'  make bootstrap-idempotency Verify repeated bootstrap leaves tracked source stable' \
@@ -67,6 +68,13 @@ install-check:
 		exit 2; \
 	fi
 	./scripts/install-check.sh "$(LATEST_ARCHIVE)"
+
+reproducibility-check:
+	@if [[ -z "$(LATEST_ARCHIVE)" ]]; then \
+		echo "no release archive found; run make package first" >&2; \
+		exit 2; \
+	fi
+	./scripts/reproducibility-check.sh "$(LATEST_ARCHIVE)"
 
 tamper-check:
 	@if [[ -z "$(LATEST_ARCHIVE)" ]]; then \

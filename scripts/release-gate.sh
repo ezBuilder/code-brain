@@ -22,6 +22,7 @@ if [[ -z "$ARCHIVE" || ! -f "$ARCHIVE" ]]; then
 fi
 ./scripts/verify-artifacts.sh "$ARCHIVE" >/dev/null
 ./scripts/install-check.sh "$ARCHIVE"
+./scripts/reproducibility-check.sh "$ARCHIVE" >/dev/null
 ./scripts/artifact-tamper-check.sh "$ARCHIVE"
 ./scripts/rollback-drill.sh >/dev/null
 ./scripts/bootstrap-idempotency.sh >/dev/null

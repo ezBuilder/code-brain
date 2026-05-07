@@ -40,12 +40,13 @@ make release-gate
 uv run --project .ai/runtime ai report release-notes
 ```
 
-The release gate runs environment checks, fresh-clone preflight, bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, rollback drill, bootstrap idempotency drill, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
+The release gate runs environment checks, fresh-clone preflight, bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, package reproducibility check, rollback drill, bootstrap idempotency drill, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
 It starts with `scripts/env-check.sh`, which reports bash, git, make, uv, uv-managed Python, and optional PowerShell status as JSON.
 It also starts with `scripts/preflight.sh --check-only`, which verifies repo layout, required tools, Python version, conditional encrypted-secret tooling, conditional Git LFS tooling, and cache permission posture.
 It starts with `scripts/lint.sh`, which checks shell syntax, Python compilation, Makefile dry-runs, and PowerShell bootstrap/shim parsing when PowerShell is available.
 Direct `bootstrap.sh` runs also start with `scripts/env-check.sh` and `scripts/preflight.sh --check-only`; `bootstrap.sh` and `bootstrap.ps1` render with `--dry-run` under CI/GitHub Actions.
 It also runs artifact tamper checks so checksum, manifest, SBOM, provenance, and release notes corruption must be rejected before release.
+It runs `scripts/reproducibility-check.sh` after install verification so repeated package builds must produce the same archive SHA-256.
 It runs `scripts/bootstrap-idempotency.sh` in a temporary git copy and fails if two consecutive CI-mode bootstrap runs change tracked source or `.ai/generated/manifest.json`.
 Use `scripts/verify-artifacts.sh` when you need to validate downloaded release artifacts before running package code.
 CI uses the same Makefile targets as local release verification; write-heavy smoke/docs flows run only inside temporary repositories with CI policy explicitly cleared.

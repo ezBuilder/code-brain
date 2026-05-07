@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import zipfile
 import hashlib
 from pathlib import Path
@@ -79,6 +80,15 @@ def copy_repo(tmp_path: Path) -> Path:
             path.unlink()
     (target / ".ai" / "memory" / "audit-index.jsonl").write_text("\n", encoding="utf-8")
     return target
+
+
+def init_package_repo(repo: Path) -> None:
+    shutil.rmtree(repo / "dist", ignore_errors=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "package-test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Package Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "package-test-baseline"], cwd=repo, check=True)
 
 
 def test_version_json() -> None:
@@ -1603,6 +1613,79 @@ def test_bootstrap_idempotency_integration_invariants() -> None:
     assert "./scripts/bootstrap-idempotency.sh >/dev/null" in release_gate
     assert "bootstrap-idempotency:" in makefile
     assert "make -n bootstrap-idempotency" in docs_check
+
+
+def test_package_archive_is_reproducible_and_normalized(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    out_a = tmp_path / "a"
+    out_b = tmp_path / "b"
+    env_a = os.environ.copy()
+    env_a["DIST_OVERRIDE"] = str(out_a)
+    env_b = os.environ.copy()
+    env_b["DIST_OVERRIDE"] = str(out_b)
+    first = subprocess.run(["bash", "scripts/package.sh"], cwd=repo, env=env_a, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    second = subprocess.run(["bash", "scripts/package.sh"], cwd=repo, env=env_b, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert second.returncode == 0, second.stdout + second.stderr
+    archive_a = Path(first.stdout.splitlines()[0])
+    archive_b = Path(second.stdout.splitlines()[0])
+    assert hashlib.sha256(archive_a.read_bytes()).hexdigest() == hashlib.sha256(archive_b.read_bytes()).hexdigest()
+    commit_time = int(subprocess.check_output(["git", "log", "-1", "--format=%ct"], cwd=repo, text=True).strip())
+    with tarfile.open(archive_a, "r:gz") as archive:
+        members = archive.getmembers()
+        names = [member.name for member in members]
+        assert names == sorted(names)
+        for member in members:
+            assert member.uid == 0
+            assert member.gid == 0
+            assert member.uname == ""
+            assert member.gname == ""
+            assert member.mtime == commit_time
+            assert "mtime" not in member.pax_headers
+            assert "atime" not in member.pax_headers
+            assert "ctime" not in member.pax_headers
+
+
+def test_reproducibility_check_script_detects_drift(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    package = subprocess.run(["bash", "scripts/package.sh"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert package.returncode == 0, package.stdout + package.stderr
+    archive = Path(package.stdout.splitlines()[0])
+
+    ok = subprocess.run(["bash", "scripts/reproducibility-check.sh", str(archive)], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert "reproducibility check ok" in ok.stdout
+
+    archive.write_bytes(archive.read_bytes() + b"drift")
+    drift = subprocess.run(["bash", "scripts/reproducibility-check.sh", str(archive)], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert drift.returncode == 1
+    assert "reproducibility drift" in drift.stderr
+    assert "primary=" in drift.stderr
+    assert "rebuild=" in drift.stderr
+
+    missing = subprocess.run(["bash", "scripts/reproducibility-check.sh", str(repo / "dist" / "missing.tar.gz")], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert missing.returncode == 2
+    assert "no primary archive" in missing.stderr
+
+
+def test_reproducibility_release_gate_integration_invariants() -> None:
+    package_script = (ROOT / "scripts" / "package.sh").read_text(encoding="utf-8")
+    repro_script = (ROOT / "scripts" / "reproducibility-check.sh").read_text(encoding="utf-8")
+    release_gate = (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    docs_check = (ROOT / "scripts" / "docs-check.sh").read_text(encoding="utf-8")
+    assert "gzip.GzipFile" in package_script
+    assert "mtime=0" in package_script
+    assert "tarfile.PAX_FORMAT" in package_script
+    assert "uid = 0" in package_script
+    assert "gid = 0" in package_script
+    assert "DIST_OVERRIDE" in package_script
+    assert "reproducibility drift" in repro_script
+    assert "./scripts/reproducibility-check.sh \"$ARCHIVE\" >/dev/null" in release_gate
+    assert "reproducibility-check:" in makefile
+    assert "make -n reproducibility-check" in docs_check
 
 
 def test_ci_migrate_upgrade_write_policy(tmp_path: Path) -> None:

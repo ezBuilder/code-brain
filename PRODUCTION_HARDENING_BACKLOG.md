@@ -52,7 +52,6 @@ This backlog tracks remaining commercial-readiness work after the current releas
 
 - VPS live testing is deferred to the operator.
 - Preserve `scripts/preflight.sh --check-only --json` as the first failure point for fresh clones.
-- Keep `.githooks/post-merge` and `.githooks/post-checkout` advisory-only: dry-run startup checks may warn, but Git updates must not mutate tracked source or fail because local cache is stale.
 - Keep repeated bootstrap idempotency covered by `scripts/bootstrap-idempotency.sh`.
 - Keep bootstrap failures clear when `uv`, Python, optional PowerShell, `sops`, `age`, or Git LFS are missing.
 - Add VPS-specific notes only after the operator reports the actual target OS, shell, and deployment path.

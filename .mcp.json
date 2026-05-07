@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "code-brain": {
+      "command": ".ai/bin/ai-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

@@ -24,6 +24,8 @@ uv run --project .ai/runtime ai worker status --json
 uv run --project .ai/runtime ai index rebuild --json
 uv run --project .ai/runtime ai code query "worker IPC" --json
 uv run --project .ai/runtime ai obs metrics --json
+uv run --project .ai/runtime ai obs usage --json
+uv run --project .ai/runtime ai obs search --query "worker IPC" --json
 uv run --project .ai/runtime ai obs health-summary --json
 uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
 uv run --project .ai/runtime ai migrate --dry-run --json
@@ -31,7 +33,6 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 uv run --project .ai/runtime ai report status --json
 uv run --project .ai/runtime ai report release-gate-summary --json
 uv run --project .ai/runtime ai session start --agent codex --json
-make install-hooks
 ```
 
 ## Full Local Verification
@@ -67,8 +68,8 @@ make release-gate
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.
 `scripts/lockfile-check.sh` verifies `.ai/runtime/uv.lock` drift and prints the `uv lock --project .ai/runtime` remediation when stale.
 `ai session start` is the normal Mac/VPS entrypoint after pulling from GitHub; it rebuilds missing or stale local cache, records `SessionStart`, and returns doctor status.
-`bootstrap.sh` and `make install-hooks` configure `core.hooksPath` to `.githooks`; `post-merge` and branch `post-checkout` run `ai session start --dry-run` and tell the operator to run `make session-start` when local state is stale.
-`Makefile` provides operator shortcuts such as `make env-check`, `make preflight`, `make lockfile-check`, `make lock-check`, `make session-start`, `make install-hooks`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
+Existing projects can be attached with one command: `./scripts/install-into.sh install /path/to/repo`. Use `upgrade` to refresh managed Code Brain files and `uninstall` to remove only files recorded in `.ai/generated/install-manifest.json`.
+`Makefile` provides operator shortcuts such as `make env-check`, `make preflight`, `make lockfile-check`, `make lock-check`, `make session-start`, `make install-into TARGET=/path/to/repo`, `make upgrade-in TARGET=/path/to/repo`, `make uninstall-from TARGET=/path/to/repo`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
 Use `make clean-cache` for ignored runtime cache files, `make clean-artifacts` for `dist/`, and `make clean-all` for cache, virtualenv, and release artifacts.
 GitHub Actions uses the same Makefile targets as local release verification.
 `.github/workflows/release-gate.yml` runs the full local gate with read-only repository permissions and uploads `dist/release-gate.summary.json` plus release artifacts for review.
@@ -88,6 +89,9 @@ Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for c
 - CI is read-only. Write commands are rejected before worker contact.
 - Tracked source must not contain plaintext secrets.
 - `.ai/cache/code.sqlite` is the single cache database.
+- Search cache stores SQLite FTS5 rows plus summaries only; snippets are read lazily from tracked source files, so full file bodies are not duplicated in the cache.
+- `doctor --strict` checks index freshness, and read-only query paths never silently rewrite legacy search cache schemas.
+- Default search retriever is `bm25`; `vector` and `hybrid` are future opt-in modes and fail clearly until the optional vector stack exists.
 - `.ai/generated/manifest.json` owns generated metadata.
 - Audit data is append-only and rotates by year.
 
@@ -100,17 +104,18 @@ Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for c
 | Doctor | `ai doctor --strict --json` | working |
 | Worker IPC | `ai worker health/status/stop --force --json` | local envelope validation and singleton lock recovery |
 | Hooks | `ai hook <HookName> --json` with JSON stdin | fast-path, redacted, append-only outside CI |
-| Session | `ai session start --agent ... --json`, `.githooks/post-merge`, `.githooks/post-checkout` | GitHub-baseline Mac/VPS startup with stale index rebuild + SessionStart hook + doctor summary; git hooks run dry-run startup checks |
+| Session | `ai session start --agent ... --json` | GitHub-baseline Mac/VPS startup with stale index rebuild + SessionStart hook + doctor summary |
 | Memory | `ai memory append-event` | append-only JSONL |
 | Audit | `ai audit append --action ...` | yearly audit JSONL + audit index + hash-chain verification |
-| Search | `ai index rebuild`, `ai code query` | single `.ai/cache/code.sqlite` with FTS5 |
+| Audit Repair | `ai audit rebuild-index` | reconstructs audit index from yearly audit logs after restore/upgrade |
+| Search | `ai index rebuild`, `ai code query` | single `.ai/cache/code.sqlite` with contentless FTS5 and lazy source snippets |
 | MCP | `ai mcp` / `ai mcp --once-json ...` | read tools and rebuild request over JSON-RPC |
 | Queue | `ai queue enqueue/lease/complete/fail/status` | P0-P3 file queue with lease and dead-letter |
 | Trust | `ai trust init/list/revoke` | local age-like identity and tracked machine public record |
 | Secrets | `ai secrets status` | key source status without exposing plaintext |
 | Inbox | `ai inbox request/list/approve/reject` | narrow 5-gate approval records, redacted |
 | Notify | `ai notify enqueue` | P3 outbound adapter jobs, no hot-path network |
-| Observability | `ai obs log/metrics/slo/health-summary` | local JSONL logs, metrics, SLO check, and read-only health rollup |
+| Observability | `ai obs log/metrics/usage/search/slo/health-summary` | local JSONL logs, actual Claude transcript token usage when available, measured search/context bytes, SLO check, and read-only health rollup |
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
 | Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration, bootstrap, and local rollback backups |
 | Package | `scripts/package.sh`, `scripts/install-check.sh`, `scripts/reproducibility-check.sh` | deterministic tarball + checksum + manifest + SBOM + provenance + release notes + bash/PowerShell install verification |

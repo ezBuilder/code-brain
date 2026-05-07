@@ -5,9 +5,6 @@ cd "$(dirname "$0")"
 ./scripts/preflight.sh --check-only >/dev/null
 ./scripts/env-check.sh >/dev/null
 uv sync --project .ai/runtime
-if git rev-parse --git-dir >/dev/null 2>&1; then
-  git config core.hooksPath .githooks
-fi
 if [[ "${CI:-}" =~ ^(1|true|yes)$ || -n "${GITHUB_ACTIONS:-}" ]]; then
   uv run --project .ai/runtime ai render --dry-run --json >/dev/null
 else

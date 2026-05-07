@@ -1,0 +1,24 @@
+# Code Brain — Codex CLI integration
+# Project-local Codex configuration. Codex CLI reads `.codex/config.toml` (and
+# merges user-level `~/.codex/config.toml`). The schema below registers the
+# Code Brain stdio MCP server so Codex can call the same read-only methods
+# (obs_usage, obs_health_summary, obs_search, doctor_strict, code_query,
+# memory_query, context_pack, ai_status, ai_request_rebuild) that Claude Code
+# reaches through `.mcp.json`.
+#
+# NOTE — verify against your Codex CLI version. The TOML key conventions for
+# MCP server registration have evolved; if Codex CLI rejects this layout, run
+# `codex --help` (or its equivalent) and adjust to the keys your version
+# expects. Both common layouts are shown below; keep only the one your CLI
+# accepts.
+
+[mcp_servers.code-brain]
+command = ".ai/bin/ai-mcp"
+args = []
+
+# Alternative layout (some Codex versions) — uncomment if the section above is
+# not honored:
+# [[mcp_servers]]
+# name = "code-brain"
+# command = ".ai/bin/ai-mcp"
+# args = []

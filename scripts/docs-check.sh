@@ -50,11 +50,36 @@ for needle in \
   "make lockfile-check" \
   "make lock-check" \
   "make session-start" \
-  "make install-hooks" \
+  "ai obs search --refresh-stale" \
+  "secret_scan_allowlist.txt" \
+  "no_token_estimates" \
+  "ai exec run" \
+  "sandbox_execute" \
+  "session_resume" \
+  "ai memory decision add" \
+  "ai memory todo add" \
+  "ai memory session append" \
+  "record_decision" \
+  "record_todo" \
+  "append_session_note" \
+  "PreToolUse" \
+  "precall" \
+  ".claude/settings.json" \
+  ".codex/hooks.json" \
+  "auto-routing" \
+  "porter unicode61" \
+  "mcp_methods_registered" \
+  ".claude/commands/cb-" \
+  ".codex/prompts/cb-" \
+  "/cb-usage" \
+  "/cb-health" \
+  "/cb-search" \
+  "/cb-doctor" \
+  "make install-into TARGET=/path/to/repo" \
+  "make upgrade-in TARGET=/path/to/repo" \
+  "make uninstall-from TARGET=/path/to/repo" \
+  "ai audit rebuild-index" \
   "ai session start" \
-  ".githooks/post-merge" \
-  ".githooks/post-checkout" \
-  "core.hooksPath" \
   "uv lock --check --project .ai/runtime" \
   "make lint" \
   "make release-gate" \
@@ -71,6 +96,7 @@ do
 done
 
 uv run --project .ai/runtime ai version >/dev/null
+uv run --project .ai/runtime ai index rebuild --json >/dev/null
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
 uv run --project .ai/runtime ai report status --json >/dev/null
 uv run --project .ai/runtime ai obs metrics --json >/dev/null
@@ -95,7 +121,9 @@ make -n preflight >/dev/null
 make -n lockfile-check >/dev/null
 make -n lock-check >/dev/null
 make -n session-start >/dev/null
-make -n install-hooks >/dev/null
+make -n install-into TARGET=/tmp/code-brain-docs-target >/dev/null
+make -n upgrade-in TARGET=/tmp/code-brain-docs-target >/dev/null
+make -n uninstall-from TARGET=/tmp/code-brain-docs-target >/dev/null
 make -n lint >/dev/null
 make -n quick >/dev/null
 make -n package >/dev/null

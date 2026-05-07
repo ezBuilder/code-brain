@@ -16,7 +16,6 @@ make -n env-check >/dev/null
 make -n lockfile-check >/dev/null
 make -n lock-check >/dev/null
 make -n session-start >/dev/null
-make -n install-hooks >/dev/null
 make -n quick >/dev/null
 make -n package >/dev/null
 make -n verify-artifacts >/dev/null

@@ -10,10 +10,10 @@ from .config import load_config
 from .doctor import as_payload, run_checks
 from .hooks import handle_hook, read_payload
 from .inbox import decide, list_approvals, request_approval
-from .memory import append_audit, append_event
-from .obs import diagnostics, health_summary, metrics, prune_diagnostics, slo_bench, write_log
+from .memory import append_audit, append_event, rebuild_audit_index
+from .obs import diagnostics, health_summary, metrics, prune_diagnostics, search_report, slo_bench, usage_report, write_log
 from .paths import find_repo_root
-from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, PolicyDenied, WORKER_UNAVAILABLE, reject_ci_write
+from .policy import CONFIG_INVALID, GENERIC_ERROR, MANIFEST_DRIFT, OK, PERMISSION_DENIED, PolicyDenied, WORKER_UNAVAILABLE, reject_ci_write
 from .render import render
 from .search import context_pack, query, rebuild
 from .secrets_store import status as secrets_status
@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser.add_argument("--json", action="store_true", dest="command_json")
     render_parser.add_argument("--dry-run", action="store_true")
     render_parser.add_argument("--no-overwrite", action="store_true")
+    render_parser.add_argument("--manifest-only", action="store_true")
     doctor_parser = sub.add_parser("doctor")
     doctor_parser.add_argument("--json", action="store_true", dest="command_json")
     doctor_parser.add_argument("--strict", action="store_true")
@@ -125,6 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
     obs_log.add_argument("--json", action="store_true", dest="command_json")
     obs_metrics = obs_sub.add_parser("metrics")
     obs_metrics.add_argument("--json", action="store_true", dest="command_json")
+    obs_search = obs_sub.add_parser("search")
+    obs_search.add_argument("--query")
+    obs_search.add_argument("--limit", type=int, default=5)
+    obs_search.add_argument("--refresh-stale", action="store_true", dest="refresh_stale",
+                            help="rebuild index before query if any result would be stale (write op)")
+    obs_search.add_argument("--json", action="store_true", dest="command_json")
+    obs_usage = obs_sub.add_parser("usage")
+    obs_usage.add_argument("--json", action="store_true", dest="command_json")
     obs_slo = obs_sub.add_parser("slo")
     obs_slo.add_argument("--iterations", type=int, default=10)
     obs_slo.add_argument("--json", action="store_true", dest="command_json")
@@ -162,12 +171,58 @@ def build_parser() -> argparse.ArgumentParser:
     memory_sub = memory.add_subparsers(dest="memory_command", required=True)
     memory_append_event = memory_sub.add_parser("append-event")
     memory_append_event.add_argument("--json", action="store_true", dest="command_json")
+    memory_decision = memory_sub.add_parser("decision")
+    memory_decision_sub = memory_decision.add_subparsers(dest="memory_decision_command", required=True)
+    memory_decision_add = memory_decision_sub.add_parser("add")
+    memory_decision_add.add_argument("--text", required=True)
+    memory_decision_add.add_argument("--tag", action="append", default=[])
+    memory_decision_add.add_argument("--source", default="operator")
+    memory_decision_add.add_argument("--json", action="store_true", dest="command_json")
+    memory_todo = memory_sub.add_parser("todo")
+    memory_todo_sub = memory_todo.add_subparsers(dest="memory_todo_command", required=True)
+    memory_todo_add = memory_todo_sub.add_parser("add")
+    memory_todo_add.add_argument("--title", required=True)
+    memory_todo_add.add_argument("--owner", default="")
+    memory_todo_add.add_argument("--tag", action="append", default=[])
+    memory_todo_add.add_argument("--source", default="operator")
+    memory_todo_add.add_argument("--json", action="store_true", dest="command_json")
+    memory_todo_close = memory_todo_sub.add_parser("close")
+    memory_todo_close.add_argument("--match", required=True, help="todo id or title substring")
+    memory_todo_close.add_argument("--status", default="done", choices=["done", "closed", "cancelled", "canceled"])
+    memory_todo_close.add_argument("--reason", default="")
+    memory_todo_close.add_argument("--json", action="store_true", dest="command_json")
+    memory_session = memory_sub.add_parser("session")
+    memory_session_sub = memory_session.add_subparsers(dest="memory_session_command", required=True)
+    memory_session_append = memory_session_sub.add_parser("append")
+    memory_session_append.add_argument("--text", required=True)
+    memory_session_append.add_argument("--json", action="store_true", dest="command_json")
     audit = sub.add_parser("audit")
     audit_sub = audit.add_subparsers(dest="audit_command", required=True)
     audit_append = audit_sub.add_parser("append")
     audit_append.add_argument("--action", required=True)
     audit_append.add_argument("--category", default="manual")
     audit_append.add_argument("--json", action="store_true", dest="command_json")
+    audit_rebuild = audit_sub.add_parser("rebuild-index")
+    audit_rebuild.add_argument("--json", action="store_true", dest="command_json")
+    exec_parser = sub.add_parser("exec", help="run a shell command in Code Brain sandbox (truncated summary, fetchable by id)")
+    exec_sub = exec_parser.add_subparsers(dest="exec_command", required=True)
+    exec_run = exec_sub.add_parser("run")
+    exec_run.add_argument("--cwd")
+    exec_run.add_argument("--timeout", type=int, default=30)
+    exec_run.add_argument("--json", action="store_true", dest="command_json")
+    exec_run.add_argument("argv", nargs=argparse.REMAINDER, help="command and arguments after --")
+    exec_fetch = exec_sub.add_parser("fetch")
+    exec_fetch.add_argument("--exec-id", required=True)
+    exec_fetch.add_argument("--line-start", type=int, default=1)
+    exec_fetch.add_argument("--line-end", type=int)
+    exec_fetch.add_argument("--grep")
+    exec_fetch.add_argument("--json", action="store_true", dest="command_json")
+    exec_list = exec_sub.add_parser("list")
+    exec_list.add_argument("--limit", type=int, default=20)
+    exec_list.add_argument("--json", action="store_true", dest="command_json")
+    exec_prune = exec_sub.add_parser("prune")
+    exec_prune.add_argument("--older-than-seconds", type=int, default=86400)
+    exec_prune.add_argument("--json", action="store_true", dest="command_json")
     index = sub.add_parser("index")
     index_sub = index.add_subparsers(dest="index_command", required=True)
     index_rebuild = index_sub.add_parser("rebuild")
@@ -234,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "render":
             reject_ci_write("render", dry_run=args.dry_run)
-            result = render(root, dry_run=args.dry_run, no_overwrite=args.no_overwrite)
+            result = render(root, dry_run=args.dry_run, no_overwrite=args.no_overwrite, manifest_only=args.manifest_only)
             emit(result, as_json=as_json)
             return OK
         if args.command == "doctor":
@@ -368,6 +423,20 @@ def main(argv: list[str] | None = None) -> int:
             payload = metrics(root)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "obs" and args.obs_command == "search":
+            if getattr(args, "refresh_stale", False):
+                reject_ci_write("index", dry_run=False)
+                rebuild(root)
+            payload = search_report(root, query_text=args.query, limit=args.limit)
+            emit(payload, as_json=as_json)
+            stale = (payload.get("query") or {}).get("stale_results") or []
+            if stale and not getattr(args, "refresh_stale", False):
+                return MANIFEST_DRIFT
+            return OK
+        if args.command == "obs" and args.obs_command == "usage":
+            payload = usage_report(root)
+            emit(payload, as_json=as_json)
+            return OK
         if args.command == "obs" and args.obs_command == "slo":
             payload = slo_bench(root, iterations=args.iterations)
             emit(payload, as_json=as_json)
@@ -429,9 +498,38 @@ def main(argv: list[str] | None = None) -> int:
             payload = append_event(root, read_payload())
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "memory" and args.memory_command == "decision" and args.memory_decision_command == "add":
+            reject_ci_write("memory")
+            from .memory import append_decision
+            payload = append_decision(root, text=args.text, tags=args.tag, source=args.source)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "todo" and args.memory_todo_command == "add":
+            reject_ci_write("memory")
+            from .memory import append_todo
+            payload = append_todo(root, title=args.title, owner=args.owner, tags=args.tag, source=args.source)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "todo" and args.memory_todo_command == "close":
+            reject_ci_write("memory")
+            from .memory import close_todo
+            payload = close_todo(root, match=args.match, status=args.status, reason=args.reason)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "session" and args.memory_session_command == "append":
+            reject_ci_write("memory")
+            from .memory import append_session_note
+            payload = append_session_note(root, text=args.text)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "audit" and args.audit_command == "append":
             reject_ci_write("audit")
             payload = append_audit(root, action=args.action, category=args.category, payload=read_payload())
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "audit" and args.audit_command == "rebuild-index":
+            reject_ci_write("audit")
+            payload = rebuild_audit_index(root)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "index" and args.index_command == "rebuild":
@@ -439,6 +537,39 @@ def main(argv: list[str] | None = None) -> int:
             payload = rebuild(root)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "exec":
+            from .sandbox import execute as sandbox_execute, fetch as sandbox_fetch, list_executions as sandbox_list, prune as sandbox_prune
+
+            if args.exec_command == "run":
+                reject_ci_write("exec")
+                argv = args.argv or []
+                if argv and argv[0] == "--":
+                    argv = argv[1:]
+                if not argv:
+                    print("usage: ai exec run [--cwd PATH] [--timeout N] -- COMMAND [ARGS...]", file=sys.stderr)
+                    return GENERIC_ERROR
+                payload = sandbox_execute(root, command=argv, cwd=args.cwd, timeout=args.timeout)
+                emit(payload, as_json=as_json)
+                return OK
+            if args.exec_command == "fetch":
+                payload = sandbox_fetch(
+                    root,
+                    exec_id=args.exec_id,
+                    line_start=args.line_start,
+                    line_end=args.line_end,
+                    grep_pattern=args.grep,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if args.exec_command == "list":
+                payload = sandbox_list(root, limit=args.limit)
+                emit(payload, as_json=as_json)
+                return OK
+            if args.exec_command == "prune":
+                reject_ci_write("exec")
+                payload = sandbox_prune(root, older_than_seconds=args.older_than_seconds)
+                emit(payload, as_json=as_json)
+                return OK
         if args.command == "code" and args.code_command == "query":
             payload = query(root, args.query, limit=args.limit)
             emit(payload, as_json=as_json)
@@ -456,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent=args.agent,
                 rebuild_mode=args.rebuild,
                 dry_run=args.dry_run,
+                strict=args.strict,
                 query_text=args.query,
                 limit=args.limit,
             )

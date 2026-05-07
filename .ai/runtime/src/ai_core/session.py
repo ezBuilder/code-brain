@@ -54,6 +54,7 @@ def start_session(
     agent: str,
     rebuild_mode: str = "auto",
     dry_run: bool = False,
+    strict: bool = False,
     query_text: str | None = None,
     limit: int = 5,
 ) -> dict[str, Any]:
@@ -76,7 +77,7 @@ def start_session(
     hook_payload = handle_hook(root, "SessionStart", {"agent": agent, "dry": dry_run})
     doctor_payload = as_payload(run_checks(root))
     payload: dict[str, Any] = {
-        "ok": bool(doctor_payload.get("ok")),
+        "ok": bool(doctor_payload.get("ok")) if strict else bool(hook_payload.get("ok")),
         "agent": agent,
         "index": index_payload,
         "hook": hook_payload,
@@ -84,4 +85,15 @@ def start_session(
     }
     if query_text:
         payload["context"] = context_pack(root, query_text, limit=limit)
+    if not dry_run:
+        try:
+            from .session_resume import write_snapshot
+            session_id = str(hook_payload.get("session_id") or "")
+            if not session_id:
+                from secrets import token_hex
+                session_id = f"{agent}-{token_hex(6)}"
+            snapshot = write_snapshot(root, session_id=session_id, agent=agent)
+            payload["resume"] = {"ok": True, "path": snapshot.get("path"), "session_id": session_id}
+        except Exception as exc:
+            payload["resume"] = {"ok": False, "reason": str(exc)[:200]}
     return payload

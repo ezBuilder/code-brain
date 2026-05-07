@@ -47,6 +47,156 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
             _unlock(handle)
 
 
+def decisions_path(root: Path) -> Path:
+    return root / ".ai" / "memory" / "decisions.jsonl"
+
+
+def todos_path(root: Path) -> Path:
+    return root / ".ai" / "memory" / "todos.jsonl"
+
+
+def session_current_path(root: Path) -> Path:
+    return root / ".ai" / "memory" / "session-current.md"
+
+
+def _short_id(prefix: str) -> str:
+    import secrets
+    return f"{prefix}-{secrets.token_hex(4)}"
+
+
+def append_decision(
+    root: Path,
+    *,
+    text: str,
+    tags: list[str] | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    from .redact import redact_value
+    text_clean = redact_value(str(text)).strip()
+    if not text_clean:
+        return {"ok": False, "reason": "empty_text"}
+    tag_list = [str(t).strip() for t in (tags or []) if str(t).strip()]
+    record = {
+        "id": _short_id("dec"),
+        "decided_at": now_iso(),
+        "decision": text_clean[:1024],
+        "tags": tag_list,
+        "source": str(source or "operator")[:64],
+    }
+    append_jsonl(decisions_path(root), record)
+    append_audit(root, action="memory.decision_add", category="memory", payload={"id": record["id"]})
+    return {"ok": True, "record": record}
+
+
+def append_todo(
+    root: Path,
+    *,
+    title: str,
+    owner: str | None = None,
+    tags: list[str] | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    from .redact import redact_value
+    title_clean = redact_value(str(title)).strip()
+    if not title_clean:
+        return {"ok": False, "reason": "empty_title"}
+    tag_list = [str(t).strip() for t in (tags or []) if str(t).strip()]
+    record = {
+        "id": _short_id("todo"),
+        "title": title_clean[:512],
+        "status": "open",
+        "owner": str(owner or "")[:64],
+        "tags": tag_list,
+        "created_at": now_iso(),
+        "source": str(source or "operator")[:64],
+    }
+    append_jsonl(todos_path(root), record)
+    append_audit(root, action="memory.todo_add", category="memory", payload={"id": record["id"]})
+    return {"ok": True, "record": record}
+
+
+def close_todo(
+    root: Path,
+    *,
+    match: str,
+    status: str = "done",
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Mark the latest matching open todo as closed. Match is substring on title or exact id.
+
+    Writes a *new* status-update line (append-only); the original open line stays for audit.
+    """
+    if status not in {"done", "closed", "cancelled", "canceled"}:
+        return {"ok": False, "reason": "invalid_status"}
+    path = todos_path(root)
+    if not path.exists():
+        return {"ok": False, "reason": "no_todos"}
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        eid = str(entry.get("id") or "")
+        if eid in seen:
+            continue
+        seen.add(eid)
+        candidates.append(entry)
+    target: dict[str, Any] | None = None
+    needle = match.strip().lower()
+    for entry in reversed(candidates):
+        cur_status = str(entry.get("status") or "open").lower()
+        if cur_status in {"done", "closed", "completed", "cancelled", "canceled"}:
+            continue
+        if needle == str(entry.get("id") or "").lower():
+            target = entry; break
+        title = str(entry.get("title") or entry.get("text") or "").lower()
+        if needle and needle in title:
+            target = entry; break
+    if target is None:
+        return {"ok": False, "reason": "no_match"}
+    update = {
+        "id": target["id"],
+        "title": target.get("title"),
+        "status": status,
+        "owner": target.get("owner", ""),
+        "tags": target.get("tags", []),
+        "created_at": target.get("created_at"),
+        "closed_at": now_iso(),
+        "close_reason": (reason or "")[:240],
+        "source": target.get("source", "operator"),
+    }
+    append_jsonl(path, update)
+    append_audit(root, action="memory.todo_close", category="memory", payload={"id": target["id"], "status": status})
+    return {"ok": True, "record": update}
+
+
+def append_session_note(root: Path, *, text: str) -> dict[str, Any]:
+    from .redact import redact_value
+    text_clean = redact_value(str(text)).strip()
+    if not text_clean:
+        return {"ok": False, "reason": "empty_text"}
+    path = session_current_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = f"- [{now_iso()}] {text_clean[:1024]}\n"
+    if not path.exists():
+        path.write_text("# Current Session\n\n", encoding="utf-8")
+    with path.open("a", encoding="utf-8") as handle:
+        _lock_exclusive(handle)
+        try:
+            handle.write(line)
+        finally:
+            _unlock(handle)
+    append_audit(root, action="memory.session_append", category="memory", payload={"bytes": len(line)})
+    return {"ok": True, "appended_bytes": len(line.encode("utf-8")), "path": str(path.relative_to(root))}
+
+
 def audit_path(root: Path, *, at: datetime | None = None) -> Path:
     effective = at or datetime.now(timezone.utc)
     return root / ".ai" / "memory" / "audit" / f"{effective.year}.jsonl"
@@ -81,6 +231,32 @@ def append_audit(root: Path, *, action: str, category: str, payload: dict[str, A
         {"ts": record["ts"], "category": category, "action": action, "path": path.relative_to(root).as_posix()},
     )
     return record
+
+
+def rebuild_audit_index(root: Path) -> dict[str, Any]:
+    audit_root = root / ".ai" / "memory" / "audit"
+    index_path = root / ".ai" / "memory" / "audit-index.jsonl"
+    rows: list[dict[str, Any]] = []
+    for path in sorted(audit_root.glob("*.jsonl")):
+        rel = path.relative_to(root).as_posix()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                continue
+            rows.append(
+                {
+                    "ts": record.get("ts"),
+                    "category": record.get("category"),
+                    "action": record.get("action"),
+                    "path": rel,
+                }
+            )
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    text = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for row in rows)
+    index_path.write_text(text, encoding="utf-8")
+    return {"ok": True, "path": index_path.relative_to(root).as_posix(), "indexed": len(rows)}
 
 
 def append_event(root: Path, event: dict[str, Any]) -> dict[str, Any]:

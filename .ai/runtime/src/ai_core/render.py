@@ -48,13 +48,17 @@ def file_sha(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def render(root: Path, *, dry_run: bool = False, no_overwrite: bool = False) -> dict[str, Any]:
+def render(root: Path, *, dry_run: bool = False, no_overwrite: bool = False, manifest_only: bool = False) -> dict[str, Any]:
     manifest = build_manifest(root)
     writes = {
         root / "AGENTS.md": "# AGENTS.md\n\nCanonical agent instructions live in `.ai/AGENTS.md`.\n",
         root / "CLAUDE.md": "# CLAUDE.md\n\nCanonical Claude instructions live in `.ai/AGENTS.md`.\n",
         root / ".ai" / "generated" / "manifest.json": json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     }
+    if manifest_only:
+        writes = {
+            root / ".ai" / "generated" / "manifest.json": writes[root / ".ai" / "generated" / "manifest.json"],
+        }
     planned = []
     for path, content in writes.items():
         exists = path.exists()
@@ -67,4 +71,3 @@ def render(root: Path, *, dry_run: bool = False, no_overwrite: bool = False) -> 
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
     return {"planned": planned, "manifest": manifest}
-

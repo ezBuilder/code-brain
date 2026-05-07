@@ -29,6 +29,7 @@ WRITE_COMMANDS = {
     "audit",
     "worker_stop",
     "session",
+    "exec",
 }
 
 

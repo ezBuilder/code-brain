@@ -1,0 +1,21 @@
+{
+  "_note": "Codex hook schema may differ across versions. Verify with your codex CLI release. PreToolUse currently supports deny rules only — input rewriting awaits upstream updatedInput support.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PreToolUse",
+        "matchers": ["Bash"]
+      }
+    ],
+    "SessionStart": [
+      {
+        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook SessionStart"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook UserPromptSubmit"
+      }
+    ]
+  }
+}

@@ -28,6 +28,7 @@ def run_checks(root: Path) -> list[Check]:
         check_config(root),
         check_gitattributes(root),
         check_sqlite_features(),
+        check_index_freshness(root),
         check_manifest(root),
         check_trust(root),
         check_jsonl(root),
@@ -35,6 +36,8 @@ def run_checks(root: Path) -> list[Check]:
         check_audit_chain(root),
         check_hot_path_slo(root),
         check_secret_scan(root),
+        check_no_token_estimates(root),
+        check_mcp_methods_registered(root),
         check_redaction_self_test(),
         check_bootstrap_preflight(root),
         check_worker_singleton_lock(root),
@@ -74,6 +77,14 @@ def check_config(root: Path) -> Check:
     bad = [key for key in ("embeddings", "remote_llm", "external_notifications") if features.get(key) is not False]
     if bad:
         return Check("config", False, "default-off features enabled: " + ", ".join(bad))
+    search = config.get("search", {})
+    if not isinstance(search, dict):
+        return Check("config", False, "search config must be a mapping")
+    retriever = search.get("retriever", "bm25")
+    if retriever not in {"bm25", "vector", "hybrid"}:
+        return Check("config", False, f"unknown search retriever: {retriever}")
+    if retriever != "bm25":
+        return Check("config", False, f"search retriever not implemented by default install: {retriever}")
     return Check("config", True, "ok")
 
 
@@ -95,6 +106,38 @@ def check_sqlite_features() -> Check:
     finally:
         conn.close()
     return Check("sqlite_features", True, "FTS5 and JSON1 available")
+
+
+def check_index_freshness(root: Path) -> Check:
+    db = root / ".ai" / "cache" / "code.sqlite"
+    if not db.exists():
+        return Check("index_freshness", True, "not indexed")
+    stale: list[str] = []
+    try:
+        with sqlite3.connect(db) as conn:
+            conn.row_factory = sqlite3.Row
+            columns = {row["name"] for row in conn.execute("pragma table_info(chunks)").fetchall()}
+            if "content" in columns or "summary" not in columns or not {"path", "sha256"}.issubset(columns):
+                return Check("index_freshness", False, "legacy index schema; run ai index rebuild")
+            rows = conn.execute("select path, sha256 from chunks order by path").fetchall()
+    except sqlite3.Error as exc:
+        return Check("index_freshness", False, f"index unreadable: {exc}")
+    for row in rows:
+        rel_path = str(row["path"])
+        path = root / rel_path
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            stale.append(rel_path)
+            continue
+        redacted = str(redact_value(content))
+        if hashlib.sha256(redacted.encode("utf-8")).hexdigest() != row["sha256"]:
+            stale.append(rel_path)
+        if len(stale) >= 10:
+            break
+    if stale:
+        return Check("index_freshness", False, "stale: " + ", ".join(stale))
+    return Check("index_freshness", True, f"ok indexed={len(rows)}")
 
 
 def check_manifest(root: Path) -> Check:
@@ -243,8 +286,125 @@ def check_hot_path_slo(root: Path) -> Check:
 
 
 def check_secret_scan(root: Path) -> Check:
-    hits = list(secret_hits(root))
-    return Check("secret_scan", not hits, "ok" if not hits else "hits: " + ", ".join(hits[:10]))
+    allowlist = read_secret_scan_allowlist(root)
+    flagged: list[str] = []
+    acknowledged: list[str] = []
+    for hit in secret_hits(root):
+        (acknowledged if hit in allowlist else flagged).append(hit)
+    if flagged:
+        detail = (
+            f"flagged={len(flagged)} acknowledged={len(acknowledged)} "
+            f"allowlist=.ai/secret_scan_allowlist.txt: " + ", ".join(flagged[:10])
+        )
+        return Check("secret_scan", False, detail)
+    if acknowledged:
+        return Check("secret_scan", True, f"ok (flagged=0 acknowledged={len(acknowledged)} via allowlist)")
+    return Check("secret_scan", True, "ok")
+
+
+def read_secret_scan_allowlist(root: Path) -> set[str]:
+    path = root / ".ai" / "secret_scan_allowlist.txt"
+    if not path.exists():
+        return set()
+    entries: set[str] = set()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        entries.add(stripped)
+    return entries
+
+
+FORBIDDEN_TOKEN_ESTIMATE_KEYWORDS = (
+    "estimated_tokens",
+    "tokens_estimated",
+    "tokens_saved",
+    "token_savings",
+    "estimated_token_savings",
+    "estimate_tokens(",
+    "guess_tokens(",
+)
+
+TOKEN_ESTIMATE_GUARDED_FILES = (
+    "obs.py",
+    "report.py",
+    "session.py",
+    "transcripts.py",
+    "search.py",
+)
+
+
+def check_no_token_estimates(root: Path) -> Check:
+    base = root / ".ai" / "runtime" / "src" / "ai_core"
+    if not base.exists():
+        return Check("no_token_estimates", True, "ai_core not found")
+    offenders: list[str] = []
+    for name in TOKEN_ESTIMATE_GUARDED_FILES:
+        path = base / name
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for keyword in FORBIDDEN_TOKEN_ESTIMATE_KEYWORDS:
+            if keyword in text:
+                offenders.append(f"{name}:{keyword}")
+    if offenders:
+        return Check("no_token_estimates", False, "estimates leaked: " + ", ".join(offenders[:10]))
+    return Check("no_token_estimates", True, f"ok ({len(TOKEN_ESTIMATE_GUARDED_FILES)} files scanned)")
+
+
+REQUIRED_SLASH_COMMAND_FILES = (
+    ".claude/commands/cb-usage.md",
+    ".claude/commands/cb-health.md",
+    ".claude/commands/cb-search.md",
+    ".claude/commands/cb-doctor.md",
+    ".claude/commands/cb-exec.md",
+)
+
+REQUIRED_CODEX_PROMPT_FILES = (
+    ".codex/prompts/cb-usage.md",
+    ".codex/prompts/cb-health.md",
+    ".codex/prompts/cb-search.md",
+    ".codex/prompts/cb-doctor.md",
+    ".codex/prompts/cb-exec.md",
+)
+
+
+def check_mcp_methods_registered(root: Path) -> Check:
+    from .mcp_server import MCP_METHODS
+
+    mcp_config = root / ".mcp.json"
+    if not mcp_config.exists():
+        return Check("mcp_methods_registered", False, ".mcp.json missing")
+    try:
+        config = json.loads(mcp_config.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return Check("mcp_methods_registered", False, f".mcp.json invalid: {exc}")
+    servers = config.get("mcpServers") if isinstance(config, dict) else None
+    if not isinstance(servers, dict) or "code-brain" not in servers:
+        return Check("mcp_methods_registered", False, ".mcp.json missing mcpServers.code-brain entry")
+    server = servers["code-brain"]
+    if not isinstance(server, dict) or server.get("command") != ".ai/bin/ai-mcp":
+        return Check("mcp_methods_registered", False, ".mcp.json code-brain.command is not .ai/bin/ai-mcp")
+    missing_slash = [path for path in REQUIRED_SLASH_COMMAND_FILES if not (root / path).exists()]
+    missing_codex = [path for path in REQUIRED_CODEX_PROMPT_FILES if not (root / path).exists()]
+    method_count = len(MCP_METHODS)
+    if missing_slash:
+        return Check("mcp_methods_registered", False, "missing claude commands: " + ", ".join(missing_slash))
+    if missing_codex:
+        return Check("mcp_methods_registered", False, "missing codex prompts: " + ", ".join(missing_codex))
+    return Check(
+        "mcp_methods_registered",
+        True,
+        f"ok mcp_methods={method_count} claude_commands={len(REQUIRED_SLASH_COMMAND_FILES)} "
+        f"codex_prompts={len(REQUIRED_CODEX_PROMPT_FILES)}",
+    )
 
 
 def check_redaction_self_test() -> Check:
@@ -353,13 +513,56 @@ def check_diagnostics(root: Path) -> Check:
     return Check("diagnostics_dry_run", bool(payload.get("ok")), "ok" if payload.get("ok") else "failed")
 
 
+SECRET_SCAN_IGNORED_PARTS = {
+    ".venv",
+    "cache",
+    ".git",
+    ".claude",
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".output",
+    "dist",
+    "build",
+    "coverage",
+    "logs",
+    ".playwright-mcp",
+    ".dart_tool",
+    "source-maps",
+}
+
+SECRET_SCAN_IGNORED_NAMES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+    "Cargo.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "go.sum",
+    "poetry.lock",
+    "firebase_options.dart",
+}
+
+SECRET_SCAN_IGNORED_SUFFIXES = {
+    ".map",
+    ".min.js",
+    ".min.css",
+}
+
+
 def secret_hits(root: Path) -> Iterable[str]:
-    ignored_parts = {".venv", "cache", ".git", ".claude"}
-    for path in root.rglob("*"):
+    for path in secret_scan_files(root):
         rel_parts = set(path.relative_to(root).parts)
-        if path.is_dir() or rel_parts & ignored_parts:
+        if path.is_dir() or rel_parts & SECRET_SCAN_IGNORED_PARTS:
             continue
-        if path.suffix in {".png", ".sqlite", ".db"}:
+        if path.name in SECRET_SCAN_IGNORED_NAMES:
+            continue
+        if any(path.name.endswith(suffix) for suffix in SECRET_SCAN_IGNORED_SUFFIXES):
+            continue
+        if path.suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".sqlite", ".db", ".rdb", ".zip", ".gz", ".tar"}:
+            continue
+        if path.stat().st_size > 1_000_000:
             continue
         if path.name.endswith(".enc.yaml") or path.name.endswith(".enc.yml"):
             continue
@@ -371,6 +574,21 @@ def secret_hits(root: Path) -> Iterable[str]:
             if pattern.search(text):
                 yield path.relative_to(root).as_posix()
                 break
+
+
+def secret_scan_files(root: Path) -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return sorted(path for path in root.rglob("*") if path.is_file())
+    rels = [item.decode("utf-8") for item in result.stdout.split(b"\0") if item]
+    return sorted(path for rel in rels if (path := root / rel).is_file())
 
 
 def as_payload(checks: list[Check]) -> dict[str, object]:

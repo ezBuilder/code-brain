@@ -113,7 +113,8 @@ requires_lfs = "filter=lfs" in gitattributes
 
 checks = {
     "repo_layout": {
-        "ok": (root / ".ai" / "runtime" / "pyproject.toml").exists() and (root / "bootstrap.sh").exists(),
+        "ok": (root / ".ai" / "runtime" / "pyproject.toml").exists()
+        and ((root / "bootstrap.sh").exists() or (root / "bootstrap-code-brain.sh").exists()),
         "required": True,
         "detail": "ok",
     },

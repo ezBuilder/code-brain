@@ -1,5 +1,43 @@
 #!/usr/bin/env bash
-set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-exec uv run --project "$ROOT/.ai/runtime" ai hook "$@"
+# Code Brain hook shim. Resolves project root via:
+#   1) $CLAUDE_PROJECT_DIR / $CODEX_PROJECT_DIR if set
+#   2) Script-relative path (this file should live at <root>/.ai/bin/ai-hook)
+#   3) Walk-up search from cwd for .ai/config.yaml
+# Fails open (exit 0) if root cannot be resolved, so the hook never blocks the
+# user's underlying tool call by accident.
+set -uo pipefail
 
+resolve_root() {
+  local candidate
+  for candidate in "${CLAUDE_PROJECT_DIR:-}" "${CODEX_PROJECT_DIR:-}"; do
+    if [[ -n "$candidate" && -f "$candidate/.ai/config.yaml" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  local script_dir
+  if script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"; then
+    if [[ -f "$script_dir/../../.ai/config.yaml" ]]; then
+      (cd "$script_dir/../.." && pwd)
+      return 0
+    fi
+  fi
+  local cur
+  cur="$(pwd 2>/dev/null || printf '/')"
+  while [[ -n "$cur" && "$cur" != "/" ]]; do
+    if [[ -f "$cur/.ai/config.yaml" ]]; then
+      printf '%s\n' "$cur"
+      return 0
+    fi
+    cur="$(dirname "$cur")"
+  done
+  return 1
+}
+
+ROOT="$(resolve_root || true)"
+if [[ -z "${ROOT:-}" ]]; then
+  echo "ai-hook: cannot locate code-brain project root (no .ai/config.yaml found)" >&2
+  exit 0
+fi
+cd "$ROOT"
+exec uv run --project "$ROOT/.ai/runtime" ai hook "$@"

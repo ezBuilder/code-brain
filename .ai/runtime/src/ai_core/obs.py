@@ -38,10 +38,13 @@ def write_log(root: Path, level: str, event: str, payload: dict[str, Any]) -> di
 
 def metrics(root: Path) -> dict[str, Any]:
     from .worker.scheduler import queue_age_stats, recovery_status
+    from .search import observability as search_observability
+    from .transcripts import claude_usage_summary, codex_usage_summary
 
     queue_root = root / ".ai" / "memory" / "queue"
     recovery = recovery_status(root)
     ages = queue_age_stats(root)
+    search = search_observability(root)
     return {
         "ok": True,
         "runtime_version": __version__,
@@ -57,8 +60,146 @@ def metrics(root: Path) -> dict[str, Any]:
         },
         "cache": {
             "code_sqlite_exists": (root / ".ai" / "cache" / "code.sqlite").exists(),
+            "code_sqlite_bytes": search.get("sqlite_bytes", 0),
+            "indexed_files": search.get("indexed_files", 0),
+            "indexed_bytes": search.get("indexed_bytes", 0),
+        },
+        "search": search,
+        "usage": {
+            "claude": _usage_totals_only(claude_usage_summary(root)),
+            "codex": codex_usage_summary(root),
         },
     }
+
+
+def search_report(root: Path, *, query_text: str | None = None, limit: int = 5) -> dict[str, Any]:
+    from .doctor import as_payload, run_checks
+    from .search import observability as search_observability
+
+    doctor = as_payload(run_checks(root))
+    freshness = next((check for check in doctor["checks"] if check["name"] == "index_freshness"), None)
+    payload = search_observability(root, query_text=query_text, limit=limit)
+    payload["doctor"] = {
+        "ok": doctor["ok"],
+        "index_freshness": freshness,
+    }
+    query = payload.get("query")
+    if isinstance(query, dict):
+        stale = query.get("stale_results") or []
+        if stale:
+            query["remediation"] = {
+                "command": "ai index rebuild --json",
+                "alternative": "ai obs search --refresh-stale --query <text>",
+                "stale_count": len(stale),
+                "exit_code": 13,
+            }
+    return payload
+
+
+def usage_report(root: Path) -> dict[str, Any]:
+    from .transcripts import claude_usage_summary, codex_usage_summary
+
+    events = event_observability(root)
+    claude = claude_usage_summary(root)
+    return {
+        "ok": True,
+        "actual_token_usage": {
+            "claude": claude,
+            "codex": codex_usage_summary(root),
+        },
+        "measured_code_brain_effect": events,
+        "claims": {
+            "token_usage": "actual only when sourced from agent session transcripts",
+            "context_reduction": "measured in bytes only; no token-saving estimate is emitted",
+        },
+    }
+
+
+def event_observability(root: Path) -> dict[str, Any]:
+    events_root = root / ".ai" / "memory" / "events"
+    totals = {
+        "events": 0,
+        "hook_events": 0,
+        "mcp_requests": 0,
+        "additional_context_bytes": 0,
+        "mcp_request_bytes": 0,
+        "mcp_response_bytes": 0,
+        "hook_breakdown": {},
+        "mcp_breakdown": {},
+        "sandbox_executions": 0,
+        "pretooluse_blocks": 0,
+        "pretooluse_allows": 0,
+    }
+    if not events_root.exists():
+        return {"ok": True, **totals}
+    HOOK_NAMES = {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "PreCompact"}
+    hook_breakdown: dict[str, dict[str, int]] = {}
+    mcp_breakdown: dict[str, dict[str, int]] = {}
+    for path in sorted(events_root.glob("*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            kind = str(record.get("kind") or payload.get("hook") or payload.get("kind") or "")
+            totals["events"] += 1
+            ctx_bytes = _int(payload.get("additional_context_bytes"))
+            req_bytes = _int(payload.get("request_bytes"))
+            resp_bytes = _int(payload.get("response_bytes"))
+            totals["additional_context_bytes"] += ctx_bytes
+            totals["mcp_request_bytes"] += req_bytes
+            totals["mcp_response_bytes"] += resp_bytes
+            if kind == "mcp.request":
+                totals["mcp_requests"] += 1
+                method = str(payload.get("method") or "unknown")
+                bucket = mcp_breakdown.setdefault(
+                    method, {"count": 0, "request_bytes": 0, "response_bytes": 0}
+                )
+                bucket["count"] += 1
+                bucket["request_bytes"] += req_bytes
+                bucket["response_bytes"] += resp_bytes
+            elif kind == "sandbox.execute":
+                totals["sandbox_executions"] += 1
+            elif kind in HOOK_NAMES:
+                totals["hook_events"] += 1
+                bucket = hook_breakdown.setdefault(
+                    kind, {"count": 0, "bytes_total": 0, "blocked": 0, "allowed": 0}
+                )
+                bucket["count"] += 1
+                bucket["bytes_total"] += ctx_bytes
+                if kind == "PreToolUse":
+                    precall = payload.get("precall") if isinstance(payload.get("precall"), dict) else None
+                    action = (precall or {}).get("action")
+                    decision = payload.get("decision") or (payload.get("response") or {}).get("decision")
+                    if action == "block" or decision == "block":
+                        bucket["blocked"] += 1
+                        totals["pretooluse_blocks"] += 1
+                    elif action == "allow":
+                        bucket["allowed"] += 1
+                        totals["pretooluse_allows"] += 1
+    totals["hook_breakdown"] = {k: hook_breakdown[k] for k in sorted(hook_breakdown)}
+    totals["mcp_breakdown"] = {k: mcp_breakdown[k] for k in sorted(mcp_breakdown)}
+    return {"ok": True, **totals}
+
+
+def _usage_totals_only(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": payload.get("ok"),
+        "source": payload.get("source"),
+        "sessions_matched": payload.get("sessions_matched", 0),
+        "messages": payload.get("messages", 0),
+        "tokens": payload.get("tokens", {}),
+        "total_observed_tokens": payload.get("total_observed_tokens", 0),
+    }
+
+
+def _int(value: Any) -> int:
+    return value if isinstance(value, int) else 0
 
 
 def health_summary(root: Path) -> dict[str, Any]:
@@ -66,7 +207,11 @@ def health_summary(root: Path) -> dict[str, Any]:
     from .worker.scheduler import QUEUE_PENDING_AGE_STALE_SECONDS, QUEUE_PROCESSING_AGE_STALE_SECONDS, status as queue_status
 
     doctor = as_payload(run_checks(root))
-    failed_checks = [check["name"] for check in doctor.get("checks", []) if not check.get("ok")]
+    failed_checks = [
+        {"name": check["name"], "detail": check.get("detail", "")}
+        for check in doctor.get("checks", [])
+        if not check.get("ok")
+    ]
     worker = lock_status(root)
     queue = queue_status(root)
     pending_age = int(queue.get("oldest_pending_age_seconds", 0) or 0)
@@ -97,8 +242,34 @@ def health_summary(root: Path) -> dict[str, Any]:
             "age_stats_skipped": int(queue.get("age_stats_skipped", 0) or 0),
         },
         "release_artifacts": release_artifact_summary(root),
+        "index": index_summary(root),
     }
     return redact_value(payload)
+
+
+def index_summary(root: Path) -> dict[str, Any]:
+    db = root / ".ai" / "cache" / "code.sqlite"
+    if not db.exists():
+        return {"present": False, "indexed_files": 0, "indexed_bytes": 0, "db_bytes": 0}
+    indexed_files = 0
+    indexed_bytes = 0
+    try:
+        import sqlite3
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "select count(*) as n, coalesce(sum(m.bytes), 0) as b "
+                "from chunks c left join chunk_meta m on m.chunk_id = c.id"
+            ).fetchone()
+            indexed_files = int(row[0] or 0)
+            indexed_bytes = int(row[1] or 0)
+    except Exception:
+        pass
+    return {
+        "present": True,
+        "indexed_files": indexed_files,
+        "indexed_bytes": indexed_bytes,
+        "db_bytes": db.stat().st_size,
+    }
 
 
 def release_artifact_summary(root: Path) -> dict[str, Any]:

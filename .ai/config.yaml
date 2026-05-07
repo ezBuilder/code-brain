@@ -10,6 +10,7 @@ features:
   external_notifications: false
 cache:
   sqlite_path: .ai/cache/code.sqlite
+search:
+  retriever: bm25
 manifest:
   path: .ai/generated/manifest.json
-

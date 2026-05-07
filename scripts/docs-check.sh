@@ -49,6 +49,8 @@ for needle in \
   "make preflight" \
   "make lockfile-check" \
   "make lock-check" \
+  "make session-start" \
+  "ai session start" \
   "uv lock --check --project .ai/runtime" \
   "make lint" \
   "make release-gate" \
@@ -88,6 +90,7 @@ make -n env-check >/dev/null
 make -n preflight >/dev/null
 make -n lockfile-check >/dev/null
 make -n lock-check >/dev/null
+make -n session-start >/dev/null
 make -n lint >/dev/null
 make -n quick >/dev/null
 make -n package >/dev/null

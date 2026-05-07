@@ -775,6 +775,52 @@ def test_ci_index_rebuild_rejected() -> None:
     assert result.returncode == 16
 
 
+def test_session_start_rebuilds_missing_index_and_records_hook(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    db = repo / ".ai" / "cache" / "code.sqlite"
+    db.unlink(missing_ok=True)
+    event_path = repo / ".ai" / "memory" / "events" / "events.jsonl"
+    before = event_path.read_text(encoding="utf-8") if event_path.exists() else ""
+    result = run_ai("session", "start", "--agent", "codex", "--query", "manifest", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["agent"] == "codex"
+    assert payload["index"]["rebuilt"] is True
+    assert payload["index"]["before"]["reason"] == "missing"
+    assert payload["hook"]["hook"] == "SessionStart"
+    assert payload["hook"]["persisted"] is True
+    assert payload["context"]["additionalContext"]
+    assert db.exists()
+    assert len(event_path.read_text(encoding="utf-8")) > len(before)
+
+
+def test_session_start_dry_run_is_ci_safe_and_does_not_write(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    db = repo / ".ai" / "cache" / "code.sqlite"
+    db.unlink(missing_ok=True)
+    event_path = repo / ".ai" / "memory" / "events" / "events.jsonl"
+    before = event_path.read_text(encoding="utf-8") if event_path.exists() else ""
+    result = run_ai("session", "start", "--dry-run", "--agent", "codex", "--json", env={"CI": "true"}, cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["index"]["dry_run"] is True
+    assert payload["index"]["would_rebuild"] is True
+    assert payload["hook"]["mode"] == "ci-fast-path"
+    assert payload["hook"]["persisted"] is False
+    assert not db.exists()
+    assert (event_path.read_text(encoding="utf-8") if event_path.exists() else "") == before
+
+
+def test_session_start_write_is_rejected_in_ci(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = run_ai("session", "start", "--json", env={"CI": "true"}, cwd=repo)
+    assert result.returncode == 16
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "CI_READ_ONLY"
+    assert payload["command"] == "session"
+
+
 def test_queue_lifecycle_complete(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     enqueue_result = run_ai_input(

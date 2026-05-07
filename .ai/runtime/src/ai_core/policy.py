@@ -28,6 +28,7 @@ WRITE_COMMANDS = {
     "memory",
     "audit",
     "worker_stop",
+    "session",
 }
 
 

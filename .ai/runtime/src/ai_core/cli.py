@@ -184,6 +184,16 @@ def build_parser() -> argparse.ArgumentParser:
     context_pack_parser.add_argument("query")
     context_pack_parser.add_argument("--limit", type=int, default=5)
     context_pack_parser.add_argument("--json", action="store_true", dest="command_json")
+    session = sub.add_parser("session")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    session_start = session_sub.add_parser("start")
+    session_start.add_argument("--agent", default="operator")
+    session_start.add_argument("--rebuild", choices=["auto", "always", "never"], default="auto")
+    session_start.add_argument("--dry-run", action="store_true")
+    session_start.add_argument("--strict", action="store_true")
+    session_start.add_argument("--query")
+    session_start.add_argument("--limit", type=int, default=5)
+    session_start.add_argument("--json", action="store_true", dest="command_json")
     mcp = sub.add_parser("mcp")
     mcp.add_argument("--once-json")
     report = sub.add_parser("report")
@@ -437,6 +447,20 @@ def main(argv: list[str] | None = None) -> int:
             payload = context_pack(root, args.query, limit=args.limit)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "session" and args.session_command == "start":
+            reject_ci_write("session", dry_run=args.dry_run)
+            from .session import start_session
+
+            payload = start_session(
+                root,
+                agent=args.agent,
+                rebuild_mode=args.rebuild,
+                dry_run=args.dry_run,
+                query_text=args.query,
+                limit=args.limit,
+            )
+            emit(payload, as_json=as_json)
+            return OK if payload["ok"] or not args.strict else CONFIG_INVALID
         if args.command == "mcp":
             from .mcp_server import handle_request, serve_stdio
 

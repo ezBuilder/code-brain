@@ -10,6 +10,7 @@ make env-check
 make preflight
 make lockfile-check
 make lock-check
+make session-start
 make lint
 make quick
 ./bootstrap.sh
@@ -17,6 +18,7 @@ uv run --project .ai/runtime ai doctor --strict --json
 uv run --project .ai/runtime ai report status --json
 uv run --project .ai/runtime ai report release-gate-summary --json
 uv run --project .ai/runtime ai worker status --json
+uv run --project .ai/runtime ai session start --agent codex --json
 ```
 
 Expected result:
@@ -28,6 +30,8 @@ Expected result:
 - `report.status.ok` is `true`.
 - `git.status_short` is empty for tracked files.
 - Runtime artifacts appear only in ignored paths such as `.ai/cache/`, `.ai/runtime/.venv/`, `.ai/runtime/.pytest_cache/`, `__pycache__/`, and `dist/`.
+
+Mac/VPS handoff uses GitHub tracked files as the baseline. After `git pull` or fresh clone, run `ai session start` or `make session-start`; local cache, virtualenv, and search index are regenerated on that machine rather than shared through Git.
 
 ## Release Gate
 

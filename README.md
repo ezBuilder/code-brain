@@ -30,6 +30,7 @@ uv run --project .ai/runtime ai migrate --dry-run --json
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 uv run --project .ai/runtime ai report status --json
 uv run --project .ai/runtime ai report release-gate-summary --json
+uv run --project .ai/runtime ai session start --agent codex --json
 ```
 
 ## Full Local Verification
@@ -64,7 +65,8 @@ make release-gate
 `scripts/reproducibility-check.sh` rebuilds the package into a temporary directory and fails if the archive SHA-256 differs.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.
 `scripts/lockfile-check.sh` verifies `.ai/runtime/uv.lock` drift and prints the `uv lock --project .ai/runtime` remediation when stale.
-`Makefile` provides operator shortcuts such as `make env-check`, `make preflight`, `make lockfile-check`, `make lock-check`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
+`ai session start` is the normal Mac/VPS entrypoint after pulling from GitHub; it rebuilds missing or stale local cache, records `SessionStart`, and returns doctor status.
+`Makefile` provides operator shortcuts such as `make env-check`, `make preflight`, `make lockfile-check`, `make lock-check`, `make session-start`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
 Use `make clean-cache` for ignored runtime cache files, `make clean-artifacts` for `dist/`, and `make clean-all` for cache, virtualenv, and release artifacts.
 GitHub Actions uses the same Makefile targets as local release verification.
 `.github/workflows/release-gate.yml` runs the full local gate with read-only repository permissions and uploads `dist/release-gate.summary.json` plus release artifacts for review.
@@ -96,6 +98,7 @@ Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for c
 | Doctor | `ai doctor --strict --json` | working |
 | Worker IPC | `ai worker health/status/stop --force --json` | local envelope validation and singleton lock recovery |
 | Hooks | `ai hook <HookName> --json` with JSON stdin | fast-path, redacted, append-only outside CI |
+| Session | `ai session start --agent ... --json` | GitHub-baseline Mac/VPS startup with stale index rebuild + SessionStart hook + doctor summary |
 | Memory | `ai memory append-event` | append-only JSONL |
 | Audit | `ai audit append --action ...` | yearly audit JSONL + audit index + hash-chain verification |
 | Search | `ai index rebuild`, `ai code query` | single `.ai/cache/code.sqlite` with FTS5 |

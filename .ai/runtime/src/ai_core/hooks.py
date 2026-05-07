@@ -46,4 +46,5 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
 
 def build_context(hook_name: str, payload: dict[str, Any]) -> str:
     agent = payload.get("agent", "unknown")
-    return f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={'off' if is_ci() else 'worker-local'}."
+    writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
+    return f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={writes}."

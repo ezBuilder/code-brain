@@ -14,6 +14,19 @@ from .obs import metrics
 from .redact import redact_value
 from .worker.ipc import PROTOCOL_VERSION
 
+RELEASE_GATE_SUMMARY_SCHEMA_VERSION = 1
+RELEASE_GATE_SUMMARY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "generated_at",
+        "git_sha",
+        "ci",
+        "release_ready",
+        "release_artifacts",
+        "checks",
+    }
+)
+
 
 def git_output(root: Path, *args: str) -> str:
     try:
@@ -56,8 +69,8 @@ def release_gate_summary(root: Path, *, git_sha: str | None = None, status: dict
     artifacts = payload.get("release_artifacts", {})
     doctor = payload.get("doctor", {})
     checks = doctor.get("checks", []) if isinstance(doctor, dict) else []
-    return {
-        "schema_version": 1,
+    summary = {
+        "schema_version": RELEASE_GATE_SUMMARY_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "git_sha": sha,
         "ci": any(os.environ.get(name) for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI")),
@@ -65,6 +78,21 @@ def release_gate_summary(root: Path, *, git_sha: str | None = None, status: dict
         "release_artifacts": redact_value(artifacts),
         "checks": redact_value(checks),
     }
+    assert_release_gate_summary_schema(summary)
+    return summary
+
+
+def assert_release_gate_summary_schema(payload: dict[str, Any]) -> None:
+    fields = set(payload)
+    if fields != RELEASE_GATE_SUMMARY_FIELDS:
+        missing = sorted(RELEASE_GATE_SUMMARY_FIELDS - fields)
+        extra = sorted(fields - RELEASE_GATE_SUMMARY_FIELDS)
+        raise ValueError(f"release gate summary schema fields mismatch: missing={missing}, extra={extra}")
+    if payload.get("schema_version") != RELEASE_GATE_SUMMARY_SCHEMA_VERSION:
+        raise ValueError(
+            "release gate summary schema version mismatch: "
+            f"expected={RELEASE_GATE_SUMMARY_SCHEMA_VERSION}, actual={payload.get('schema_version')}"
+        )
 
 
 def release_notes(root: Path) -> str:

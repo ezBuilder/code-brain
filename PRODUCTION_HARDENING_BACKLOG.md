@@ -7,6 +7,7 @@ This backlog tracks remaining commercial-readiness work after the current releas
 - Verify every release from a clean tracked tree with `./scripts/release-gate.sh`.
 - Keep `release_ready`, `release_artifacts.all_valid`, and `release_artifacts.all_current` as hard blockers.
 - Keep `dist/release-gate.summary.json` attached to every CI run and handoff bundle.
+- Keep release gate summary schema locked through `RELEASE_GATE_SUMMARY_SCHEMA_VERSION`.
 - Add release tag signing only after key ownership and rotation are documented.
 - Keep rollback drills in the release gate so upgrade backup and rollback paths are checked before handoff.
 - Add a changelog generator only if it consumes existing release notes and does not rewrite PRD content.

@@ -7,6 +7,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
+
+from ai_core.report import assert_release_gate_summary_schema  # noqa: E402
+
 
 def load_summary(path: Path) -> dict[str, Any]:
     try:
@@ -15,6 +20,10 @@ def load_summary(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: summary is not a JSON object")
+    try:
+        assert_release_gate_summary_schema(payload)
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
     return payload
 
 

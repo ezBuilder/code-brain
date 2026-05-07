@@ -90,7 +90,7 @@ def test_version_json() -> None:
 
 
 def test_release_gate_summary_schema_and_redaction(monkeypatch) -> None:
-    from ai_core.report import release_gate_summary
+    from ai_core.report import RELEASE_GATE_SUMMARY_FIELDS, RELEASE_GATE_SUMMARY_SCHEMA_VERSION, release_gate_summary
 
     status = {
         "release_ready": True,
@@ -102,8 +102,8 @@ def test_release_gate_summary_schema_and_redaction(monkeypatch) -> None:
     }
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     summary = release_gate_summary(ROOT, git_sha="deadbeef", status=status)
-    assert set(summary) == {"schema_version", "generated_at", "git_sha", "ci", "release_ready", "release_artifacts", "checks"}
-    assert summary["schema_version"] == 1
+    assert set(summary) == RELEASE_GATE_SUMMARY_FIELDS
+    assert summary["schema_version"] == RELEASE_GATE_SUMMARY_SCHEMA_VERSION
     assert summary["generated_at"].endswith("Z")
     assert summary["git_sha"] == "deadbeef"
     assert summary["ci"] is True
@@ -117,6 +117,35 @@ def test_release_gate_summary_command_json() -> None:
     payload = json.loads(result.stdout)
     assert payload["git_sha"] == "deadbeef"
     assert payload["schema_version"] == 1
+
+
+def test_release_gate_summary_schema_guard_rejects_drift() -> None:
+    from ai_core.report import RELEASE_GATE_SUMMARY_SCHEMA_VERSION, assert_release_gate_summary_schema
+
+    payload = {
+        "schema_version": RELEASE_GATE_SUMMARY_SCHEMA_VERSION,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "git_sha": "abc123",
+        "ci": True,
+        "release_ready": True,
+        "release_artifacts": {},
+        "checks": [],
+    }
+    assert_release_gate_summary_schema(payload)
+    with_extra = dict(payload, unexpected=True)
+    try:
+        assert_release_gate_summary_schema(with_extra)
+    except ValueError as exc:
+        assert "extra=['unexpected']" in str(exc)
+    else:
+        raise AssertionError("extra summary field should fail schema guard")
+    wrong_version = dict(payload, schema_version=2)
+    try:
+        assert_release_gate_summary_schema(wrong_version)
+    except ValueError as exc:
+        assert "schema version mismatch" in str(exc)
+    else:
+        raise AssertionError("schema version drift should fail schema guard")
 
 
 def test_release_gate_workflow_invariants() -> None:
@@ -225,6 +254,7 @@ def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_pa
         "schema_version": 1,
         "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
+        "ci": True,
         "release_ready": True,
         "release_artifacts": {"all_present": True, "all_valid": True, "all_current": True},
         "checks": [{"name": "layout", "ok": True, "detail": "ok"}],
@@ -240,7 +270,15 @@ def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_pa
 def test_summary_parity_release_ready_mismatch_fails(tmp_path: Path) -> None:
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
-    base = {"schema_version": 1, "git_sha": "abc123", "release_ready": True, "release_artifacts": {}, "checks": []}
+    base = {
+        "schema_version": 1,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "git_sha": "abc123",
+        "ci": True,
+        "release_ready": True,
+        "release_artifacts": {},
+        "checks": [],
+    }
     left.write_text(json.dumps(base), encoding="utf-8")
     changed = dict(base, release_ready=False)
     right.write_text(json.dumps(changed), encoding="utf-8")
@@ -256,7 +294,9 @@ def test_summary_parity_check_set_mismatch_fails(tmp_path: Path) -> None:
     right = tmp_path / "right.json"
     base = {
         "schema_version": 1,
+        "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
+        "ci": True,
         "release_ready": True,
         "release_artifacts": {},
         "checks": [{"name": "layout", "ok": True}, {"name": "queue_age", "ok": True}],
@@ -272,7 +312,20 @@ def test_summary_parity_check_set_mismatch_fails(tmp_path: Path) -> None:
 def test_summary_parity_missing_or_invalid_file_returns_two(tmp_path: Path) -> None:
     left = tmp_path / "left.json"
     missing = tmp_path / "missing.json"
-    left.write_text('{"schema_version":1}', encoding="utf-8")
+    left.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-01-01T00:00:00Z",
+                "git_sha": "abc123",
+                "ci": True,
+                "release_ready": True,
+                "release_artifacts": {},
+                "checks": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(missing)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
     assert result.returncode == 2
     assert str(missing) in result.stderr
@@ -280,6 +333,26 @@ def test_summary_parity_missing_or_invalid_file_returns_two(tmp_path: Path) -> N
     left.write_text("not json", encoding="utf-8")
     result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(missing)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
     assert result.returncode == 2
+
+
+def test_summary_parity_schema_drift_returns_two(tmp_path: Path) -> None:
+    left = tmp_path / "left.json"
+    right = tmp_path / "right.json"
+    payload = {
+        "schema_version": 1,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "git_sha": "abc123",
+        "ci": True,
+        "release_ready": True,
+        "release_artifacts": {},
+        "checks": [],
+    }
+    left.write_text(json.dumps(dict(payload, unexpected=True)), encoding="utf-8")
+    right.write_text(json.dumps(payload), encoding="utf-8")
+    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(right), "--json"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
+    assert result.returncode == 2
+    assert json.loads(result.stdout)["ok"] is False
+    assert "release gate summary schema fields mismatch" in json.loads(result.stdout)["error"]
 
 
 def test_render_dry_run_json() -> None:

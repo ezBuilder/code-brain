@@ -9,10 +9,12 @@ import sys
 import tarfile
 import zipfile
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 PYTHON = sys.executable
+sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
 
 def run_ai(*args: str, env: dict[str, str] | None = None, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
@@ -1372,6 +1374,94 @@ def test_audit_append_updates_index_consistently(tmp_path: Path) -> None:
     assert index_records[-1]["path"].startswith(".ai/memory/audit/")
     doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
     assert doctor_result.returncode == 0, doctor_result.stdout + doctor_result.stderr
+
+
+def test_append_audit_chains_prev_sha(tmp_path: Path) -> None:
+    from ai_core.memory import append_audit
+
+    repo = copy_repo(tmp_path)
+    records = [
+        append_audit(repo, action="test.first", category="test", payload={"index": 1}),
+        append_audit(repo, action="test.second", category="test", payload={"index": 2}),
+        append_audit(repo, action="test.third", category="test", payload={"index": 3}),
+    ]
+    audit_path = next((repo / ".ai" / "memory" / "audit").glob("*.jsonl"))
+    lines = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 3
+    assert records[0]["prev_sha"] is None
+    assert records[1]["prev_sha"] == hashlib.sha256(lines[0].encode("utf-8")).hexdigest()
+    assert records[2]["prev_sha"] == hashlib.sha256(lines[1].encode("utf-8")).hexdigest()
+    assert set(records[0]) == {"ts", "monotonic_ns", "action", "category", "payload", "prev_sha"}
+
+
+def test_check_audit_chain_detects_middle_tampering(tmp_path: Path) -> None:
+    from ai_core.doctor import check_audit_chain
+    from ai_core.memory import append_audit
+
+    repo = copy_repo(tmp_path)
+    append_audit(repo, action="test.first", category="test", payload={"value": "one"})
+    append_audit(repo, action="test.second", category="test", payload={"value": "two"})
+    append_audit(repo, action="test.third", category="test", payload={"value": "three"})
+    audit_path = next((repo / ".ai" / "memory" / "audit").glob("*.jsonl"))
+    lines = audit_path.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1].replace('"two"', '"tampered"', 1)
+    audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = check_audit_chain(repo)
+    assert result.ok is False
+    assert "line 3" in result.detail
+    assert "prev_sha_mismatch" in result.detail
+
+
+def test_check_audit_chain_passes_with_legacy_prefix(tmp_path: Path) -> None:
+    from ai_core.doctor import check_audit_chain
+    from ai_core.memory import append_audit
+
+    repo = copy_repo(tmp_path)
+    audit_dir = repo / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = audit_dir / "2026.jsonl"
+    legacy_lines = [
+        json.dumps({"ts": "2026-01-01T00:00:00Z", "action": "legacy.one", "category": "test", "payload": {}}, sort_keys=True),
+        json.dumps({"ts": "2026-01-01T00:00:01Z", "action": "legacy.two", "category": "test", "payload": {}}, sort_keys=True),
+    ]
+    audit_path.write_text("\n".join(legacy_lines) + "\n", encoding="utf-8")
+
+    first = append_audit(repo, action="test.first", category="test", payload={"value": "one"})
+    assert first["prev_sha"] == hashlib.sha256(legacy_lines[-1].encode("utf-8")).hexdigest()
+    assert check_audit_chain(repo).ok is True
+
+    append_audit(repo, action="test.second", category="test", payload={"value": "two"})
+    lines = audit_path.read_text(encoding="utf-8").splitlines()
+    lines[0] = lines[0].replace("legacy.one", "legacy.changed", 1)
+    audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert check_audit_chain(repo).ok is True
+
+    lines = audit_path.read_text(encoding="utf-8").splitlines()
+    lines[2] = lines[2].replace('"one"', '"tampered"', 1)
+    audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = check_audit_chain(repo)
+    assert result.ok is False
+    assert "prev_sha_mismatch" in result.detail
+
+
+def test_append_audit_concurrent_safe(tmp_path: Path) -> None:
+    from ai_core.doctor import check_audit_chain
+    from ai_core.memory import append_audit
+
+    repo = copy_repo(tmp_path)
+
+    def write_one(index: int) -> None:
+        append_audit(repo, action="test.concurrent", category="test", payload={"index": index})
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        list(pool.map(write_one, range(50)))
+
+    audit_path = next((repo / ".ai" / "memory" / "audit").glob("*.jsonl"))
+    lines = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 50
+    assert all(isinstance(json.loads(line), dict) for line in lines)
+    assert check_audit_chain(repo).ok is True
 
 
 def test_doctor_rejects_audit_index_mismatch(tmp_path: Path) -> None:

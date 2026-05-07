@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -31,6 +32,7 @@ def run_checks(root: Path) -> list[Check]:
         check_trust(root),
         check_jsonl(root),
         check_audit_index(root),
+        check_audit_chain(root),
         check_hot_path_slo(root),
         check_secret_scan(root),
         check_redaction_self_test(),
@@ -182,6 +184,50 @@ def check_audit_index(root: Path) -> Check:
         bad.append(f"audit-index:orphan:{key[0]}")
 
     return Check("audit_index", not bad, "ok" if not bad else "invalid: " + ", ".join(bad[:10]))
+
+
+def check_audit_chain(root: Path) -> Check:
+    audit_root = root / ".ai" / "memory" / "audit"
+    bad: list[str] = []
+    chained = 0
+
+    for path in sorted(audit_root.glob("*.jsonl")):
+        previous_line: str | None = None
+        previous_was_chained = False
+        rel_path = path.relative_to(root).as_posix()
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                bad.append(f"{rel_path}:line {line_no}:invalid_json:{exc.msg}")
+                previous_line = line
+                previous_was_chained = False
+                continue
+            if not isinstance(record, dict):
+                bad.append(f"{rel_path}:line {line_no}:not_object")
+                previous_line = line
+                previous_was_chained = False
+                continue
+
+            is_chained = "prev_sha" in record
+            if is_chained:
+                chained += 1
+                prev_sha = record.get("prev_sha")
+                if prev_sha is not None and not (isinstance(prev_sha, str) and len(prev_sha) == 64):
+                    bad.append(f"{rel_path}:line {line_no}:prev_sha_invalid")
+                expected = hashlib.sha256(previous_line.encode("utf-8")).hexdigest() if previous_line is not None else None
+                if (previous_was_chained or previous_line is None) and prev_sha != expected:
+                    bad.append(f"{rel_path}:line {line_no}:prev_sha_mismatch")
+
+            previous_line = line
+            previous_was_chained = is_chained
+
+    if bad:
+        return Check("audit_chain", False, "invalid: " + ", ".join(bad[:10]))
+    detail = f"ok chained_lines={chained}" if chained else "ok no chained lines yet"
+    return Check("audit_chain", True, detail)
 
 
 def check_hot_path_slo(root: Path) -> Check:

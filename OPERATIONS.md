@@ -96,6 +96,7 @@ uv run --project .ai/runtime ai report status --json
 ```
 
 Treat a strict doctor failure as a release blocker. Metrics, health summary, and SLO output are read-only and allowed in CI.
+The `audit_chain` doctor check verifies chained audit entries with `prev_sha`; legacy audit prefixes remain readable, while tampering after the chain starts is reported as `prev_sha_mismatch`.
 `queue status` and `obs metrics` include `oldest_pending_age_seconds`, `oldest_processing_age_seconds`, and matching job ids so operators can spot backlog drift before leases expire.
 `obs health-summary` rolls up doctor failures, singleton worker lock state, queue age, and the latest `dist/release-gate.summary.json` artifact booleans; it exits `0` for status reporting even when `"ok": false`.
 
@@ -262,6 +263,7 @@ make clean-all
 | `doctor` reports manifest drift | Generated manifest is stale after config or trust changes | Run `uv run --project .ai/runtime ai render --json`, then rerun doctor |
 | `doctor` reports secret scan failure | A tracked file contains a token-like value | Remove the secret, rotate it outside this repo, rerun doctor |
 | `doctor` reports trust failure | Public machine record is malformed or has an invalid status | Fix or recreate the file with `ai trust init`, then render |
+| `doctor` reports `audit_chain` failure | A chained audit JSONL line or its predecessor changed after append | Preserve the file for investigation, compare against release artifacts or backups, then restore trusted audit history |
 | SQLite FTS5 or JSON1 check fails | Python SQLite was built without required extensions | Use the bundled `uv` Python environment or rebuild Python with FTS5 and JSON1 |
 | Queue has stuck processing jobs | Worker lease expired or worker exited mid-job | Run `ai queue recover-expired --json`, then inspect `ai queue status --json` |
 | Dead-letter count grows | Jobs are failing repeatedly | Inspect dead-letter JSON locally, fix the producer or worker, then archive old dead jobs |

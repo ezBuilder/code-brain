@@ -95,7 +95,7 @@ Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for c
 | Worker IPC | `ai worker health/status/stop --force --json` | local envelope validation and singleton lock recovery |
 | Hooks | `ai hook <HookName> --json` with JSON stdin | fast-path, redacted, append-only outside CI |
 | Memory | `ai memory append-event` | append-only JSONL |
-| Audit | `ai audit append --action ...` | yearly audit JSONL + audit index |
+| Audit | `ai audit append --action ...` | yearly audit JSONL + audit index + hash-chain verification |
 | Search | `ai index rebuild`, `ai code query` | single `.ai/cache/code.sqlite` with FTS5 |
 | MCP | `ai mcp` / `ai mcp --once-json ...` | read tools and rebuild request over JSON-RPC |
 | Queue | `ai queue enqueue/lease/complete/fail/status` | P0-P3 file queue with lease and dead-letter |

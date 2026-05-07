@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 import hashlib
 from pathlib import Path
 
@@ -59,7 +60,7 @@ def copy_repo(tmp_path: Path) -> Path:
     shutil.copytree(
         ROOT,
         target,
-        ignore=shutil.ignore_patterns(".git", ".venv", ".pytest_cache", "__pycache__", "cache"),
+        ignore=shutil.ignore_patterns(".git", ".claude", ".venv", ".pytest_cache", "__pycache__", "cache"),
     )
     for pattern in (
         ".ai/memory/queue/*.json",
@@ -111,6 +112,34 @@ def test_doctor_strict_passes_after_render() -> None:
     slo_check = next(check for check in payload["checks"] if check["name"] == "hot_path_slo")
     assert slo_check["ok"] is True
     assert "target_ms=200" in slo_check["detail"]
+    redaction_check = next(check for check in payload["checks"] if check["name"] == "redaction_self_test")
+    assert redaction_check["ok"] is True
+
+
+def test_redaction_expanded_secret_shapes() -> None:
+    from ai_core.redact import redact_value
+
+    samples = [
+        "AKIA" + "A" * 16,
+        "ghp_" + "a" * 36,
+        "gho_" + "b" * 36,
+        "github_pat_" + "c" * 28,
+        "sk-" + "d" * 32,
+        "sk-ant-" + "e" * 32,
+        "xoxb-" + "1-2-" + "f" * 24,
+        "Authorization: Bearer " + "eyJ" + "a" * 20 + "." + "eyJ" + "b" * 20 + "." + "c" * 20,
+        "api_key=" + "g" * 24,
+        "-----BEGIN " + "PRIVATE KEY-----\n" + "h" * 32 + "\n-----END " + "PRIVATE KEY-----",
+        "/Users/example/project",
+        "/home/example/project",
+        "C:\\Users\\example\\project",
+        "192.168.1.10",
+    ]
+    payload = {"samples": samples, "nested": [{"token": samples[1]}]}
+    redacted = json.dumps(redact_value(payload), sort_keys=True)
+    for sample in samples:
+        assert sample not in redacted
+    assert redacted.count("[REDACTED]") >= len(samples)
 
 
 def test_worker_health_validates_envelope() -> None:
@@ -559,7 +588,17 @@ def test_obs_log_metrics_slo_and_diagnostics(tmp_path: Path) -> None:
     assert json.loads(dry_result.stdout)["dry_run"] is True
     bundle_result = run_ai("diagnostics", "bundle", "--json", cwd=repo)
     assert bundle_result.returncode == 0, bundle_result.stdout + bundle_result.stderr
-    assert (repo / json.loads(bundle_result.stdout)["path"]).exists()
+    bundle_path = repo / json.loads(bundle_result.stdout)["path"]
+    assert bundle_path.exists()
+    with zipfile.ZipFile(bundle_path) as archive:
+        names = archive.namelist()
+        assert len(names) == 1
+        assert names[0].startswith("diagnostics-")
+        assert names[0].endswith(".json")
+        assert not any(name.endswith(".enc.yaml") or name.endswith(".enc.yml") for name in names)
+        bundle = json.loads(archive.read(names[0]).decode("utf-8"))
+    assert set(bundle) == {"created_at", "doctor", "metrics", "platform", "runtime_version"}
+    assert set(bundle["metrics"]) == {"cache", "ok", "queue", "runtime_version"}
 
 
 def test_ci_diagnostics_write_rejected_but_dry_run_allowed(tmp_path: Path) -> None:

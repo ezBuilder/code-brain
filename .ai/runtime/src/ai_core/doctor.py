@@ -1,21 +1,16 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from .config import load_config
+from .redact import SECRET_PATTERNS
+from .redact import redact_value
 from .render import build_manifest
 from .trust import parse_simple_toml
-
-SECRET_PATTERNS = [
-    re.compile(r"AKIA[0-9A-Z]{16}"),
-    re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?[A-Za-z0-9./+=-]{20,}['\"]?"),
-    re.compile(r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-]
 
 
 @dataclass
@@ -37,6 +32,7 @@ def run_checks(root: Path) -> list[Check]:
         check_audit_index(root),
         check_hot_path_slo(root),
         check_secret_scan(root),
+        check_redaction_self_test(),
         check_diagnostics(root),
     ]
     return checks
@@ -200,6 +196,29 @@ def check_secret_scan(root: Path) -> Check:
     return Check("secret_scan", not hits, "ok" if not hits else "hits: " + ", ".join(hits[:10]))
 
 
+def check_redaction_self_test() -> Check:
+    samples = [
+        "AKIA" + "A" * 16,
+        "ghp_" + "a" * 36,
+        "gho_" + "b" * 36,
+        "github_pat_" + "c" * 28,
+        "sk-" + "d" * 32,
+        "sk-ant-" + "e" * 32,
+        "xoxb-" + "1-2-" + "f" * 24,
+        "Authorization: Bearer " + "eyJ" + "a" * 20 + "." + "eyJ" + "b" * 20 + "." + "c" * 20,
+        "token=" + "g" * 24,
+        "-----BEGIN " + "PRIVATE KEY-----\n" + "h" * 32 + "\n-----END " + "PRIVATE KEY-----",
+        "/Users/example/project",
+        "/home/example/project",
+        "C:\\Users\\example\\project",
+        "192.168.1.10",
+    ]
+    redacted = redact_value({"samples": samples})
+    text = json.dumps(redacted, sort_keys=True)
+    leaked = [sample for sample in samples if sample in text]
+    return Check("redaction_self_test", not leaked and "[REDACTED]" in text, "ok" if not leaked else "leaked: " + str(len(leaked)))
+
+
 def check_diagnostics(root: Path) -> Check:
     try:
         from .obs import diagnostics
@@ -211,7 +230,7 @@ def check_diagnostics(root: Path) -> Check:
 
 
 def secret_hits(root: Path) -> Iterable[str]:
-    ignored_parts = {".venv", "cache", ".git"}
+    ignored_parts = {".venv", "cache", ".git", ".claude"}
     for path in root.rglob("*"):
         rel_parts = set(path.relative_to(root).parts)
         if path.is_dir() or rel_parts & ignored_parts:

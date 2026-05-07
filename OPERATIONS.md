@@ -14,6 +14,7 @@ make quick
 uv run --project .ai/runtime ai doctor --strict --json
 uv run --project .ai/runtime ai report status --json
 uv run --project .ai/runtime ai report release-gate-summary --json
+uv run --project .ai/runtime ai worker status --json
 ```
 
 Expected result:
@@ -86,6 +87,7 @@ uv run --project .ai/runtime ai doctor --strict --json
 uv run --project .ai/runtime ai obs metrics --json
 uv run --project .ai/runtime ai obs slo --json
 uv run --project .ai/runtime ai queue status --json
+uv run --project .ai/runtime ai worker status --json
 uv run --project .ai/runtime ai report status --json
 ```
 
@@ -102,7 +104,29 @@ CI=true uv run --project .ai/runtime ai render
 ```
 
 The first two commands should pass. The final command must fail with exit code `16`.
-Write commands such as render, queue mutation, trust mutation, inbox mutation, notify enqueue, memory append, audit append, diagnostics write, migration, upgrade apply, and index rebuild are denied in CI with exit `16` and a `CI_READ_ONLY` JSON error when JSON output is requested. Read-only commands such as `queue status`, `trust list`, `secrets status`, `inbox list`, reports, metrics, and `worker health` remain allowed; `worker health` does not create a worker token when CI/GitHub Actions is set.
+Write commands such as render, queue mutation, worker stop, trust mutation, inbox mutation, notify enqueue, memory append, audit append, diagnostics write, migration, upgrade apply, and index rebuild are denied in CI with exit `16` and a `CI_READ_ONLY` JSON error when JSON output is requested. Read-only commands such as `queue status`, `worker status`, `trust list`, `secrets status`, `inbox list`, reports, metrics, and `worker health` remain allowed; `worker health` does not create a worker token when CI/GitHub Actions is set.
+
+## Worker Lock Recovery
+
+Inspect the singleton worker lock before starting or replacing a worker:
+
+```bash
+uv run --project .ai/runtime ai worker status --json
+```
+
+Clear stale or corrupt local locks:
+
+```bash
+uv run --project .ai/runtime ai worker stop --json
+```
+
+If the lock is live on this host, stop the process first. Use `worker stop --force --json` only after confirming the PID is gone or intentionally replacing the local worker:
+
+```bash
+uv run --project .ai/runtime ai worker stop --force --reason operator-confirmed --json
+```
+
+Cross-host locks are refused even with `--force`; clear them on the host that owns the lock. CI remains read-only: `worker stop --force` is rejected with `CI_READ_ONLY` and exit code `16`.
 
 ## Queue Operations
 
@@ -233,6 +257,7 @@ make lint
 make release-gate
 uv run --project .ai/runtime ai report status --json
 uv run --project .ai/runtime ai report release-gate-summary --json
+uv run --project .ai/runtime ai worker status --json
 git status --short
 ```
 

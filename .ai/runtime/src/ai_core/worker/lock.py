@@ -46,24 +46,111 @@ def read_lock(path: Path) -> dict[str, Any] | None:
 
 def lock_status(root: Path) -> dict[str, Any]:
     path = lock_path(root)
+    rel_path = path.relative_to(root).as_posix()
+    hostname_local = socket.gethostname()
     try:
         record = read_lock(path)
     except (OSError, json.JSONDecodeError) as exc:
-        return {"ok": False, "locked": True, "stale": True, "path": path.relative_to(root).as_posix(), "error": str(exc)}
+        return {
+            "ok": False,
+            "locked": True,
+            "stale": True,
+            "cross_host": False,
+            "reason": "corrupt",
+            "path": rel_path,
+            "hostname_local": hostname_local,
+            "error": str(exc),
+        }
     if not record:
-        return {"ok": True, "locked": False, "stale": False, "path": path.relative_to(root).as_posix()}
+        return {
+            "ok": True,
+            "locked": False,
+            "stale": False,
+            "cross_host": False,
+            "reason": "no_lock",
+            "path": rel_path,
+            "hostname_local": hostname_local,
+            "error": None,
+        }
     pid = int(record.get("pid", 0) or 0)
-    alive = pid_is_alive(pid)
+    hostname = record.get("hostname")
+    if not pid or not hostname:
+        return {
+            "ok": False,
+            "locked": True,
+            "stale": True,
+            "cross_host": False,
+            "reason": "corrupt",
+            "path": rel_path,
+            "pid": pid,
+            "owner": record.get("owner"),
+            "hostname": hostname,
+            "hostname_local": hostname_local,
+            "acquired_at": record.get("acquired_at"),
+            "error": "missing pid or hostname",
+        }
+    cross_host = hostname != hostname_local
+    alive = True if cross_host else pid_is_alive(pid)
+    reason = "cross_host" if cross_host else ("healthy" if alive else "stale_dead_pid")
     return {
-        "ok": alive,
+        "ok": bool(alive),
         "locked": True,
         "stale": not alive,
-        "path": path.relative_to(root).as_posix(),
+        "cross_host": cross_host,
+        "reason": reason,
+        "path": rel_path,
         "pid": pid,
         "owner": record.get("owner"),
-        "hostname": record.get("hostname"),
+        "hostname": hostname,
+        "hostname_local": hostname_local,
         "acquired_at": record.get("acquired_at"),
+        "error": None,
     }
+
+
+def clear_worker_lock(root: Path, *, force: bool = False, reason: str = "operator") -> dict[str, Any]:
+    status = lock_status(root)
+    if not status.get("locked"):
+        return {"ok": True, "action": "no_op", "reason": status.get("reason", "no_lock"), "force": force, "lock": status}
+    if status.get("cross_host"):
+        payload = {"reason": "cross_host", "force": force, "pid": status.get("pid"), "hostname": status.get("hostname")}
+        append_worker_lock_audit(root, action="worker.lock_refused", payload=payload)
+        return {
+            "ok": False,
+            "action": "refused",
+            "reason": "cross_host",
+            "hint": "clear this lock on the host that owns it",
+            "force": force,
+            "lock": status,
+        }
+    stale_or_corrupt = bool(status.get("stale") or status.get("reason") == "corrupt")
+    if stale_or_corrupt:
+        lock_path(root).unlink(missing_ok=True)
+        action = "worker.lock_clear"
+        payload = {"reason": status.get("reason"), "requested_reason": reason, "force": force, "pid": status.get("pid")}
+        append_worker_lock_audit(root, action=action, payload=payload)
+        return {"ok": True, "action": "cleared", "reason": status.get("reason"), "force": force, "lock": status}
+    if not force:
+        payload = {"reason": "live_local", "force": False, "pid": status.get("pid"), "hostname": status.get("hostname")}
+        append_worker_lock_audit(root, action="worker.lock_refused", payload=payload)
+        return {
+            "ok": False,
+            "action": "refused",
+            "reason": "live_local",
+            "hint": f"rerun with --force only after stopping pid {status.get('pid')}",
+            "force": False,
+            "lock": status,
+        }
+    lock_path(root).unlink(missing_ok=True)
+    payload = {"reason": "live_local", "requested_reason": reason, "force": True, "pid": status.get("pid")}
+    append_worker_lock_audit(root, action="worker.lock_force_clear", payload=payload)
+    return {"ok": True, "action": "force_cleared", "reason": "live_local", "force": True, "lock": status}
+
+
+def append_worker_lock_audit(root: Path, *, action: str, payload: dict[str, Any]) -> None:
+    from ai_core.memory import append_audit
+
+    append_audit(root, action=action, category="worker", payload=payload)
 
 
 @dataclass

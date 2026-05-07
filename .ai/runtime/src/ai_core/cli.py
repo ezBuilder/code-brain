@@ -13,7 +13,7 @@ from .inbox import decide, list_approvals, request_approval
 from .memory import append_audit, append_event
 from .obs import diagnostics, metrics, prune_diagnostics, slo_bench, write_log
 from .paths import find_repo_root
-from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, PolicyDenied, reject_ci_write
+from .policy import CONFIG_INVALID, GENERIC_ERROR, OK, PERMISSION_DENIED, PolicyDenied, WORKER_UNAVAILABLE, reject_ci_write
 from .render import render
 from .search import context_pack, query, rebuild
 from .secrets_store import status as secrets_status
@@ -48,6 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     worker_health.add_argument("--envelope-json")
     worker_status = worker_sub.add_parser("status")
     worker_status.add_argument("--json", action="store_true", dest="command_json")
+    worker_stop = worker_sub.add_parser("stop")
+    worker_stop.add_argument("--force", action="store_true")
+    worker_stop.add_argument("--reason", default="operator")
+    worker_stop.add_argument("--json", action="store_true", dest="command_json")
     queue = sub.add_parser("queue")
     queue_sub = queue.add_subparsers(dest="queue_command", required=True)
     queue_enqueue = queue_sub.add_parser("enqueue")
@@ -234,6 +238,13 @@ def main(argv: list[str] | None = None) -> int:
             payload = {"ok": True, "lock": lock_status(root)}
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "worker" and args.worker_command == "stop":
+            reject_ci_write("worker_stop")
+            from .worker.lock import clear_worker_lock
+
+            payload = clear_worker_lock(root, force=args.force, reason=args.reason)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else WORKER_UNAVAILABLE
         if args.command == "queue" and args.queue_command == "enqueue":
             reject_ci_write("queue")
             from .worker.scheduler import enqueue

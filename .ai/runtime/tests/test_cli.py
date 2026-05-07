@@ -270,6 +270,13 @@ def test_ci_worker_health_does_not_create_token(tmp_path: Path) -> None:
     assert not token_path.exists()
 
 
+def test_ci_worker_stop_rejected(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = run_ai("worker", "stop", "--force", "--json", env={"CI": "true"}, cwd=repo)
+    assert result.returncode == 16
+    assert json.loads(result.stdout)["error"] == "CI_READ_ONLY"
+
+
 def test_worker_status_reports_singleton_lock(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     result = run_ai("worker", "status", "--json", cwd=repo)
@@ -277,6 +284,8 @@ def test_worker_status_reports_singleton_lock(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["lock"]["locked"] is False
     assert payload["lock"]["stale"] is False
+    assert payload["lock"]["reason"] == "no_lock"
+    assert {"cross_host", "hostname_local", "reason", "error"} <= set(payload["lock"])
 
 
 def test_worker_singleton_lock_rejects_second_instance(tmp_path: Path) -> None:
@@ -310,6 +319,80 @@ def test_worker_singleton_lock_recovers_stale_pid(tmp_path: Path) -> None:
         assert payload["owner"] == "test"
     finally:
         lock.release()
+
+
+def test_worker_stop_clears_stale_lock(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    lock_file = repo / ".ai" / "cache" / "run" / "worker.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text(
+        json.dumps(
+            {
+                "pid": 99999999,
+                "owner": "dead",
+                "hostname": __import__("socket").gethostname(),
+                "acquired_at": "2026-01-01T00:00:00Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = run_ai("worker", "stop", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["action"] == "cleared"
+    assert payload["reason"] == "stale_dead_pid"
+    assert not lock_file.exists()
+
+
+def test_worker_stop_refuses_live_lock_without_force(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    lock_file = repo / ".ai" / "cache" / "run" / "worker.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text(
+        json.dumps({"pid": os.getpid(), "owner": "live", "hostname": __import__("socket").gethostname(), "acquired_at": "2026-01-01T00:00:00Z"})
+        + "\n",
+        encoding="utf-8",
+    )
+    result = run_ai("worker", "stop", "--json", cwd=repo)
+    assert result.returncode == 14
+    payload = json.loads(result.stdout)
+    assert payload["action"] == "refused"
+    assert payload["reason"] == "live_local"
+    assert lock_file.exists()
+
+
+def test_worker_stop_force_clears_live_local_lock(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    lock_file = repo / ".ai" / "cache" / "run" / "worker.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text(
+        json.dumps({"pid": os.getpid(), "owner": "live", "hostname": __import__("socket").gethostname(), "acquired_at": "2026-01-01T00:00:00Z"})
+        + "\n",
+        encoding="utf-8",
+    )
+    result = run_ai("worker", "stop", "--force", "--reason", "operator-confirmed", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["action"] == "force_cleared"
+    assert payload["force"] is True
+    assert not lock_file.exists()
+
+
+def test_worker_stop_refuses_cross_host_lock_even_with_force(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    lock_file = repo / ".ai" / "cache" / "run" / "worker.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text(
+        json.dumps({"pid": 123, "owner": "remote", "hostname": "other-host", "acquired_at": "2026-01-01T00:00:00Z"}) + "\n",
+        encoding="utf-8",
+    )
+    result = run_ai("worker", "stop", "--force", "--json", cwd=repo)
+    assert result.returncode == 14
+    payload = json.loads(result.stdout)
+    assert payload["action"] == "refused"
+    assert payload["reason"] == "cross_host"
+    assert lock_file.exists()
 
 
 def test_queue_lock_serializes_mutation_file(tmp_path: Path) -> None:
@@ -672,6 +755,7 @@ def test_ci_mutation_commands_rejected(tmp_path: Path) -> None:
         ("queue", "lease", "--worker-id", "ci"),
         ("queue", "recover-expired"),
         ("queue", "archive-dead", "--older-than-days", "0"),
+        ("worker", "stop", "--force"),
         ("trust", "revoke", "missing"),
         ("inbox", "approve", "missing"),
         ("inbox", "reject", "missing"),

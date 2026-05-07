@@ -20,6 +20,7 @@ uv run --project .ai/runtime ai render --dry-run
 uv run --project .ai/runtime ai doctor --strict
 printf '{"agent":"codex"}' | uv run --project .ai/runtime ai hook SessionStart --json
 uv run --project .ai/runtime ai worker health --json
+uv run --project .ai/runtime ai worker status --json
 uv run --project .ai/runtime ai index rebuild --json
 uv run --project .ai/runtime ai code query "worker IPC" --json
 uv run --project .ai/runtime ai obs metrics --json
@@ -64,6 +65,7 @@ GitHub Actions uses the same Makefile targets as local release verification.
 ## Operations
 
 Use `OPERATIONS.md` as the handoff runbook for daily health checks, queue recovery, trust setup, diagnostics bundles, upgrades, rollback, and troubleshooting.
+Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for commercial hardening rounds.
 
 ## Locked Rules
 
@@ -82,7 +84,7 @@ Use `OPERATIONS.md` as the handoff runbook for daily health checks, queue recove
 | CLI | `ai version`, `ai config show` | working |
 | Render | `ai render --dry-run`, `ai render --no-overwrite` | working |
 | Doctor | `ai doctor --strict --json` | working |
-| Worker IPC | `ai worker health --json` | local envelope validation |
+| Worker IPC | `ai worker health/status/stop --force --json` | local envelope validation and singleton lock recovery |
 | Hooks | `ai hook <HookName> --json` with JSON stdin | fast-path, redacted, append-only outside CI |
 | Memory | `ai memory append-event` | append-only JSONL |
 | Audit | `ai audit append --action ...` | yearly audit JSONL + audit index |

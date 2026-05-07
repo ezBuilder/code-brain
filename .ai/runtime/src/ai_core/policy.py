@@ -27,6 +27,7 @@ WRITE_COMMANDS = {
     "diagnostics_write",
     "memory",
     "audit",
+    "worker_stop",
 }
 
 

@@ -27,7 +27,9 @@ for needle in \
   "release-gate.summary.json" \
   "ai report release-gate-summary" \
   "queue status" \
+  "worker stop --force" \
   "worker health" \
+  "PRODUCTION_HARDENING_BACKLOG.md" \
   "./scripts/release-gate.sh" \
   "make env-check" \
   "make preflight" \
@@ -71,6 +73,16 @@ make -n clean-all >/dev/null
 
 CI=true uv run --project .ai/runtime ai obs metrics --json >/dev/null
 CI=true uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
+
+set +e
+CI=true uv run --project .ai/runtime ai worker stop --force --json >/tmp/code-brain-worker-stop-ci.out 2>/tmp/code-brain-worker-stop-ci.err
+status=$?
+set -e
+if [[ "$status" -ne 16 ]]; then
+  echo "expected CI worker stop rejection exit 16, got $status" >&2
+  cat /tmp/code-brain-worker-stop-ci.err >&2
+  exit 1
+fi
 
 set +e
 CI=true uv run --project .ai/runtime ai render >/tmp/code-brain-docs-ci-write.out 2>/tmp/code-brain-docs-ci-write.err

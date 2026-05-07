@@ -19,6 +19,7 @@ make release-gate
 uv run --project .ai/runtime ai doctor --strict --json
 uv run --project .ai/runtime ai report status --json
 uv run --project .ai/runtime ai report release-gate-summary --json
+uv run --project .ai/runtime ai worker status --json
 git status --short
 ```
 
@@ -54,6 +55,7 @@ git status --short
 - CI JSON write rejection must include `CI_READ_ONLY`.
 - CI must allow read-only status/list/report/metrics commands.
 - CI worker health must remain read-only and must not create `.ai/cache/run/worker.token`.
+- CI must reject `worker stop --force`; worker lock cleanup is a local operator action.
 
 ## Build Artifact
 

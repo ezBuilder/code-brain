@@ -29,6 +29,8 @@ for needle in \
   "summary-observe" \
   "summary-parity.py" \
   "RELEASE_GATE_SUMMARY_SCHEMA_VERSION" \
+  "dep_advisory" \
+  "finding_count" \
   "audit_chain" \
   "prev_sha_mismatch" \
   "dep-advisory.json" \
@@ -75,7 +77,8 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json >/dev
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
 uv run --project .ai/runtime ai report release-gate-summary --git-sha "$(git rev-parse HEAD)" --json >/dev/null
-uv run --project .ai/runtime python -c 'from ai_core.report import RELEASE_GATE_SUMMARY_SCHEMA_VERSION; assert RELEASE_GATE_SUMMARY_SCHEMA_VERSION == 1'
+uv run --project .ai/runtime python -c 'from ai_core.report import RELEASE_GATE_SUMMARY_SCHEMA_VERSION; assert RELEASE_GATE_SUMMARY_SCHEMA_VERSION == 2'
+uv run --project .ai/runtime python -c 'from ai_core.report import release_gate_summary; from pathlib import Path; s=release_gate_summary(Path(".")); assert set(s["dep_advisory"]) == {"finding_count", "mode", "generated_at", "skipped"}'
 uv run --project .ai/runtime python -c 'from ai_core.doctor import check_audit_chain; from pathlib import Path; r=check_audit_chain(Path(".")); assert r.ok'
 CODE_BRAIN_DEP_ADVISORY_OFFLINE=1 ./scripts/dep-advisory.sh >/dev/null
 ./scripts/env-check.sh >/dev/null

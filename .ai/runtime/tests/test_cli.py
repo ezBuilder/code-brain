@@ -128,7 +128,8 @@ def test_release_gate_summary_command_json() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["git_sha"] == "deadbeef"
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
+    assert set(payload["dep_advisory"]) == {"finding_count", "mode", "generated_at", "skipped"}
 
 
 def test_release_gate_summary_schema_guard_rejects_drift() -> None:
@@ -141,6 +142,7 @@ def test_release_gate_summary_schema_guard_rejects_drift() -> None:
         "ci": True,
         "release_ready": True,
         "release_artifacts": {},
+        "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
         "checks": [],
     }
     assert_release_gate_summary_schema(payload)
@@ -151,7 +153,7 @@ def test_release_gate_summary_schema_guard_rejects_drift() -> None:
         assert "extra=['unexpected']" in str(exc)
     else:
         raise AssertionError("extra summary field should fail schema guard")
-    wrong_version = dict(payload, schema_version=2)
+    wrong_version = dict(payload, schema_version=1)
     try:
         assert_release_gate_summary_schema(wrong_version)
     except ValueError as exc:
@@ -307,12 +309,13 @@ def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_pa
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
         "ci": True,
         "release_ready": True,
         "release_artifacts": {"all_present": True, "all_valid": True, "all_current": True},
+        "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
         "checks": [{"name": "layout", "ok": True, "detail": "ok"}],
     }
     left.write_text(json.dumps(payload), encoding="utf-8")
@@ -327,12 +330,13 @@ def test_summary_parity_release_ready_mismatch_fails(tmp_path: Path) -> None:
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
     base = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
         "ci": True,
         "release_ready": True,
         "release_artifacts": {},
+        "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
         "checks": [],
     }
     left.write_text(json.dumps(base), encoding="utf-8")
@@ -349,12 +353,13 @@ def test_summary_parity_check_set_mismatch_fails(tmp_path: Path) -> None:
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
     base = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
         "ci": True,
         "release_ready": True,
         "release_artifacts": {},
+        "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
         "checks": [{"name": "layout", "ok": True}, {"name": "queue_age", "ok": True}],
     }
     left.write_text(json.dumps(base), encoding="utf-8")
@@ -371,12 +376,13 @@ def test_summary_parity_missing_or_invalid_file_returns_two(tmp_path: Path) -> N
     left.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "generated_at": "2026-01-01T00:00:00Z",
                 "git_sha": "abc123",
                 "ci": True,
                 "release_ready": True,
                 "release_artifacts": {},
+                "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
                 "checks": [],
             }
         ),
@@ -395,12 +401,13 @@ def test_summary_parity_schema_drift_returns_two(tmp_path: Path) -> None:
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
         "ci": True,
         "release_ready": True,
         "release_artifacts": {},
+        "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
         "checks": [],
     }
     left.write_text(json.dumps(dict(payload, unexpected=True)), encoding="utf-8")

@@ -69,6 +69,7 @@ Use `make clean-cache` for ignored runtime cache files, `make clean-artifacts` f
 GitHub Actions uses the same Makefile targets as local release verification.
 `.github/workflows/release-gate.yml` runs the full local gate with read-only repository permissions and uploads `dist/release-gate.summary.json` plus release artifacts for review.
 `RELEASE_GATE_SUMMARY_SCHEMA_VERSION` locks the CI summary contract so silent field drift fails generation or cross-OS parity comparison.
+Release summary schema v2 includes `dep_advisory.finding_count`, `mode`, `generated_at`, and `skipped` from the advisory artifact.
 Dependency vulnerability scanning is advisory-only: `scripts/dep-advisory.sh` writes `dist/dep-advisory.json`, never fails the release gate on findings, and records offline/tool skips explicitly.
 
 ## Operations

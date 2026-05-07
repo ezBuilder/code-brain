@@ -29,6 +29,7 @@ def load_summary(path: Path) -> dict[str, Any]:
 
 def canonical(payload: dict[str, Any]) -> dict[str, Any]:
     artifacts = payload.get("release_artifacts", {})
+    dep_advisory = payload.get("dep_advisory", {})
     checks = payload.get("checks", [])
     check_map = {}
     if isinstance(checks, list):
@@ -60,6 +61,10 @@ def canonical(payload: dict[str, Any]) -> dict[str, Any]:
         "git_sha": payload.get("git_sha"),
         "release_ready": payload.get("release_ready"),
         "release_artifacts": artifact_subset,
+        "dep_advisory": {
+            key: dep_advisory.get(key) if isinstance(dep_advisory, dict) else None
+            for key in ("finding_count", "mode", "skipped")
+        },
         "checks": dict(sorted(check_map.items())),
     }
 
@@ -68,7 +73,7 @@ def compare(left: dict[str, Any], right: dict[str, Any]) -> list[dict[str, Any]]
     left_canonical = canonical(left)
     right_canonical = canonical(right)
     mismatches = []
-    for field in ("schema_version", "git_sha", "release_ready", "release_artifacts", "checks"):
+    for field in ("schema_version", "git_sha", "release_ready", "release_artifacts", "dep_advisory", "checks"):
         if left_canonical.get(field) != right_canonical.get(field):
             mismatches.append({"field": field, "left": left_canonical.get(field), "right": right_canonical.get(field)})
     return mismatches

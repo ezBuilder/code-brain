@@ -14,7 +14,7 @@ from .obs import metrics
 from .redact import redact_value
 from .worker.ipc import PROTOCOL_VERSION
 
-RELEASE_GATE_SUMMARY_SCHEMA_VERSION = 1
+RELEASE_GATE_SUMMARY_SCHEMA_VERSION = 2
 RELEASE_GATE_SUMMARY_FIELDS = frozenset(
     {
         "schema_version",
@@ -23,6 +23,7 @@ RELEASE_GATE_SUMMARY_FIELDS = frozenset(
         "ci",
         "release_ready",
         "release_artifacts",
+        "dep_advisory",
         "checks",
     }
 )
@@ -76,10 +77,35 @@ def release_gate_summary(root: Path, *, git_sha: str | None = None, status: dict
         "ci": any(os.environ.get(name) for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI")),
         "release_ready": bool(payload.get("release_ready")),
         "release_artifacts": redact_value(artifacts),
+        "dep_advisory": redact_value(dep_advisory_summary(root)),
         "checks": redact_value(checks),
     }
     assert_release_gate_summary_schema(summary)
     return summary
+
+
+def dep_advisory_summary(root: Path) -> dict[str, Any]:
+    path = root / "dist" / "dep-advisory.json"
+    if not path.exists():
+        return {"finding_count": None, "mode": None, "generated_at": None, "skipped": "missing"}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"finding_count": None, "mode": None, "generated_at": None, "skipped": "invalid-json"}
+    if not isinstance(payload, dict):
+        return {"finding_count": None, "mode": None, "generated_at": None, "skipped": "invalid-schema"}
+    finding_count = payload.get("finding_count")
+    if not isinstance(finding_count, int):
+        finding_count = None
+    mode = payload.get("mode")
+    generated_at = payload.get("generated_at")
+    skipped = payload.get("skipped")
+    return {
+        "finding_count": finding_count,
+        "mode": mode if isinstance(mode, str) else None,
+        "generated_at": generated_at if isinstance(generated_at, str) else None,
+        "skipped": skipped if skipped is None or isinstance(skipped, str) else "invalid-schema",
+    }
 
 
 def assert_release_gate_summary_schema(payload: dict[str, Any]) -> None:
@@ -93,6 +119,15 @@ def assert_release_gate_summary_schema(payload: dict[str, Any]) -> None:
             "release gate summary schema version mismatch: "
             f"expected={RELEASE_GATE_SUMMARY_SCHEMA_VERSION}, actual={payload.get('schema_version')}"
         )
+    dep_advisory = payload.get("dep_advisory")
+    if not isinstance(dep_advisory, dict):
+        raise ValueError("release gate summary dep_advisory must be an object")
+    expected_dep_fields = {"finding_count", "mode", "generated_at", "skipped"}
+    dep_fields = set(dep_advisory)
+    if dep_fields != expected_dep_fields:
+        missing = sorted(expected_dep_fields - dep_fields)
+        extra = sorted(dep_fields - expected_dep_fields)
+        raise ValueError(f"release gate summary dep_advisory fields mismatch: missing={missing}, extra={extra}")
 
 
 def release_notes(root: Path) -> str:

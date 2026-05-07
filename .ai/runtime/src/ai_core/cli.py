@@ -192,6 +192,7 @@ def emit(payload: object, *, as_json: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    os.umask(0o077)
     parser = build_parser()
     args = parser.parse_args(argv)
     as_json = bool(args.json or getattr(args, "command_json", False))

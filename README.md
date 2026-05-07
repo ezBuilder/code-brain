@@ -12,6 +12,7 @@ This implementation follows the Claude-authored PRD and MVP implementation plan 
 ```bash
 cd code-brain
 make env-check
+make preflight
 make lint
 make quick
 uv run --project .ai/runtime ai version
@@ -33,6 +34,7 @@ uv run --project .ai/runtime ai report status --json
 ```bash
 ./bootstrap.sh
 ./scripts/env-check.sh
+./scripts/preflight.sh --check-only --json
 ./scripts/lint.sh
 ./scripts/smoke.sh
 ./scripts/docs-check.sh
@@ -43,16 +45,17 @@ uv run --project .ai/runtime ai report status --json
 ./scripts/release-gate.sh
 make lint
 make env-check
+make preflight
 make release-gate
 ```
 
 `scripts/smoke.sh` copies the repository to a temporary directory before running write-heavy flows such as queue, trust, inbox, notify, diagnostics bundle, and upgrade rollback. The working tree stays clean.
-`bootstrap.sh` starts with the same environment check used by the release gate, then renders with `--dry-run` under CI/GitHub Actions.
+`bootstrap.sh` starts with the same environment and fresh-clone preflight checks used by the release gate, then renders with `--dry-run` under CI/GitHub Actions.
 `bootstrap.ps1` follows the same CI dry-run render policy for PowerShell operators.
 `scripts/docs-check.sh` verifies the operator runbook commands and CI write-denial behavior.
 `scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, provenance, and release notes without executing package code.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.
-`Makefile` provides operator shortcuts such as `make env-check`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
+`Makefile` provides operator shortcuts such as `make env-check`, `make preflight`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
 Use `make clean-cache` for ignored runtime cache files, `make clean-artifacts` for `dist/`, and `make clean-all` for cache, virtualenv, and release artifacts.
 GitHub Actions uses the same Makefile targets as local release verification.
 

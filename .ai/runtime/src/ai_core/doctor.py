@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -33,6 +34,7 @@ def run_checks(root: Path) -> list[Check]:
         check_hot_path_slo(root),
         check_secret_scan(root),
         check_redaction_self_test(),
+        check_bootstrap_preflight(root),
         check_diagnostics(root),
     ]
     return checks
@@ -219,11 +221,33 @@ def check_redaction_self_test() -> Check:
     return Check("redaction_self_test", not leaked and "[REDACTED]" in text, "ok" if not leaked else "leaked: " + str(len(leaked)))
 
 
+def check_bootstrap_preflight(root: Path) -> Check:
+    script = root / "scripts" / "preflight.sh"
+    if not script.exists():
+        return Check("bootstrap_preflight", False, "scripts/preflight.sh missing")
+    result = subprocess.run(
+        [str(script), "--check-only", "--json"],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        return Check("bootstrap_preflight", False, detail[:500])
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return Check("bootstrap_preflight", False, f"invalid json: {exc}")
+    return Check("bootstrap_preflight", payload.get("ok") is True, "ok" if payload.get("ok") is True else "failed")
+
+
 def check_diagnostics(root: Path) -> Check:
     try:
         from .obs import diagnostics
 
-        payload = diagnostics(root, dry_run=True)
+        payload = diagnostics(root, dry_run=True, include_doctor=False)
     except Exception as exc:
         return Check("diagnostics_dry_run", False, str(exc))
     return Check("diagnostics_dry_run", bool(payload.get("ok")), "ok" if payload.get("ok") else "failed")

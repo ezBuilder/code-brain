@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 cd "$(dirname "$0")"
+./scripts/preflight.sh --check-only >/dev/null
 ./scripts/env-check.sh >/dev/null
 uv sync --project .ai/runtime
 if [[ "${CI:-}" =~ ^(1|true|yes)$ || -n "${GITHUB_ACTIONS:-}" ]]; then

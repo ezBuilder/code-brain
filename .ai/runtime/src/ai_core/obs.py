@@ -63,8 +63,8 @@ def slo_bench(root: Path, iterations: int = 10) -> dict[str, Any]:
     return {"ok": p95 <= 200, "iterations": iterations, "p95_ms": p95, "target_ms": 200, "samples_ms": elapsed}
 
 
-def diagnostics(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
-    checks = as_payload(run_checks(root))
+def diagnostics(root: Path, *, dry_run: bool = False, include_doctor: bool = True) -> dict[str, Any]:
+    checks = as_payload(run_checks(root)) if include_doctor else {"ok": True, "checks": []}
     bundle = {
         "created_at": now_iso(),
         "runtime_version": __version__,
@@ -104,4 +104,3 @@ def prune_diagnostics(root: Path, *, keep_days: int = 30) -> dict[str, Any]:
             shutil.rmtree(path)
             removed += 1
     return {"ok": True, "removed": removed}
-

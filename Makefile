@@ -3,12 +3,13 @@ SHELL := /usr/bin/env bash
 
 LATEST_ARCHIVE := $(shell ls -t dist/code-brain-*.tar.gz 2>/dev/null | head -n 1)
 
-.PHONY: help env-check lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check tamper-check release-gate report release-notes clean-cache clean-artifacts clean-all
+.PHONY: help env-check preflight lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check tamper-check release-gate report release-notes clean-cache clean-artifacts clean-all
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  make env-check         Verify required local toolchain' \
+		'  make preflight         Verify fresh-clone bootstrap readiness' \
 		'  make lint              Run static script and Python compile checks' \
 		'  make quick             Run fast local health checks' \
 		'  make package           Build release artifacts under dist/' \
@@ -23,6 +24,9 @@ help:
 
 env-check:
 	./scripts/env-check.sh
+
+preflight:
+	./scripts/preflight.sh --check-only --json
 
 lint:
 	./scripts/lint.sh

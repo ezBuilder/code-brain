@@ -8,6 +8,7 @@ REPORT_OUTPUT="$(mktemp)"
 trap 'rm -f "$PACKAGE_OUTPUT" "$REPORT_OUTPUT"' EXIT
 
 ./scripts/env-check.sh >/dev/null
+./scripts/preflight.sh --check-only >/dev/null
 ./scripts/lint.sh
 ./bootstrap.sh
 ./scripts/smoke.sh

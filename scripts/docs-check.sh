@@ -27,6 +27,7 @@ for needle in \
   "worker health" \
   "./scripts/release-gate.sh" \
   "make env-check" \
+  "make preflight" \
   "make lint" \
   "make release-gate" \
   "make clean-all" \
@@ -50,7 +51,9 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json >/dev
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
 ./scripts/env-check.sh >/dev/null
+./scripts/preflight.sh --check-only --json >/dev/null
 make -n env-check >/dev/null
+make -n preflight >/dev/null
 make -n lint >/dev/null
 make -n quick >/dev/null
 make -n package >/dev/null
@@ -92,6 +95,7 @@ tar \
 cd "$COPY"
 unset CI GITHUB_ACTIONS
 uv run --project .ai/runtime ai render --json >/dev/null
+./scripts/preflight.sh --check-only --json >/dev/null
 uv run --project .ai/runtime ai queue recover-expired --json >/dev/null
 uv run --project .ai/runtime ai queue archive-dead --older-than-days 30 --json >/dev/null
 uv run --project .ai/runtime ai diagnostics bundle --json >/dev/null

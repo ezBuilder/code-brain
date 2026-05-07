@@ -114,6 +114,27 @@ def test_doctor_strict_passes_after_render() -> None:
     assert "target_ms=200" in slo_check["detail"]
     redaction_check = next(check for check in payload["checks"] if check["name"] == "redaction_self_test")
     assert redaction_check["ok"] is True
+    preflight_check = next(check for check in payload["checks"] if check["name"] == "bootstrap_preflight")
+    assert preflight_check["ok"] is True
+
+
+def test_preflight_check_only_json(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = subprocess.run(
+        ["./scripts/preflight.sh", "--check-only", "--json"],
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["check_only"] is True
+    assert payload["checks"]["python"]["minimum"] == "3.11"
+    assert payload["checks"]["sops"]["required"] is False
+    assert payload["checks"]["age"]["required"] is False
 
 
 def test_redaction_expanded_secret_shapes() -> None:

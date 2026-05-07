@@ -15,6 +15,9 @@ from ai_core.worker.lock import queue_lock
 PRIORITIES = {"P0", "P1", "P2", "P3"}
 LEASE_TTL_SECONDS = 300
 DEFAULT_MAX_ATTEMPTS = 3
+MAX_ATTEMPTS_LIMIT = 50
+RECOVERY_SWEEP_INTERVAL_SECONDS = 60
+RECOVERY_STALE_SECONDS = 3600
 
 
 def now() -> datetime:
@@ -34,9 +37,12 @@ def ensure_queue_dirs(root: Path) -> None:
         (queue_root(root) / name).mkdir(parents=True, exist_ok=True)
 
 
-def enqueue(root: Path, priority: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+def enqueue(root: Path, priority: str, kind: str, payload: dict[str, Any], *, max_attempts: int | None = None) -> dict[str, Any]:
     if priority not in PRIORITIES:
         raise ValueError(f"invalid priority: {priority}")
+    attempts_limit = max_attempts if max_attempts is not None else DEFAULT_MAX_ATTEMPTS
+    if attempts_limit < 1 or attempts_limit > MAX_ATTEMPTS_LIMIT:
+        raise ValueError(f"max_attempts must be between 1 and {MAX_ATTEMPTS_LIMIT}")
     with queue_lock(root):
         ensure_queue_dirs(root)
         job_id = f"{priority.lower()}-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
@@ -47,7 +53,7 @@ def enqueue(root: Path, priority: str, kind: str, payload: dict[str, Any]) -> di
             "payload": redact_value(payload),
             "status": "pending",
             "attempts": 0,
-            "max_attempts": DEFAULT_MAX_ATTEMPTS,
+            "max_attempts": attempts_limit,
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
@@ -60,6 +66,7 @@ def enqueue(root: Path, priority: str, kind: str, payload: dict[str, Any]) -> di
 
 
 def lease_next(root: Path, worker_id: str, *, priority: str | None = None) -> dict[str, Any]:
+    sweep_if_due(root)
     with queue_lock(root):
         ensure_queue_dirs(root)
         candidates = sorted(path for path in queue_root(root).glob("*.json") if not priority or path.name.startswith(priority.lower() + "-"))
@@ -103,6 +110,7 @@ def fail(root: Path, job_id: str, lease_id: str, reason: str) -> dict[str, Any]:
         path = find_processing(root, job_id)
         job = read_job(path)
         require_lease(job, lease_id)
+        append_attempt_history(job, outcome="failed", reason=reason)
         job.update({"status": "dead", "failed_at": now_iso(), "failure_reason": reason, "updated_at": now_iso()})
         target = queue_root(root) / "dead" / path.name
         write_job(target, job)
@@ -115,34 +123,72 @@ def recover_expired(root: Path) -> dict[str, Any]:
     with queue_lock(root):
         recovered = 0
         dead_lettered = 0
+        skipped = 0
         current = now()
         for path in sorted((queue_root(root) / "processing").glob("*.json")):
             job = read_job(path)
-            expires = parse_iso(str(job.get("lease_expires_at", "")))
+            try:
+                expires = parse_iso(str(job.get("lease_expires_at", "")))
+            except ValueError:
+                skipped += 1
+                append_audit(
+                    root,
+                    action="queue.recovery_skip",
+                    category="queue",
+                    payload={"job_id": job.get("id"), "reason": "invalid_expires_at"},
+                )
+                continue
             if expires and expires < current:
                 attempts = int(job.get("attempts", 0) or 0)
                 max_attempts = int(job.get("max_attempts", DEFAULT_MAX_ATTEMPTS) or DEFAULT_MAX_ATTEMPTS)
                 if attempts >= max_attempts:
+                    reason = f"max_attempts_exceeded:{attempts}/{max_attempts}"
+                    append_attempt_history(job, outcome="promoted_dead", expired_at=expires.isoformat().replace("+00:00", "Z"))
                     job.update(
                         {
                             "status": "dead",
                             "failed_at": now_iso(),
-                            "failure_reason": "lease expired after max attempts",
+                            "failure_reason": reason,
                             "updated_at": now_iso(),
                         }
                     )
                     target = queue_root(root) / "dead" / path.name
                     write_job(target, job)
                     dead_lettered += 1
+                    append_audit(
+                        root,
+                        action="queue.dead_letter_promote",
+                        category="queue",
+                        payload={"job_id": job.get("id"), "attempts": attempts, "max_attempts": max_attempts, "reason": reason},
+                    )
                 else:
-                    job.update({"status": "pending", "lease_id": None, "worker_id": None, "updated_at": now_iso()})
+                    append_attempt_history(job, outcome="expired", expired_at=expires.isoformat().replace("+00:00", "Z"))
+                    job.update(
+                        {
+                            "status": "pending",
+                            "lease_id": None,
+                            "worker_id": None,
+                            "leased_at": None,
+                            "lease_expires_at": None,
+                            "last_recovery_at": now_iso(),
+                            "updated_at": now_iso(),
+                        }
+                    )
                     target = queue_root(root) / path.name
                     write_job(target, job)
                     recovered += 1
                 path.unlink()
         if recovered or dead_lettered:
             append_audit(root, action="queue.recover_expired", category="queue", payload={"recovered": recovered, "dead_lettered": dead_lettered})
-        return {"ok": True, "recovered": recovered, "dead_lettered": dead_lettered}
+        state = write_recovery_state(root, recovered=recovered, dead_lettered=dead_lettered, skipped=skipped)
+        return {
+            "ok": True,
+            "recovered": recovered,
+            "dead_lettered": dead_lettered,
+            "promoted": dead_lettered,
+            "skipped": skipped,
+            "recovery": state,
+        }
 
 
 def archive_dead(root: Path, *, older_than_days: int = 30) -> dict[str, Any]:
@@ -166,13 +212,101 @@ def archive_dead(root: Path, *, older_than_days: int = 30) -> dict[str, Any]:
 def status(root: Path) -> dict[str, Any]:
     ensure_queue_dirs(root)
     expired_processing = expired_processing_jobs(root)
+    recovery = recovery_status(root)
     return {
         "ok": True,
         "pending": len(list(queue_root(root).glob("*.json"))),
         "processing": len(list((queue_root(root) / "processing").glob("*.json"))),
         "dead": len(list((queue_root(root) / "dead").glob("*.json"))),
         "expired_processing": len(expired_processing),
+        "recovery": recovery,
     }
+
+
+def recovery_state_path(root: Path) -> Path:
+    return root / ".ai" / "cache" / "run" / "queue.recovery.json"
+
+
+def read_recovery_state(root: Path) -> dict[str, Any] | None:
+    path = recovery_state_path(root)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "invalid_recovery_state"}
+    return payload if isinstance(payload, dict) else {"ok": False, "error": "invalid_recovery_state"}
+
+
+def write_recovery_state(root: Path, *, recovered: int, dead_lettered: int, skipped: int) -> dict[str, Any]:
+    ensure_queue_dirs(root)
+    expired_remaining = len(expired_processing_jobs(root))
+    state = {
+        "ok": True,
+        "last_run_at": now_iso(),
+        "last_recovered": recovered,
+        "last_dead_lettered": dead_lettered,
+        "last_promoted": dead_lettered,
+        "last_skipped": skipped,
+        "processing_remaining": len(list((queue_root(root) / "processing").glob("*.json"))),
+        "expired_remaining": expired_remaining,
+    }
+    path = recovery_state_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    path.chmod(0o600)
+    return state
+
+
+def recovery_status(root: Path) -> dict[str, Any]:
+    state = read_recovery_state(root)
+    expired = expired_processing_jobs(root)
+    if not state:
+        return {"ok": True, "state": "missing", "lag_seconds": None, "expired_processing": len(expired)}
+    if state.get("ok") is False:
+        return {"ok": False, "state": "invalid", "lag_seconds": None, "expired_processing": len(expired)}
+    try:
+        last_run = parse_iso(str(state.get("last_run_at", "")))
+    except ValueError:
+        return {"ok": False, "state": "invalid", "lag_seconds": None, "expired_processing": len(expired)}
+    lag = int((now() - last_run).total_seconds()) if last_run else None
+    return {
+        "ok": lag is not None and lag <= RECOVERY_STALE_SECONDS,
+        "state": "present",
+        "lag_seconds": lag,
+        "expired_processing": len(expired),
+        "last_recovered": state.get("last_recovered", 0),
+        "last_dead_lettered": state.get("last_dead_lettered", state.get("last_promoted", 0)),
+        "last_skipped": state.get("last_skipped", 0),
+    }
+
+
+def sweep_if_due(root: Path) -> None:
+    state = read_recovery_state(root)
+    if state and state.get("ok") is not False:
+        try:
+            last_run = parse_iso(str(state.get("last_run_at", "")))
+        except ValueError:
+            last_run = None
+        if last_run and (now() - last_run).total_seconds() < RECOVERY_SWEEP_INTERVAL_SECONDS:
+            return
+    recover_expired(root)
+
+
+def append_attempt_history(job: dict[str, Any], *, outcome: str, expired_at: str | None = None, reason: str | None = None) -> None:
+    history = job.get("attempt_history")
+    if not isinstance(history, list):
+        history = []
+    record = {"attempt": int(job.get("attempts", 0) or 0), "outcome": outcome, "at": now_iso()}
+    if expired_at:
+        record["expired_at"] = expired_at
+    if reason:
+        record["reason"] = reason
+    history.append(record)
+    job["attempt_history"] = history[-10:]
 
 
 def expired_processing_jobs(root: Path) -> list[dict[str, Any]]:

@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_enqueue = queue_sub.add_parser("enqueue")
     queue_enqueue.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], required=True)
     queue_enqueue.add_argument("--kind", required=True)
+    queue_enqueue.add_argument("--max-attempts", type=int)
     queue_enqueue.add_argument("--json", action="store_true", dest="command_json")
     queue_lease = queue_sub.add_parser("lease")
     queue_lease.add_argument("--worker-id", required=True)
@@ -234,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             reject_ci_write("queue")
             from .worker.scheduler import enqueue
 
-            payload = enqueue(root, args.priority, args.kind, read_payload())
+            payload = enqueue(root, args.priority, args.kind, read_payload(), max_attempts=args.max_attempts)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "lease":

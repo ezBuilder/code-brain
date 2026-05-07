@@ -255,10 +255,19 @@ def check_worker_singleton_lock(root: Path) -> Check:
 
 
 def check_queue_lease_recovery(root: Path) -> Check:
-    from .worker.scheduler import expired_processing_jobs
+    from .worker.scheduler import RECOVERY_STALE_SECONDS, expired_processing_jobs, recovery_status
 
     expired = expired_processing_jobs(root)
-    return Check("queue_lease_recovery", not expired, "ok" if not expired else "expired processing jobs: " + json.dumps(expired[:5], sort_keys=True))
+    state = recovery_status(root)
+    if expired:
+        return Check("queue_lease_recovery", False, "expired processing jobs: " + json.dumps(expired[:5], sort_keys=True))
+    if state.get("state") == "invalid":
+        return Check("queue_lease_recovery", False, "invalid recovery state")
+    lag = state.get("lag_seconds")
+    if isinstance(lag, int) and lag > RECOVERY_STALE_SECONDS:
+        return Check("queue_lease_recovery", False, f"recovery state stale lag={lag}s")
+    detail = "ok" if lag is None else f"ok lag={lag}s"
+    return Check("queue_lease_recovery", True, detail)
 
 
 def check_diagnostics(root: Path) -> Check:

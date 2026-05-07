@@ -37,7 +37,10 @@ def write_log(root: Path, level: str, event: str, payload: dict[str, Any]) -> di
 
 
 def metrics(root: Path) -> dict[str, Any]:
+    from .worker.scheduler import recovery_status
+
     queue_root = root / ".ai" / "memory" / "queue"
+    recovery = recovery_status(root)
     return {
         "ok": True,
         "runtime_version": __version__,
@@ -45,6 +48,10 @@ def metrics(root: Path) -> dict[str, Any]:
             "pending": len(list(queue_root.glob("*.json"))),
             "processing": len(list((queue_root / "processing").glob("*.json"))),
             "dead": len(list((queue_root / "dead").glob("*.json"))),
+            "expired_processing": recovery["expired_processing"],
+            "recovery_lag_seconds": recovery["lag_seconds"],
+            "last_recovered": recovery.get("last_recovered", 0),
+            "last_dead_lettered": recovery.get("last_dead_lettered", 0),
         },
         "cache": {
             "code_sqlite_exists": (root / ".ai" / "cache" / "code.sqlite").exists(),

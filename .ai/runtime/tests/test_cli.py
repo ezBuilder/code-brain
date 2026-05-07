@@ -72,6 +72,7 @@ def copy_repo(tmp_path: Path) -> Path:
         ".ai/memory/inbox/*.json",
         ".ai/cache/logs/*.jsonl",
         ".ai/cache/diagnostics/*",
+        ".ai/cache/run/queue.recovery.json",
     ):
         for path in target.glob(pattern):
             path.unlink()
@@ -407,6 +408,41 @@ def test_queue_jobs_default_max_attempts(tmp_path: Path) -> None:
     assert job["max_attempts"] == 3
 
 
+def test_queue_enqueue_accepts_max_attempts(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    enqueue_result = run_ai_input(
+        "queue",
+        "enqueue",
+        "--priority",
+        "P2",
+        "--kind",
+        "index",
+        "--max-attempts",
+        "2",
+        "--json",
+        stdin="{}",
+        cwd=repo,
+    )
+    assert enqueue_result.returncode == 0, enqueue_result.stdout + enqueue_result.stderr
+    assert json.loads(enqueue_result.stdout)["job"]["max_attempts"] == 2
+
+    bad_result = run_ai_input(
+        "queue",
+        "enqueue",
+        "--priority",
+        "P2",
+        "--kind",
+        "index",
+        "--max-attempts",
+        "0",
+        "--json",
+        stdin="{}",
+        cwd=repo,
+    )
+    assert bad_result.returncode == 1
+    assert "max_attempts must be between" in json.loads(bad_result.stdout)["error"]
+
+
 def test_recover_expired_requeues_below_max_and_releases_new_lease(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     enqueue_result = run_ai_input("queue", "enqueue", "--priority", "P2", "--kind", "index", "--json", stdin="{}", cwd=repo)
@@ -420,7 +456,11 @@ def test_recover_expired_requeues_below_max_and_releases_new_lease(tmp_path: Pat
     processing_path.write_text(json.dumps(job, sort_keys=True) + "\n", encoding="utf-8")
     recover_result = run_ai("queue", "recover-expired", "--json", cwd=repo)
     assert recover_result.returncode == 0, recover_result.stdout + recover_result.stderr
-    assert json.loads(recover_result.stdout) == {"ok": True, "recovered": 1, "dead_lettered": 0}
+    recovered = json.loads(recover_result.stdout)
+    assert recovered["recovered"] == 1
+    assert recovered["dead_lettered"] == 0
+    assert recovered["promoted"] == 0
+    assert recovered["recovery"]["last_recovered"] == 1
     next_lease = run_ai("queue", "lease", "--worker-id", "worker-2", "--json", cwd=repo)
     leased_again = json.loads(next_lease.stdout)["job"]
     assert leased_again["id"] == leased["id"]
@@ -442,11 +482,52 @@ def test_recover_expired_dead_letters_at_max_attempts(tmp_path: Path) -> None:
     processing_path.write_text(json.dumps(job, sort_keys=True) + "\n", encoding="utf-8")
     recover_result = run_ai("queue", "recover-expired", "--json", cwd=repo)
     assert recover_result.returncode == 0, recover_result.stdout + recover_result.stderr
-    assert json.loads(recover_result.stdout) == {"ok": True, "recovered": 0, "dead_lettered": 1}
+    recovered = json.loads(recover_result.stdout)
+    assert recovered["recovered"] == 0
+    assert recovered["dead_lettered"] == 1
+    assert recovered["promoted"] == 1
     dead_path = repo / ".ai" / "memory" / "queue" / "dead" / f"{leased['id']}.json"
     dead = json.loads(dead_path.read_text(encoding="utf-8"))
     assert dead["status"] == "dead"
-    assert dead["failure_reason"] == "lease expired after max attempts"
+    assert dead["failure_reason"] == "max_attempts_exceeded:3/3"
+    assert dead["attempt_history"][-1]["outcome"] == "promoted_dead"
+
+
+def test_lease_next_triggers_due_recovery_sweep(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    enqueue_result = run_ai_input("queue", "enqueue", "--priority", "P2", "--kind", "index", "--json", stdin="{}", cwd=repo)
+    assert enqueue_result.returncode == 0
+    lease_result = run_ai("queue", "lease", "--worker-id", "worker-1", "--json", cwd=repo)
+    leased = json.loads(lease_result.stdout)["job"]
+    processing_path = repo / ".ai" / "memory" / "queue" / "processing" / f"{leased['id']}.json"
+    job = json.loads(processing_path.read_text(encoding="utf-8"))
+    job["lease_expires_at"] = "2000-01-01T00:00:00Z"
+    processing_path.write_text(json.dumps(job, sort_keys=True) + "\n", encoding="utf-8")
+    (repo / ".ai" / "cache" / "run" / "queue.recovery.json").unlink()
+
+    swept_lease = run_ai("queue", "lease", "--worker-id", "worker-2", "--json", cwd=repo)
+    assert swept_lease.returncode == 0, swept_lease.stdout + swept_lease.stderr
+    leased_again = json.loads(swept_lease.stdout)["job"]
+    assert leased_again["id"] == leased["id"]
+    state = json.loads((repo / ".ai" / "cache" / "run" / "queue.recovery.json").read_text(encoding="utf-8"))
+    assert state["last_recovered"] == 1
+
+
+def test_lease_next_skips_recent_recovery_sweep(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    enqueue_result = run_ai_input("queue", "enqueue", "--priority", "P2", "--kind", "index", "--json", stdin="{}", cwd=repo)
+    assert enqueue_result.returncode == 0
+    lease_result = run_ai("queue", "lease", "--worker-id", "worker-1", "--json", cwd=repo)
+    leased = json.loads(lease_result.stdout)["job"]
+    processing_path = repo / ".ai" / "memory" / "queue" / "processing" / f"{leased['id']}.json"
+    job = json.loads(processing_path.read_text(encoding="utf-8"))
+    job["lease_expires_at"] = "2000-01-01T00:00:00Z"
+    processing_path.write_text(json.dumps(job, sort_keys=True) + "\n", encoding="utf-8")
+
+    empty_lease = run_ai("queue", "lease", "--worker-id", "worker-2", "--json", cwd=repo)
+    assert empty_lease.returncode == 0, empty_lease.stdout + empty_lease.stderr
+    assert json.loads(empty_lease.stdout)["job"] is None
+    assert processing_path.exists()
 
 
 def test_queue_status_counts_expired_processing(tmp_path: Path) -> None:
@@ -461,7 +542,9 @@ def test_queue_status_counts_expired_processing(tmp_path: Path) -> None:
     processing_path.write_text(json.dumps(job, sort_keys=True) + "\n", encoding="utf-8")
     status_result = run_ai("queue", "status", "--json", cwd=repo)
     assert status_result.returncode == 0, status_result.stdout + status_result.stderr
-    assert json.loads(status_result.stdout)["expired_processing"] == 1
+    status = json.loads(status_result.stdout)
+    assert status["expired_processing"] == 1
+    assert status["recovery"]["expired_processing"] == 1
 
 
 def test_doctor_rejects_expired_processing_lease(tmp_path: Path) -> None:
@@ -478,6 +561,21 @@ def test_doctor_rejects_expired_processing_lease(tmp_path: Path) -> None:
     assert doctor_result.returncode == 10
     check = next(check for check in json.loads(doctor_result.stdout)["checks"] if check["name"] == "queue_lease_recovery")
     assert check["ok"] is False
+
+
+def test_doctor_rejects_stale_queue_recovery_state(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    state_path = repo / ".ai" / "cache" / "run" / "queue.recovery.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"ok": True, "last_run_at": "2000-01-01T00:00:00Z", "last_recovered": 0}) + "\n",
+        encoding="utf-8",
+    )
+    doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    assert doctor_result.returncode == 10
+    check = next(check for check in json.loads(doctor_result.stdout)["checks"] if check["name"] == "queue_lease_recovery")
+    assert check["ok"] is False
+    assert "stale" in check["detail"]
 
 
 def test_queue_fail_and_archive(tmp_path: Path) -> None:

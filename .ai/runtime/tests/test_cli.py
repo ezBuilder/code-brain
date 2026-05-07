@@ -1104,6 +1104,56 @@ def test_migrate_and_upgrade_plan_apply_rollback(tmp_path: Path) -> None:
     assert incompatible_result.returncode == 1
 
 
+def test_upgrade_dry_run_does_not_mutate_or_create_backup(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    manifest = repo / ".ai" / "generated" / "manifest.json"
+    before = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    before_mtime = manifest.stat().st_mtime_ns
+
+    dry_result = run_ai("upgrade", "apply", "--target-version", "0.1.1", "--dry-run", "--json", cwd=repo)
+    assert dry_result.returncode == 0, dry_result.stdout + dry_result.stderr
+    payload = json.loads(dry_result.stdout)
+    assert payload["dry_run"] is True
+    assert not (repo / payload["backup_path"]).exists()
+    assert hashlib.sha256(manifest.read_bytes()).hexdigest() == before
+    assert manifest.stat().st_mtime_ns == before_mtime
+    assert not (repo / ".ai" / "cache" / "upgrade").exists()
+
+
+def test_rollback_overwrites_manifest_drift(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    manifest = repo / ".ai" / "generated" / "manifest.json"
+    before = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    apply_result = run_ai("upgrade", "apply", "--target-version", "0.1.1", "--json", cwd=repo)
+    assert apply_result.returncode == 0, apply_result.stdout + apply_result.stderr
+    backup_path = json.loads(apply_result.stdout)["backup_path"]
+
+    manifest.write_text(manifest.read_text(encoding="utf-8") + "\n{\"drift\": true}\n", encoding="utf-8")
+    assert hashlib.sha256(manifest.read_bytes()).hexdigest() != before
+    rollback_result = run_ai("upgrade", "rollback", "--backup-path", backup_path, "--json", cwd=repo)
+    assert rollback_result.returncode == 0, rollback_result.stdout + rollback_result.stderr
+    assert hashlib.sha256(manifest.read_bytes()).hexdigest() == before
+
+
+def test_rollback_drill_script_does_not_mutate_worktree() -> None:
+    manifest = ROOT / ".ai" / "generated" / "manifest.json"
+    before = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    before_mtime = manifest.stat().st_mtime_ns
+    result = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "rollback-drill.sh")],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "rollback drill ok" in result.stdout
+    assert hashlib.sha256(manifest.read_bytes()).hexdigest() == before
+    assert manifest.stat().st_mtime_ns == before_mtime
+    assert "rollback-drill.sh" in (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
+
+
 def test_ci_migrate_upgrade_write_policy(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     dry_migrate = run_ai("migrate", "--dry-run", "--json", env={"CI": "true"}, cwd=repo)

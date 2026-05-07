@@ -23,6 +23,7 @@ fi
 ./scripts/verify-artifacts.sh "$ARCHIVE" >/dev/null
 ./scripts/install-check.sh "$ARCHIVE"
 ./scripts/artifact-tamper-check.sh "$ARCHIVE"
+./scripts/rollback-drill.sh >/dev/null
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
 uv run --project .ai/runtime ai report status --json >"$REPORT_OUTPUT"
 mkdir -p dist

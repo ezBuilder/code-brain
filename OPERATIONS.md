@@ -204,6 +204,14 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json
 ```
 
+Run the rollback drill before release handoff:
+
+```bash
+make rollback-drill
+```
+
+The drill copies the repository to a temporary directory, verifies `upgrade apply --dry-run` does not create a backup, creates a rollback backup in the copy, simulates manifest drift, restores through `upgrade rollback`, and runs strict doctor in the copy. It must leave the original worktree clean.
+
 Apply only after the plan is compatible:
 
 ```bash

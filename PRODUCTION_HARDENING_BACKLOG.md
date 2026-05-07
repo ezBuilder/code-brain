@@ -8,7 +8,7 @@ This backlog tracks remaining commercial-readiness work after the current releas
 - Keep `release_ready`, `release_artifacts.all_valid`, and `release_artifacts.all_current` as hard blockers.
 - Keep `dist/release-gate.summary.json` attached to every CI run and handoff bundle.
 - Add release tag signing only after key ownership and rotation are documented.
-- Add a rollback drill that starts from a packaged archive, applies a dry-run upgrade, then restores from a rollback backup.
+- Keep rollback drills in the release gate so upgrade backup and rollback paths are checked before handoff.
 - Add a changelog generator only if it consumes existing release notes and does not rewrite PRD content.
 
 ## CI And Read-Only Policy

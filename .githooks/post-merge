@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$ROOT" || ! -x "$ROOT/.ai/bin/ai" ]]; then
+  exit 0
+fi
+
+OUT="$(mktemp "${TMPDIR:-/tmp}/code-brain-session.XXXXXX")"
+ERR="$(mktemp "${TMPDIR:-/tmp}/code-brain-session-err.XXXXXX")"
+trap 'rm -f "$OUT" "$ERR"' EXIT
+
+cd "$ROOT"
+if ! "$ROOT/.ai/bin/ai" session start --agent operator --dry-run --json >"$OUT" 2>"$ERR"; then
+  echo "code-brain: session startup check failed after git update; run 'make session-start'" >&2
+  sed 's/^/code-brain: /' "$ERR" >&2
+  exit 0
+fi
+
+if grep -Eq '"would_rebuild"[[:space:]]*:[[:space:]]*true' "$OUT"; then
+  echo "code-brain: stale local state detected after git update; run 'make session-start'" >&2
+fi
+
+exit 0

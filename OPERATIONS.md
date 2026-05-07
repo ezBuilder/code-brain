@@ -11,6 +11,7 @@ make preflight
 make lockfile-check
 make lock-check
 make session-start
+make install-hooks
 make lint
 make quick
 ./bootstrap.sh
@@ -31,7 +32,7 @@ Expected result:
 - `git.status_short` is empty for tracked files.
 - Runtime artifacts appear only in ignored paths such as `.ai/cache/`, `.ai/runtime/.venv/`, `.ai/runtime/.pytest_cache/`, `__pycache__/`, and `dist/`.
 
-Mac/VPS handoff uses GitHub tracked files as the baseline. After `git pull` or fresh clone, run `ai session start` or `make session-start`; local cache, virtualenv, and search index are regenerated on that machine rather than shared through Git.
+Mac/VPS handoff uses GitHub tracked files as the baseline. After `git pull` or fresh clone, run `ai session start` or `make session-start`; local cache, virtualenv, and search index are regenerated on that machine rather than shared through Git. `bootstrap.sh` and `make install-hooks` configure `core.hooksPath` to `.githooks`; `post-merge` and branch `post-checkout` run a dry-run session startup check and print `make session-start` when local state needs refresh.
 
 ## Release Gate
 
@@ -52,6 +53,7 @@ It also starts with `scripts/preflight.sh --check-only`, which verifies repo lay
 It runs `scripts/lockfile-check.sh` before package creation so runtime dependency changes cannot drift from the checked-in lockfile. The script wraps `uv lock --check --project .ai/runtime` and prints the `uv lock --project .ai/runtime` remediation when the lockfile is missing or stale.
 It starts with `scripts/lint.sh`, which checks shell syntax, Python compilation, Makefile dry-runs, and PowerShell bootstrap/shim parsing when PowerShell is available.
 Direct `bootstrap.sh` runs also start with `scripts/env-check.sh` and `scripts/preflight.sh --check-only`; `bootstrap.sh` and `bootstrap.ps1` render with `--dry-run` under CI/GitHub Actions.
+On git checkouts with metadata available, `bootstrap.sh` also installs `.githooks/post-merge` and `.githooks/post-checkout` by setting `core.hooksPath=.githooks`.
 It also runs artifact tamper checks so checksum, manifest, SBOM, provenance, and release notes corruption must be rejected before release.
 It runs `scripts/reproducibility-check.sh` after install verification so repeated package builds must produce the same archive SHA-256.
 It runs `scripts/bootstrap-idempotency.sh` in a temporary git copy and fails if two consecutive CI-mode bootstrap runs change tracked source or `.ai/generated/manifest.json`.
@@ -289,6 +291,7 @@ make env-check
 make lockfile-check
 make lock-check
 make lint
+make install-hooks
 ./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/artifact-tamper-check.sh
 make release-gate

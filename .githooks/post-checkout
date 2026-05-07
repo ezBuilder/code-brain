@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# post-checkout args: previous HEAD, new HEAD, checkout type (1=branch, 0=file)
+if [[ "${3:-0}" != "1" ]]; then
+  exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$ROOT" || ! -x "$ROOT/.githooks/post-merge" ]]; then
+  exit 0
+fi
+
+exec "$ROOT/.githooks/post-merge"

@@ -3,7 +3,7 @@ SHELL := /usr/bin/env bash
 
 LATEST_ARCHIVE := $(shell ls -t dist/code-brain-*.tar.gz 2>/dev/null | head -n 1)
 
-.PHONY: help env-check preflight lockfile-check lock-check session-start lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check reproducibility-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
+.PHONY: help env-check preflight lockfile-check lock-check session-start install-hooks lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check reproducibility-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
 
 help:
 	@printf '%s\n' \
@@ -12,6 +12,7 @@ help:
 		'  make preflight         Verify fresh-clone bootstrap readiness' \
 		'  make lockfile-check    Verify uv.lock matches runtime dependencies' \
 		'  make session-start     Auto-prepare index, hook, and health for a new agent session' \
+		'  make install-hooks     Configure git hook startup checks' \
 		'  make lint              Run static script and Python compile checks' \
 		'  make quick             Run fast local health checks' \
 		'  make package           Build release artifacts under dist/' \
@@ -40,6 +41,10 @@ lock-check: lockfile-check
 
 session-start:
 	uv run --project .ai/runtime ai session start --agent operator --json
+
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "core.hooksPath -> $$(git config core.hooksPath)"
 
 lint:
 	./scripts/lint.sh

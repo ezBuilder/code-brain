@@ -821,6 +821,66 @@ def test_session_start_write_is_rejected_in_ci(tmp_path: Path) -> None:
     assert payload["command"] == "session"
 
 
+def test_git_startup_hooks_are_present_and_advisory() -> None:
+    post_merge = ROOT / ".githooks" / "post-merge"
+    post_checkout = ROOT / ".githooks" / "post-checkout"
+    assert post_merge.exists()
+    assert post_checkout.exists()
+    assert os.access(post_merge, os.X_OK)
+    assert os.access(post_checkout, os.X_OK)
+    merge_text = post_merge.read_text(encoding="utf-8")
+    checkout_text = post_checkout.read_text(encoding="utf-8")
+    assert "set -euo pipefail" in merge_text
+    assert "session start --agent operator --dry-run --json" in merge_text
+    assert "make session-start" in merge_text
+    assert '"would_rebuild"' in merge_text
+    assert '${3:-0}' in checkout_text
+    assert 'exec "$ROOT/.githooks/post-merge"' in checkout_text
+
+
+def test_post_checkout_file_checkout_is_noop() -> None:
+    result = subprocess.run(
+        ["bash", ".githooks/post-checkout", "old", "new", "0"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_install_hooks_target_and_bootstrap_integration() -> None:
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+    docs_check = (ROOT / "scripts" / "docs-check.sh").read_text(encoding="utf-8")
+    lint = (ROOT / "scripts" / "lint.sh").read_text(encoding="utf-8")
+    assert "install-hooks:" in makefile
+    assert "git config core.hooksPath .githooks" in makefile
+    assert "git config core.hooksPath .githooks" in bootstrap
+    assert "git rev-parse --git-dir" in bootstrap
+    assert "make -n install-hooks" in docs_check
+    assert "make -n install-hooks" in lint
+
+
+def test_install_hooks_sets_core_hooks_path_in_temp_git_repo(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    result = subprocess.run(
+        ["make", "install-hooks"],
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    configured = subprocess.check_output(["git", "config", "--get", "core.hooksPath"], cwd=repo, text=True).strip()
+    assert configured == ".githooks"
+
+
 def test_queue_lifecycle_complete(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     enqueue_result = run_ai_input(

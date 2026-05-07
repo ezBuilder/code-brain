@@ -162,6 +162,8 @@ release_notes = release_notes_path.read_text(encoding="utf-8")
 required_notes = [
     f"# Code Brain {manifest.get('version')} Release Notes",
     actual_archive_sha,
+    f"- Git HEAD: `{git.get('head')}`",
+    "- Git status: `clean`",
     manifest_path.name,
     sbom_path.name,
     provenance_path.name,

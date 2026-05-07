@@ -167,6 +167,29 @@ path.write_text(text.replace("Release Notes", "Release Log", 1), encoding="utf-8
 PY
 }
 
+tamper_release_notes_git_head() {
+  local dir="$1"
+  python - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
+import re
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+path.write_text(re.sub(r"- Git HEAD: `[^`]+`", "- Git HEAD: `000000000000`", text, count=1), encoding="utf-8")
+PY
+}
+
+tamper_release_notes_git_status() {
+  local dir="$1"
+  python - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+path.write_text(text.replace("- Git status: `clean`", "- Git status: `dirty`", 1), encoding="utf-8")
+PY
+}
+
 expect_unsafe_archive_failure() {
   local dir="$TMP/unsafe_archive"
   local payload="$TMP/unsafe-payload"
@@ -335,6 +358,8 @@ expect_install_check_failure missing_provenance tamper_missing_provenance
 expect_install_check_failure dirty_provenance tamper_dirty_provenance
 expect_install_check_failure metadata_version tamper_metadata_version
 expect_install_check_failure release_notes tamper_release_notes
+expect_install_check_failure release_notes_git_head tamper_release_notes_git_head
+expect_install_check_failure release_notes_git_status tamper_release_notes_git_status
 expect_install_check_failure missing_release_notes tamper_missing_release_notes
 expect_unsafe_archive_failure
 expect_unsafe_member_type_failure

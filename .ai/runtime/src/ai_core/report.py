@@ -41,6 +41,12 @@ def status_report(root: Path) -> dict[str, Any]:
     }
 
 
+def status_exit_ok(payload: dict[str, Any]) -> bool:
+    artifacts = payload.get("release_artifacts", {})
+    artifacts_ok = not artifacts.get("all_present") or artifacts.get("all_valid") is True
+    return bool(payload.get("ok") and artifacts_ok)
+
+
 def release_notes(root: Path) -> str:
     commits = git_output(root, "log", "--oneline", "--decorate", "-12")
     report = status_report(root)
@@ -246,8 +252,12 @@ def provenance_summary(
 
 def release_notes_summary(archive: Path, manifest: Path, sbom: Path, provenance: Path, release_notes: Path) -> dict[str, Any]:
     if not release_notes.exists():
-        return {"valid": False}
+        return {"valid": False, "git_head_valid": False, "git_status_valid": False}
     text = release_notes.read_text(encoding="utf-8")
+    provenance_payload = json_payload(provenance) or {}
+    provenance_git = provenance_payload.get("git", {})
+    git_head = provenance_git.get("head") if isinstance(provenance_git, dict) else None
+    git_status = provenance_git.get("status_short") if isinstance(provenance_git, dict) else None
     required = [
         f"# Code Brain {__version__} Release Notes",
         file_sha256(archive) or "",
@@ -256,4 +266,10 @@ def release_notes_summary(archive: Path, manifest: Path, sbom: Path, provenance:
         provenance.name,
         "./scripts/release-gate.sh",
     ]
-    return {"valid": all(needle and needle in text for needle in required)}
+    git_head_valid = bool(git_head and f"- Git HEAD: `{git_head}`" in text)
+    git_status_valid = git_status == "" and "- Git status: `clean`" in text
+    return {
+        "valid": all(needle and needle in text for needle in required) and git_head_valid and git_status_valid,
+        "git_head_valid": git_head_valid,
+        "git_status_valid": git_status_valid,
+    }

@@ -626,6 +626,8 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
         assert "current" in artifacts["provenance"]
         assert "git_head_matches" in artifacts["provenance"]
         assert artifacts["release_notes"]["valid"] is True
+        assert artifacts["release_notes"]["git_head_valid"] is True
+        assert artifacts["release_notes"]["git_status_valid"] is True
         assert artifacts["all_valid"] is True
     else:
         assert artifacts["archive"]["archive_exists"] is False
@@ -635,3 +637,18 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
     assert "SBOM" in notes_result.stdout
     assert "./scripts/docs-check.sh" in notes_result.stdout
     assert "./scripts/release-gate.sh" in notes_result.stdout
+
+
+def test_report_status_rejects_release_notes_git_mismatch(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    notes_path = repo / "dist" / "code-brain-0.1.0.release-notes.md"
+    if not notes_path.exists():
+        return
+    text = notes_path.read_text(encoding="utf-8")
+    notes_path.write_text(text.replace("- Git status: `clean`", "- Git status: `dirty`", 1), encoding="utf-8")
+    status_result = run_ai("report", "status", "--json", cwd=repo)
+    assert status_result.returncode == 1, status_result.stdout + status_result.stderr
+    payload = json.loads(status_result.stdout)
+    assert payload["release_ready"] is False
+    assert payload["release_artifacts"]["release_notes"]["valid"] is False
+    assert payload["release_artifacts"]["release_notes"]["git_status_valid"] is False

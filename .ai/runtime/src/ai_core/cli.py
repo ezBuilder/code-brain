@@ -405,11 +405,11 @@ def main(argv: list[str] | None = None) -> int:
                 return OK
             return serve_stdio(root)
         if args.command == "report" and args.report_command == "status":
-            from .report import status_report
+            from .report import status_exit_ok, status_report
 
             payload = status_report(root)
             emit(payload, as_json=as_json)
-            return OK if payload["ok"] else GENERIC_ERROR
+            return OK if status_exit_ok(payload) else GENERIC_ERROR
         if args.command == "report" and args.report_command == "release-notes":
             from .report import release_notes
 

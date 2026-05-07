@@ -24,6 +24,7 @@ fi
 ./scripts/install-check.sh "$ARCHIVE"
 ./scripts/artifact-tamper-check.sh "$ARCHIVE"
 ./scripts/rollback-drill.sh >/dev/null
+./scripts/bootstrap-idempotency.sh >/dev/null
 ./scripts/dep-advisory.sh >/dev/null
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
 uv run --project .ai/runtime ai report status --json >"$REPORT_OUTPUT"

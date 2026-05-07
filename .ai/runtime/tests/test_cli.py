@@ -1508,7 +1508,28 @@ def test_rollback_drill_script_does_not_mutate_worktree() -> None:
     assert "rollback drill ok" in result.stdout
     assert hashlib.sha256(manifest.read_bytes()).hexdigest() == before
     assert manifest.stat().st_mtime_ns == before_mtime
+    rollback_script = (ROOT / "scripts" / "rollback-drill.sh").read_text(encoding="utf-8")
+    assert "unset CI GITHUB_ACTIONS GITLAB_CI AI_CI" in rollback_script
     assert "rollback-drill.sh" in (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
+
+
+def test_bootstrap_idempotency_integration_invariants() -> None:
+    script = (ROOT / "scripts" / "bootstrap-idempotency.sh").read_text(encoding="utf-8")
+    release_gate = (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    docs_check = (ROOT / "scripts" / "docs-check.sh").read_text(encoding="utf-8")
+    assert "COPYFILE_DISABLE=1" in script
+    assert "--exclude './.git'" in script
+    assert "--exclude './.ai/cache'" in script
+    assert "--exclude './dist'" in script
+    assert "CI=true GITHUB_ACTIONS=true ./bootstrap.sh" in script
+    assert "git status --short" in script
+    assert "manifest_sha" in script
+    assert "env -u CI -u GITHUB_ACTIONS -u GITLAB_CI -u AI_CI uv run" in bootstrap
+    assert "./scripts/bootstrap-idempotency.sh >/dev/null" in release_gate
+    assert "bootstrap-idempotency:" in makefile
+    assert "make -n bootstrap-idempotency" in docs_check
 
 
 def test_ci_migrate_upgrade_write_policy(tmp_path: Path) -> None:

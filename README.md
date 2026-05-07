@@ -45,6 +45,8 @@ uv run --project .ai/runtime ai report release-gate-summary --json
 ./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/install-check.sh
 ./scripts/artifact-tamper-check.sh
+./scripts/rollback-drill.sh
+./scripts/bootstrap-idempotency.sh
 ./scripts/release-gate.sh
 make lint
 make env-check
@@ -54,6 +56,7 @@ make release-gate
 
 `scripts/smoke.sh` copies the repository to a temporary directory before running write-heavy flows such as queue, trust, inbox, notify, diagnostics bundle, and upgrade rollback. The working tree stays clean.
 `bootstrap.sh` starts with the same environment and fresh-clone preflight checks used by the release gate, then renders with `--dry-run` under CI/GitHub Actions.
+`scripts/bootstrap-idempotency.sh` runs bootstrap twice in a temporary git copy and fails if tracked source or the generated manifest changes.
 `bootstrap.ps1` follows the same CI dry-run render policy for PowerShell operators.
 `scripts/docs-check.sh` verifies the operator runbook commands and CI write-denial behavior.
 `scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, provenance, and release notes without executing package code.
@@ -99,7 +102,7 @@ Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for c
 | Notify | `ai notify enqueue` | P3 outbound adapter jobs, no hot-path network |
 | Observability | `ai obs log/metrics/slo/health-summary` | local JSONL logs, metrics, SLO check, and read-only health rollup |
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
-| Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration and local rollback backups |
+| Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration, bootstrap, and local rollback backups |
 | Package | `scripts/package.sh`, `scripts/install-check.sh` | tarball + checksum + manifest + SBOM + provenance + release notes + bash/PowerShell install verification |
 | Advisory | `scripts/dep-advisory.sh` | read-only dependency vulnerability advisory at `dist/dep-advisory.json` |
 | Report | `ai report status/release-notes/release-gate-summary` | release state, artifact integrity, CI summary, and generated notes |

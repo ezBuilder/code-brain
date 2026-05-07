@@ -11,4 +11,4 @@ else
   uv run --project .ai/runtime ai render
 fi
 uv run --project .ai/runtime ai doctor --strict
-uv run --project .ai/runtime python -m pytest .ai/runtime/tests
+env -u CI -u GITHUB_ACTIONS -u GITLAB_CI -u AI_CI uv run --project .ai/runtime python -m pytest .ai/runtime/tests

@@ -41,6 +41,7 @@ git status --short
 - Install check verifies the tarball in a temporary directory, including `.ai/bin/ai`, `.ai/bin/ai-hook`, and PowerShell shims when PowerShell is available.
 - Artifact tamper check verifies corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.
 - Rollback drill verifies upgrade backup and rollback restore the generated manifest byte-for-byte in a temporary copy.
+- Bootstrap idempotency drill runs `bootstrap.sh` twice in a temporary git copy and verifies tracked source plus `.ai/generated/manifest.json` stay stable.
 - Dependency vulnerability advisory writes `dist/dep-advisory.json`; findings are visible in handoff artifacts but do not fail the release gate without an approved hard-fail policy.
 - Make targets wrap common operator flows, including `make env-check`, `make lint`, `make quick`, `make verify-artifacts`, and `make release-gate`.
 - GitHub Actions runs `.github/workflows/release-gate.yml` with the same release gate used for local verification.

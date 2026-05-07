@@ -50,6 +50,7 @@ This backlog tracks remaining commercial-readiness work after the current releas
 
 - VPS live testing is deferred to the operator.
 - Preserve `scripts/preflight.sh --check-only --json` as the first failure point for fresh clones.
+- Keep repeated bootstrap idempotency covered by `scripts/bootstrap-idempotency.sh`.
 - Keep bootstrap failures clear when `uv`, Python, optional PowerShell, `sops`, `age`, or Git LFS are missing.
 - Add VPS-specific notes only after the operator reports the actual target OS, shell, and deployment path.
 - Keep local cache and release artifacts ignored, never tracked.

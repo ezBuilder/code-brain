@@ -3,7 +3,7 @@ SHELL := /usr/bin/env bash
 
 LATEST_ARCHIVE := $(shell ls -t dist/code-brain-*.tar.gz 2>/dev/null | head -n 1)
 
-.PHONY: help env-check preflight lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check tamper-check rollback-drill release-gate report release-notes clean-cache clean-artifacts clean-all
+.PHONY: help env-check preflight lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
 
 help:
 	@printf '%s\n' \
@@ -17,6 +17,7 @@ help:
 		'  make install-check     Verify extracted package execution' \
 		'  make tamper-check      Verify corrupted artifacts are rejected' \
 		'  make rollback-drill    Verify upgrade backup rollback in a temporary copy' \
+		'  make bootstrap-idempotency Verify repeated bootstrap leaves tracked source stable' \
 		'  make release-gate      Run the full release gate' \
 		'  make report            Print release status JSON' \
 		'  make clean-cache       Remove ignored runtime cache files' \
@@ -76,6 +77,9 @@ tamper-check:
 
 rollback-drill:
 	./scripts/rollback-drill.sh
+
+bootstrap-idempotency:
+	./scripts/bootstrap-idempotency.sh
 
 release-gate:
 	./scripts/release-gate.sh

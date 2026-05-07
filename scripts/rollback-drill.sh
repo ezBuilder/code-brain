@@ -27,6 +27,7 @@ tar \
   -C "$ROOT" -cf - . | tar -C "$WORK" -xf -
 
 cd "$WORK"
+unset CI GITHUB_ACTIONS GITLAB_CI AI_CI
 
 manifest=".ai/generated/manifest.json"
 before="$(shasum -a 256 "$manifest" | awk '{print $1}')"

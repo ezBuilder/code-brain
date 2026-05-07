@@ -25,6 +25,8 @@ for needle in \
   "CI_READ_ONLY" \
   "release_ready" \
   "release-gate.yml" \
+  "summary-observe" \
+  "summary-parity.py" \
   "release-gate.summary.json" \
   "ai report release-gate-summary" \
   "queue status" \

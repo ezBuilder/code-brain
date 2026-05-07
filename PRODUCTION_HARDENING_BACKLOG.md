@@ -16,7 +16,7 @@ This backlog tracks remaining commercial-readiness work after the current releas
 - Keep GitHub Actions permissions at `contents: read`.
 - Keep checkout `persist-credentials: false`.
 - Keep CI write probes for representative mutation commands: render, queue mutation, worker stop, trust revoke, inbox decision, diagnostics prune, migration, upgrade rollback, and index rebuild.
-- Add a workflow status observation step after pushed `main` runs are available.
+- Keep workflow summary observation active so supported CI operating systems agree on release readiness for the same git SHA.
 - Add branch protection outside this repository: require release gate, forbid direct force pushes, and require signed commits if the operator policy demands it.
 - Do not introduce CI secrets until an explicit secret inventory and redaction test exists.
 

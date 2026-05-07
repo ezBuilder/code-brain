@@ -15,7 +15,12 @@ concurrency:
 
 jobs:
   release-gate:
-    runs-on: ubuntu-latest
+    name: release-gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     env:
       CI: "true"
       AI_CI: "true"
@@ -47,7 +52,7 @@ jobs:
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: code-brain-release-artifacts
+          name: code-brain-release-artifacts-${{ matrix.os }}
           path: |
             dist/code-brain-*.tar.gz
             dist/code-brain-*.tar.gz.sha256
@@ -61,7 +66,34 @@ jobs:
       - name: Upload release gate summary
         uses: actions/upload-artifact@v4
         with:
-          name: release-gate-summary
+          name: release-gate-summary-${{ matrix.os }}
           path: dist/release-gate.summary.json
           if-no-files-found: error
           retention-days: 14
+
+  summary-observe:
+    name: summary-observe
+    needs: release-gate
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      AI_CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release gate summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-gate-summary-*
+          path: .ci-summaries
+
+      - name: Compare canonical summary parity
+        run: |
+          python scripts/summary-parity.py \
+            .ci-summaries/release-gate-summary-ubuntu-latest/release-gate.summary.json \
+            .ci-summaries/release-gate-summary-macos-latest/release-gate.summary.json \
+            --json

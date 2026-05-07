@@ -126,6 +126,11 @@ def test_release_gate_workflow_invariants() -> None:
     assert "fetch-depth: 0" in workflow
     assert "concurrency:" in workflow
     assert "cancel-in-progress: true" in workflow
+    assert "summary-observe" in workflow
+    assert "actions/download-artifact@v4" in workflow
+    assert "summary-parity.py" in workflow
+    assert "ubuntu-latest" in workflow
+    assert "macos-latest" in workflow
     assert '[[ "$rc" -eq 16 ]]' in workflow
     assert "retention-days: 14" in workflow
     assert "retention-days: 30" in workflow
@@ -133,6 +138,70 @@ def test_release_gate_workflow_invariants() -> None:
     assert "gh pr" not in workflow
     assert "git push" not in workflow
     assert "GITHUB_TOKEN" not in workflow
+
+
+def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_path: Path) -> None:
+    left = tmp_path / "left.json"
+    right = tmp_path / "right.json"
+    payload = {
+        "schema_version": 1,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "git_sha": "abc123",
+        "release_ready": True,
+        "release_artifacts": {"all_present": True, "all_valid": True, "all_current": True},
+        "checks": [{"name": "layout", "ok": True, "detail": "ok"}],
+    }
+    left.write_text(json.dumps(payload), encoding="utf-8")
+    changed = dict(payload, generated_at="2026-01-01T00:01:00Z")
+    right.write_text(json.dumps(changed), encoding="utf-8")
+    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(right), "--json"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
+    assert result.returncode == 0, result.stdout
+    assert json.loads(result.stdout) == {"mismatches": [], "ok": True}
+
+
+def test_summary_parity_release_ready_mismatch_fails(tmp_path: Path) -> None:
+    left = tmp_path / "left.json"
+    right = tmp_path / "right.json"
+    base = {"schema_version": 1, "git_sha": "abc123", "release_ready": True, "release_artifacts": {}, "checks": []}
+    left.write_text(json.dumps(base), encoding="utf-8")
+    changed = dict(base, release_ready=False)
+    right.write_text(json.dumps(changed), encoding="utf-8")
+    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(right), "--json"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["mismatches"][0]["field"] == "release_ready"
+
+
+def test_summary_parity_check_set_mismatch_fails(tmp_path: Path) -> None:
+    left = tmp_path / "left.json"
+    right = tmp_path / "right.json"
+    base = {
+        "schema_version": 1,
+        "git_sha": "abc123",
+        "release_ready": True,
+        "release_artifacts": {},
+        "checks": [{"name": "layout", "ok": True}, {"name": "queue_age", "ok": True}],
+    }
+    left.write_text(json.dumps(base), encoding="utf-8")
+    changed = dict(base, checks=[{"name": "layout", "ok": True}])
+    right.write_text(json.dumps(changed), encoding="utf-8")
+    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(right)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
+    assert result.returncode == 1
+    assert "queue_age" in result.stderr
+
+
+def test_summary_parity_missing_or_invalid_file_returns_two(tmp_path: Path) -> None:
+    left = tmp_path / "left.json"
+    missing = tmp_path / "missing.json"
+    left.write_text('{"schema_version":1}', encoding="utf-8")
+    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(missing)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
+    assert result.returncode == 2
+    assert str(missing) in result.stderr
+
+    left.write_text("not json", encoding="utf-8")
+    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(missing)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
+    assert result.returncode == 2
 
 
 def test_render_dry_run_json() -> None:

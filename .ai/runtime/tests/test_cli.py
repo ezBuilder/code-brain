@@ -108,6 +108,9 @@ def test_doctor_strict_passes_after_render() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
+    slo_check = next(check for check in payload["checks"] if check["name"] == "hot_path_slo")
+    assert slo_check["ok"] is True
+    assert "target_ms=200" in slo_check["detail"]
 
 
 def test_worker_health_validates_envelope() -> None:

@@ -35,6 +35,7 @@ def run_checks(root: Path) -> list[Check]:
         check_trust(root),
         check_jsonl(root),
         check_audit_index(root),
+        check_hot_path_slo(root),
         check_secret_scan(root),
         check_diagnostics(root),
     ]
@@ -180,6 +181,18 @@ def check_audit_index(root: Path) -> Check:
         bad.append(f"audit-index:orphan:{key[0]}")
 
     return Check("audit_index", not bad, "ok" if not bad else "invalid: " + ", ".join(bad[:10]))
+
+
+def check_hot_path_slo(root: Path) -> Check:
+    from .hooks import HOT_PATH_TARGET_MS, handle_hook
+
+    samples = []
+    for _ in range(10):
+        payload = handle_hook(root, "DoctorSLOBaseline", {"agent": "doctor", "dry": True})
+        samples.append(int(payload["elapsed_ms"]))
+    p95 = sorted(samples)[max(0, int(len(samples) * 0.95) - 1)] if samples else 0
+    ok = p95 <= HOT_PATH_TARGET_MS
+    return Check("hot_path_slo", ok, f"p95_ms={p95}, target_ms={HOT_PATH_TARGET_MS}")
 
 
 def check_secret_scan(root: Path) -> Check:

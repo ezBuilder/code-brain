@@ -222,6 +222,72 @@ def test_ci_worker_health_does_not_create_token(tmp_path: Path) -> None:
     assert not token_path.exists()
 
 
+def test_worker_status_reports_singleton_lock(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = run_ai("worker", "status", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["lock"]["locked"] is False
+    assert payload["lock"]["stale"] is False
+
+
+def test_worker_singleton_lock_rejects_second_instance(tmp_path: Path) -> None:
+    from ai_core.worker.lock import WorkerAlreadyRunning, acquire_worker_lock
+
+    repo = copy_repo(tmp_path)
+    first = acquire_worker_lock(repo, owner="test")
+    try:
+        try:
+            acquire_worker_lock(repo, owner="test")
+        except WorkerAlreadyRunning as exc:
+            assert exc.exit_code == 75
+        else:
+            raise AssertionError("second worker lock acquisition should fail")
+    finally:
+        first.release()
+    assert not (repo / ".ai" / "cache" / "run" / "worker.lock").exists()
+
+
+def test_worker_singleton_lock_recovers_stale_pid(tmp_path: Path) -> None:
+    from ai_core.worker.lock import acquire_worker_lock
+
+    repo = copy_repo(tmp_path)
+    lock_file = repo / ".ai" / "cache" / "run" / "worker.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text(json.dumps({"pid": 99999999, "owner": "dead", "acquired_at": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8")
+    lock = acquire_worker_lock(repo, owner="test")
+    try:
+        payload = json.loads(lock_file.read_text(encoding="utf-8"))
+        assert payload["pid"] == os.getpid()
+        assert payload["owner"] == "test"
+    finally:
+        lock.release()
+
+
+def test_queue_lock_serializes_mutation_file(tmp_path: Path) -> None:
+    from ai_core.worker.lock import queue_lock
+
+    repo = copy_repo(tmp_path)
+    with queue_lock(repo):
+        result = run_ai("worker", "status", "--json", cwd=repo)
+        assert result.returncode == 0, result.stdout + result.stderr
+    lock_file = repo / ".ai" / "cache" / "run" / "queue.lock"
+    assert lock_file.exists()
+    assert oct(lock_file.stat().st_mode & 0o777) == "0o600"
+
+
+def test_doctor_rejects_stale_worker_lock(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    lock_file = repo / ".ai" / "cache" / "run" / "worker.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text(json.dumps({"pid": 99999999, "owner": "dead", "acquired_at": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8")
+    result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    assert result.returncode == 10
+    payload = json.loads(result.stdout)
+    check = next(check for check in payload["checks"] if check["name"] == "worker_singleton_lock")
+    assert check["ok"] is False
+
+
 def test_hook_appends_redacted_event(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     event_path = repo / ".ai" / "memory" / "events" / "events.jsonl"

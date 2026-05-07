@@ -35,6 +35,7 @@ def run_checks(root: Path) -> list[Check]:
         check_secret_scan(root),
         check_redaction_self_test(),
         check_bootstrap_preflight(root),
+        check_worker_singleton_lock(root),
         check_diagnostics(root),
     ]
     return checks
@@ -241,6 +242,15 @@ def check_bootstrap_preflight(root: Path) -> Check:
     except json.JSONDecodeError as exc:
         return Check("bootstrap_preflight", False, f"invalid json: {exc}")
     return Check("bootstrap_preflight", payload.get("ok") is True, "ok" if payload.get("ok") is True else "failed")
+
+
+def check_worker_singleton_lock(root: Path) -> Check:
+    from .worker.lock import lock_status
+
+    status = lock_status(root)
+    if status.get("stale"):
+        return Check("worker_singleton_lock", False, json.dumps(status, sort_keys=True))
+    return Check("worker_singleton_lock", status.get("ok") is True, "ok" if status.get("ok") is True else json.dumps(status, sort_keys=True))
 
 
 def check_diagnostics(root: Path) -> Check:

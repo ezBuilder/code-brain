@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     worker_health = worker_sub.add_parser("health")
     worker_health.add_argument("--json", action="store_true", dest="command_json")
     worker_health.add_argument("--envelope-json")
+    worker_status = worker_sub.add_parser("status")
+    worker_status.add_argument("--json", action="store_true", dest="command_json")
     queue = sub.add_parser("queue")
     queue_sub = queue.add_subparsers(dest="queue_command", required=True)
     queue_enqueue = queue_sub.add_parser("enqueue")
@@ -220,6 +222,12 @@ def main(argv: list[str] | None = None) -> int:
             from .worker.ipc import health, parse_envelope
 
             payload = health(root, parse_envelope(args.envelope_json))
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "worker" and args.worker_command == "status":
+            from .worker.lock import lock_status
+
+            payload = {"ok": True, "lock": lock_status(root)}
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "enqueue":

@@ -13,6 +13,7 @@ make quick
 ./bootstrap.sh
 uv run --project .ai/runtime ai doctor --strict --json
 uv run --project .ai/runtime ai report status --json
+uv run --project .ai/runtime ai report release-gate-summary --json
 ```
 
 Expected result:
@@ -46,6 +47,7 @@ Direct `bootstrap.sh` runs also start with `scripts/env-check.sh` and `scripts/p
 It also runs artifact tamper checks so checksum, manifest, SBOM, provenance, and release notes corruption must be rejected before release.
 Use `scripts/verify-artifacts.sh` when you need to validate downloaded release artifacts before running package code.
 CI uses the same Makefile targets as local release verification; write-heavy smoke/docs flows run only inside temporary repositories with CI policy explicitly cleared.
+`.github/workflows/release-gate.yml` runs the full release gate with read-only repository permissions, verifies CI write rejection, and uploads `dist/release-gate.summary.json` plus release artifacts for retention.
 
 ## Install From Archive
 
@@ -230,7 +232,8 @@ make lint
 ./scripts/artifact-tamper-check.sh
 make release-gate
 uv run --project .ai/runtime ai report status --json
+uv run --project .ai/runtime ai report release-gate-summary --json
 git status --short
 ```
 
-Attach `dist/code-brain-<version>.release-notes.md`, the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`, `dist/code-brain-<version>.manifest.json`, `dist/code-brain-<version>.sbom.json`, and `dist/code-brain-<version>.provenance.json`.
+Attach `dist/release-gate.summary.json`, `dist/code-brain-<version>.release-notes.md`, the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`, `dist/code-brain-<version>.manifest.json`, `dist/code-brain-<version>.sbom.json`, and `dist/code-brain-<version>.provenance.json`.

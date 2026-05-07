@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -86,6 +87,52 @@ def test_version_json() -> None:
     payload = json.loads(result.stdout)
     assert payload["version"] == "0.1.0"
     assert payload["protocol_version"] == 1
+
+
+def test_release_gate_summary_schema_and_redaction(monkeypatch) -> None:
+    from ai_core.report import release_gate_summary
+
+    status = {
+        "release_ready": True,
+        "release_artifacts": {
+            "all_current": True,
+            "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.0.release-notes.md"},
+        },
+        "doctor": {"checks": [{"name": "layout", "ok": True, "detail": "ok"}]},
+    }
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    summary = release_gate_summary(ROOT, git_sha="deadbeef", status=status)
+    assert set(summary) == {"schema_version", "generated_at", "git_sha", "ci", "release_ready", "release_artifacts", "checks"}
+    assert summary["schema_version"] == 1
+    assert summary["generated_at"].endswith("Z")
+    assert summary["git_sha"] == "deadbeef"
+    assert summary["ci"] is True
+    assert summary["release_ready"] is True
+    assert "/Users/" not in json.dumps(summary, sort_keys=True)
+
+
+def test_release_gate_summary_command_json() -> None:
+    result = run_ai("report", "release-gate-summary", "--git-sha", "deadbeef", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["git_sha"] == "deadbeef"
+    assert payload["schema_version"] == 1
+
+
+def test_release_gate_workflow_invariants() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release-gate.yml").read_text(encoding="utf-8")
+    assert re.search(r"permissions:\s*\n\s*contents: read", workflow)
+    assert "persist-credentials: false" in workflow
+    assert "fetch-depth: 0" in workflow
+    assert "concurrency:" in workflow
+    assert "cancel-in-progress: true" in workflow
+    assert '[[ "$rc" -eq 16 ]]' in workflow
+    assert "retention-days: 14" in workflow
+    assert "retention-days: 30" in workflow
+    assert not re.search(r"\$\{\{\s*secrets\.", workflow)
+    assert "gh pr" not in workflow
+    assert "git push" not in workflow
+    assert "GITHUB_TOKEN" not in workflow
 
 
 def test_render_dry_run_json() -> None:

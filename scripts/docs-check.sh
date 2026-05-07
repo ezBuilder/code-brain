@@ -23,6 +23,9 @@ for needle in \
   "exit code \`16\`" \
   "CI_READ_ONLY" \
   "release_ready" \
+  "release-gate.yml" \
+  "release-gate.summary.json" \
+  "ai report release-gate-summary" \
   "queue status" \
   "worker health" \
   "./scripts/release-gate.sh" \
@@ -50,6 +53,7 @@ uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
+uv run --project .ai/runtime ai report release-gate-summary --git-sha "$(git rev-parse HEAD)" --json >/dev/null
 ./scripts/env-check.sh >/dev/null
 ./scripts/preflight.sh --check-only --json >/dev/null
 make -n env-check >/dev/null

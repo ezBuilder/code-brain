@@ -1,0 +1,67 @@
+name: release-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      AI_CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Release gate
+        run: ./scripts/release-gate.sh
+
+      - name: CI write rejection probe
+        run: |
+          set +e
+          uv run --project .ai/runtime ai render --json >ci-write-probe.json
+          rc="$?"
+          set -e
+          if [[ "$rc" -eq 16 ]]; then
+            exit 0
+          fi
+          cat ci-write-probe.json
+          exit 1
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-brain-release-artifacts
+          path: |
+            dist/code-brain-*.tar.gz
+            dist/code-brain-*.tar.gz.sha256
+            dist/code-brain-*.manifest.json
+            dist/code-brain-*.sbom.json
+            dist/code-brain-*.provenance.json
+            dist/code-brain-*.release-notes.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload release gate summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-summary
+          path: dist/release-gate.summary.json
+          if-no-files-found: error
+          retention-days: 14

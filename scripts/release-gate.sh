@@ -25,6 +25,8 @@ fi
 ./scripts/artifact-tamper-check.sh "$ARCHIVE"
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
 uv run --project .ai/runtime ai report status --json >"$REPORT_OUTPUT"
+mkdir -p dist
+uv run --project .ai/runtime ai report release-gate-summary --git-sha "$(git rev-parse HEAD)" --json >dist/release-gate.summary.json
 python - "$REPORT_OUTPUT" <<'PY'
 import json
 import sys

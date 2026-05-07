@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .doctor import as_payload, run_checks
 from .obs import metrics
+from .redact import redact_value
 from .worker.ipc import PROTOCOL_VERSION
 
 
@@ -45,6 +48,23 @@ def status_exit_ok(payload: dict[str, Any]) -> bool:
     artifacts = payload.get("release_artifacts", {})
     artifacts_ok = not artifacts.get("all_present") or artifacts.get("all_valid") is True
     return bool(payload.get("ok") and artifacts_ok)
+
+
+def release_gate_summary(root: Path, *, git_sha: str | None = None, status: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = status or status_report(root)
+    sha = git_sha or git_output(root, "rev-parse", "HEAD")
+    artifacts = payload.get("release_artifacts", {})
+    doctor = payload.get("doctor", {})
+    checks = doctor.get("checks", []) if isinstance(doctor, dict) else []
+    return {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "git_sha": sha,
+        "ci": any(os.environ.get(name) for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI")),
+        "release_ready": bool(payload.get("release_ready")),
+        "release_artifacts": redact_value(artifacts),
+        "checks": redact_value(checks),
+    }
 
 
 def release_notes(root: Path) -> str:

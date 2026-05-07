@@ -181,6 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
     report_status = report_sub.add_parser("status")
     report_status.add_argument("--json", action="store_true", dest="command_json")
     report_sub.add_parser("release-notes")
+    report_summary = report_sub.add_parser("release-gate-summary")
+    report_summary.add_argument("--git-sha")
+    report_summary.add_argument("--json", action="store_true", dest="command_json")
     return parser
 
 
@@ -424,6 +427,12 @@ def main(argv: list[str] | None = None) -> int:
             from .report import release_notes
 
             print(release_notes(root))
+            return OK
+        if args.command == "report" and args.report_command == "release-gate-summary":
+            from .report import release_gate_summary
+
+            payload = release_gate_summary(root, git_sha=args.git_sha)
+            emit(payload, as_json=True)
             return OK
     except PolicyDenied as exc:
         emit({"ok": False, "error": "CI_READ_ONLY", "command": exc.command, "exit_code": PERMISSION_DENIED}, as_json=True)

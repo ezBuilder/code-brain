@@ -27,6 +27,7 @@ uv run --project .ai/runtime ai diagnostics bundle --dry-run --json
 uv run --project .ai/runtime ai migrate --dry-run --json
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json
 uv run --project .ai/runtime ai report status --json
+uv run --project .ai/runtime ai report release-gate-summary --json
 ```
 
 ## Full Local Verification
@@ -58,6 +59,7 @@ make release-gate
 `Makefile` provides operator shortcuts such as `make env-check`, `make preflight`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
 Use `make clean-cache` for ignored runtime cache files, `make clean-artifacts` for `dist/`, and `make clean-all` for cache, virtualenv, and release artifacts.
 GitHub Actions uses the same Makefile targets as local release verification.
+`.github/workflows/release-gate.yml` runs the full local gate with read-only repository permissions and uploads `dist/release-gate.summary.json` plus release artifacts for review.
 
 ## Operations
 
@@ -95,7 +97,7 @@ Use `OPERATIONS.md` as the handoff runbook for daily health checks, queue recove
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
 | Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration and local rollback backups |
 | Package | `scripts/package.sh`, `scripts/install-check.sh` | tarball + checksum + manifest + SBOM + provenance + release notes + bash/PowerShell install verification |
-| Report | `ai report status/release-notes` | release state, artifact integrity, and generated notes |
+| Report | `ai report status/release-notes/release-gate-summary` | release state, artifact integrity, CI summary, and generated notes |
 
 ## Release Gate
 

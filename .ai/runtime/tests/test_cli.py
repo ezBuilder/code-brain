@@ -260,17 +260,47 @@ def test_dep_advisory_release_gate_integration_invariants() -> None:
 
 
 def test_uv_lock_check_release_gate_integration_invariants() -> None:
+    script = (ROOT / "scripts" / "lockfile-check.sh").read_text(encoding="utf-8")
     release_gate = (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     docs_check = (ROOT / "scripts" / "docs-check.sh").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     operations = (ROOT / "OPERATIONS.md").read_text(encoding="utf-8")
-    assert "uv lock --check --project .ai/runtime >/dev/null" in release_gate
+    assert "uv lock --check --project .ai/runtime" in script
+    assert "uv lock --project .ai/runtime" in script
+    assert "./scripts/lockfile-check.sh >/dev/null" in release_gate
+    assert release_gate.find("./scripts/lockfile-check.sh") < release_gate.find("./bootstrap.sh")
+    assert "lockfile-check:" in makefile
     assert "lock-check:" in makefile
-    assert "uv lock --check --project .ai/runtime" in makefile
+    assert "./scripts/lockfile-check.sh" in makefile
+    assert "make -n lockfile-check" in docs_check
     assert "make -n lock-check" in docs_check
+    assert "./scripts/lockfile-check.sh" in docs_check
+    assert "scripts/lockfile-check.sh" in readme
     assert "uv lock --check --project .ai/runtime" in readme
-    assert "uv lock --check --project .ai/runtime" in operations
+    assert "scripts/lockfile-check.sh" in operations
+
+
+def test_lockfile_check_passes_without_modifying_lock(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    lockfile = repo / ".ai" / "runtime" / "uv.lock"
+    before = (lockfile.stat().st_mtime_ns, hashlib.sha256(lockfile.read_bytes()).hexdigest())
+    result = subprocess.run(["bash", "scripts/lockfile-check.sh"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    after = (lockfile.stat().st_mtime_ns, hashlib.sha256(lockfile.read_bytes()).hexdigest())
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "lockfile-check ok"
+    assert result.stderr == ""
+    assert after == before
+
+
+def test_lockfile_check_handles_missing_lockfile(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    (repo / ".ai" / "runtime" / "uv.lock").unlink()
+    result = subprocess.run(["bash", "scripts/lockfile-check.sh"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 1
+    assert "missing .ai/runtime/uv.lock" in result.stderr
+    assert "remediation" in result.stderr
+    assert "uv lock --project .ai/runtime" in result.stderr
 
 
 def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_path: Path) -> None:

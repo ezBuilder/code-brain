@@ -3,14 +3,14 @@ SHELL := /usr/bin/env bash
 
 LATEST_ARCHIVE := $(shell ls -t dist/code-brain-*.tar.gz 2>/dev/null | head -n 1)
 
-.PHONY: help env-check preflight lock-check lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check reproducibility-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
+.PHONY: help env-check preflight lockfile-check lock-check lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check reproducibility-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  make env-check         Verify required local toolchain' \
 		'  make preflight         Verify fresh-clone bootstrap readiness' \
-		'  make lock-check        Verify uv.lock matches runtime dependencies' \
+		'  make lockfile-check    Verify uv.lock matches runtime dependencies' \
 		'  make lint              Run static script and Python compile checks' \
 		'  make quick             Run fast local health checks' \
 		'  make package           Build release artifacts under dist/' \
@@ -32,8 +32,10 @@ env-check:
 preflight:
 	./scripts/preflight.sh --check-only --json
 
-lock-check:
-	uv lock --check --project .ai/runtime
+lockfile-check:
+	./scripts/lockfile-check.sh
+
+lock-check: lockfile-check
 
 lint:
 	./scripts/lint.sh

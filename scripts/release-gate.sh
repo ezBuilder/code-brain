@@ -9,7 +9,7 @@ trap 'rm -f "$PACKAGE_OUTPUT" "$REPORT_OUTPUT"' EXIT
 
 ./scripts/env-check.sh >/dev/null
 ./scripts/preflight.sh --check-only >/dev/null
-uv lock --check --project .ai/runtime >/dev/null
+./scripts/lockfile-check.sh >/dev/null
 ./scripts/lint.sh
 ./bootstrap.sh
 ./scripts/smoke.sh

@@ -42,8 +42,10 @@ for needle in \
   "worker health" \
   "PRODUCTION_HARDENING_BACKLOG.md" \
   "./scripts/release-gate.sh" \
+  "scripts/lockfile-check.sh" \
   "make env-check" \
   "make preflight" \
+  "make lockfile-check" \
   "make lock-check" \
   "uv lock --check --project .ai/runtime" \
   "make lint" \
@@ -78,8 +80,10 @@ uv run --project .ai/runtime python -c 'from ai_core.doctor import check_audit_c
 CODE_BRAIN_DEP_ADVISORY_OFFLINE=1 ./scripts/dep-advisory.sh >/dev/null
 ./scripts/env-check.sh >/dev/null
 ./scripts/preflight.sh --check-only --json >/dev/null
+./scripts/lockfile-check.sh >/dev/null
 make -n env-check >/dev/null
 make -n preflight >/dev/null
+make -n lockfile-check >/dev/null
 make -n lock-check >/dev/null
 make -n lint >/dev/null
 make -n quick >/dev/null

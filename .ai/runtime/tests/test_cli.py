@@ -806,6 +806,115 @@ def test_queue_fail_and_archive(tmp_path: Path) -> None:
     assert json.loads(archive_result.stdout)["archived"] == 1
 
 
+def test_queue_dead_empty_returns_zero_count(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    result = run_ai("queue", "dead", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 0
+    assert payload["matched"] == 0
+    assert payload["returned"] == 0
+    assert payload["skipped"] == 0
+    assert payload["items"] == []
+
+
+def test_queue_dead_sorted_desc_by_failed_at(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    dead_dir = repo / ".ai" / "memory" / "queue" / "dead"
+    dead_dir.mkdir(parents=True, exist_ok=True)
+    for job_id, failed_at in [
+        ("job-old", "2026-01-01T00:00:00Z"),
+        ("job-new", "2026-01-01T02:00:00Z"),
+        ("job-mid", "2026-01-01T01:00:00Z"),
+    ]:
+        (dead_dir / f"{job_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": job_id,
+                    "priority": "P2",
+                    "kind": "index",
+                    "status": "dead",
+                    "attempts": 2,
+                    "max_attempts": 3,
+                    "failed_at": failed_at,
+                    "failure_reason": "boom",
+                    "payload": {"secret": "hidden"},
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    result = run_ai("queue", "dead", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    items = json.loads(result.stdout)["items"]
+    assert [item["id"] for item in items] == ["job-new", "job-mid", "job-old"]
+    assert all(isinstance(item["age_seconds"], int) and item["age_seconds"] >= 0 for item in items)
+
+
+def test_queue_dead_respects_limit_and_since(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    dead_dir = repo / ".ai" / "memory" / "queue" / "dead"
+    dead_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(5):
+        failed_at = f"2026-01-01T0{index}:00:00Z"
+        (dead_dir / f"job-{index}.json").write_text(
+            json.dumps({"id": f"job-{index}", "priority": "P3", "kind": "notify", "failed_at": failed_at}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    limited = run_ai("queue", "dead", "--limit", "2", "--json", cwd=repo)
+    assert limited.returncode == 0, limited.stdout + limited.stderr
+    limited_payload = json.loads(limited.stdout)
+    assert limited_payload["count"] == 5
+    assert limited_payload["matched"] == 5
+    assert limited_payload["returned"] == 2
+    assert len(limited_payload["items"]) == 2
+
+    since = run_ai("queue", "dead", "--since", "2026-01-01T02:30:00Z", "--json", cwd=repo)
+    assert since.returncode == 0, since.stdout + since.stderr
+    since_payload = json.loads(since.stdout)
+    assert since_payload["count"] == 5
+    assert since_payload["matched"] == 2
+    assert [item["id"] for item in since_payload["items"]] == ["job-4", "job-3"]
+
+    too_many = run_ai("queue", "dead", "--limit", "999", "--json", cwd=repo)
+    assert too_many.returncode == 1
+    assert "limit must be between" in json.loads(too_many.stdout)["error"]
+
+
+def test_queue_dead_omits_payload_and_counts_skipped(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    dead_dir = repo / ".ai" / "memory" / "queue" / "dead"
+    dead_dir.mkdir(parents=True, exist_ok=True)
+    secret_value = "secret-token-" + "AKIA" + "0" * 16
+    (dead_dir / "safe.json").write_text(
+        json.dumps(
+            {
+                "id": "safe",
+                "priority": "P1",
+                "kind": "index",
+                "failed_at": "2026-01-01T00:00:00Z",
+                "failure_reason": "boom",
+                "payload": {"token": secret_value},
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (dead_dir / "corrupt.json").write_text("{not-json\n", encoding="utf-8")
+    result = run_ai("queue", "dead", "--json", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 2
+    assert payload["matched"] == 1
+    assert payload["returned"] == 1
+    assert payload["skipped"] == 1
+    assert "payload" not in result.stdout
+    assert "secret-token" not in result.stdout
+    assert "AKIA" + "0" * 16 not in result.stdout
+
+
 def test_ci_queue_write_rejected() -> None:
     result = run_ai_input(
         "queue",
@@ -847,6 +956,7 @@ def test_ci_mutation_commands_rejected(tmp_path: Path) -> None:
 def test_ci_read_only_commands_allowed(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     commands = [
+        ("queue", "dead", "--json"),
         ("queue", "status", "--json"),
         ("trust", "list", "--json"),
         ("secrets", "status", "--json"),

@@ -27,7 +27,7 @@ This backlog tracks remaining commercial-readiness work after the current releas
 - Keep `queue_lock` around every queue mutation.
 - Add a worker-loop integration only when there is an actual daemon lifecycle, systemd unit, or supervisor contract.
 - Keep queue age metrics and doctor thresholds visible for oldest pending and oldest processing jobs.
-- Add a dead-letter inspection command before adding any dead-letter replay command.
+- Keep dead-letter inspection read-only and payload-free before adding any dead-letter replay command.
 - Keep dead-letter replay gated by an explicit operator action.
 
 ## Observability And Diagnostics

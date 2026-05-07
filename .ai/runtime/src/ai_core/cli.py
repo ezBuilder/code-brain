@@ -77,6 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
     queue_archive = queue_sub.add_parser("archive-dead")
     queue_archive.add_argument("--older-than-days", type=int, default=30)
     queue_archive.add_argument("--json", action="store_true", dest="command_json")
+    queue_dead = queue_sub.add_parser("dead")
+    queue_dead.add_argument("--limit", type=int, default=50)
+    queue_dead.add_argument("--since")
+    queue_dead.add_argument("--json", action="store_true", dest="command_json")
     queue_status_parser = queue_sub.add_parser("status")
     queue_status_parser.add_argument("--json", action="store_true", dest="command_json")
     trust = sub.add_parser("trust")
@@ -285,6 +289,12 @@ def main(argv: list[str] | None = None) -> int:
             from .worker.scheduler import archive_dead
 
             payload = archive_dead(root, older_than_days=args.older_than_days)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "queue" and args.queue_command == "dead":
+            from .worker.scheduler import list_dead
+
+            payload = list_dead(root, limit=args.limit, since_iso=args.since)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "queue" and args.queue_command == "status":

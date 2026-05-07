@@ -19,6 +19,7 @@ for needle in \
   "ai report status --json" \
   "ai diagnostics bundle --dry-run --json" \
   "ai queue recover-expired --json" \
+  "ai queue dead --json" \
   "ai upgrade plan --target-version" \
   "exit code \`16\`" \
   "CI_READ_ONLY" \
@@ -53,6 +54,7 @@ uv run --project .ai/runtime ai report status --json >/dev/null
 uv run --project .ai/runtime ai obs metrics --json >/dev/null
 uv run --project .ai/runtime ai obs slo --json >/dev/null
 uv run --project .ai/runtime ai queue status --json >/dev/null
+uv run --project .ai/runtime ai queue dead --json --limit 1 >/dev/null
 uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null

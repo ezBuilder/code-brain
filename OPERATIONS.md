@@ -151,6 +151,15 @@ Archive old dead-letter jobs:
 uv run --project .ai/runtime ai queue archive-dead --older-than-days 30 --json
 ```
 
+Inspect dead-letter jobs before archive or replay planning:
+
+```bash
+uv run --project .ai/runtime ai queue dead --json --limit 50
+uv run --project .ai/runtime ai queue dead --json --since 2026-01-01T00:00:00Z
+```
+
+Dead-letter inspection is read-only and allowed in CI. It omits job payloads, returns newest failures first, caps `--limit` at 500, and reports malformed dead-letter files as `skipped`.
+
 The queue uses P0-P3 priorities and stores jobs under `.ai/memory/queue/`. Dead-letter files stay local until archived.
 
 ## Trust And Secrets

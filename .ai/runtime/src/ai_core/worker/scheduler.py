@@ -211,6 +211,51 @@ def archive_dead(root: Path, *, older_than_days: int = 30) -> dict[str, Any]:
         return {"ok": True, "archived": archived}
 
 
+def list_dead(root: Path, *, limit: int = 50, since_iso: str | None = None) -> dict[str, Any]:
+    if limit < 0 or limit > 500:
+        raise ValueError("limit must be between 0 and 500")
+    ensure_queue_dirs(root)
+    since = parse_iso(since_iso) if since_iso else None
+    current = now()
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    total_files = 0
+    for path in sorted((queue_root(root) / "dead").glob("*.json")):
+        total_files += 1
+        try:
+            job = read_job(path)
+            failed = parse_iso(str(job.get("failed_at", job.get("updated_at", ""))))
+        except (OSError, ValueError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        if since and (not failed or failed < since):
+            continue
+        items.append(
+            {
+                "id": job.get("id") or path.stem,
+                "priority": job.get("priority"),
+                "kind": job.get("kind"),
+                "status": job.get("status", "dead"),
+                "attempts": int(job.get("attempts", 0) or 0),
+                "max_attempts": int(job.get("max_attempts", DEFAULT_MAX_ATTEMPTS) or DEFAULT_MAX_ATTEMPTS),
+                "failed_at": job.get("failed_at"),
+                "failure_reason": job.get("failure_reason"),
+                "age_seconds": max(0, int((current - failed).total_seconds())) if failed else None,
+                "path": path.relative_to(root).as_posix(),
+            }
+        )
+    items.sort(key=lambda item: item.get("failed_at") or "", reverse=True)
+    limited = items[:limit]
+    return {
+        "ok": True,
+        "count": total_files,
+        "matched": len(items),
+        "returned": len(limited),
+        "skipped": skipped,
+        "items": limited,
+    }
+
+
 def status(root: Path) -> dict[str, Any]:
     ensure_queue_dirs(root)
     expired_processing = expired_processing_jobs(root)

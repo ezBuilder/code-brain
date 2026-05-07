@@ -13,6 +13,7 @@ done
 uv run --project .ai/runtime python -m compileall -q .ai/runtime/src .ai/runtime/tests
 
 make -n env-check >/dev/null
+make -n lock-check >/dev/null
 make -n quick >/dev/null
 make -n package >/dev/null
 make -n verify-artifacts >/dev/null

@@ -63,7 +63,7 @@ make release-gate
 `scripts/verify-artifacts.sh` verifies release checksum, manifest, SBOM, provenance, and release notes without executing package code.
 `scripts/reproducibility-check.sh` rebuilds the package into a temporary directory and fails if the archive SHA-256 differs.
 `scripts/artifact-tamper-check.sh` verifies that corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.
-`Makefile` provides operator shortcuts such as `make env-check`, `make preflight`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
+`Makefile` provides operator shortcuts such as `make env-check`, `make preflight`, `make lock-check`, `make lint`, `make quick`, `make package`, `make verify-artifacts`, and `make release-gate`.
 Use `make clean-cache` for ignored runtime cache files, `make clean-artifacts` for `dist/`, and `make clean-all` for cache, virtualenv, and release artifacts.
 GitHub Actions uses the same Makefile targets as local release verification.
 `.github/workflows/release-gate.yml` runs the full local gate with read-only repository permissions and uploads `dist/release-gate.summary.json` plus release artifacts for review.
@@ -117,6 +117,7 @@ Before tagging a release:
 ```bash
 ./bootstrap.sh
 ./scripts/env-check.sh
+uv lock --check --project .ai/runtime
 ./scripts/lint.sh
 ./scripts/smoke.sh
 ./scripts/docs-check.sh
@@ -127,6 +128,7 @@ Before tagging a release:
 ./scripts/release-gate.sh
 make lint
 make env-check
+make lock-check
 make release-gate
 git status --short
 ```

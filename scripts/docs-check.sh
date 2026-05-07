@@ -44,6 +44,8 @@ for needle in \
   "./scripts/release-gate.sh" \
   "make env-check" \
   "make preflight" \
+  "make lock-check" \
+  "uv lock --check --project .ai/runtime" \
   "make lint" \
   "make release-gate" \
   "make clean-all" \
@@ -78,6 +80,7 @@ CODE_BRAIN_DEP_ADVISORY_OFFLINE=1 ./scripts/dep-advisory.sh >/dev/null
 ./scripts/preflight.sh --check-only --json >/dev/null
 make -n env-check >/dev/null
 make -n preflight >/dev/null
+make -n lock-check >/dev/null
 make -n lint >/dev/null
 make -n quick >/dev/null
 make -n package >/dev/null

@@ -259,6 +259,20 @@ def test_dep_advisory_release_gate_integration_invariants() -> None:
     assert "CODE_BRAIN_DEP_ADVISORY_OFFLINE=1 ./scripts/dep-advisory.sh" in docs_check
 
 
+def test_uv_lock_check_release_gate_integration_invariants() -> None:
+    release_gate = (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    docs_check = (ROOT / "scripts" / "docs-check.sh").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    operations = (ROOT / "OPERATIONS.md").read_text(encoding="utf-8")
+    assert "uv lock --check --project .ai/runtime >/dev/null" in release_gate
+    assert "lock-check:" in makefile
+    assert "uv lock --check --project .ai/runtime" in makefile
+    assert "make -n lock-check" in docs_check
+    assert "uv lock --check --project .ai/runtime" in readme
+    assert "uv lock --check --project .ai/runtime" in operations
+
+
 def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_path: Path) -> None:
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"

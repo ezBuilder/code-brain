@@ -28,6 +28,8 @@ for needle in \
   "release-gate.yml" \
   "summary-observe" \
   "summary-parity.py" \
+  "dep-advisory.json" \
+  "dep-advisory.sh" \
   "release-gate.summary.json" \
   "ai report release-gate-summary" \
   "queue status" \
@@ -64,6 +66,7 @@ uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json >/dev
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
 uv run --project .ai/runtime ai report release-gate-summary --git-sha "$(git rev-parse HEAD)" --json >/dev/null
+CODE_BRAIN_DEP_ADVISORY_OFFLINE=1 ./scripts/dep-advisory.sh >/dev/null
 ./scripts/env-check.sh >/dev/null
 ./scripts/preflight.sh --check-only --json >/dev/null
 make -n env-check >/dev/null

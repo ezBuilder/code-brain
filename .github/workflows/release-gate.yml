@@ -60,6 +60,7 @@ jobs:
             dist/code-brain-*.sbom.json
             dist/code-brain-*.provenance.json
             dist/code-brain-*.release-notes.md
+            dist/dep-advisory.json
           if-no-files-found: error
           retention-days: 30
 

@@ -129,6 +129,7 @@ def test_release_gate_workflow_invariants() -> None:
     assert "summary-observe" in workflow
     assert "actions/download-artifact@v4" in workflow
     assert "summary-parity.py" in workflow
+    assert "dist/dep-advisory.json" in workflow
     assert "ubuntu-latest" in workflow
     assert "macos-latest" in workflow
     assert '[[ "$rc" -eq 16 ]]' in workflow
@@ -138,6 +139,83 @@ def test_release_gate_workflow_invariants() -> None:
     assert "gh pr" not in workflow
     assert "git push" not in workflow
     assert "GITHUB_TOKEN" not in workflow
+
+
+def test_dep_advisory_offline_skip_emits_schema(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    env = os.environ.copy()
+    env["CODE_BRAIN_DEP_ADVISORY_OFFLINE"] = "1"
+    result = subprocess.run(
+        ["bash", "scripts/dep-advisory.sh"],
+        cwd=repo,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "offline-skipped" in result.stdout
+    payload = json.loads((repo / "dist" / "dep-advisory.json").read_text(encoding="utf-8"))
+    assert payload["ok"] is True
+    assert payload["skipped"] == "offline"
+    assert payload["findings"] == []
+    assert payload["finding_count"] == 0
+    assert payload["tool"] == "pip-audit"
+    assert payload["mode"] == "advisory"
+
+
+def test_dep_advisory_findings_do_not_fail_gate(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    raw = {
+        "dependencies": [
+            {
+                "name": "pkg",
+                "version": "1.0",
+                "vulns": [
+                    {
+                        "id": "GHSA-xxxx",
+                        "fix_versions": ["1.1"],
+                        "description": "x" * 300,
+                    }
+                ],
+            }
+        ]
+    }
+    env = os.environ.copy()
+    env["CODE_BRAIN_DEP_ADVISORY_RAW"] = json.dumps(raw)
+    result = subprocess.run(
+        ["bash", "scripts/dep-advisory.sh"],
+        cwd=repo,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads((repo / "dist" / "dep-advisory.json").read_text(encoding="utf-8"))
+    assert payload["ok"] is True
+    assert payload["skipped"] is None
+    assert payload["finding_count"] == 1
+    assert payload["findings"][0]["package"] == "pkg"
+    assert payload["findings"][0]["version"] == "1.0"
+    assert payload["findings"][0]["id"] == "GHSA-xxxx"
+    assert payload["findings"][0]["fix_versions"] == ["1.1"]
+    assert len(payload["findings"][0]["description"]) == 240
+
+
+def test_dep_advisory_release_gate_integration_invariants() -> None:
+    script = (ROOT / "scripts" / "dep-advisory.sh").read_text(encoding="utf-8")
+    release_gate = (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "release-gate.yml").read_text(encoding="utf-8")
+    docs_check = (ROOT / "scripts" / "docs-check.sh").read_text(encoding="utf-8")
+    assert "set -euo pipefail" in script
+    assert "pip-audit" in script
+    assert "finding_count" in script
+    assert "./scripts/dep-advisory.sh >/dev/null" in release_gate
+    assert "dist/dep-advisory.json" in workflow
+    assert "CODE_BRAIN_DEP_ADVISORY_OFFLINE=1 ./scripts/dep-advisory.sh" in docs_check
 
 
 def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_path: Path) -> None:

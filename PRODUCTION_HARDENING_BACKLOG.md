@@ -43,7 +43,7 @@ This backlog tracks remaining commercial-readiness work after the current releas
 - Keep package verification before install verification.
 - Keep artifact tamper checks covering checksum, manifest, SBOM, provenance, and release notes.
 - Add archive extraction path traversal tests if package contents expand beyond the current controlled file list.
-- Add dependency vulnerability scanning only as a read-only advisory gate unless the operator approves a hard fail policy.
+- Keep dependency vulnerability scanning as a read-only advisory gate unless the operator approves a hard fail policy.
 - Keep SBOM lockfile hash validation.
 
 ## Fresh Clone And VPS Handoff

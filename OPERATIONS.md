@@ -48,7 +48,7 @@ Direct `bootstrap.sh` runs also start with `scripts/env-check.sh` and `scripts/p
 It also runs artifact tamper checks so checksum, manifest, SBOM, provenance, and release notes corruption must be rejected before release.
 Use `scripts/verify-artifacts.sh` when you need to validate downloaded release artifacts before running package code.
 CI uses the same Makefile targets as local release verification; write-heavy smoke/docs flows run only inside temporary repositories with CI policy explicitly cleared.
-`.github/workflows/release-gate.yml` runs the full release gate with read-only repository permissions, verifies CI write rejection, uploads `dist/release-gate.summary.json` plus release artifacts for retention, and uses `summary-observe` with `scripts/summary-parity.py` to compare canonical summary fields across supported CI operating systems.
+`.github/workflows/release-gate.yml` runs the full release gate with read-only repository permissions, verifies CI write rejection, uploads `dist/release-gate.summary.json`, `dist/dep-advisory.json`, plus release artifacts for retention, and uses `summary-observe` with `scripts/summary-parity.py` to compare canonical summary fields across supported CI operating systems.
 
 ## Install From Archive
 
@@ -285,3 +285,4 @@ git status --short
 ```
 
 Attach `dist/release-gate.summary.json`, `dist/code-brain-<version>.release-notes.md`, the archive checksum from `dist/code-brain-<version>.tar.gz.sha256`, `dist/code-brain-<version>.manifest.json`, `dist/code-brain-<version>.sbom.json`, and `dist/code-brain-<version>.provenance.json`.
+Attach `dist/dep-advisory.json` as an advisory dependency vulnerability report. Findings or offline skips do not fail the release gate unless a future hard-fail policy is explicitly approved.

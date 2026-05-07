@@ -62,6 +62,7 @@ make release-gate
 Use `make clean-cache` for ignored runtime cache files, `make clean-artifacts` for `dist/`, and `make clean-all` for cache, virtualenv, and release artifacts.
 GitHub Actions uses the same Makefile targets as local release verification.
 `.github/workflows/release-gate.yml` runs the full local gate with read-only repository permissions and uploads `dist/release-gate.summary.json` plus release artifacts for review.
+Dependency vulnerability scanning is advisory-only: `scripts/dep-advisory.sh` writes `dist/dep-advisory.json`, never fails the release gate on findings, and records offline/tool skips explicitly.
 
 ## Operations
 
@@ -100,6 +101,7 @@ Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for c
 | Diagnostics | `ai diagnostics bundle/prune` | redacted local bundle under `.ai/cache/diagnostics` |
 | Release | `ai migrate`, `ai upgrade plan/apply/rollback` | idempotent migration and local rollback backups |
 | Package | `scripts/package.sh`, `scripts/install-check.sh` | tarball + checksum + manifest + SBOM + provenance + release notes + bash/PowerShell install verification |
+| Advisory | `scripts/dep-advisory.sh` | read-only dependency vulnerability advisory at `dist/dep-advisory.json` |
 | Report | `ai report status/release-notes/release-gate-summary` | release state, artifact integrity, CI summary, and generated notes |
 
 ## Release Gate

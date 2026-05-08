@@ -10,6 +10,13 @@ from .config import load_config
 from .redact import redact_value
 
 SCHEMA_VERSION = 3
+# Path prefixes excluded from FTS5 indexing. These are runtime-accumulating
+# operational logs / caches whose content changes on every CLI invocation,
+# so indexing them creates a perpetual `index_freshness` staleness loop.
+SKIP_PATH_PREFIXES = (
+    ".ai/memory/",
+    ".ai/cache/",
+)
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -341,13 +348,14 @@ def iter_text_files(root: Path):
         if not path.is_file():
             continue
         rel = path.relative_to(root)
+        rel_posix = rel.as_posix()
+        if any(rel_posix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
+            continue
         if any(part in SKIP_DIRS for part in rel.parts):
             continue
         if path.name in SKIP_NAMES:
             continue
         if any(path.name.endswith(suffix) for suffix in SKIP_SUFFIXES):
-            continue
-        if rel.as_posix() == ".ai/cache/code.sqlite":
             continue
         if path.stat().st_size > MAX_TEXT_BYTES:
             continue

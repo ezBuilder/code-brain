@@ -227,6 +227,83 @@ def build_parser() -> argparse.ArgumentParser:
     index_sub = index.add_subparsers(dest="index_command", required=True)
     index_rebuild = index_sub.add_parser("rebuild")
     index_rebuild.add_argument("--json", action="store_true", dest="command_json")
+    index_rebuild.add_argument(
+        "--single-flight",
+        action="store_true",
+        dest="single_flight",
+        help="non-blocking flock on .ai/cache/.rebuild.lock; skip if another rebuild is in progress",
+    )
+    recommend_parser = sub.add_parser("recommend")
+    recommend_sub = recommend_parser.add_subparsers(dest="recommend_command", required=True)
+    recommend_skills = recommend_sub.add_parser("skills")
+    recommend_skills_sub = recommend_skills.add_subparsers(dest="recommend_skills_command", required=False)
+    recommend_skills.add_argument("--limit", type=int, default=5)
+    recommend_skills.add_argument("--no-global", action="store_true", dest="no_global")
+    recommend_skills.add_argument("--min-signal", type=int, default=3, dest="min_signal")
+    recommend_skills.add_argument("--json", action="store_true", dest="command_json")
+    rec_accept = recommend_skills_sub.add_parser("accept")
+    rec_accept.add_argument("candidate_id")
+    rec_accept.add_argument("--json", action="store_true", dest="command_json")
+    rec_reject = recommend_skills_sub.add_parser("reject")
+    rec_reject.add_argument("candidate_id")
+    rec_reject.add_argument("--json", action="store_true", dest="command_json")
+
+    skills_parser = sub.add_parser("skills")
+    skills_sub = skills_parser.add_subparsers(dest="skills_command", required=True)
+    skills_list = skills_sub.add_parser("list")
+    skills_list.add_argument("--json", action="store_true", dest="command_json")
+    skills_uninstall = skills_sub.add_parser("uninstall")
+    skills_uninstall.add_argument("slug")
+    skills_uninstall.add_argument("--force", action="store_true")
+    skills_uninstall.add_argument("--json", action="store_true", dest="command_json")
+
+    precall_parser = sub.add_parser("precall")
+    precall_sub = precall_parser.add_subparsers(dest="precall_command", required=True)
+    pc_list = precall_sub.add_parser("list")
+    pc_list.add_argument("--json", action="store_true", dest="command_json")
+    pc_recommend = precall_sub.add_parser("recommend")
+    pc_recommend.add_argument("--limit", type=int, default=5)
+    pc_recommend.add_argument("--min-signal", type=int, default=5, dest="min_signal")
+    pc_recommend.add_argument("--include-transcripts", action="store_true", dest="include_transcripts")
+    pc_recommend.add_argument("--json", action="store_true", dest="command_json")
+    pc_accept = precall_sub.add_parser("accept")
+    pc_accept.add_argument("candidate_id")
+    pc_accept.add_argument("--json", action="store_true", dest="command_json")
+    pc_activate = precall_sub.add_parser("activate")
+    pc_activate.add_argument("candidate_id")
+    pc_activate.add_argument("--force", action="store_true")
+    pc_activate.add_argument("--json", action="store_true", dest="command_json")
+    pc_reject = precall_sub.add_parser("reject")
+    pc_reject.add_argument("candidate_id")
+    pc_reject.add_argument("--json", action="store_true", dest="command_json")
+    pc_disable = precall_sub.add_parser("disable")
+    pc_disable.add_argument("candidate_id")
+    pc_disable.add_argument("--json", action="store_true", dest="command_json")
+
+    federated_parser = sub.add_parser("federated")
+    federated_sub = federated_parser.add_subparsers(dest="federated_command", required=True)
+    fed_summary = federated_sub.add_parser("summary")
+    fed_summary.add_argument("--json", action="store_true", dest="command_json")
+
+    agents_parser = sub.add_parser("agents")
+    agents_sub = agents_parser.add_subparsers(dest="agents_command", required=True)
+    ag_recommend = agents_sub.add_parser("recommend")
+    ag_recommend.add_argument("--limit", type=int, default=5)
+    ag_recommend.add_argument("--min-signal", type=int, default=3, dest="min_signal")
+    ag_recommend.add_argument("--json", action="store_true", dest="command_json")
+    ag_accept = agents_sub.add_parser("accept")
+    ag_accept.add_argument("candidate_id")
+    ag_accept.add_argument("--json", action="store_true", dest="command_json")
+    ag_reject = agents_sub.add_parser("reject")
+    ag_reject.add_argument("candidate_id")
+    ag_reject.add_argument("--json", action="store_true", dest="command_json")
+    ag_list = agents_sub.add_parser("list")
+    ag_list.add_argument("--json", action="store_true", dest="command_json")
+    ag_uninstall = agents_sub.add_parser("uninstall")
+    ag_uninstall.add_argument("slug")
+    ag_uninstall.add_argument("--force", action="store_true")
+    ag_uninstall.add_argument("--json", action="store_true", dest="command_json")
+
     code = sub.add_parser("code")
     code_sub = code.add_subparsers(dest="code_command", required=True)
     code_query = code_sub.add_parser("query")
@@ -534,9 +611,121 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "index" and args.index_command == "rebuild":
             reject_ci_write("index")
-            payload = rebuild(root)
+            payload = rebuild(root, single_flight=getattr(args, "single_flight", False))
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "recommend" and args.recommend_command == "skills":
+            from .recommend import accept as rec_accept_fn, recommend as rec_run, reject as rec_reject_fn
+            sub_cmd = getattr(args, "recommend_skills_command", None)
+            if sub_cmd == "accept":
+                reject_ci_write("skills")
+                payload = rec_accept_fn(root, args.candidate_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if sub_cmd == "reject":
+                reject_ci_write("skills")
+                payload = rec_reject_fn(root, args.candidate_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            payload = rec_run(
+                root,
+                limit=args.limit,
+                include_global=not getattr(args, "no_global", False),
+                min_signal=getattr(args, "min_signal", 3),
+            )
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "skills" and args.skills_command == "list":
+            from .recommend import list_visible
+            payload = {"ok": True, "skills": list_visible(root)}
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "skills" and args.skills_command == "uninstall":
+            reject_ci_write("skills")
+            from .recommend import uninstall as skills_uninstall_fn
+            payload = skills_uninstall_fn(root, args.slug, force=args.force)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "precall":
+            from .precall_recommend import (
+                accept as pc_accept_fn,
+                activate as pc_activate_fn,
+                disable as pc_disable_fn,
+                list_visible as pc_list_visible,
+                recommend as pc_recommend_fn,
+                reject as pc_reject_fn,
+            )
+            cmd = args.precall_command
+            if cmd == "list":
+                payload = {"ok": True, "rules": pc_list_visible(root)}
+                emit(payload, as_json=as_json)
+                return OK
+            if cmd == "recommend":
+                payload = pc_recommend_fn(
+                    root,
+                    limit=args.limit,
+                    min_signal=getattr(args, "min_signal", 5),
+                    include_transcripts=getattr(args, "include_transcripts", False),
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if cmd == "accept":
+                reject_ci_write("precall")
+                payload = pc_accept_fn(root, args.candidate_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if cmd == "activate":
+                reject_ci_write("precall")
+                payload = pc_activate_fn(root, args.candidate_id, force=args.force)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if cmd == "reject":
+                reject_ci_write("precall")
+                payload = pc_reject_fn(root, args.candidate_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if cmd == "disable":
+                reject_ci_write("precall")
+                payload = pc_disable_fn(root, args.candidate_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "federated" and args.federated_command == "summary":
+            from .federated import cross_project_summary
+            payload = cross_project_summary(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "agents":
+            from .agent_recommend import (
+                accept as ag_accept_fn,
+                list_visible as ag_list_visible,
+                recommend as ag_recommend_fn,
+                reject as ag_reject_fn,
+                uninstall as ag_uninstall_fn,
+            )
+            cmd = args.agents_command
+            if cmd == "list":
+                payload = {"ok": True, "agents": ag_list_visible(root)}
+                emit(payload, as_json=as_json)
+                return OK
+            if cmd == "recommend":
+                payload = ag_recommend_fn(root, limit=args.limit, min_signal=args.min_signal)
+                emit(payload, as_json=as_json)
+                return OK
+            if cmd == "accept":
+                reject_ci_write("agents")
+                payload = ag_accept_fn(root, args.candidate_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if cmd == "reject":
+                reject_ci_write("agents")
+                payload = ag_reject_fn(root, args.candidate_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if cmd == "uninstall":
+                reject_ci_write("agents")
+                payload = ag_uninstall_fn(root, args.slug, force=args.force)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "exec":
             from .sandbox import execute as sandbox_execute, fetch as sandbox_fetch, list_executions as sandbox_list, prune as sandbox_prune
 

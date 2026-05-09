@@ -44,8 +44,76 @@ def run_checks(root: Path) -> list[Check]:
         check_queue_lease_recovery(root),
         check_queue_age(root),
         check_diagnostics(root),
+        check_skills_catalog(root),
+        check_precall_rules(root),
     ]
     return checks
+
+
+def check_precall_rules(root: Path) -> Check:
+    catalog = root / ".ai" / "precall_rules" / "catalog.jsonl"
+    if not catalog.exists():
+        return Check("precall_rules", True, "no rules yet")
+    try:
+        import re as _re
+        from .precall_recommend import list_catalog
+        entries = list_catalog(root)
+    except Exception as exc:
+        return Check("precall_rules", False, f"catalog read error: {exc}")
+    bad_regex = 0
+    stuck_dry_run = 0
+    for e in entries:
+        try:
+            _re.compile(e.pattern)
+        except _re.error:
+            bad_regex += 1
+        if e.status == "dry_run" and e.dry_run_observations > 100:
+            stuck_dry_run += 1
+    if bad_regex:
+        return Check(
+            "precall_rules", False,
+            f"entries={len(entries)} bad_regex={bad_regex}",
+        )
+    detail = f"entries={len(entries)} active={sum(1 for e in entries if e.status=='active')}"
+    if stuck_dry_run:
+        detail += f" stuck_dry_run={stuck_dry_run}"
+    return Check("precall_rules", True, detail)
+
+
+def check_skills_catalog(root: Path) -> Check:
+    catalog = root / ".ai" / "skills" / "catalog.jsonl"
+    if not catalog.exists():
+        return Check("skills_catalog", True, "no catalog yet")
+    try:
+        from .recommend import _read_marker, _sha256, list_catalog
+        entries = list_catalog(root)
+    except Exception as exc:
+        return Check("skills_catalog", False, f"catalog read error: {exc}")
+    drift = 0
+    missing = 0
+    for entry in entries:
+        if entry.status != "installed":
+            continue
+        for rel in entry.installed_paths:
+            path = root / rel
+            if not path.exists():
+                missing += 1
+                continue
+            marker = _read_marker(path)
+            disk_sha = _sha256(marker.get("__body__", ""))
+            if entry.body_sha256 and disk_sha != entry.body_sha256:
+                drift += 1
+    if missing or drift:
+        return Check(
+            "skills_catalog",
+            False,
+            f"installed={sum(1 for e in entries if e.status == 'installed')} drift={drift} missing={missing}",
+        )
+    return Check(
+        "skills_catalog",
+        True,
+        f"entries={len(entries)} installed={sum(1 for e in entries if e.status == 'installed')}",
+    )
 
 
 def check_layout(root: Path) -> Check:

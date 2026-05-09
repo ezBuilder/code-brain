@@ -122,6 +122,9 @@ def event_observability(root: Path) -> dict[str, Any]:
         "hook_events": 0,
         "mcp_requests": 0,
         "additional_context_bytes": 0,
+        "original_context_bytes": 0,
+        "delta_skipped_count": 0,
+        "delta_saved_bytes": 0,
         "mcp_request_bytes": 0,
         "mcp_response_bytes": 0,
         "hook_breakdown": {},
@@ -132,7 +135,12 @@ def event_observability(root: Path) -> dict[str, Any]:
     }
     if not events_root.exists():
         return {"ok": True, **totals}
-    HOOK_NAMES = {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "PreCompact"}
+    HOOK_NAMES = {
+        "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+        "Stop", "SubagentStop", "PreCompact", "PostCompact",
+        "SessionEnd", "Notification", "PermissionRequest", "PermissionDenied",
+        "CwdChanged", "ConfigChange", "InstructionsLoaded",
+    }
     hook_breakdown: dict[str, dict[str, int]] = {}
     mcp_breakdown: dict[str, dict[str, int]] = {}
     for path in sorted(events_root.glob("*.jsonl")):
@@ -149,9 +157,15 @@ def event_observability(root: Path) -> dict[str, Any]:
             kind = str(record.get("kind") or payload.get("hook") or payload.get("kind") or "")
             totals["events"] += 1
             ctx_bytes = _int(payload.get("additional_context_bytes"))
+            orig_bytes = _int(payload.get("original_context_bytes")) or ctx_bytes
+            delta_skipped = bool(payload.get("delta_skipped"))
             req_bytes = _int(payload.get("request_bytes"))
             resp_bytes = _int(payload.get("response_bytes"))
             totals["additional_context_bytes"] += ctx_bytes
+            totals["original_context_bytes"] += orig_bytes
+            if delta_skipped:
+                totals["delta_skipped_count"] += 1
+                totals["delta_saved_bytes"] += max(0, orig_bytes - ctx_bytes)
             totals["mcp_request_bytes"] += req_bytes
             totals["mcp_response_bytes"] += resp_bytes
             if kind == "mcp.request":
@@ -182,6 +196,9 @@ def event_observability(root: Path) -> dict[str, Any]:
                     elif action == "allow":
                         bucket["allowed"] += 1
                         totals["pretooluse_allows"] += 1
+                    elif action == "observe":
+                        bucket.setdefault("observed", 0)
+                        bucket["observed"] += 1
     totals["hook_breakdown"] = {k: hook_breakdown[k] for k in sorted(hook_breakdown)}
     totals["mcp_breakdown"] = {k: mcp_breakdown[k] for k in sorted(mcp_breakdown)}
     return {"ok": True, **totals}

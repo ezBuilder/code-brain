@@ -10,12 +10,20 @@ from .config import load_config
 from .redact import redact_value
 
 SCHEMA_VERSION = 3
+import os as _os
+try:
+    SNIPPET_MAX_BYTES = max(80, min(2048, int(_os.environ.get("AI_SNIPPET_MAX_BYTES", "240"))))
+except (ValueError, TypeError):
+    SNIPPET_MAX_BYTES = 240
 # Path prefixes excluded from FTS5 indexing. These are runtime-accumulating
 # operational logs / caches whose content changes on every CLI invocation,
 # so indexing them creates a perpetual `index_freshness` staleness loop.
 SKIP_PATH_PREFIXES = (
     ".ai/memory/",
     ".ai/cache/",
+    ".ai/skills/",
+    ".ai/precall_rules/",
+    ".ai/agents_catalog/",
 )
 SKIP_DIRS = {
     ".git",
@@ -171,7 +179,33 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"pragma user_version={SCHEMA_VERSION}")
 
 
-def rebuild(root: Path) -> dict[str, Any]:
+def rebuild(root: Path, *, single_flight: bool = False) -> dict[str, Any]:
+    if single_flight:
+        from .portable import lock_exclusive_nonblocking, unlock
+        lock_path = root / ".ai" / "cache" / ".rebuild.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = open(lock_path, "w")
+        try:
+            if not lock_exclusive_nonblocking(lock_fd):
+                lock_fd.close()
+                return {
+                    "ok": True,
+                    "skipped": "another rebuild in progress",
+                    "db_path": db_path(root).relative_to(root).as_posix(),
+                }
+            try:
+                return _rebuild_inner(root)
+            finally:
+                unlock(lock_fd)
+        finally:
+            try:
+                lock_fd.close()
+            except Exception:
+                pass
+    return _rebuild_inner(root)
+
+
+def _rebuild_inner(root: Path) -> dict[str, Any]:
     with connect(root) as conn:
         init_schema(conn, migrate_legacy=True)
         conn.execute("begin immediate")
@@ -413,7 +447,7 @@ def snippet_from_file(root: Path, rel_path: str, query_text: str, *, fallback: s
         snippet = "..." + snippet
     if end < len(redacted):
         snippet += "..."
-    return snippet[:420]
+    return snippet[:SNIPPET_MAX_BYTES]
 
 
 def escape_fts_query(text: str) -> str:

@@ -208,24 +208,42 @@ def acquire_worker_lock(root: Path, *, owner: str = "worker") -> WorkerLock:
 
 @contextmanager
 def queue_lock(root: Path):
+    from ..portable import IS_WINDOWS
+
     path = queue_lock_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        try:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except ImportError:
-            pass
+        if IS_WINDOWS:
+            try:
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            except (ImportError, OSError):
+                pass
+        else:
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
         yield
     finally:
         try:
-            try:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except ImportError:
-                pass
+            if IS_WINDOWS:
+                try:
+                    import msvcrt
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                    except OSError:
+                        pass
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except (ImportError, OSError):
+                    pass
+            else:
+                try:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except (ImportError, OSError):
+                    pass
         finally:
             os.close(fd)

@@ -23,7 +23,10 @@ from typing import Any
 from ai_core.redact import redact_value
 
 RESUME_RETENTION_DAYS = 14
-RESUME_MAX_BYTES = 4096
+try:
+    RESUME_MAX_BYTES = max(512, min(8192, int(os.environ.get("AI_RESUME_MAX_BYTES", "4096"))))
+except (ValueError, TypeError):
+    RESUME_MAX_BYTES = 4096
 SCHEMA_VERSION = 1
 
 _DONE_STATUSES = {"done", "closed", "completed", "cancelled", "canceled"}
@@ -137,8 +140,20 @@ def _ensure_session_dir(root: Path, session_id: str) -> Path:
     return session_dir
 
 
-def write_snapshot(root: Path, *, session_id: str, agent: str) -> dict[str, Any]:
-    """Compose, redact, size-cap, and atomically write a resume snapshot."""
+def write_snapshot(
+    root: Path,
+    *,
+    session_id: str,
+    agent: str,
+    force: bool = False,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Compose, redact, size-cap, and atomically write a resume snapshot.
+
+    `force=True` is currently a marker (every write fully recomposes anyway), but
+    it is recorded in the snapshot's `forced_reason` so PreCompact / SessionEnd
+    audits stay distinguishable from regular session boundaries.
+    """
 
     root = Path(root)
     session_dir = _ensure_session_dir(root, session_id)
@@ -155,6 +170,8 @@ def write_snapshot(root: Path, *, session_id: str, agent: str) -> dict[str, Any]
         "session_tail": _session_tail(root),
         "audit_tail_actions": _audit_tail_actions(root),
     }
+    if force:
+        payload["forced_reason"] = (reason or "force")[:64]
 
     # Redact every string value before persisting.
     payload = redact_value(payload)

@@ -1,15 +1,46 @@
 {
   "_note": "Codex hook schema may differ across versions. Verify with your codex CLI release. PreToolUse currently supports deny rules only — input rewriting awaits upstream updatedInput support.",
   "hooks": {
+    "PermissionRequest": [
+      {
+        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PermissionRequest"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PostToolUse",
+        "matchers": [
+          "Edit",
+          "Write",
+          "MultiEdit",
+          "NotebookEdit",
+          "Read",
+          "Glob",
+          "Grep"
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PreToolUse",
-        "matchers": ["Bash"]
+        "matchers": [
+          "Bash"
+        ]
       }
     ],
     "SessionStart": [
       {
         "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook SessionStart"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook Stop"
+      }
+    ],
+    "SubagentStop": [
+      {
+        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook SubagentStop"
       }
     ],
     "UserPromptSubmit": [

@@ -1,0 +1,21 @@
+name: windows-runtime
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pytest-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Sync runtime deps
+        shell: pwsh
+        run: |
+          uv sync --project .ai/runtime --all-extras --dev
+      - name: Pytest (cross-platform unit tests)
+        shell: pwsh
+        run: |
+          uv run --project .ai/runtime python -m pytest .ai/runtime/tests -x --tb=short -q

@@ -22,3 +22,6 @@ args = []
 # name = "code-brain"
 # command = ".ai/bin/ai-mcp"
 # args = []
+
+[features]
+codex_hooks = true

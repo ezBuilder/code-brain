@@ -67,12 +67,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "obs_usage",
-        "description": "Actual token usage from Claude/Codex transcripts plus measured Code Brain effect bytes.",
+        "description": "Token usage + Code Brain effect bytes. Read-only.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "obs_health_summary",
-        "description": "Read-only roll-up: doctor checks, queue counts, worker lock, release artifacts, index state.",
+        "description": "Doctor + queue + worker + index roll-up. Read-only.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -91,7 +91,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "sandbox_execute",
-        "description": "Run a shell command in Code Brain's sandbox. Returns short summary plus exec_id; full output stored on disk.",
+        "description": "Run shell in sandbox; returns summary+exec_id, full output on disk. Write-class.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -126,13 +126,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "record_decision",
-        "description": (
-            "Persist a project decision to .ai/memory/decisions.jsonl. Call this whenever the "
-            "user makes or confirms a meaningful project decision — architectural choice, scope "
-            "change, dropped option, locked policy. Decisions auto-inject into next session's "
-            "additionalContext via SessionStart hook. Keep `text` short (<200 chars), prefer one "
-            "decision per call."
-        ),
+        "description": "Persist decision to .ai/memory/decisions.jsonl. Auto-injected next session. Write-class.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -145,11 +139,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "record_todo",
-        "description": (
-            "Persist an open todo to .ai/memory/todos.jsonl. Call this when the user mentions a "
-            "future task that should be remembered across sessions, or you yourself defer work. "
-            "Open todos auto-inject into next session's additionalContext."
-        ),
+        "description": "Persist open todo to .ai/memory/todos.jsonl. Auto-injected next session. Write-class.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -163,7 +153,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "close_todo",
-        "description": "Mark an open todo as done/closed. `match` accepts the todo id or a unique substring of the title.",
+        "description": "Close a todo by id or title substring. Write-class.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -176,15 +166,165 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "append_session_note",
-        "description": (
-            "Append a short, human-readable note to .ai/memory/session-current.md. Use for "
-            "milestones the operator should see when resuming the session — completed tasks, "
-            "discoveries, reminders. The hook injects the last lines on SessionStart."
-        ),
+        "description": "Append milestone line to .ai/memory/session-current.md. Write-class.",
         "inputSchema": {
             "type": "object",
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
+        },
+    },
+    {
+        "name": "recommend_skills",
+        "description": "Propose slash-command skills from cross-session memory. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 5},
+                "include_global": {"type": "boolean", "default": True},
+                "min_signal": {"type": "integer", "default": 3},
+            },
+        },
+    },
+    {
+        "name": "recommend_skills_accept",
+        "description": "Install candidate slash command. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "recommend_skills_reject",
+        "description": "Mark a candidate as rejected so it is not surfaced again. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "skills_list",
+        "description": "List catalog entries (pending/installed/rejected/uninstalled). Read-only.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "skills_uninstall",
+        "description": "Uninstall skill; rejects on drift unless force=true. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string"},
+                "force": {"type": "boolean", "default": False},
+            },
+            "required": ["slug"],
+        },
+    },
+    {
+        "name": "precall_recommend",
+        "description": "Propose precall rules from accumulated Bash invocations. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 5},
+                "min_signal": {"type": "integer", "default": 5},
+                "include_transcripts": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "precall_list",
+        "description": "List precall rule catalog. Read-only.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "precall_accept",
+        "description": "Promote pending → dry_run (safety probe + regex compile). Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "precall_activate",
+        "description": "Promote dry_run → active; refuses if observed<required unless force=true. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "force": {"type": "boolean", "default": False},
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "precall_reject",
+        "description": "Mark a candidate as rejected (no longer surfaced). Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "precall_disable",
+        "description": "Disable an active or dry_run rule. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "federated_summary",
+        "description": "Cross-project pattern counts (no raw text leak). Read-only.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "agents_recommend",
+        "description": "Propose .claude/agents/<slug>.md from transcripts+decisions. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 5},
+                "min_signal": {"type": "integer", "default": 3},
+            },
+        },
+    },
+    {
+        "name": "agents_list",
+        "description": "List agent catalog entries. Read-only.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "agents_accept",
+        "description": "Install a candidate sub-agent definition into .claude/agents. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "agents_reject",
+        "description": "Mark an agent candidate as rejected. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "agents_uninstall",
+        "description": "Uninstall agent; rejects on drift unless force=true. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string"},
+                "force": {"type": "boolean", "default": False},
+            },
+            "required": ["slug"],
         },
     },
 )
@@ -271,6 +411,97 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         if not isinstance(text, str) or not text.strip():
             raise ValueError("append_session_note requires non-empty text")
         return append_session_note(root, text=text)
+    if name == "recommend_skills":
+        from .recommend import recommend as rec_run
+        return rec_run(
+            root,
+            limit=int(args.get("limit", 5) or 5),
+            include_global=bool(args.get("include_global", True)),
+            min_signal=int(args.get("min_signal", 3) or 3),
+        )
+    if name == "recommend_skills_accept":
+        from .recommend import accept as rec_accept_fn
+        cid = args.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise ValueError("recommend_skills_accept requires id string")
+        return rec_accept_fn(root, cid)
+    if name == "recommend_skills_reject":
+        from .recommend import reject as rec_reject_fn
+        cid = args.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise ValueError("recommend_skills_reject requires id string")
+        return rec_reject_fn(root, cid)
+    if name == "skills_list":
+        from .recommend import list_visible
+        return {"ok": True, "skills": list_visible(root)}
+    if name == "skills_uninstall":
+        from .recommend import uninstall as skills_uninstall_fn
+        slug = args.get("slug")
+        if not isinstance(slug, str) or not slug:
+            raise ValueError("skills_uninstall requires slug string")
+        return skills_uninstall_fn(root, slug, force=bool(args.get("force", False)))
+    if name == "precall_recommend":
+        from .precall_recommend import recommend as pc_run
+        return pc_run(
+            root,
+            limit=int(args.get("limit", 5) or 5),
+            min_signal=int(args.get("min_signal", 5) or 5),
+            include_transcripts=bool(args.get("include_transcripts", False)),
+        )
+    if name == "precall_list":
+        from .precall_recommend import list_visible
+        return {"ok": True, "rules": list_visible(root)}
+    if name == "precall_accept":
+        from .precall_recommend import accept as pc_accept_fn
+        cid = args.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise ValueError("precall_accept requires id string")
+        return pc_accept_fn(root, cid)
+    if name == "precall_activate":
+        from .precall_recommend import activate as pc_activate_fn
+        cid = args.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise ValueError("precall_activate requires id string")
+        return pc_activate_fn(root, cid, force=bool(args.get("force", False)))
+    if name == "precall_reject":
+        from .precall_recommend import reject as pc_reject_fn
+        cid = args.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise ValueError("precall_reject requires id string")
+        return pc_reject_fn(root, cid)
+    if name == "precall_disable":
+        from .precall_recommend import disable as pc_disable_fn
+        cid = args.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise ValueError("precall_disable requires id string")
+        return pc_disable_fn(root, cid)
+    if name == "federated_summary":
+        from .federated import cross_project_summary
+        return cross_project_summary(root)
+    if name == "agents_recommend":
+        from .agent_recommend import recommend as ag_run
+        return ag_run(root, limit=int(args.get("limit", 5) or 5), min_signal=int(args.get("min_signal", 3) or 3))
+    if name == "agents_list":
+        from .agent_recommend import list_visible
+        return {"ok": True, "agents": list_visible(root)}
+    if name == "agents_accept":
+        from .agent_recommend import accept as ag_accept_fn
+        cid = args.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise ValueError("agents_accept requires id string")
+        return ag_accept_fn(root, cid)
+    if name == "agents_reject":
+        from .agent_recommend import reject as ag_reject_fn
+        cid = args.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise ValueError("agents_reject requires id string")
+        return ag_reject_fn(root, cid)
+    if name == "agents_uninstall":
+        from .agent_recommend import uninstall as ag_uninstall_fn
+        slug = args.get("slug")
+        if not isinstance(slug, str) or not slug:
+            raise ValueError("agents_uninstall requires slug string")
+        return ag_uninstall_fn(root, slug, force=bool(args.get("force", False)))
     raise KeyError(name)
 
 
@@ -371,7 +602,6 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
                 "capabilities": {
                     "tools": {"listChanged": False},
                     "resources": {"subscribe": False, "listChanged": False},
-                    "prompts": {"listChanged": False},
                 },
                 "serverInfo": {"name": MCP_SERVER_NAME, "version": __version__},
             }
@@ -410,19 +640,9 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
                         },
                     )
         elif method == "prompts/list":
-            response = _ok(request_id, {"prompts": _list_prompts(root)})
+            response = _ok(request_id, {"prompts": []})
         elif method == "prompts/get":
-            prompt_name = params.get("name")
-            prompt_args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-            if not isinstance(prompt_name, str) or not prompt_name:
-                response = _err(request_id, -32602, "prompts/get requires name")
-            else:
-                try:
-                    response = _ok(request_id, _get_prompt(root, prompt_name, prompt_args or {}))
-                except KeyError:
-                    response = _err(request_id, -32602, f"unknown prompt: {prompt_name}")
-                except Exception as exc:
-                    response = _err(request_id, -32000, str(exc))
+            response = _err(request_id, -32601, "prompts disabled — use local .claude/commands or .codex/prompts directly")
         elif method == "resources/list":
             response = _ok(request_id, {"resources": []})
         elif method == "resources/templates/list":

@@ -8,12 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .portable import lock_exclusive_blocking, unlock
 from .redact import redact_value
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows fallback
-    fcntl = None  # type: ignore[assignment]
 
 _AUDIT_THREAD_LOCK = threading.RLock()
 
@@ -27,13 +23,11 @@ def line_sha(line: str) -> str:
 
 
 def _lock_exclusive(handle: Any) -> None:
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    lock_exclusive_blocking(handle)
 
 
 def _unlock(handle: Any) -> None:
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    unlock(handle)
 
 
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -257,6 +251,86 @@ def rebuild_audit_index(root: Path) -> dict[str, Any]:
     text = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for row in rows)
     index_path.write_text(text, encoding="utf-8")
     return {"ok": True, "path": index_path.relative_to(root).as_posix(), "indexed": len(rows)}
+
+
+def read_jsonl_tail(path: Path, limit: int) -> list[dict[str, Any]]:
+    if not path.exists() or limit <= 0:
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines[-(limit * 4):]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            out.append(entry)
+    return out[-limit:]
+
+
+def read_jsonl_open_todos(path: Path, limit: int) -> list[dict[str, Any]]:
+    if not path.exists() or limit <= 0:
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    open_items: list[dict[str, Any]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        status = str(entry.get("status") or entry.get("state") or "open").lower()
+        if status in {"done", "closed", "completed", "cancelled", "canceled"}:
+            continue
+        open_items.append(entry)
+        if len(open_items) >= limit:
+            break
+    return open_items
+
+
+def read_jsonl_all(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            out.append(entry)
+    return out
+
+
+def read_text_tail(path: Path, lines: int) -> str:
+    if not path.exists() or lines <= 0:
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    tail = text.rstrip().splitlines()[-lines:]
+    return "\n".join(tail)
 
 
 def append_event(root: Path, event: dict[str, Any]) -> dict[str, Any]:

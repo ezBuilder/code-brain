@@ -252,6 +252,56 @@ if cleaned:
     new_text = cleaned + "\n\n" + block
 else:
     new_text = block
+
+def ensure_features_codex_hooks(text: str) -> str:
+    """Idempotently set [features].codex_hooks = true without disturbing
+    other user-defined keys in the [features] table or other sections."""
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    found_section = False
+    set_in_section = False
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        if stripped == "[features]":
+            found_section = True
+            out.append(line)
+            i += 1
+            section_lines: list[str] = []
+            while i < n:
+                inner = lines[i]
+                inner_stripped = inner.lstrip()
+                if inner_stripped.startswith("[") and not inner_stripped.startswith("[]"):
+                    break
+                section_lines.append(inner)
+                i += 1
+            replaced = False
+            for j, sl in enumerate(section_lines):
+                sl_stripped = sl.strip()
+                if sl_stripped.startswith("codex_hooks") and "=" in sl_stripped:
+                    section_lines[j] = "codex_hooks = true"
+                    replaced = True
+                    break
+            if not replaced:
+                # Append before trailing blank lines so the file stays tidy.
+                while section_lines and section_lines[-1].strip() == "":
+                    section_lines.pop()
+                section_lines.append("codex_hooks = true")
+            out.extend(section_lines)
+            set_in_section = True
+            continue
+        out.append(line)
+        i += 1
+    if not found_section:
+        joined = "\n".join(out).rstrip()
+        suffix = "\n\n[features]\ncodex_hooks = true\n"
+        return (joined + suffix) if joined else suffix.lstrip()
+    return "\n".join(out).rstrip() + "\n"
+
+new_text = ensure_features_codex_hooks(new_text)
+
 dst.parent.mkdir(parents=True, exist_ok=True)
 dst.write_text(new_text, encoding="utf-8")
 PY
@@ -270,11 +320,45 @@ managed = {
         {"matcher": "Bash",
          "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PreToolUse"}]}
     ],
+    "PostToolUse": [
+        {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep",
+         "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUse"}]}
+    ],
     "SessionStart": [
         {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SessionStart"}]}
     ],
     "UserPromptSubmit": [
         {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook UserPromptSubmit"}]}
+    ],
+    "Stop": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook Stop"}]}
+    ],
+    "SubagentStop": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SubagentStop"}]}
+    ],
+    "PreCompact": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PreCompact"}]}
+    ],
+    "SessionEnd": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SessionEnd"}]}
+    ],
+    "Notification": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook Notification"}]}
+    ],
+    "PostCompact": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostCompact"}]}
+    ],
+    "CwdChanged": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook CwdChanged"}]}
+    ],
+    "ConfigChange": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook ConfigChange"}]}
+    ],
+    "PermissionDenied": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PermissionDenied"}]}
+    ],
+    "InstructionsLoaded": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook InstructionsLoaded"}]}
     ],
 }
 if dst.exists():
@@ -333,8 +417,12 @@ from pathlib import Path
 dst = Path(sys.argv[1])
 managed_codex_hooks = {
     "PreToolUse": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PreToolUse", "matchers": ["Bash"]}],
+    "PostToolUse": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PostToolUse", "matchers": ["Edit", "Write", "MultiEdit", "NotebookEdit", "Read", "Glob", "Grep"]}],
     "SessionStart": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook SessionStart"}],
     "UserPromptSubmit": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook UserPromptSubmit"}],
+    "Stop": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook Stop"}],
+    "SubagentStop": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook SubagentStop"}],
+    "PermissionRequest": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PermissionRequest"}],
 }
 if dst.exists():
     try:

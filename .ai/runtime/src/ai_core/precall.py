@@ -203,11 +203,46 @@ def should_intercept(command_str: str | None) -> dict[str, Any]:
     }
 
 
-def evaluate(tool_name: str, tool_input: Any) -> dict[str, Any]:
-    """Evaluate a Claude Code tool call and decide allow/block.
+def _match_extra_rules(
+    command: str,
+    rules: list[dict[str, Any]] | None,
+    *,
+    statuses: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """Return the first matching rule with status in `statuses`, or None.
 
-    Returns a dict with at least ``action`` and ``reason``. When blocking,
-    also includes ``suggestion`` and ``binary``.
+    Rules are pre-compiled by the caller (each entry must already have a `_compiled`
+    re.Pattern). We never compile here to keep this pure-function and cheap.
+    """
+    if not rules:
+        return None
+    for rule in rules:
+        if rule.get("status") not in statuses:
+            continue
+        compiled = rule.get("_compiled")
+        if compiled is None:
+            continue
+        if compiled.search(command):
+            return rule
+    return None
+
+
+def evaluate(
+    tool_name: str,
+    tool_input: Any,
+    *,
+    extra_rules: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate a Claude Code tool call and decide allow/block/observe.
+
+    Evaluation order (deterministic):
+      1. Non-Bash tool → allow.
+      2. Empty command → allow.
+      3. Hatch detected → allow (user already capped output; do NOT apply user rules).
+      4. Hard-coded long-output binary intercept → block (built-in always wins).
+      5. Active extra_rules match → block (with rule_id).
+      6. Dry-run extra_rules match → observe (do not block; caller increments counter).
+      7. Otherwise → allow.
     """
     if tool_name != "Bash":
         return {"action": "allow", "reason": "non_bash_tool"}
@@ -216,14 +251,37 @@ def evaluate(tool_name: str, tool_input: Any) -> dict[str, Any]:
         return {"action": "allow", "reason": "no_command"}
 
     command = tool_input.get("command", "")
-    decision = should_intercept(command)
+    if not command:
+        return {"action": "allow", "reason": "empty_command"}
 
+    if _has_hatch(str(command)):
+        return {"action": "allow", "reason": "hatch_detected"}
+
+    decision = should_intercept(command)
     if decision["intercept"]:
         return {
             "action": "block",
             "reason": decision["reason"],
             "suggestion": decision["suggested_command"],
             "binary": decision["binary"],
+        }
+
+    active = _match_extra_rules(str(command), extra_rules, statuses=("active",))
+    if active is not None:
+        return {
+            "action": "block",
+            "reason": f"user_rule:{active.get('kind') or 'custom'}",
+            "suggestion": str(active.get("suggestion") or "ai exec run -- <command>"),
+            "binary": None,
+            "rule_id": active.get("id"),
+        }
+
+    dry = _match_extra_rules(str(command), extra_rules, statuses=("dry_run",))
+    if dry is not None:
+        return {
+            "action": "observe",
+            "reason": f"user_rule_dry_run:{dry.get('kind') or 'custom'}",
+            "rule_id": dry.get("id"),
         }
 
     return {"action": "allow", "reason": decision["reason"]}

@@ -2629,6 +2629,43 @@ def test_session_start_with_rebuild_always_doctor_passes(tmp_path: Path) -> None
     assert "index_freshness" not in fails, f"index_freshness still failing: {fails}"
 
 
+def test_session_start_auto_rebuilds_hash_drift_when_mtime_is_older(tmp_path: Path) -> None:
+    """Auto rebuild must not rely only on source mtime.
+
+    Git checkout, external tools, or filesystem timestamp behavior can leave a
+    changed file with an mtime older than the SQLite index. The doctor catches
+    that by hash; session-start auto must catch it too.
+    """
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    target = repo / "src" / "mtime-hidden-drift.ts"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("export const HiddenDriftNeedle = 'before';\n", encoding="utf-8")
+    subprocess.run(["git", "add", "src/mtime-hidden-drift.ts"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add hidden drift fixture"], cwd=repo, check=True)
+
+    rebuild_result = run_ai("index", "rebuild", "--json", cwd=repo)
+    assert rebuild_result.returncode == 0, rebuild_result.stdout + rebuild_result.stderr
+    db = repo / ".ai" / "cache" / "code.sqlite"
+    db_mtime = db.stat().st_mtime
+
+    target.write_text("export const HiddenDriftNeedle = 'after';\n", encoding="utf-8")
+    old_time = max(1, db_mtime - 60)
+    os.utime(target, (old_time, old_time))
+
+    session_result = run_ai("session", "start", "--agent", "operator", "--rebuild", "auto", "--json", cwd=repo)
+    assert session_result.returncode == 0, session_result.stdout + session_result.stderr
+    session_payload = json.loads(session_result.stdout)
+    assert session_payload["index"]["before"]["reason"] == "hash_mismatch"
+    assert session_payload["index"]["rebuilt"] is True
+    assert session_payload["index"]["after"]["reason"] == "current"
+
+    doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    payload = json.loads(doctor_result.stdout)
+    fails = [c["name"] for c in payload["checks"] if not c.get("ok")]
+    assert "index_freshness" not in fails, f"index_freshness still failing: {fails}"
+
+
 def test_event_observability_breaks_down_hook_and_mcp(tmp_path: Path) -> None:
     sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
     from ai_core.obs import event_observability

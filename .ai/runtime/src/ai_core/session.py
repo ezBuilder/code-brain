@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .doctor import as_payload, run_checks
+from .doctor import as_payload, check_index_freshness, run_checks
 from .hooks import handle_hook
 from .search import context_pack, db_path, iter_text_files, rebuild
 
@@ -23,18 +23,30 @@ def index_status(root: Path) -> dict[str, Any]:
     db_mtime = path.stat().st_mtime if exists else None
     stale = not exists or indexed == 0 or (db_mtime is not None and source_mtime > db_mtime)
     reason = "current"
+    freshness_detail = ""
     if not exists:
         reason = "missing"
     elif indexed == 0:
         reason = "empty"
     elif db_mtime is not None and source_mtime > db_mtime:
         reason = "stale"
+    elif exists:
+        freshness = check_index_freshness(root)
+        freshness_detail = freshness.detail
+        if not freshness.ok:
+            stale = True
+            reason = "hash_mismatch"
+            if "legacy index schema" in freshness.detail:
+                reason = "legacy_schema"
+            elif "index unreadable" in freshness.detail:
+                reason = "unreadable"
     return {
         "db_path": path.relative_to(root).as_posix(),
         "exists": exists,
         "indexed": indexed,
         "stale": stale,
         "reason": reason,
+        "freshness_detail": freshness_detail,
     }
 
 

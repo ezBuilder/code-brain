@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Repo-local AI agent infrastructure runtime"
 requires-python = ">=3.11"
 dependencies = [
+  "certifi>=2024.8.30",
   "pytest>=8.0",
 ]
 

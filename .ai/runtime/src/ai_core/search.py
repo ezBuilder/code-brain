@@ -24,6 +24,7 @@ SKIP_PATH_PREFIXES = (
     ".ai/skills/",
     ".ai/precall_rules/",
     ".ai/agents_catalog/",
+    ".codebrain/",
 )
 SKIP_DIRS = {
     ".git",

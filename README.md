@@ -110,6 +110,7 @@ Use `PRODUCTION_HARDENING_BACKLOG.md` as the dense remaining-work register for c
 | Audit Repair | `ai audit rebuild-index` | reconstructs audit index from yearly audit logs after restore/upgrade |
 | Search | `ai index rebuild`, `ai code query` | single `.ai/cache/code.sqlite` with contentless FTS5 and lazy source snippets |
 | MCP | `ai mcp` / `ai mcp --once-json ...` | read tools and rebuild request over JSON-RPC |
+| Remote Memory | `ai remote-memory ...` | opt-in Cloudflare-backed memory adapter; default off, never called from hook hot paths |
 | Queue | `ai queue enqueue/lease/complete/fail/status` | P0-P3 file queue with lease and dead-letter |
 | Trust | `ai trust init/list/revoke` | local age-like identity and tracked machine public record |
 | Secrets | `ai secrets status` | key source status without exposing plaintext |

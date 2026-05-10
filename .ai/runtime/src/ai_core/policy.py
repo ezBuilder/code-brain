@@ -30,6 +30,7 @@ WRITE_COMMANDS = {
     "worker_stop",
     "session",
     "exec",
+    "remote_memory",
 }
 
 

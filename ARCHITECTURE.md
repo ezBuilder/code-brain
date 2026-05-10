@@ -214,6 +214,7 @@ queue 디렉터리:
   .ai/cache/uv/                ← uv 의존성 캐시
   .ai/cache/diagnostics/       ← redacted bundle zip
   .ai/cache/upgrade/           ← rollback backup
+  .ai/cache/remote-memory/     ← optional Cloudflare remote-memory pull cache
 
                      RELEASE ARTIFACTS (dist/, gitignored)
                      ────────────────────────────────────

@@ -304,6 +304,29 @@ def build_parser() -> argparse.ArgumentParser:
     ag_uninstall.add_argument("--force", action="store_true")
     ag_uninstall.add_argument("--json", action="store_true", dest="command_json")
 
+    remote_memory = sub.add_parser("remote-memory")
+    remote_memory_sub = remote_memory.add_subparsers(dest="remote_memory_command", required=True)
+    remote_status = remote_memory_sub.add_parser("status")
+    remote_status.add_argument("--json", action="store_true", dest="command_json")
+    remote_recall = remote_memory_sub.add_parser("recall")
+    remote_recall.add_argument("--query", required=True)
+    remote_recall.add_argument("--project", default="current")
+    remote_recall.add_argument("--top-k", type=int, default=5, dest="top_k")
+    remote_recall.add_argument("--scope", choices=["global", "project"])
+    remote_recall.add_argument("--include-cross-project", action="store_true", dest="include_cross_project")
+    remote_recall.add_argument("--json", action="store_true", dest="command_json")
+    remote_remember = remote_memory_sub.add_parser("remember")
+    remote_remember.add_argument("--text", required=True)
+    remote_remember.add_argument("--scope", choices=["global", "project"], default="project")
+    remote_remember.add_argument("--project", default="current")
+    remote_remember.add_argument("--tag", action="append", default=[])
+    remote_remember.add_argument("--source-agent", default="operator", dest="source_agent")
+    remote_remember.add_argument("--source-surface", default="cli", dest="source_surface")
+    remote_remember.add_argument("--json", action="store_true", dest="command_json")
+    remote_sync = remote_memory_sub.add_parser("sync")
+    remote_sync.add_argument("--direction", choices=["pull", "push"], required=True)
+    remote_sync.add_argument("--json", action="store_true", dest="command_json")
+
     code = sub.add_parser("code")
     code_sub = code.add_subparsers(dest="code_command", required=True)
     code_query = code_sub.add_parser("query")
@@ -724,6 +747,47 @@ def main(argv: list[str] | None = None) -> int:
             if cmd == "uninstall":
                 reject_ci_write("agents")
                 payload = ag_uninstall_fn(root, args.slug, force=args.force)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "remote-memory":
+            from . import remote_memory as rm
+
+            project = None if getattr(args, "project", "current") == "current" else getattr(args, "project", None)
+            cmd = args.remote_memory_command
+            if cmd == "status":
+                payload = rm.status(root)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") or not payload.get("enabled") else CONFIG_INVALID
+            if cmd == "recall":
+                payload = rm.recall(
+                    root,
+                    query=args.query,
+                    project=project,
+                    top_k=args.top_k,
+                    include_cross_project=args.include_cross_project,
+                    scope=args.scope,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if cmd == "remember":
+                reject_ci_write("remote_memory")
+                payload = rm.remember(
+                    root,
+                    text=args.text,
+                    scope=args.scope,
+                    project=project,
+                    tags=args.tag,
+                    source_agent=args.source_agent,
+                    source_surface=args.source_surface,
+                )
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if cmd == "sync":
+                if args.direction == "pull":
+                    reject_ci_write("remote_memory")
+                else:
+                    reject_ci_write("remote_memory")
+                payload = rm.sync(root, direction=args.direction)
                 emit(payload, as_json=as_json)
                 return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "exec":

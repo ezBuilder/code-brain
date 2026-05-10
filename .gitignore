@@ -3,6 +3,7 @@
 .ai/runtime/.pytest_cache/
 __pycache__/
 *.pyc
+node_modules/
 dist/
 .DS_Store
 .claude/*

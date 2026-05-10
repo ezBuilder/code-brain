@@ -327,6 +327,57 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "required": ["slug"],
         },
     },
+    {
+        "name": "remote_memory_recall",
+        "description": "Recall opt-in Cloudflare remote memory through the local adapter. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "project": {"type": "string", "default": "current"},
+                "top_k": {"type": "integer", "default": 5},
+                "scope": {"type": "string", "enum": ["global", "project"]},
+                "include_cross_project": {"type": "boolean", "default": False},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "remote_memory_remember",
+        "description": "Explicitly store a redacted note in opt-in Cloudflare remote memory. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "scope": {"type": "string", "enum": ["global", "project"], "default": "project"},
+                "project": {"type": "string", "default": "current"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "source_agent": {"type": "string", "default": "agent"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "remote_memory_list_recent",
+        "description": "List recent opt-in remote memories scoped to current project plus global entries. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "default": "current"},
+                "n": {"type": "integer", "default": 10},
+                "include_cross_project": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "remote_memory_forget",
+        "description": "Delete an opt-in remote memory by id. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -502,6 +553,50 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         if not isinstance(slug, str) or not slug:
             raise ValueError("agents_uninstall requires slug string")
         return ag_uninstall_fn(root, slug, force=bool(args.get("force", False)))
+    if name == "remote_memory_recall":
+        from . import remote_memory as rm
+        query_text = args.get("query")
+        if not isinstance(query_text, str) or not query_text.strip():
+            raise ValueError("remote_memory_recall requires query string")
+        project = args.get("project")
+        return rm.recall(
+            root,
+            query=query_text,
+            project=None if project in (None, "current") else str(project),
+            top_k=int(args.get("top_k", 5) or 5),
+            include_cross_project=bool(args.get("include_cross_project", False)),
+            scope=str(args["scope"]) if isinstance(args.get("scope"), str) else None,
+        )
+    if name == "remote_memory_remember":
+        from . import remote_memory as rm
+        text = args.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("remote_memory_remember requires text string")
+        project = args.get("project")
+        return rm.remember(
+            root,
+            text=text,
+            scope=str(args.get("scope", "project")),
+            project=None if project in (None, "current") else str(project),
+            tags=args.get("tags") if isinstance(args.get("tags"), list) else None,
+            source_agent=str(args.get("source_agent", "agent")),
+            source_surface="mcp",
+        )
+    if name == "remote_memory_list_recent":
+        from . import remote_memory as rm
+        project = args.get("project")
+        return rm.list_recent(
+            root,
+            project=None if project in (None, "current") else str(project),
+            n=int(args.get("n", 10) or 10),
+            include_cross_project=bool(args.get("include_cross_project", False)),
+        )
+    if name == "remote_memory_forget":
+        from . import remote_memory as rm
+        entry_id = args.get("id")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            raise ValueError("remote_memory_forget requires id string")
+        return rm.forget(root, entry_id=entry_id)
     raise KeyError(name)
 
 

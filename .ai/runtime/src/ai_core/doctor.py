@@ -145,6 +145,11 @@ def check_config(root: Path) -> Check:
     bad = [key for key in ("embeddings", "remote_llm", "external_notifications") if features.get(key) is not False]
     if bad:
         return Check("config", False, "default-off features enabled: " + ", ".join(bad))
+    remote = config.get("remote_memory", {})
+    if not isinstance(remote, dict):
+        return Check("config", False, "remote_memory config must be a mapping")
+    if remote.get("provider", "cloudflare") != "cloudflare":
+        return Check("config", False, f"unknown remote_memory provider: {remote.get('provider')}")
     search = config.get("search", {})
     if not isinstance(search, dict):
         return Check("config", False, "search config must be a mapping")
@@ -586,6 +591,7 @@ SECRET_SCAN_IGNORED_PARTS = {
     "cache",
     ".git",
     ".claude",
+    ".codebrain",
     "node_modules",
     ".next",
     ".nuxt",

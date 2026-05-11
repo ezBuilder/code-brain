@@ -59,8 +59,22 @@ managed_files() {
       .codex/prompts \
       scripts/env-check.sh \
       scripts/preflight.sh
-  )
+  ) | grep -vx ".ai/secret_scan_allowlist.txt" || true
   printf '%s\n' "bootstrap-code-brain.sh"
+}
+
+# User-owned files seeded on first install but never managed afterwards.
+# Manifest does NOT track these — uninstall will leave them alone.
+seed_user_owned_files() {
+  local seeds=(".ai/secret_scan_allowlist.txt")
+  for rel in "${seeds[@]}"; do
+    local src="$SOURCE_ROOT/$rel"
+    local dst="$TARGET_ROOT/$rel"
+    if [[ -f "$src" && ! -e "$dst" ]]; then
+      mkdir -p "$(dirname "$dst")"
+      cp "$src" "$dst"
+    fi
+  done
 }
 
 merged_config_files() {
@@ -95,12 +109,6 @@ copy_file() {
     return 0
   fi
   if [[ "$ACTION" == "upgrade" && "$rel" == .ai/memory/* && -e "$dst" ]]; then
-    return 0
-  fi
-  # User-owned files: copy once on install, never overwrite on upgrade.
-  # secret_scan_allowlist.txt accumulates per-project acknowledged false-positives
-  # that must survive upgrades.
-  if [[ "$ACTION" == "upgrade" && "$rel" == ".ai/secret_scan_allowlist.txt" && -e "$dst" ]]; then
     return 0
   fi
   if [[ ! -f "$src" ]]; then
@@ -466,6 +474,7 @@ install_or_upgrade() {
   while IFS= read -r rel; do
     copy_file "$rel"
   done < <(managed_files)
+  seed_user_owned_files
   merge_mcp_json
   merge_codex_config
   merge_claude_settings

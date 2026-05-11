@@ -20,6 +20,7 @@ import os as _os
 HOT_PATH_TARGET_MS = 200
 INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit"}
 AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop", "PostToolUse"}
+CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "PreToolUse", "PostToolUse"}
 try:
     MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "4096"))))
 except (ValueError, TypeError):
@@ -193,12 +194,15 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         "elapsed_ms": elapsed_ms,
         "target_ms": HOT_PATH_TARGET_MS,
         "additional_context_bytes": additional_context_bytes,
-        "additionalContext": additional_context,
-        "hookSpecificOutput": {
+    }
+    if effective_hook in CONTEXT_INJECTION_HOOKS:
+        response["additionalContext"] = additional_context
+        response["hookSpecificOutput"] = {
             "hookEventName": effective_hook,
             "additionalContext": additional_context,
-        },
-    }
+        }
+    else:
+        response["hookSpecificOutput"] = {"hookEventName": effective_hook}
     if precall_decision:
         response["precall"] = precall_decision
         if precall_decision.get("action") == "block":

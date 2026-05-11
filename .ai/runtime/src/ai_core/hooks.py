@@ -201,8 +201,6 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             "hookEventName": effective_hook,
             "additionalContext": additional_context,
         }
-    else:
-        response["hookSpecificOutput"] = {"hookEventName": effective_hook}
     if precall_decision:
         response["precall"] = precall_decision
         if precall_decision.get("action") == "block":

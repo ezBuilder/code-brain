@@ -97,6 +97,12 @@ copy_file() {
   if [[ "$ACTION" == "upgrade" && "$rel" == .ai/memory/* && -e "$dst" ]]; then
     return 0
   fi
+  # User-owned files: copy once on install, never overwrite on upgrade.
+  # secret_scan_allowlist.txt accumulates per-project acknowledged false-positives
+  # that must survive upgrades.
+  if [[ "$ACTION" == "upgrade" && "$rel" == ".ai/secret_scan_allowlist.txt" && -e "$dst" ]]; then
+    return 0
+  fi
   if [[ ! -f "$src" ]]; then
     echo "install-into failed: missing source file $rel" >&2
     exit 2

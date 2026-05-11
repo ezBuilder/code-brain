@@ -2,6 +2,14 @@
 
 This repository uses `.ai/` as the single repo-local source for AI agent context, memory, generated metadata, trust, and runtime tooling.
 
+## Branching Policy (hard rule)
+
+- **`develop` is the default working branch.** Every commit, every push, every PR target must be `develop` unless the user explicitly requests otherwise.
+- **Never commit or push to `main`.** `main` only advances when the user gives an explicit "merge to main" / "main에 머지" / "main 반영" instruction. No exceptions for "small fixes", "trivial typo", "just one line" — still wait for the explicit request.
+- **Do not create new branches** (`feature/*`, `fix/*`, `codex/*`, etc.) unless the user asks. Work directly on `develop`.
+- The GitHub repository default branch is `develop`. Local checkouts must mirror this — agents should `git switch develop` at session start if found on another branch and no work is in flight.
+- When the user requests a merge to main: fast-forward `main` to `develop`, push, then `git switch develop` back immediately.
+
 ## Search Routing (Token Cost)
 
 - **Code search/discovery (indexed)**: prefer MCP `code_query` / `context_pack` over `Bash grep`/`rg`. BM25 returns top-5 snippets (~2 KB) vs full grep dumps (50–500 KB).

@@ -88,6 +88,17 @@ def test_mcp_lists_remote_memory_tools(tmp_path: Path) -> None:
     assert {"remote_memory_recall", "remote_memory_remember", "remote_memory_list_recent", "remote_memory_forget"} <= names
 
 
+def test_mcp_obs_usage_compact_by_default(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "obs_usage", "arguments": {}}}
+    result = run_ai("mcp", "--once-json", json.dumps(request), cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)["result"]["structuredContent"]
+    usage = payload["actual_token_usage"]
+    assert "sessions" not in usage["claude"]
+    assert "sessions" not in usage["codex"]
+
+
 def test_worker_source_enforces_auth_and_scoping() -> None:
     source = (Path(__file__).resolve().parents[3] / "remote-memory" / "cloudflare-worker" / "src" / "index.ts").read_text(
         encoding="utf-8"

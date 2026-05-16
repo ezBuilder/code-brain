@@ -68,7 +68,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "obs_usage",
         "description": "Token usage + Code Brain effect bytes. Read-only.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"include_sessions": {"type": "boolean", "default": False}},
+        },
     },
     {
         "name": "obs_health_summary",
@@ -406,7 +409,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "ai_request_rebuild":
         return rebuild(root)
     if name == "obs_usage":
-        return usage_report(root)
+        return usage_report(root, include_sessions=bool(args.get("include_sessions", False)))
     if name == "obs_health_summary":
         return health_summary(root)
     if name == "obs_search":

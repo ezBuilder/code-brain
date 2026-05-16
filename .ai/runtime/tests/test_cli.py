@@ -266,6 +266,24 @@ def test_dep_advisory_release_gate_integration_invariants() -> None:
     assert "CODE_BRAIN_DEP_ADVISORY_OFFLINE=1 ./scripts/dep-advisory.sh" in docs_check
 
 
+def test_obs_usage_compact_by_default() -> None:
+    result = run_ai("obs", "usage", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    usage = payload["actual_token_usage"]
+    assert "sessions" not in usage["claude"]
+    assert "sessions" not in usage["codex"]
+
+
+def test_obs_usage_include_sessions_opt_in() -> None:
+    result = run_ai("obs", "usage", "--include-sessions", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    usage = payload["actual_token_usage"]
+    assert "sessions" in usage["claude"]
+    assert "sessions" in usage["codex"]
+
+
 def test_uv_lock_check_release_gate_integration_invariants() -> None:
     script = (ROOT / "scripts" / "lockfile-check.sh").read_text(encoding="utf-8")
     release_gate = (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
@@ -2957,10 +2975,9 @@ def test_post_tool_use_hook_skips_injection(tmp_path: Path) -> None:
     result = run_ai_input("hook", "PostToolUse", "--json", stdin=payload, cwd=repo)
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
-    ctx = response["additionalContext"]
-    assert "Should NOT appear" not in ctx
-    assert "Recent decisions" not in ctx
-    assert "Search routing" not in ctx
+    assert response["additional_context_bytes"] == 0
+    assert "additionalContext" not in response
+    assert "hookSpecificOutput" not in response
 
 
 def test_user_prompt_submit_hook_includes_routing_when_memory_empty(tmp_path: Path) -> None:

@@ -68,6 +68,7 @@ def test_pretooluse_grep_single_file_allows() -> None:
     payload = _parse_ok(result)
     assert payload.get("precall", {}).get("action") == "allow"
     assert payload.get("decision") != "block"
+    assert payload["additional_context_bytes"] == 0
 
 
 def test_pretooluse_rg_blocks() -> None:
@@ -101,7 +102,7 @@ def test_pretooluse_find_blocks() -> None:
     assert cmd in suggestion
 
 
-def test_pretooluse_with_pipe_head_allows() -> None:
+def test_pretooluse_with_pipe_head_blocks() -> None:
     result = run_hook(
         "PreToolUse",
         {
@@ -111,8 +112,8 @@ def test_pretooluse_with_pipe_head_allows() -> None:
         },
     )
     payload = _parse_ok(result)
-    assert payload.get("precall", {}).get("action") == "allow"
-    assert payload.get("decision") != "block"
+    assert payload.get("decision") == "block"
+    assert payload.get("precall", {}).get("binary") == "grep"
 
 
 def test_pretooluse_non_bash_tool_allows() -> None:
@@ -186,3 +187,35 @@ def test_pretooluse_default_output_is_codex_wire_shape() -> None:
     assert output["hookEventName"] == "PreToolUse"
     assert output["permissionDecision"] == "deny"
     assert "long_output_binary:rg" in output["permissionDecisionReason"]
+
+
+def test_posttooluse_default_output_is_silent() -> None:
+    result = run_hook(
+        "PostToolUse",
+        {
+            "agent": "codex",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/tmp/x"},
+        },
+    )
+    payload = _parse_ok(result)
+    assert payload["additional_context_bytes"] == 0
+    wire = subprocess.run(
+        [PYTHON, "-m", "ai_core.cli", "hook", "PostToolUse"],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / ".ai" / "runtime" / "src")},
+        text=True,
+        input=json.dumps(
+            {
+                "agent": "codex",
+                "dry": True,
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/tmp/x"},
+            }
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert wire.returncode == 0, wire.stderr
+    assert json.loads(wire.stdout) == {}

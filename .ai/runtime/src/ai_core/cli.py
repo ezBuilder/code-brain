@@ -133,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
                             help="rebuild index before query if any result would be stale (write op)")
     obs_search.add_argument("--json", action="store_true", dest="command_json")
     obs_usage = obs_sub.add_parser("usage")
+    obs_usage.add_argument("--include-sessions", action="store_true", dest="include_sessions")
     obs_usage.add_argument("--json", action="store_true", dest="command_json")
     obs_slo = obs_sub.add_parser("slo")
     obs_slo.add_argument("--iterations", type=int, default=10)
@@ -534,7 +535,7 @@ def main(argv: list[str] | None = None) -> int:
                 return MANIFEST_DRIFT
             return OK
         if args.command == "obs" and args.obs_command == "usage":
-            payload = usage_report(root)
+            payload = usage_report(root, include_sessions=bool(getattr(args, "include_sessions", False)))
             emit(payload, as_json=as_json)
             return OK
         if args.command == "obs" and args.obs_command == "slo":

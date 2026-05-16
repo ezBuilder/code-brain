@@ -19,8 +19,8 @@ import os as _os
 
 HOT_PATH_TARGET_MS = 200
 INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit"}
-AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop", "PostToolUse"}
-CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "PreToolUse", "PostToolUse"}
+AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop"}
+CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart"}
 SKILL_RECOMMENDATION_HOOKS = {"SessionStart"}
 try:
     MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "4096"))))
@@ -480,7 +480,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
     header = f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={writes}."
     if hook_name not in INJECTION_HOOKS or root is None:
-        return header
+        return ""
     sections = [header]
     routing = (
         "Search routing: prefer MCP `code_query` / `context_pack` over Bash grep/find. "

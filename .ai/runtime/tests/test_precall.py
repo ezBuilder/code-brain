@@ -56,14 +56,20 @@ def test_ack_intercepts() -> None:
     assert result["binary"] == "ack"
 
 
-def test_hatch_head_allows() -> None:
+def test_head_pipe_still_intercepts() -> None:
     result = should_intercept("grep -rn pattern src/ | head -50")
-    assert result["intercept"] is False
-    assert result["reason"] == "hatch_detected"
+    assert result["intercept"] is True
+    assert result["binary"] == "grep"
 
 
-def test_hatch_dev_null_allows() -> None:
+def test_stderr_dev_null_still_intercepts() -> None:
     result = should_intercept('find . -name "*.tmp" 2>/dev/null')
+    assert result["intercept"] is True
+    assert result["binary"] == "find"
+
+
+def test_stdout_dev_null_allows() -> None:
+    result = should_intercept('find . -name "*.tmp" >/dev/null')
     assert result["intercept"] is False
     assert result["reason"] == "hatch_detected"
 
@@ -74,10 +80,23 @@ def test_hatch_wc_allows() -> None:
     assert result["reason"] == "hatch_detected"
 
 
-def test_compound_command_allows() -> None:
+def test_compound_command_intercepts_broad_segment() -> None:
     result = should_intercept("cd src && grep -rn pattern .")
-    assert result["intercept"] is False
-    assert result["reason"] == "compound_command"
+    assert result["intercept"] is True
+    assert result["binary"] == "grep"
+
+
+def test_shell_wrapper_intercepts_inner_command() -> None:
+    result = should_intercept('bash -lc "rg pattern | head -20"')
+    assert result["intercept"] is True
+    assert result["binary"] == "rg"
+
+
+def test_git_grep_intercepts() -> None:
+    result = should_intercept("git grep pattern")
+    assert result["intercept"] is True
+    assert result["binary"] == "grep"
+    assert result["reason"] == "long_output_binary:git-grep"
 
 
 def test_unbalanced_quotes_allows() -> None:

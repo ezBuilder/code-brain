@@ -96,16 +96,20 @@ def search_report(root: Path, *, query_text: str | None = None, limit: int = 5) 
     return payload
 
 
-def usage_report(root: Path) -> dict[str, Any]:
+def usage_report(root: Path, *, include_sessions: bool = False) -> dict[str, Any]:
     from .transcripts import claude_usage_summary, codex_usage_summary
 
     events = event_observability(root)
     claude = claude_usage_summary(root)
+    codex = codex_usage_summary(root)
+    if not include_sessions:
+        claude = _usage_totals_only(claude)
+        codex = _usage_totals_only(codex)
     return {
         "ok": True,
         "actual_token_usage": {
             "claude": claude,
-            "codex": codex_usage_summary(root),
+            "codex": codex,
         },
         "measured_code_brain_effect": events,
         "claims": {
@@ -205,14 +209,19 @@ def event_observability(root: Path) -> dict[str, Any]:
 
 
 def _usage_totals_only(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
+    compact = {
         "ok": payload.get("ok"),
         "source": payload.get("source"),
+        "sessions_scanned": payload.get("sessions_scanned", 0),
         "sessions_matched": payload.get("sessions_matched", 0),
         "messages": payload.get("messages", 0),
         "tokens": payload.get("tokens", {}),
         "total_observed_tokens": payload.get("total_observed_tokens", 0),
     }
+    for key in ("user_messages", "agent_messages", "turns"):
+        if key in payload:
+            compact[key] = payload.get(key, 0)
+    return compact
 
 
 def _int(value: Any) -> int:

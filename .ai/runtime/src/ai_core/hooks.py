@@ -21,6 +21,7 @@ HOT_PATH_TARGET_MS = 200
 INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit"}
 AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop", "PostToolUse"}
 CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "PreToolUse", "PostToolUse"}
+SKILL_RECOMMENDATION_HOOKS = {"SessionStart"}
 try:
     MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "4096"))))
 except (ValueError, TypeError):
@@ -29,6 +30,7 @@ DECISIONS_TAIL = 5
 TODOS_LIMIT = 5
 SESSION_TAIL_LINES = 8
 DELTA_NOTICE = "Code Brain context unchanged since last injection (delta-skipped)."
+SKILL_RECOMMENDATION_DISABLE_VALUES = {"0", "false", "no", "off"}
 
 
 def _injection_marker_path(root: Path) -> Path:
@@ -89,6 +91,46 @@ def _spawn_background_rebuild(root: Path) -> None:
             )
     except Exception:
         pass
+
+
+def _skill_recommendation_context(root: Path, hook_name: str, payload: dict[str, Any]) -> str:
+    if hook_name not in SKILL_RECOMMENDATION_HOOKS:
+        return ""
+    if _os.environ.get("AI_SKILL_RECOMMENDATIONS", "1").lower() in SKILL_RECOMMENDATION_DISABLE_VALUES:
+        return ""
+    try:
+        min_signal = int(_os.environ.get("AI_SKILL_RECOMMEND_MIN_SIGNAL", "3"))
+    except (TypeError, ValueError):
+        min_signal = 3
+    persist = not (is_ci() or payload.get("dry") is True)
+    try:
+        from .recommend import recommend
+
+        result = recommend(
+            root,
+            limit=3,
+            include_global=False,
+            min_signal=min_signal,
+            persist=persist,
+        )
+    except Exception:
+        return ""
+    candidates = result.get("candidates") if isinstance(result, dict) else []
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+    lines = [
+        "Skill recommendations available. Surface these to the user; install only after explicit approval:",
+    ]
+    for cand in candidates[:3]:
+        if not isinstance(cand, dict):
+            continue
+        cid = str(cand.get("id") or "")
+        slug = str(cand.get("slug") or "")
+        desc = str(cand.get("description") or "")[:120]
+        if cid and slug:
+            lines.append(f"  - {cid} | {slug}: {desc}")
+    lines.append("Approval: `ai recommend skills accept <id>`; reject noise with `ai recommend skills reject <id>`.")
+    return "\n".join(lines) if len(lines) > 2 else ""
 
 
 def read_payload(stdin: str | None = None) -> dict[str, Any]:
@@ -207,7 +249,7 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             import os
             rewrite_mode = os.environ.get("AI_PRECALL_REWRITE", "").lower() in ("1", "true", "yes")
             suggestion = str(precall_decision.get("suggestion") or "")
-            if rewrite_mode and suggestion.startswith("ai exec run --"):
+            if rewrite_mode and suggestion.startswith(".ai/bin/ai exec run --"):
                 response["hookSpecificOutput"] = {
                     "hookEventName": effective_hook,
                     "permissionDecision": "allow",
@@ -237,6 +279,50 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     "(first 30 + last 5 lines, total under 4 KB) to keep your context window small."
                 )
     return redact_value(response)
+
+
+def codex_wire_output(response: dict[str, Any]) -> dict[str, Any]:
+    """Project the verbose diagnostic hook response to Codex's strict wire schema.
+
+    `ai hook --json` intentionally returns diagnostic fields used by tests and
+    observability. Actual Codex hook commands must emit only fields accepted by
+    the current hook runtime; otherwise Codex marks the hook as failed and opens.
+    """
+    hook = str(response.get("hook") or "")
+    hook_specific = response.get("hookSpecificOutput")
+    hook_specific = hook_specific if isinstance(hook_specific, dict) else {}
+
+    if response.get("decision") == "block":
+        reason = str(response.get("reason") or hook_specific.get("permissionDecisionReason") or "Blocked by Code Brain hook.")
+        if hook == "PreToolUse":
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        if hook in {"UserPromptSubmit", "PostToolUse", "Stop"}:
+            return {"decision": "block", "reason": reason}
+
+    additional_context = hook_specific.get("additionalContext")
+    if hook in {"SessionStart", "UserPromptSubmit"} and additional_context:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": hook,
+                "additionalContext": str(additional_context),
+            }
+        }
+    if hook == "PostToolUse" and additional_context:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": str(additional_context),
+            }
+        }
+    if hook == "Stop":
+        return {"continue": True}
+    return {}
 
 
 LIFECYCLE_SNAPSHOT_HOOKS = {"PreCompact", "SessionEnd"}
@@ -439,6 +525,9 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             owner = str(entry.get("owner") or "")
             lines.append(f"  - {text} [{owner}]" if owner else f"  - {text}")
         sections.append("\n".join(lines))
+    skill_recommendations = _skill_recommendation_context(root, hook_name, payload)
+    if skill_recommendations:
+        sections.append(skill_recommendations)
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
         sections.append("Session-current tail:\n" + session_tail)
@@ -459,4 +548,3 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         truncated = composed.encode("utf-8")[: MAX_INJECTION_BYTES - 3].decode("utf-8", errors="ignore") + "..."
         composed = truncated
     return composed
-

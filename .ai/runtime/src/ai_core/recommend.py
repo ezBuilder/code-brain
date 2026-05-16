@@ -358,7 +358,7 @@ def _candidates_from_codex_groups(signals: Signals, *, min_signal: int) -> list[
     group_outcomes: dict[str, list[str]] = {}
     for thread in signals.global_codex_threads:
         tg = str(thread.get("task_group") or "").strip()
-        if not tg:
+        if not tg or _is_path_like_task_group(tg):
             continue
         groups[tg] += 1
         group_outcomes.setdefault(tg, []).append(str(thread.get("task_outcome") or ""))
@@ -377,6 +377,16 @@ def _candidates_from_codex_groups(signals: Signals, *, min_signal: int) -> list[
         cid = _candidate_id(slug, body)
         out.append(Candidate(id=cid, slug=slug, description=desc, body=body, evidence=evidence))
     return out
+
+
+def _is_path_like_task_group(text: str) -> bool:
+    if text.startswith(("/", "~")):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", text):
+        return True
+    if "/workspace/" in text or "\\workspace\\" in text:
+        return True
+    return False
 
 
 # ---------- draft body composition ----------
@@ -509,6 +519,7 @@ def recommend(
     include_global: bool = True,
     min_signal: int = MIN_SIGNAL_DEFAULT,
     home: Path | None = None,
+    persist: bool = True,
 ) -> dict[str, Any]:
     signals = gather_signals(root, include_global=include_global, home=home)
     cands = cluster_candidates(signals, limit=limit, min_signal=min_signal)
@@ -525,7 +536,7 @@ def recommend(
         prior_slug_status = slug_status.get(c.slug)
         if prior_slug_status in {"rejected", "installed", "uninstalled"}:
             continue
-        if c.id not in existing:
+        if c.id not in existing and persist:
             upsert_pending_candidate(root, c)
         out.append(
             {

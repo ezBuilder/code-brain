@@ -50,7 +50,8 @@ All four operations are write-class: rejected in CI per existing `WRITE_COMMANDS
 
 Code Brain mines accumulated memory (decisions, todos, audit, session notes; optionally project-filtered Claude/Codex global memory) and proposes per-project slash commands. The flow is *recommend → review → accept*; never auto-install.
 
-- **List candidates**: `ai recommend skills [--limit N] [--no-global] [--min-signal K] [--json]` — read-only. Heuristic clustering, no LLM/network. Returns `{candidates: [{id, slug, description, body, evidence}, ...]}`.
+- **Proactive surfacing**: the `SessionStart` hook may inject a short "Skill recommendations available" block when local signals cross the threshold. The agent must show those candidates to the user and ask for approval before accepting. Do not silently install, reject, or promote.
+- **List candidates**: `ai recommend skills [--limit N] [--no-global] [--min-signal K] [--json]` — local-only, no LLM/network, no install. It may persist pending catalog entries so accept/reject can target stable ids. Returns `{candidates: [{id, slug, description, body, evidence}, ...]}`.
 - **Install one**: `ai recommend skills accept <id>` — writes `.claude/commands/<slug>.md` and `.codex/prompts/<slug>.md` with frontmatter `managed-by: code-brain` + `body-sha256` for drift tracking. Write-class.
 - **Dismiss**: `ai recommend skills reject <id>` — kept in catalog with status `rejected` so it is never re-suggested.
 - **List installed**: `ai skills list [--json]`
@@ -64,11 +65,11 @@ Danger patterns (`<system-reminder>`, `Ignore previous instructions`, etc.) in d
 
 ## Hook Event Coverage
 
-Code Brain registers Claude Code hooks: PreToolUse, PostToolUse, SessionStart, UserPromptSubmit, Stop, SubagentStop, **PreCompact, SessionEnd, Notification**. Codex hooks: PreToolUse, PostToolUse, SessionStart, UserPromptSubmit, Stop, SubagentStop, **PermissionRequest**.
+Code Brain registers Claude Code hooks: PreToolUse, PostToolUse, SessionStart, UserPromptSubmit, Stop, SubagentStop, **PreCompact, PostCompact, SessionEnd, Notification**. Codex hooks: PreToolUse, PostToolUse, SessionStart, UserPromptSubmit, Stop, SubagentStop, **PreCompact, PostCompact, PermissionRequest**.
 
 PreCompact and SessionEnd force-write a session-resume snapshot before the session boundary so cross-session memory survives `/compact` and `/clear`. Notification and PermissionRequest emit observation-only audit entries (no blocking yet).
 
-`install-into.sh` ensures `~/.codex/config.toml` (or `<repo>/.codex/config.toml`) sets `[features].codex_hooks = true` idempotently — without disturbing other user-defined keys in that section.
+`install-into.sh` ensures `~/.codex/config.toml` (or `<repo>/.codex/config.toml`) sets `[features].hooks = true` idempotently — without disturbing other user-defined keys in that section. The deprecated `codex_hooks` key, if present, is migrated to `hooks`.
 
 Hook responses follow the Claude Code spec via `hookSpecificOutput.{hookEventName, additionalContext, permissionDecision}`. Top-level `additionalContext` is preserved for backward compat.
 

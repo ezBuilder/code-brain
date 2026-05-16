@@ -107,6 +107,14 @@ def test_recommend_persists_pending(tmp_root: Path):
     assert any(e.status == "pending" for e in cat)
 
 
+def test_recommend_preview_can_skip_persist(tmp_root: Path):
+    _seed_decisions(tmp_root, "deploy", 4)
+    out = recommend(tmp_root, include_global=False, min_signal=3, persist=False)
+    assert out["ok"]
+    assert len(out["candidates"]) >= 1
+    assert list_catalog(tmp_root) == []
+
+
 def test_recommend_dedupes_after_reject(tmp_root: Path):
     _seed_decisions(tmp_root, "deploy", 4)
     first = recommend(tmp_root, include_global=False, min_signal=3)
@@ -206,6 +214,25 @@ def test_codex_cwd_match(tmp_root: Path, monkeypatch: pytest.MonkeyPatch):
     sig = gather_signals(tmp_root, include_global=True, home=fake_home)
     assert len(sig.global_codex_threads) == 1
     assert sig.global_codex_threads[0]["task_group"] == "deploy-runbook"
+
+
+def test_recommend_skips_path_like_codex_groups(tmp_root: Path):
+    fake_home = tmp_root / "home"
+    (fake_home / ".codex" / "memories").mkdir(parents=True)
+    raw = fake_home / ".codex" / "memories" / "raw_memories.md"
+    blocks = []
+    for i in range(3):
+        blocks.append(
+            f"## Thread `path-{i}`\n"
+            "updated_at: 2026-05-01T00:00:00Z\n"
+            f"cwd: {tmp_root}\n\n"
+            f"task_group: {tmp_root}\n"
+            "task_outcome: partial\n"
+            "keywords: navio\n"
+        )
+    raw.write_text("# Raw Memories\n\n" + "\n".join(blocks), encoding="utf-8")
+    rec = recommend(tmp_root, include_global=True, home=fake_home, min_signal=3)
+    assert rec == {"ok": True, "candidates": [], "note": "signals_below_threshold"}
 
 
 def test_slug_dedup_after_reject(tmp_root: Path):

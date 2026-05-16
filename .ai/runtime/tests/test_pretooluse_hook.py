@@ -53,7 +53,7 @@ def test_pretooluse_grep_recursive_blocks() -> None:
     payload = _parse_ok(result)
     assert payload.get("decision") == "block"
     assert payload.get("precall", {}).get("binary") == "grep"
-    assert "ai exec run" in payload.get("reason", "")
+    assert ".ai/bin/ai exec run" in payload.get("reason", "")
 
 
 def test_pretooluse_grep_single_file_allows() -> None:
@@ -141,7 +141,7 @@ def test_pretooluse_decision_message_includes_sandbox_pointer() -> None:
     payload = _parse_ok(result)
     assert payload.get("decision") == "block"
     reason = payload.get("reason", "")
-    assert "ai exec run" in reason
+    assert ".ai/bin/ai exec run" in reason
     assert "sandbox_execute" in reason
 
 
@@ -156,3 +156,33 @@ def test_pretooluse_hot_path_under_200ms() -> None:
     )
     payload = _parse_ok(result)
     assert payload.get("elapsed_ms", 9999) <= 200
+
+
+def test_pretooluse_default_output_is_codex_wire_shape() -> None:
+    merged = os.environ.copy()
+    for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI"):
+        merged.pop(name, None)
+    merged["PYTHONPATH"] = str(ROOT / ".ai" / "runtime" / "src")
+    result = subprocess.run(
+        [PYTHON, "-m", "ai_core.cli", "hook", "PreToolUse"],
+        cwd=ROOT,
+        env=merged,
+        text=True,
+        input=json.dumps(
+            {
+                "agent": "codex",
+                "dry": True,
+                "tool_name": "Bash",
+                "tool_input": {"command": "rg pattern"},
+            }
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    payload = _parse_ok(result)
+    assert set(payload) == {"hookSpecificOutput"}
+    output = payload["hookSpecificOutput"]
+    assert output["hookEventName"] == "PreToolUse"
+    assert output["permissionDecision"] == "deny"
+    assert "long_output_binary:rg" in output["permissionDecisionReason"]

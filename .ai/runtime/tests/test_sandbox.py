@@ -26,7 +26,9 @@ def _isolate_ci(monkeypatch):
 def test_execute_runs_command_and_stores_output(tmp_path: Path) -> None:
     result = sandbox.execute(tmp_path, command=["echo", "hello"])
     assert result["ok"] is True
-    assert any("hello" in line for line in result["first_lines"])
+    # Short output → compact mode ("output" field). Either way, payload must contain "hello".
+    combined = result.get("output") if "output" in result else "\n".join(result.get("first_lines", []))
+    assert combined is not None and "hello" in combined
 
     out_path = tmp_path / ".ai" / "cache" / "sandbox" / f"{result['exec_id']}.txt"
     assert out_path.exists()
@@ -62,8 +64,8 @@ def test_execute_redacts_secrets_in_summary(tmp_path: Path) -> None:
     secret = "AKIA" + "A" * 16
     result = sandbox.execute(tmp_path, command=["echo", secret])
     assert result["ok"] is True
-    joined = "\n".join(result["first_lines"])
-    assert secret not in joined
+    joined = result.get("output") if "output" in result else "\n".join(result.get("first_lines", []))
+    assert joined is not None and secret not in joined
     assert "[REDACTED]" in joined
 
     out_path = tmp_path / ".ai" / "cache" / "sandbox" / f"{result['exec_id']}.txt"
@@ -148,3 +150,30 @@ def test_prune_removes_old_executions(tmp_path: Path) -> None:
     assert pruned["removed_count"] == 1
     assert not meta_path.exists()
     assert not txt_path.exists()
+
+def test_execute_accepts_string_command(tmp_path: Path) -> None:
+    # When command is a string, sandbox runs it via `bash -lc` so heredocs/pipes work.
+    result = sandbox.execute(tmp_path, command="echo hi | tr a-z A-Z")
+    assert result["ok"] is True
+    payload = result.get("output") if "output" in result else "\n".join(result.get("first_lines", []))
+    assert payload is not None and "HI" in payload
+
+
+def test_execute_compact_mode_for_short_output(tmp_path: Path) -> None:
+    result = sandbox.execute(tmp_path, command=["echo", "compact-me"])
+    assert result["ok"] is True
+    # Short payload → raw output field, no first/last_lines arrays.
+    assert "output" in result
+    assert "first_lines" not in result
+    assert "last_lines" not in result
+    assert "compact-me" in result["output"]
+
+
+def test_execute_verbose_mode_for_large_output(tmp_path: Path) -> None:
+    # >20 lines forces verbose mode with first_lines/last_lines split.
+    cmd = ["bash", "-c", "for i in $(seq 1 50); do echo line-$i; done"]
+    result = sandbox.execute(tmp_path, command=cmd)
+    assert result["ok"] is True
+    assert "output" not in result
+    assert isinstance(result["first_lines"], list)
+    assert isinstance(result["last_lines"], list)

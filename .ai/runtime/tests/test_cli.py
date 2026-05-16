@@ -2922,6 +2922,31 @@ def test_session_start_hook_injects_decisions_todos_session_tail(tmp_path: Path)
     assert response["elapsed_ms"] <= 200
 
 
+def test_session_start_hook_surfaces_skill_recommendations(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    decisions = repo / ".ai" / "memory" / "decisions.jsonl"
+    rows = [
+        {"decided_at": f"2026-05-08T00:00:0{i}Z", "decision": f"deploy decision {i}", "tags": ["deploy"]}
+        for i in range(4)
+    ]
+    decisions.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    result = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    response = json.loads(result.stdout)
+    ctx = response["additionalContext"]
+    assert "Skill recommendations available" in ctx
+    assert "ai recommend skills accept" in ctx
+    assert "recall-deploy-decisions" in ctx
+    catalog = repo / ".ai" / "skills" / "catalog.jsonl"
+    assert catalog.exists()
+    catalog_rows = [json.loads(line) for line in catalog.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(row.get("status") == "pending" for row in catalog_rows)
+
+
 def test_post_tool_use_hook_skips_injection(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     init_package_repo(repo)

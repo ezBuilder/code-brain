@@ -3,12 +3,12 @@
     {
       "action": "shim",
       "path": "AGENTS.md",
-      "source_sha": "561b73c787b7be3a7908bade84bf2ef9a5e5f2ac3e88e6f23074f464ab099fb0"
+      "source_sha": "72b8a6d366964be75b0c8717ff392875e53bce2d75d87a5d6463ec4953c5cb19"
     },
     {
       "action": "shim",
       "path": "CLAUDE.md",
-      "source_sha": "561b73c787b7be3a7908bade84bf2ef9a5e5f2ac3e88e6f23074f464ab099fb0"
+      "source_sha": "72b8a6d366964be75b0c8717ff392875e53bce2d75d87a5d6463ec4953c5cb19"
     }
   ],
   "chunker": {

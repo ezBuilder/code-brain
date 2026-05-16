@@ -8,7 +8,7 @@ import sys
 from . import __version__
 from .config import load_config
 from .doctor import as_payload, run_checks
-from .hooks import handle_hook, read_payload
+from .hooks import codex_wire_output, handle_hook, read_payload
 from .inbox import decide, list_approvals, request_approval
 from .memory import append_audit, append_event, rebuild_audit_index
 from .obs import diagnostics, health_summary, metrics, prune_diagnostics, search_report, slo_bench, usage_report, write_log
@@ -591,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "hook":
             payload = handle_hook(root, args.hook_name, read_payload())
-            emit(payload, as_json=True)
+            emit(payload if args.command_json else codex_wire_output(payload), as_json=True)
             return OK
         if args.command == "memory" and args.memory_command == "append-event":
             reject_ci_write("memory")

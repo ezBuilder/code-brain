@@ -267,9 +267,10 @@ if cleaned:
 else:
     new_text = block
 
-def ensure_features_codex_hooks(text: str) -> str:
-    """Idempotently set [features].codex_hooks = true without disturbing
-    other user-defined keys in the [features] table or other sections."""
+def ensure_features_hooks(text: str) -> str:
+    """Idempotently set [features].hooks = true and migrate the deprecated
+    `codex_hooks` key to `hooks` if present, without disturbing other
+    user-defined keys in the [features] table or other sections."""
     lines = text.splitlines()
     out: list[str] = []
     i = 0
@@ -291,18 +292,23 @@ def ensure_features_codex_hooks(text: str) -> str:
                     break
                 section_lines.append(inner)
                 i += 1
+            # Drop any deprecated `codex_hooks` lines (migrated to `hooks`).
+            section_lines = [
+                sl for sl in section_lines
+                if not (sl.strip().startswith("codex_hooks") and "=" in sl.strip())
+            ]
             replaced = False
             for j, sl in enumerate(section_lines):
                 sl_stripped = sl.strip()
-                if sl_stripped.startswith("codex_hooks") and "=" in sl_stripped:
-                    section_lines[j] = "codex_hooks = true"
+                if sl_stripped.startswith("hooks") and "=" in sl_stripped:
+                    section_lines[j] = "hooks = true"
                     replaced = True
                     break
             if not replaced:
                 # Append before trailing blank lines so the file stays tidy.
                 while section_lines and section_lines[-1].strip() == "":
                     section_lines.pop()
-                section_lines.append("codex_hooks = true")
+                section_lines.append("hooks = true")
             out.extend(section_lines)
             set_in_section = True
             continue
@@ -310,11 +316,11 @@ def ensure_features_codex_hooks(text: str) -> str:
         i += 1
     if not found_section:
         joined = "\n".join(out).rstrip()
-        suffix = "\n\n[features]\ncodex_hooks = true\n"
+        suffix = "\n\n[features]\nhooks = true\n"
         return (joined + suffix) if joined else suffix.lstrip()
     return "\n".join(out).rstrip() + "\n"
 
-new_text = ensure_features_codex_hooks(new_text)
+new_text = ensure_features_hooks(new_text)
 
 dst.parent.mkdir(parents=True, exist_ok=True)
 dst.write_text(new_text, encoding="utf-8")
@@ -430,13 +436,15 @@ from pathlib import Path
 
 dst = Path(sys.argv[1])
 managed_codex_hooks = {
-    "PreToolUse": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PreToolUse", "matchers": ["Bash"]}],
-    "PostToolUse": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PostToolUse", "matchers": ["Edit", "Write", "MultiEdit", "NotebookEdit", "Read", "Glob", "Grep"]}],
-    "SessionStart": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook SessionStart"}],
-    "UserPromptSubmit": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook UserPromptSubmit"}],
-    "Stop": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook Stop"}],
-    "SubagentStop": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook SubagentStop"}],
-    "PermissionRequest": [{"command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PermissionRequest"}],
+    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreToolUse', "statusMessage": "Checking Code Brain command routing"}]}],
+    "PostToolUse": [{"matcher": "Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostToolUse', "statusMessage": "Recording Code Brain tool result"}]}],
+    "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SessionStart', "statusMessage": "Loading Code Brain session context"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" UserPromptSubmit', "statusMessage": "Loading Code Brain prompt context"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" Stop', "statusMessage": "Recording Code Brain stop event"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SubagentStop', "statusMessage": "Recording Code Brain subagent stop"}]}],
+    "PreCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreCompact', "statusMessage": "Saving Code Brain compact snapshot"}]}],
+    "PostCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostCompact', "statusMessage": "Recording Code Brain compact completion"}]}],
+    "PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PermissionRequest', "statusMessage": "Checking Code Brain approval policy"}]}],
 }
 if dst.exists():
     try:
@@ -454,7 +462,13 @@ if not isinstance(hooks, dict):
 def _has_code_brain_command(hook_value):
     if isinstance(hook_value, dict):
         cmd = hook_value.get("command")
-        return isinstance(cmd, str) and "/.ai/bin/ai-hook" in cmd
+        if isinstance(cmd, str) and ".ai/bin/ai-hook" in cmd:
+            return True
+        for handler in hook_value.get("hooks", []) or []:
+            if isinstance(handler, dict):
+                cmd = handler.get("command")
+                if isinstance(cmd, str) and ".ai/bin/ai-hook" in cmd:
+                    return True
     return False
 
 for name, managed_entries in managed_codex_hooks.items():

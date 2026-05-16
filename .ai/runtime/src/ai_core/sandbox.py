@@ -18,6 +18,8 @@ _STDERR_TAIL_DEFAULT = 10
 _FETCH_LINE_CAP = 200
 _FETCH_DEFAULT_WINDOW = 100
 _FETCH_GREP_CAP = 200
+_COMPACT_MAX_LINES = 20
+_COMPACT_MAX_BYTES = 1024
 
 
 def _now_iso() -> str:
@@ -86,19 +88,27 @@ def _maybe_audit(root: Path, payload: dict[str, Any]) -> None:
 def execute(
     root: Path,
     *,
-    command: list[str],
+    command: list[str] | str,
     cwd: str | None = None,
     timeout: int = 30,
 ) -> dict[str, Any]:
-    if not command:
-        return redact_value({"ok": False, "reason": "empty_command"})
+    # Accept either an argv list or a shell string. String form runs under `bash -lc`
+    # so that heredocs, quoting and pipes work without re-escaping into a JSON array.
+    if isinstance(command, str):
+        if not command.strip():
+            return redact_value({"ok": False, "reason": "empty_command"})
+        cmd_argv = ["bash", "-lc", command]
+    else:
+        if not command:
+            return redact_value({"ok": False, "reason": "empty_command"})
+        cmd_argv = list(command)
 
     exec_id = secrets.token_hex(8)
     work_cwd = cwd if cwd is not None else str(root)
 
     try:
         completed = subprocess.run(
-            command,
+            cmd_argv,
             cwd=work_cwd,
             capture_output=True,
             text=True,
@@ -142,7 +152,7 @@ def execute(
 
     meta = {
         "exec_id": exec_id,
-        "command": list(command),
+        "command": list(cmd_argv),
         "cwd": work_cwd,
         "exit_code": completed.returncode,
         "total_bytes": total_bytes,
@@ -153,17 +163,23 @@ def execute(
     meta_path = sandbox_dir / f"{exec_id}.meta.json"
     _write_secure(meta_path, json.dumps(meta, ensure_ascii=False, sort_keys=True))
 
+    # Compact mode: when the full output is short, return it raw and skip the
+    # first_lines/last_lines split. Saves model-side tokens for small results.
+    is_compact = total_lines <= _COMPACT_MAX_LINES and total_bytes <= _COMPACT_MAX_BYTES
     summary: dict[str, Any] = {
         "ok": True,
         "exec_id": exec_id,
         "exit_code": completed.returncode,
         "total_bytes": total_bytes,
         "total_lines": total_lines,
-        "first_lines": first_lines,
-        "last_lines": last_lines,
         "stderr_tail": stderr_tail,
         "created_at": created_at,
     }
+    if is_compact:
+        summary["output"] = redacted_combined
+    else:
+        summary["first_lines"] = first_lines
+        summary["last_lines"] = last_lines
 
     _maybe_audit(
         root,

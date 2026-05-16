@@ -1,0 +1,11 @@
+{
+  "agent": "unknown",
+  "audit_tail_actions": [],
+  "decisions_tail": [],
+  "forced_reason": "session_end_other",
+  "schema_version": 1,
+  "session_id": "88d3b2e1-afc0-4552-92a2-80dc3558deb4",
+  "session_tail": "# Current Session\n\nMVP scaffold initialized.\n",
+  "todos_open": [],
+  "written_at": "2026-05-09T10:01:21Z"
+}

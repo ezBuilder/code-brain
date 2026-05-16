@@ -91,11 +91,21 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "sandbox_execute",
-        "description": "Run shell in sandbox; returns summary+exec_id, full output on disk. Write-class.",
+        "description": (
+            "Run shell in sandbox; returns summary+exec_id, full output on disk. Write-class. "
+            "command accepts either an argv array (e.g. [\"git\", \"log\"]) or a single "
+            "shell string (run under `bash -lc`) so heredocs/pipes work without JSON escaping. "
+            "For small outputs (<=20 lines / <=1KB) the response replaces first_lines/last_lines with a single `output` field."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "command": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "command": {
+                    "oneOf": [
+                        {"type": "string", "minLength": 1},
+                        {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    ]
+                },
                 "cwd": {"type": "string"},
                 "timeout": {"type": "integer", "default": 30},
             },
@@ -175,7 +185,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "recommend_skills",
-        "description": "Propose slash-command skills from cross-session memory. Read-only.",
+        "description": "Propose slash-command skills from cross-session memory. May persist pending catalog entries; does not install.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -405,11 +415,17 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         return as_payload(run_checks(root))
     if name == "sandbox_execute":
         command = args.get("command")
-        if not isinstance(command, list) or not command:
-            raise ValueError("sandbox_execute requires non-empty command list")
+        if isinstance(command, str):
+            if not command.strip():
+                raise ValueError("sandbox_execute requires non-empty command")
+            command_payload: list[str] | str = command
+        elif isinstance(command, list) and command:
+            command_payload = [str(part) for part in command]
+        else:
+            raise ValueError("sandbox_execute requires command as non-empty string or array")
         return sandbox_execute(
             root,
-            command=[str(part) for part in command],
+            command=command_payload,
             cwd=str(args["cwd"]) if isinstance(args.get("cwd"), str) else None,
             timeout=int(args.get("timeout", 30) or 30),
         )

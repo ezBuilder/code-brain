@@ -80,7 +80,7 @@ def _is_recursive_grep(tokens: list[str]) -> bool:
 
 
 def _build_suggested(command_str: str) -> str:
-    return f"ai exec run -- {command_str}"
+    return f".ai/bin/ai exec run -- {command_str}"
 
 
 def should_intercept(command_str: str | None) -> dict[str, Any]:

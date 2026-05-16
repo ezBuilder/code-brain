@@ -1,3 +1,7 @@
 $Root = Resolve-Path "$PSScriptRoot/../.."
-uv run --project "$Root/.ai/runtime" ai @args
-
+$Python = if ($IsWindows) { "$Root/.ai/runtime/.venv/Scripts/python.exe" } else { "$Root/.ai/runtime/.venv/bin/python" }
+if (Test-Path $Python) {
+  & $Python -m ai_core.cli @args
+} else {
+  uv run --project "$Root/.ai/runtime" ai @args
+}

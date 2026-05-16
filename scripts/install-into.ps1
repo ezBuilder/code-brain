@@ -167,18 +167,19 @@ def ensure_features(t):
                 if lines[i].lstrip().startswith("[") and not lines[i].lstrip().startswith("[]"):
                     break
                 section.append(lines[i]); i += 1
+            section = [sl for sl in section if not (sl.strip().startswith("codex_hooks") and "=" in sl)]
             replaced = False
             for j, sl in enumerate(section):
-                if sl.strip().startswith("codex_hooks") and "=" in sl:
-                    section[j] = "codex_hooks = true"; replaced = True; break
+                if sl.strip().startswith("hooks") and "=" in sl:
+                    section[j] = "hooks = true"; replaced = True; break
             if not replaced:
                 while section and section[-1].strip() == "": section.pop()
-                section.append("codex_hooks = true")
+                section.append("hooks = true")
             out.extend(section); continue
         out.append(lines[i]); i += 1
     if not found:
         joined = "\n".join(out).rstrip()
-        return (joined + "\n\n[features]\ncodex_hooks = true\n") if joined else "[features]\ncodex_hooks = true\n"
+        return (joined + "\n\n[features]\nhooks = true\n") if joined else "[features]\nhooks = true\n"
     return "\n".join(out).rstrip() + "\n"
 new_text = ensure_features(new_text)
 dst.parent.mkdir(parents=True, exist_ok=True)
@@ -233,21 +234,30 @@ function Merge-CodexHooksJson {
 import json, sys
 from pathlib import Path
 dst = Path(sys.argv[1])
-hooks_dir = "${"${"}CODEX_PROJECT_DIR:-${"${"}CLAUDE_PROJECT_DIR:-.${"}"}${"}"}/.ai/bin/ai-hook"
-events = ["PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop", "SubagentStop", "PermissionRequest"]
-matchers = {"PreToolUse": ["Bash"], "PostToolUse": ["Edit", "Write", "MultiEdit", "NotebookEdit"]}
-managed = {}
-for ev in events:
-    entry = {"command": f"{hooks_dir} {ev}"}
-    if ev in matchers:
-        entry["matchers"] = matchers[ev]
-    managed[ev] = [entry]
+def cb(ev, status):
+    return {"type": "command", "command": f'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" {ev}', "statusMessage": status}
+managed = {
+    "PreToolUse": [{"matcher": "Bash", "hooks": [cb("PreToolUse", "Checking Code Brain command routing")]}],
+    "PostToolUse": [{"matcher": "Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [cb("PostToolUse", "Recording Code Brain tool result")]}],
+    "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [cb("SessionStart", "Loading Code Brain session context")]}],
+    "UserPromptSubmit": [{"hooks": [cb("UserPromptSubmit", "Loading Code Brain prompt context")]}],
+    "Stop": [{"hooks": [cb("Stop", "Recording Code Brain stop event")]}],
+    "SubagentStop": [{"hooks": [cb("SubagentStop", "Recording Code Brain subagent stop")]}],
+    "PreCompact": [{"hooks": [cb("PreCompact", "Saving Code Brain compact snapshot")]}],
+    "PostCompact": [{"hooks": [cb("PostCompact", "Recording Code Brain compact completion")]}],
+    "PermissionRequest": [{"matcher": "Bash", "hooks": [cb("PermissionRequest", "Checking Code Brain approval policy")]}],
+}
 default_payload = {"_note": "Codex hook schema may differ across versions."}
 payload = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else default_payload
 if not isinstance(payload, dict):
     raise SystemExit("hooks.json is not an object")
 hooks = payload.setdefault("hooks", {})
-def has_cb(v): return isinstance(v, dict) and ".ai/bin/ai-hook" in str(v.get("command", ""))
+def has_cb(v):
+    if not isinstance(v, dict):
+        return False
+    if ".ai/bin/ai-hook" in str(v.get("command", "")):
+        return True
+    return any(isinstance(h, dict) and ".ai/bin/ai-hook" in str(h.get("command", "")) for h in v.get("hooks", []) or [])
 for name, entries in managed.items():
     existing = hooks.get(name)
     kept = [e for e in existing if not has_cb(e)] if isinstance(existing, list) else []

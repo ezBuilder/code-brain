@@ -23,7 +23,7 @@ def test_grep_recursive_intercepts() -> None:
     result = should_intercept("grep -rn pattern src/")
     assert result["intercept"] is True
     assert result["binary"] == "grep"
-    assert result["suggested_command"] == "ai exec run -- grep -rn pattern src/"
+    assert result["suggested_command"] == ".ai/bin/ai exec run -- grep -rn pattern src/"
 
 
 def test_grep_single_file_allows() -> None:
@@ -96,7 +96,7 @@ def test_evaluate_bash_with_grep_recursive_blocks() -> None:
     result = evaluate("Bash", {"command": "grep -rn x src/"})
     assert result["action"] == "block"
     assert result["binary"] == "grep"
-    assert result["suggestion"].startswith("ai exec run -- ")
+    assert result["suggestion"].startswith(".ai/bin/ai exec run -- ")
 
 
 def test_evaluate_bash_no_command_allows() -> None:
@@ -109,7 +109,7 @@ def test_evaluate_long_command_path_resolves_binary() -> None:
     result = evaluate("Bash", {"command": "/usr/bin/grep -r foo bar/"})
     assert result["action"] == "block"
     assert result["binary"] == "grep"
-    assert result["suggestion"].startswith("ai exec run -- ")
+    assert result["suggestion"].startswith(".ai/bin/ai exec run -- ")
 
 
 def test_egrep_recursive_intercepts() -> None:

@@ -1,51 +1,107 @@
 {
-  "_note": "Codex hook schema may differ across versions. Verify with your codex CLI release. PreToolUse currently supports deny rules only — input rewriting awaits upstream updatedInput support.",
+  "_note": "Code Brain Codex hooks. Keep this in the current Codex matcher-group schema: event -> matcher -> hooks[].",
   "hooks": {
     "PermissionRequest": [
       {
-        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PermissionRequest"
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PermissionRequest",
+            "statusMessage": "Checking Code Brain approval policy"
+          }
+        ]
       }
     ],
     "PostToolUse": [
       {
-        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PostToolUse",
-        "matchers": [
-          "Edit",
-          "Write",
-          "MultiEdit",
-          "NotebookEdit",
-          "Read",
-          "Glob",
-          "Grep"
+        "matcher": "Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PostToolUse",
+            "statusMessage": "Recording Code Brain tool result"
+          }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook PreToolUse",
-        "matchers": [
-          "Bash"
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PreToolUse",
+            "statusMessage": "Checking Code Brain command routing"
+          }
         ]
       }
     ],
     "SessionStart": [
       {
-        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook SessionStart"
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" SessionStart",
+            "statusMessage": "Loading Code Brain session context"
+          }
+        ]
       }
     ],
     "Stop": [
       {
-        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook Stop"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" Stop",
+            "statusMessage": "Recording Code Brain stop event"
+          }
+        ]
       }
     ],
     "SubagentStop": [
       {
-        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook SubagentStop"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" SubagentStop",
+            "statusMessage": "Recording Code Brain subagent stop"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PreCompact",
+            "statusMessage": "Saving Code Brain compact snapshot"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PostCompact",
+            "statusMessage": "Recording Code Brain compact completion"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
       {
-        "command": "${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-.}}/.ai/bin/ai-hook UserPromptSubmit"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" UserPromptSubmit",
+            "statusMessage": "Loading Code Brain prompt context"
+          }
+        ]
       }
     ]
   }

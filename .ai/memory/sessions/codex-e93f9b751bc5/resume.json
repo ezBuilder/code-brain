@@ -1,0 +1,10 @@
+{
+  "agent": "codex",
+  "audit_tail_actions": [],
+  "decisions_tail": [],
+  "schema_version": 1,
+  "session_id": "codex-e93f9b751bc5",
+  "session_tail": "# Current Session\n\nMVP scaffold initialized.\n",
+  "todos_open": [],
+  "written_at": "2026-05-15T15:42:24Z"
+}

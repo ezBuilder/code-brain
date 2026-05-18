@@ -133,6 +133,7 @@ def event_observability(root: Path) -> dict[str, Any]:
         "mcp_response_bytes": 0,
         "hook_breakdown": {},
         "mcp_breakdown": {},
+        "mcp_tool_breakdown": {},
         "sandbox_executions": 0,
         "pretooluse_blocks": 0,
         "pretooluse_allows": 0,
@@ -147,6 +148,7 @@ def event_observability(root: Path) -> dict[str, Any]:
     }
     hook_breakdown: dict[str, dict[str, int]] = {}
     mcp_breakdown: dict[str, dict[str, int]] = {}
+    mcp_tool_breakdown: dict[str, dict[str, int]] = {}
     for path in sorted(events_root.glob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -181,6 +183,14 @@ def event_observability(root: Path) -> dict[str, Any]:
                 bucket["count"] += 1
                 bucket["request_bytes"] += req_bytes
                 bucket["response_bytes"] += resp_bytes
+                tool_name = payload.get("tool_name")
+                if method == "tools/call" and isinstance(tool_name, str) and tool_name:
+                    tool_bucket = mcp_tool_breakdown.setdefault(
+                        tool_name, {"count": 0, "request_bytes": 0, "response_bytes": 0}
+                    )
+                    tool_bucket["count"] += 1
+                    tool_bucket["request_bytes"] += req_bytes
+                    tool_bucket["response_bytes"] += resp_bytes
             elif kind == "sandbox.execute":
                 totals["sandbox_executions"] += 1
             elif kind in HOOK_NAMES:
@@ -205,6 +215,7 @@ def event_observability(root: Path) -> dict[str, Any]:
                         bucket["observed"] += 1
     totals["hook_breakdown"] = {k: hook_breakdown[k] for k in sorted(hook_breakdown)}
     totals["mcp_breakdown"] = {k: mcp_breakdown[k] for k in sorted(mcp_breakdown)}
+    totals["mcp_tool_breakdown"] = {k: mcp_tool_breakdown[k] for k in sorted(mcp_tool_breakdown)}
     return {"ok": True, **totals}
 
 
@@ -269,8 +280,59 @@ def health_summary(root: Path) -> dict[str, Any]:
         },
         "release_artifacts": release_artifact_summary(root),
         "index": index_summary(root),
+        "surfacing": _surfacing_summary(root),
     }
     return redact_value(payload)
+
+
+def _surfacing_summary(root: Path) -> dict[str, Any]:
+    """Cumulative recommendation surfacing KPIs from audit log + cache freshness."""
+    import json as _json
+    import time
+
+    audit_file = root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    counts = {"surfaced": 0, "accepted": 0, "rejected": 0}
+    if audit_file.exists():
+        try:
+            for line in audit_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                act = str(rec.get("action") or "")
+                if not act.startswith(("skill.", "agent.", "precall.")):
+                    continue
+                tail = act.split(".", 1)[1]
+                if tail == "recommend_pending":
+                    counts["surfaced"] += 1
+                elif tail.startswith("accept"):
+                    counts["accepted"] += 1
+                elif tail == "reject":
+                    counts["rejected"] += 1
+        except OSError:
+            pass
+    total_acted = counts["accepted"] + counts["rejected"]
+    accept_ratio = round(counts["accepted"] / total_acted, 3) if total_acted else None
+    caches = {}
+    for name in ("skill_hot", "agent_hot", "precall_hot", "bash_heads"):
+        p = root / ".ai" / "cache" / f"{name}.json"
+        if p.exists():
+            try:
+                caches[name] = int(time.time() - p.stat().st_mtime)
+            except OSError:
+                caches[name] = None
+        else:
+            caches[name] = None
+    return {
+        "surfaced_lifetime": counts["surfaced"],
+        "accepted": counts["accepted"],
+        "rejected": counts["rejected"],
+        "accept_ratio": accept_ratio,
+        "cache_age_seconds": caches,
+    }
 
 
 def index_summary(root: Path) -> dict[str, Any]:

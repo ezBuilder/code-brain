@@ -171,6 +171,10 @@ def close_todo(
     return {"ok": True, "record": update}
 
 
+_SESSION_NOTE_MAX_BYTES = 102400
+_SESSION_NOTE_KEEP_BYTES = 51200
+
+
 def append_session_note(root: Path, *, text: str) -> dict[str, Any]:
     from .redact import redact_value
     text_clean = redact_value(str(text)).strip()
@@ -181,6 +185,21 @@ def append_session_note(root: Path, *, text: str) -> dict[str, Any]:
     line = f"- [{now_iso()}] {text_clean[:1024]}\n"
     if not path.exists():
         path.write_text("# Current Session\n\n", encoding="utf-8")
+    else:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if size > _SESSION_NOTE_MAX_BYTES:
+            try:
+                raw = path.read_bytes()
+                tail = raw[-_SESSION_NOTE_KEEP_BYTES:]
+                nl = tail.find(b"\n")
+                if nl >= 0:
+                    tail = tail[nl + 1:]
+                path.write_bytes(b"# Current Session\n\n[rotated]\n" + tail)
+            except OSError:
+                pass
     with path.open("a", encoding="utf-8") as handle:
         _lock_exclusive(handle)
         try:

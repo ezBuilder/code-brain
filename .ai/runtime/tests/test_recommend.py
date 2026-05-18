@@ -228,7 +228,7 @@ def test_recommend_skips_path_like_codex_groups(tmp_root: Path):
             f"cwd: {tmp_root}\n\n"
             f"task_group: {tmp_root}\n"
             "task_outcome: partial\n"
-            "keywords: navio\n"
+            f"keywords: unique-kw-{i}\n"
         )
     raw.write_text("# Raw Memories\n\n" + "\n".join(blocks), encoding="utf-8")
     rec = recommend(tmp_root, include_global=True, home=fake_home, min_signal=3)
@@ -268,3 +268,304 @@ def test_list_visible_includes_all_states(tmp_root: Path):
     visible = list_visible(tmp_root)
     statuses = {v["status"] for v in visible}
     assert "installed" in statuses
+
+
+def test_signal_strength_sort_prioritizes_stronger_signals(tmp_root: Path):
+    """Strong signal (bash_heads:50) must outrank weak (decision_tag:3) in cluster output."""
+    from collections import Counter
+    from ai_core.recommend import Signals, cluster_candidates
+
+    sig = Signals()
+    sig.bash_head_counts = Counter({"git": 50})
+    for i in range(3):
+        sig.decisions.append({"tags": ["infra"], "decision": f"decision infra #{i}"})
+    cands = cluster_candidates(sig, limit=5, min_signal=3)
+    assert cands, "expected candidates from seeded signals"
+    top = cands[0]
+    assert "bash_heads" in top.evidence["signals"][0], (
+        f"bash_heads:50 should outrank decision_tag:3 but got {top.evidence['signals']}"
+    )
+
+
+def test_normalized_strength_levels_disparate_signal_kinds(tmp_root: Path):
+    """codex_keywords:3 (of 3 max) and bash_heads:50 (of 50 max) should both be top — same kind-max ratio."""
+    from collections import Counter
+    from ai_core.recommend import Signals, cluster_candidates
+
+    sig = Signals()
+    sig.bash_head_counts = Counter({"git": 50, "ai": 10})
+    sig.global_codex_threads = [
+        {"task_group": "deploy", "task_outcome": "ok", "keywords": "navio,deploy"},
+        {"task_group": "deploy", "task_outcome": "ok", "keywords": "navio,deploy"},
+        {"task_group": "deploy", "task_outcome": "ok", "keywords": "navio,deploy"},
+    ]
+    cands = cluster_candidates(sig, limit=10, min_signal=3)
+    assert cands
+    top_two_kinds = {
+        cands[0].evidence["signals"][0].split(":", 1)[0],
+        cands[1].evidence["signals"][0].split(":", 1)[0],
+    }
+    assert "bash_heads" in top_two_kinds and "codex_keywords" in top_two_kinds, (
+        f"normalization should tie bash_heads:50 (max=50) with codex_keywords:3 (max=3); got {[c.evidence['signals'] for c in cands[:3]]}"
+    )
+
+
+def test_bash_head_cache_reused_within_ttl(tmp_root: Path, monkeypatch):
+    """Second call to _gather_bash_heads must hit the cache file, not re-parse transcripts."""
+    from ai_core.recommend import _gather_bash_heads, _bash_head_cache_path
+
+    cache_path = _bash_head_cache_path(tmp_root)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text('{"counts": {"git": 42}}', encoding="utf-8")
+
+    called: list[bool] = []
+
+    def boom(*args, **kwargs):
+        called.append(True)
+        raise AssertionError("transcript parse should not run while cache is warm")
+
+    import ai_core.precall_recommend as pr
+    monkeypatch.setattr(pr, "gather_bash_invocations", boom)
+
+    result = _gather_bash_heads(tmp_root)
+    assert result == {"git": 42}
+    assert called == []
+
+
+def test_bash_head_cache_miss_returns_empty_and_does_not_block(tmp_root: Path, monkeypatch):
+    """Cache miss must return empty Counter immediately (background rebuild)."""
+    from ai_core.recommend import _gather_bash_heads
+
+    spawned: list[bool] = []
+    import ai_core.recommend as recmod
+    monkeypatch.setattr(recmod, "_spawn_bash_head_cache_rebuild", lambda *_: spawned.append(True))
+
+    result = _gather_bash_heads(tmp_root)
+    assert result == {}, "cache miss must not parse synchronously"
+    assert spawned == [True], "background rebuild must be scheduled"
+
+
+def test_adaptive_threshold_actually_filters_section(tmp_root: Path, monkeypatch):
+    """Adaptive learning loop end-to-end: 20+ ignored surfaces → next section gets stricter min_signal."""
+    from ai_core.hooks import _recommendation_section
+    from ai_core.memory import append_audit
+
+    seen_min_signals: list[int] = []
+
+    def fake_invoke(_root, min_signal, _payload):
+        seen_min_signals.append(min_signal)
+        return {"candidates": []}  # empty result so section returns ""
+
+    # No surfaced events → base 3 unchanged
+    _recommendation_section(
+        tmp_root, "SessionStart", {},
+        env_toggle="X_TEST_ON", env_min_signal="X_TEST_MIN_SIGNAL",
+        invoke=fake_invoke,
+        header="h", approval_line="a",
+        label_field="slug", desc_field="description",
+    )
+    assert seen_min_signals[-1] == 3, "base min_signal should be 3 when no audit"
+
+    # Seed 20+ ignored surfacings → adaptive bump to 4
+    for i in range(22):
+        append_audit(tmp_root, action="skill.recommend_pending", category="memory", payload={"id": f"sk-{i}"})
+
+    _recommendation_section(
+        tmp_root, "SessionStart", {},
+        env_toggle="X_TEST_ON", env_min_signal="X_TEST_MIN_SIGNAL",
+        invoke=fake_invoke,
+        header="h", approval_line="a",
+        label_field="slug", desc_field="description",
+    )
+    assert seen_min_signals[-1] == 4, "20+ ignored without action should auto-raise min_signal by 1"
+
+
+def test_adaptive_min_signal_raises_when_user_ignores_recommendations(tmp_root: Path):
+    """20+ surfaced without any accept/reject should raise base min_signal by 1, 40+ by 2."""
+    from ai_core.hooks import _adaptive_min_signal_from_satisfaction
+    from ai_core.memory import append_audit
+
+    assert _adaptive_min_signal_from_satisfaction(tmp_root, 3) == 3
+
+    for i in range(20):
+        append_audit(tmp_root, action="skill.recommend_pending", category="memory", payload={"id": f"sk-{i}"})
+    assert _adaptive_min_signal_from_satisfaction(tmp_root, 3) == 4, "20+ ignored should bump min_signal by 1"
+
+    for i in range(20):
+        append_audit(tmp_root, action="agent.recommend_pending", category="memory", payload={"id": f"ag-{i}"})
+    assert _adaptive_min_signal_from_satisfaction(tmp_root, 3) == 5, "40+ ignored should bump min_signal by 2"
+
+    append_audit(tmp_root, action="skill.accept_install", category="memory", payload={"id": "sk-0"})
+    assert _adaptive_min_signal_from_satisfaction(tmp_root, 3) == 3, "any acted should drop adaptive bump back to base"
+
+
+def test_env_enabled_helper_only_truthy_values(monkeypatch):
+    from ai_core.hooks import _env_enabled
+
+    for v in ("1", "true", "TRUE", "yes", "YES", "on", "On"):
+        monkeypatch.setenv("X_TEST_TOGGLE", v)
+        assert _env_enabled("X_TEST_TOGGLE"), f"{v!r} should be enabled"
+    for v in ("0", "false", "no", "off", "", "random"):
+        monkeypatch.setenv("X_TEST_TOGGLE", v)
+        assert not _env_enabled("X_TEST_TOGGLE"), f"{v!r} should not enable"
+    monkeypatch.delenv("X_TEST_TOGGLE", raising=False)
+    assert not _env_enabled("X_TEST_TOGGLE"), "unset default is off"
+
+
+def test_env_disabled_helper_only_disable_values(monkeypatch):
+    from ai_core.hooks import _env_disabled
+
+    for v in ("0", "false", "no", "off", "FALSE"):
+        monkeypatch.setenv("X_TEST_TOGGLE", v)
+        assert _env_disabled("X_TEST_TOGGLE"), f"{v!r} should be disabled"
+    for v in ("1", "true", "yes", "on", ""):
+        monkeypatch.setenv("X_TEST_TOGGLE", v)
+        assert not _env_disabled("X_TEST_TOGGLE"), f"{v!r} should not disable"
+    monkeypatch.delenv("X_TEST_TOGGLE", raising=False)
+    assert not _env_disabled("X_TEST_TOGGLE"), "unset default is enabled (opt-out pattern)"
+
+
+def test_surfacing_summary_in_obs_health(tmp_root: Path):
+    """obs_health_summary must include surfacing KPIs computed from audit log."""
+    from ai_core.memory import append_audit
+    from ai_core.obs import _surfacing_summary
+
+    # Empty state
+    initial = _surfacing_summary(tmp_root)
+    assert initial["surfaced_lifetime"] == 0
+    assert initial["accepted"] == 0
+    assert initial["rejected"] == 0
+    assert initial["accept_ratio"] is None
+
+    # Seed audit
+    for i in range(5):
+        append_audit(tmp_root, action="skill.recommend_pending", category="memory", payload={"id": f"sk-{i}"})
+    append_audit(tmp_root, action="skill.accept_install", category="memory", payload={"id": "sk-0"})
+    append_audit(tmp_root, action="agent.reject", category="memory", payload={"id": "ag-0"})
+
+    result = _surfacing_summary(tmp_root)
+    assert result["surfaced_lifetime"] == 5
+    assert result["accepted"] == 1
+    assert result["rejected"] == 1
+    assert result["accept_ratio"] == 0.5
+    assert "skill_hot" in result["cache_age_seconds"]
+
+
+def test_federated_summary_context_skips_when_only_one_project(tmp_root: Path, monkeypatch):
+    """federated section must not render unless scanned_projects >= 2."""
+    from ai_core.hooks import _federated_summary_context
+    import ai_core.hooks as hooksmod
+
+    def fake_summary(_root, **_kw):
+        return {"scanned_projects": 1, "common_todo_patterns": [], "common_precall_kinds": []}
+
+    monkeypatch.setattr("ai_core.federated.cross_project_summary", fake_summary)
+    out = _federated_summary_context(tmp_root, "SessionStart")
+    assert out == "", f"expected empty section for 1-project scan, got {out!r}"
+
+
+def test_federated_summary_context_renders_top_patterns(tmp_root: Path, monkeypatch):
+    from ai_core.hooks import _federated_summary_context
+
+    def fake_summary(_root, **_kw):
+        return {
+            "scanned_projects": 4,
+            "common_todo_patterns": [{"bigram": "deploy nightly", "projects": 3}],
+            "common_precall_kinds": [{"kind": "compound_pipeline", "projects": 2}],
+        }
+
+    monkeypatch.setattr("ai_core.federated.cross_project_summary", fake_summary)
+    out = _federated_summary_context(tmp_root, "SessionStart")
+    assert "Federated patterns from 4 projects" in out
+    assert "deploy nightly(3)" in out
+    assert "compound_pipeline(2)" in out
+
+
+def test_stop_hook_triggers_bash_head_cache_rebuild(tmp_root: Path, monkeypatch):
+    """Stop hook should fire-and-forget a bash_heads cache rebuild so subsequent SessionStart sees fresh data."""
+    import ai_core.hooks as hooksmod
+
+    spawned: list[bool] = []
+    monkeypatch.setattr(hooksmod, "_spawn_background_rebuild", lambda *_: None)
+
+    import ai_core.recommend as recmod
+    monkeypatch.setattr(recmod, "_spawn_bash_head_cache_rebuild", lambda *_: spawned.append(True))
+
+    hooksmod.handle_hook(tmp_root, "Stop", {"session_id": "x"})
+    assert spawned == [True], "Stop hook must spawn bash_heads cache rebuild"
+
+
+def test_auto_session_note_appends_on_stop_when_enabled(tmp_root: Path, monkeypatch):
+    """AI_AUTO_SESSION_NOTE=1 must persist Stop hook's last_assistant_message first line."""
+    import ai_core.hooks as hooksmod
+
+    monkeypatch.setattr(hooksmod, "_spawn_background_rebuild", lambda *_: None)
+    import ai_core.recommend as recmod
+    monkeypatch.setattr(recmod, "_spawn_bash_head_cache_rebuild", lambda *_: None)
+    monkeypatch.setenv("AI_AUTO_SESSION_NOTE", "1")
+
+    hooksmod.handle_hook(tmp_root, "Stop", {
+        "session_id": "n",
+        "last_assistant_message": "Iteration 24 complete: opt-in auto session note added.\n\nMore body...",
+    })
+    note_file = tmp_root / ".ai" / "memory" / "session-current.md"
+    assert note_file.exists()
+    body = note_file.read_text(encoding="utf-8")
+    assert "Iteration 24 complete" in body
+    assert "[Stop]" in body, "expected [Stop] prefix in auto note"
+
+
+def test_auto_session_note_is_opt_in(tmp_root: Path, monkeypatch):
+    """default (env unset) must NOT auto-append."""
+    import ai_core.hooks as hooksmod
+
+    monkeypatch.setattr(hooksmod, "_spawn_background_rebuild", lambda *_: None)
+    import ai_core.recommend as recmod
+    monkeypatch.setattr(recmod, "_spawn_bash_head_cache_rebuild", lambda *_: None)
+    monkeypatch.delenv("AI_AUTO_SESSION_NOTE", raising=False)
+
+    hooksmod.handle_hook(tmp_root, "Stop", {
+        "session_id": "n",
+        "last_assistant_message": "should not appear",
+    })
+    note_file = tmp_root / ".ai" / "memory" / "session-current.md"
+    if note_file.exists():
+        assert "should not appear" not in note_file.read_text(encoding="utf-8")
+
+
+def test_session_note_rotates_when_exceeds_size_cap(tmp_root: Path, monkeypatch):
+    """session-current.md must auto-truncate past 100KB cap and inject [rotated] marker."""
+    from ai_core.memory import append_session_note, session_current_path
+    import ai_core.memory as memmod
+
+    monkeypatch.setattr(memmod, "_SESSION_NOTE_MAX_BYTES", 2048)
+    monkeypatch.setattr(memmod, "_SESSION_NOTE_KEEP_BYTES", 512)
+
+    path = session_current_path(tmp_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Current Session\n\n" + "old line ignored\n" * 200, encoding="utf-8")
+
+    append_session_note(tmp_root, text="newest milestone")
+    content = path.read_text(encoding="utf-8")
+    assert "[rotated]" in content
+    assert "newest milestone" in content
+    assert len(content.encode("utf-8")) < 2048 + 200
+
+
+def test_slow_hook_appends_audit_record(tmp_root: Path, monkeypatch):
+    """Hooks exceeding HOT_PATH_TARGET_MS should append a 'hook.slow' audit row for self-monitoring."""
+    import ai_core.hooks as hooksmod
+
+    # Force a slow hook by intercepting build_context to sleep just under measurement
+    monkeypatch.setattr(hooksmod, "_spawn_background_rebuild", lambda *_: None)
+    monkeypatch.setattr(hooksmod, "HOT_PATH_TARGET_MS", 0)
+
+    hooksmod.handle_hook(tmp_root, "UserPromptSubmit", {"session_id": "slow"})
+    audit_file = tmp_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    assert audit_file.exists()
+    found = False
+    for line in audit_file.read_text(encoding="utf-8").splitlines():
+        if '"hook.slow"' in line:
+            found = True
+            break
+    assert found, "expected hook.slow audit record when elapsed_ms > target"

@@ -2697,8 +2697,8 @@ def test_event_observability_breaks_down_hook_and_mcp(tmp_path: Path) -> None:
         {"timestamp": "2026-05-08T00:00:03Z", "kind": "PreToolUse", "payload": {"hook": "PreToolUse", "additional_context_bytes": 180, "precall": {"action": "block", "binary": "grep"}, "decision": "block"}},
         {"timestamp": "2026-05-08T00:00:04Z", "kind": "PreToolUse", "payload": {"hook": "PreToolUse", "additional_context_bytes": 80, "precall": {"action": "allow", "reason": "hatch_detected"}}},
         {"timestamp": "2026-05-08T00:00:05Z", "kind": "PreToolUse", "payload": {"hook": "PreToolUse", "additional_context_bytes": 200, "precall": {"action": "block", "binary": "rg"}, "decision": "block"}},
-        {"timestamp": "2026-05-08T00:00:06Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "code_query", "request_bytes": 80, "response_bytes": 1500}},
-        {"timestamp": "2026-05-08T00:00:07Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "sandbox_execute", "request_bytes": 100, "response_bytes": 600}},
+        {"timestamp": "2026-05-08T00:00:06Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "tools/call", "tool_name": "code_query", "request_bytes": 80, "response_bytes": 1500}},
+        {"timestamp": "2026-05-08T00:00:07Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "tools/call", "tool_name": "sandbox_execute", "request_bytes": 100, "response_bytes": 600}},
         {"timestamp": "2026-05-08T00:00:08Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "code_query", "request_bytes": 80, "response_bytes": 1200}},
     ]
     # Add a sandbox.execute event — should NOT count as hook_events.
@@ -2725,10 +2725,15 @@ def test_event_observability_breaks_down_hook_and_mcp(tmp_path: Path) -> None:
     assert hook_bd["PreToolUse"]["bytes_total"] == 460  # 180+80+200
 
     mcp_bd = result["mcp_breakdown"]
-    assert mcp_bd["code_query"]["count"] == 2
-    assert mcp_bd["code_query"]["response_bytes"] == 2700
-    assert mcp_bd["sandbox_execute"]["count"] == 1
-    assert mcp_bd["sandbox_execute"]["response_bytes"] == 600
+    assert mcp_bd["tools/call"]["count"] == 2
+    assert mcp_bd["tools/call"]["response_bytes"] == 2100
+    assert mcp_bd["code_query"]["count"] == 1
+    assert mcp_bd["code_query"]["response_bytes"] == 1200
+    mcp_tool_bd = result["mcp_tool_breakdown"]
+    assert mcp_tool_bd["code_query"]["count"] == 1
+    assert mcp_tool_bd["code_query"]["response_bytes"] == 1500
+    assert mcp_tool_bd["sandbox_execute"]["count"] == 1
+    assert mcp_tool_bd["sandbox_execute"]["response_bytes"] == 600
 
 
 def test_event_observability_empty_when_no_events_dir(tmp_path: Path) -> None:
@@ -2936,8 +2941,43 @@ def test_session_start_hook_injects_decisions_todos_session_tail(tmp_path: Path)
     assert "Already done" not in ctx
     assert "검색 라우팅 점검" in ctx
     assert response["additional_context_bytes"] == len(ctx.encode("utf-8"))
-    assert response["additional_context_bytes"] <= 4096
+    assert response["additional_context_bytes"] <= 12288
     assert response["elapsed_ms"] <= 200
+
+
+def test_session_start_hook_injects_prior_session_tail(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    snap_dir = repo / ".ai" / "memory" / "sessions" / "old-session"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    (snap_dir / "resume.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": "old-session",
+                "agent": "codex",
+                "written_at": "2026-05-08T01:23:45Z",
+                "decisions_tail": [],
+                "todos_open": [],
+                "session_tail": "\n".join(f"- prior milestone {i}" for i in range(12)),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_ai_input(
+        "hook",
+        "SessionStart",
+        "--json",
+        stdin=json.dumps({"agent": "codex", "dry": True, "session_id": "new-session"}),
+        cwd=repo,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    ctx = json.loads(result.stdout)["additionalContext"]
+    assert "Prior session resume" in ctx
+    assert "session tail:" in ctx
+    assert "prior milestone 11" in ctx
+    assert "prior milestone 3" not in ctx
 
 
 def test_session_start_hook_surfaces_skill_recommendations(tmp_path: Path) -> None:
@@ -2963,6 +3003,71 @@ def test_session_start_hook_surfaces_skill_recommendations(tmp_path: Path) -> No
     assert catalog.exists()
     catalog_rows = [json.loads(line) for line in catalog.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert any(row.get("status") == "pending" for row in catalog_rows)
+
+
+def test_session_start_hook_satisfaction_summary_includes_surfaced_count(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    decisions = repo / ".ai" / "memory" / "decisions.jsonl"
+    rows = [
+        {"decided_at": f"2026-05-08T00:00:0{i}Z", "decision": f"deploy decision {i}", "tags": ["deploy"]}
+        for i in range(4)
+    ]
+    decisions.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    result = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    response = json.loads(result.stdout)
+    ctx = response["additionalContext"]
+    assert "Recommendation satisfaction:" in ctx
+    assert "surfaced" in ctx
+
+
+def test_session_start_hook_compact_mode_collapses_sections(tmp_path: Path, monkeypatch) -> None:
+    """AI_RECOMMEND_COMPACT=1 must collapse skill section to a single line — opt-in only."""
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    decisions = repo / ".ai" / "memory" / "decisions.jsonl"
+    rows = [
+        {"decided_at": f"2026-05-08T00:00:0{i}Z", "decision": f"compact decision {i}", "tags": ["compact"]}
+        for i in range(4)
+    ]
+    decisions.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_RECOMMEND_COMPACT", "1")
+    result = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    ctx = json.loads(result.stdout)["additionalContext"]
+    assert "cb-skill" in ctx, "compact mode must use 'cb-skill' prefix line"
+    assert "Skill recommendations available" not in ctx, "verbose header must be omitted in compact mode"
+
+
+def test_session_start_hook_cooldown_suppresses_repeat_surfacing(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    decisions = repo / ".ai" / "memory" / "decisions.jsonl"
+    rows = [
+        {"decided_at": f"2026-05-08T00:00:0{i}Z", "decision": f"qa decision {i}", "tags": ["qa"]}
+        for i in range(4)
+    ]
+    decisions.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    first = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert first.returncode == 0
+    assert "Skill recommendations available" in json.loads(first.stdout)["additionalContext"]
+    second = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert second.returncode == 0
+    ctx2 = json.loads(second.stdout)["additionalContext"]
+    assert "Skill recommendations available" not in ctx2, (
+        "cooldown should suppress identical surfacing on the next SessionStart"
+    )
+    assert "Recommendation satisfaction:" in ctx2
 
 
 def test_post_tool_use_hook_skips_injection(tmp_path: Path) -> None:

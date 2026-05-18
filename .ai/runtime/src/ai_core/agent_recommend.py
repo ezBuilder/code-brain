@@ -138,6 +138,48 @@ def _gather_decision_tags(root: Path) -> Counter[str]:
     return counts
 
 
+_CODEX_KEYWORD_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "into", "code",
+    "fix", "add", "use", "new", "all", "via", "etc", "any", "one",
+}
+
+
+def _gather_codex_keywords(root: Path) -> Counter[str]:
+    """Codex thread keywords scoped to the current project — same source as recommend.py."""
+    path = Path("~/.codex/memories/raw_memories.md").expanduser()
+    if not path.exists():
+        return Counter()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return Counter()
+    counts: Counter[str] = Counter()
+    target = str(root)
+    blocks = re.split(r"^## Thread `", text, flags=re.MULTILINE)[1:]
+    for block in blocks:
+        m_cwd = re.search(r"^cwd:\s*(.+)$", block, re.MULTILINE)
+        if not m_cwd or not m_cwd.group(1).strip().startswith(target):
+            continue
+        m_kw = re.search(r"^keywords:\s*(.+)$", block, re.MULTILINE)
+        if not m_kw:
+            continue
+        for token in re.split(r"[,;\s]+", m_kw.group(1)):
+            t = token.strip().lower()
+            if len(t) < 3 or t in _CODEX_KEYWORD_STOPWORDS:
+                continue
+            counts[t] += 1
+    return counts
+
+
+def _adaptive_min_signal(
+    intents: Counter[str], tags: Counter[str], keywords: Counter[str], requested: int
+) -> int:
+    volume = sum(intents.values()) + sum(tags.values()) + sum(keywords.values())
+    if volume < 20 and requested > 2:
+        return 2
+    return requested
+
+
 def _draft_agent_body(slug: str, focus_topic: str, evidence_lines: list[str]) -> str:
     """Compose a `.claude/agents/<slug>.md` body. Plain text per cb-* convention."""
     bullets = "\n".join(f"- {line}" for line in evidence_lines[:5])
@@ -164,6 +206,9 @@ def cluster_candidates(
     out: list[AgentCandidate] = []
 
     intents = _gather_subagent_intents(root)
+    tags = _gather_decision_tags(root)
+    keywords = _gather_codex_keywords(root)
+    min_signal = _adaptive_min_signal(intents, tags, keywords, min_signal)
     for sub_type, count in intents.most_common():
         if count < min_signal:
             continue
@@ -184,7 +229,6 @@ def cluster_candidates(
             )
         )
 
-    tags = _gather_decision_tags(root)
     for tag, count in tags.most_common():
         if count < min_signal:
             continue
@@ -202,6 +246,26 @@ def cluster_candidates(
             AgentCandidate(
                 id=cid, slug=slug, description=desc, body=body,
                 evidence={"signals": [f"decisions:{count}"], "rationale": f"tag '{tag}' {count} decisions"},
+            )
+        )
+
+    for kw, count in keywords.most_common(12):
+        if count < min_signal:
+            continue
+        slug = _slugify(f"{kw}-investigator")
+        desc = f"'{kw}' 키워드가 {count}개 codex thread에서 반복 — 도메인 전용 investigator 후보."
+        body = _draft_agent_body(
+            slug,
+            f"the '{kw}' domain",
+            evidence_lines=[f"codex threads tagged '{kw}': {count}"],
+        )
+        if _danger_match(body):
+            continue
+        cid = _candidate_id(slug, body)
+        out.append(
+            AgentCandidate(
+                id=cid, slug=slug, description=desc, body=body,
+                evidence={"signals": [f"codex_keywords:{count}"], "rationale": f"keyword '{kw}' {count} codex threads"},
             )
         )
 

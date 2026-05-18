@@ -65,6 +65,7 @@ class Signals:
     session_tail: str = ""
     global_claude_titles: list[str] = field(default_factory=list)
     global_codex_threads: list[dict[str, Any]] = field(default_factory=list)
+    bash_head_counts: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass
@@ -166,7 +167,103 @@ def gather_signals(
         h = home or Path.home()
         sig.global_claude_titles = _gather_claude_global(h, root)
         sig.global_codex_threads = _gather_codex_global(h, root)
+        sig.bash_head_counts = _gather_bash_heads(root)
     return sig
+
+
+_BASH_DOMAIN_TOOLS = {
+    "git", "gh", "kubectl", "docker", "docker-compose", "npm", "pnpm", "yarn",
+    "cargo", "pytest", "uv", "hatch", "poetry", "pip", "make", "terraform",
+    "ansible", "aws", "gcloud", "az", "helm", "bun", "deno", "ai",
+}
+
+
+_BASH_HEAD_CACHE_TTL_SECONDS = 300
+
+
+def _bash_head_cache_path(root: Path) -> Path:
+    return root / ".ai" / "cache" / "bash_heads.json"
+
+
+def _compute_bash_heads(root: Path) -> Counter[str]:
+    try:
+        from .precall_recommend import gather_bash_invocations
+    except Exception:
+        return Counter()
+    try:
+        invs = gather_bash_invocations(root, include_transcripts=True)
+    except Exception:
+        return Counter()
+    counts: Counter[str] = Counter()
+    for cmd in invs:
+        cmd = (cmd or "").strip()
+        if not cmd or cmd.startswith("|"):
+            continue
+        parts = cmd.split()
+        i = 0
+        while i < len(parts) and ("=" in parts[i] or parts[i] in {"sudo", "time", "nohup", "exec", "env"}):
+            i += 1
+        if i >= len(parts):
+            continue
+        head = parts[i].split("/")[-1]
+        if head in _BASH_DOMAIN_TOOLS:
+            counts[head] += 1
+    return counts
+
+
+def _write_bash_head_cache(root: Path, counts: Counter[str]) -> None:
+    cache_path = _bash_head_cache_path(root)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({"counts": dict(counts)}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _spawn_bash_head_cache_rebuild(root: Path) -> None:
+    """Fire-and-forget background rebuild of bash_heads cache."""
+    import os
+    import subprocess
+    import sys
+
+    try:
+        from .portable import detached_popen_kwargs
+
+        cmd = [
+            sys.executable, "-c",
+            "from ai_core.recommend import _compute_bash_heads, _write_bash_head_cache; "
+            "from pathlib import Path; "
+            f"r=Path({str(root)!r}); _write_bash_head_cache(r, _compute_bash_heads(r))",
+        ]
+        env = {**os.environ, "PYTHONPATH": str(root / ".ai" / "runtime" / "src")}
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                cmd, stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
+                env=env, **detached_popen_kwargs(),
+            )
+    except Exception:
+        pass
+
+
+def _gather_bash_heads(root: Path) -> Counter[str]:
+    """Stale-while-revalidate cache: use cache if present, schedule rebuild if stale or missing."""
+    import time
+
+    cache_path = _bash_head_cache_path(root)
+    if cache_path.exists():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            counts_dict = payload.get("counts") if isinstance(payload, dict) else None
+            age = time.time() - cache_path.stat().st_mtime
+            if isinstance(counts_dict, dict):
+                counts = Counter({str(k): int(v) for k, v in counts_dict.items() if isinstance(v, int)})
+                if age >= _BASH_HEAD_CACHE_TTL_SECONDS:
+                    _spawn_bash_head_cache_rebuild(root)
+                return counts
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    _spawn_bash_head_cache_rebuild(root)
+    return Counter()
 
 
 def _gather_claude_global(home: Path, root: Path) -> list[str]:
@@ -233,6 +330,8 @@ def cluster_candidates(
     candidates.extend(_candidates_from_todo_tokens(signals, min_signal=min_signal))
     candidates.extend(_candidates_from_audit_actions(signals, min_signal=min_signal))
     candidates.extend(_candidates_from_codex_groups(signals, min_signal=min_signal))
+    candidates.extend(_candidates_from_codex_keywords(signals, min_signal=min_signal))
+    candidates.extend(_candidates_from_bash_heads(signals, min_signal=min_signal))
 
     deduped: dict[str, Candidate] = {}
     for c in candidates:
@@ -242,8 +341,54 @@ def cluster_candidates(
             c.rejected_reason = "danger_pattern"
         deduped[c.id] = c
     ranked = [c for c in deduped.values() if c.rejected_reason is None]
-    ranked.sort(key=lambda c: -len(c.evidence.get("signals", [])))
+    norm = _per_signal_max(ranked)
+    ranked.sort(key=lambda c: (-_normalized_strength(c, norm), -_signal_strength(c), c.slug))
     return ranked[:limit]
+
+
+def _signal_strength(c: Candidate) -> int:
+    sigs = c.evidence.get("signals") or []
+    if not isinstance(sigs, list) or not sigs:
+        return 0
+    first = str(sigs[0])
+    if ":" not in first:
+        return 0
+    try:
+        return int(first.split(":", 1)[1])
+    except ValueError:
+        return 0
+
+
+def _signal_kind(c: Candidate) -> str:
+    sigs = c.evidence.get("signals") or []
+    if not isinstance(sigs, list) or not sigs:
+        return ""
+    first = str(sigs[0])
+    return first.split(":", 1)[0] if ":" in first else ""
+
+
+def _per_signal_max(cands: list[Candidate]) -> dict[str, int]:
+    """For each signal kind, find the max raw count across candidates — used for fair normalization."""
+    out: dict[str, int] = {}
+    for c in cands:
+        kind = _signal_kind(c)
+        if not kind:
+            continue
+        strength = _signal_strength(c)
+        if strength > out.get(kind, 0):
+            out[kind] = strength
+    return out
+
+
+def _normalized_strength(c: Candidate, per_kind_max: dict[str, int]) -> float:
+    """0..1 score: count / max(count_in_same_kind). Treats codex_keywords:3 (of 3 max) and bash_heads:53 (of 53 max) as equally strong."""
+    kind = _signal_kind(c)
+    if not kind:
+        return 0.0
+    m = per_kind_max.get(kind, 0)
+    if m <= 0:
+        return 0.0
+    return _signal_strength(c) / m
 
 
 def _evidence_snippets(items: Iterable[str], head: int = 3) -> list[str]:
@@ -334,7 +479,7 @@ def _candidates_from_audit_actions(signals: Signals, *, min_signal: int) -> list
     counts = Counter(signals.audit_actions)
     out: list[Candidate] = []
     for action, count in counts.most_common(8):
-        if count < min_signal * 2:
+        if count < min_signal:
             continue
         if action.startswith("memory."):
             continue
@@ -377,6 +522,87 @@ def _candidates_from_codex_groups(signals: Signals, *, min_signal: int) -> list[
         cid = _candidate_id(slug, body)
         out.append(Candidate(id=cid, slug=slug, description=desc, body=body, evidence=evidence))
     return out
+
+
+_CODEX_KEYWORD_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "into", "code",
+    "fix", "add", "use", "new", "all", "via", "etc", "any", "one",
+}
+
+
+def _candidates_from_codex_keywords(signals: Signals, *, min_signal: int) -> list[Candidate]:
+    if not signals.global_codex_threads:
+        return []
+    kw_counts: Counter[str] = Counter()
+    kw_outcomes: dict[str, list[str]] = {}
+    for thread in signals.global_codex_threads:
+        raw = str(thread.get("keywords") or "")
+        if not raw:
+            continue
+        outcome = str(thread.get("task_outcome") or "")
+        for token in re.split(r"[,;\s]+", raw):
+            t = token.strip().lower()
+            if len(t) < 3 or t in _CODEX_KEYWORD_STOPWORDS:
+                continue
+            kw_counts[t] += 1
+            kw_outcomes.setdefault(t, []).append(outcome)
+    out: list[Candidate] = []
+    for kw, count in kw_counts.most_common(12):
+        if count < min_signal:
+            continue
+        slug = _slugify(f"recall {kw} history")
+        evidence = {
+            "signals": [f"codex_keywords:{count}"],
+            "sources": _evidence_snippets(kw_outcomes.get(kw, [])),
+            "rationale": f"keyword '{kw}' tagged {count} codex threads",
+        }
+        body = _draft_body_for_codex_group(kw, evidence["sources"])
+        desc = f"'{kw}' 관련 과거 codex 작업 이력 한 줄 요약."
+        cid = _candidate_id(slug, body)
+        out.append(Candidate(id=cid, slug=slug, description=desc, body=body, evidence=evidence))
+    return out
+
+
+def _candidates_from_bash_heads(signals: Signals, *, min_signal: int) -> list[Candidate]:
+    bash_threshold = max(min_signal * 4, 10)
+    out: list[Candidate] = []
+    for head, count in signals.bash_head_counts.most_common(8):
+        if count < bash_threshold:
+            continue
+        slug = _slugify(f"{head}-runbook")
+        evidence = {
+            "signals": [f"bash_heads:{count}"],
+            "sources": [f"{head}"],
+            "rationale": f"`{head}` invoked {count}× across transcripts",
+        }
+        body = _draft_body_for_bash_head(head, count)
+        desc = f"'{head}' 워크플로우 런북 — 트랜스크립트에서 {count}회 반복 호출."
+        cid = _candidate_id(slug, body)
+        out.append(Candidate(id=cid, slug=slug, description=desc, body=body, evidence=evidence))
+    return out
+
+
+def _draft_body_for_bash_head(head: str, count: int) -> str:
+    body = (
+        f"이 슬래시 명령은 '{head}' 도메인 작업의 런북 진입점이다. "
+        "사용자가 호출하면 다음을 1회 출력 후 stop:\n\n"
+        f"'{head}' 런북 — 최근 트랜스크립트 {count}회 호출 이력\n\n"
+        f"다음 단계 제안: 사용자에게 '{head}로 무엇을 하시려는지' 물어본 후 추가 동작.\n\n"
+        + _BODY_RULES_FOOTER
+    )
+    return body[:MAX_BODY_BYTES]
+
+
+def _adaptive_min_signal(signals: Signals, requested: int) -> int:
+    volume = (
+        len(signals.decisions)
+        + len(signals.todos_all)
+        + sum(1 for a in signals.audit_actions if not a.startswith("memory."))
+        + len(signals.global_codex_threads)
+    )
+    if volume < 50 and requested > 2:
+        return 2
+    return requested
 
 
 def _is_path_like_task_group(text: str) -> bool:
@@ -522,7 +748,8 @@ def recommend(
     persist: bool = True,
 ) -> dict[str, Any]:
     signals = gather_signals(root, include_global=include_global, home=home)
-    cands = cluster_candidates(signals, limit=limit, min_signal=min_signal)
+    effective_min_signal = _adaptive_min_signal(signals, min_signal)
+    cands = cluster_candidates(signals, limit=limit, min_signal=effective_min_signal)
     if not cands:
         return {"ok": True, "candidates": [], "note": "signals_below_threshold"}
     existing = {e.id: e for e in list_catalog(root)}

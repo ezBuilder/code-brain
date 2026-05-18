@@ -526,9 +526,11 @@ def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
     if counts["surfaced"] == 0 and total_acted == 0:
         return ""
     stale_suffix = f", {counts['stale']} stale (>{int(stale_days)}d)" if counts["stale"] else ""
+    adaptive_bump = _adaptive_min_signal_from_satisfaction(root, 3) - 3
+    adaptive_suffix = f"; adaptive +{adaptive_bump} (auto-noise reduction)" if adaptive_bump > 0 else ""
     if total_acted == 0:
         return (
-            f"Recommendation satisfaction: {counts['surfaced']} surfaced, 0 acted{stale_suffix}. "
+            f"Recommendation satisfaction: {counts['surfaced']} surfaced, 0 acted{stale_suffix}{adaptive_suffix}. "
             "Inspect: `ai recommend skills|agents|precall`; opt out: AI_*_RECOMMENDATIONS=0."
         )
     sat_pct = int(round(100 * counts["accepted"] / total_acted))

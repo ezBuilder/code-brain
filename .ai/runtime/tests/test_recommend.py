@@ -287,6 +287,18 @@ def test_signal_strength_sort_prioritizes_stronger_signals(tmp_root: Path):
     )
 
 
+def test_adaptive_cold_start_preserves_explicit_higher_threshold(tmp_root: Path):
+    """Cluster cold-start adaptive must NOT downgrade when caller already raised threshold above DEFAULT.
+    Prevents hook-level adaptive bump (3→4 after 20+ ignored) from being overridden by cluster cold-start."""
+    from ai_core.recommend import Signals, _adaptive_min_signal
+
+    sig = Signals()  # empty — volume = 0 < 50
+    assert _adaptive_min_signal(sig, 3) == 2, "default base + low volume: cold-start kicks in"
+    assert _adaptive_min_signal(sig, 4) == 4, "explicit 4 (hook adaptive bump) must not be downgraded"
+    assert _adaptive_min_signal(sig, 5) == 5, "explicit 5 must not be downgraded"
+    assert _adaptive_min_signal(sig, 2) == 2, "explicit 2 stays"
+
+
 def test_normalized_strength_levels_disparate_signal_kinds(tmp_root: Path):
     """codex_keywords:3 (of 3 max) and bash_heads:50 (of 50 max) should both be top — same kind-max ratio."""
     from collections import Counter

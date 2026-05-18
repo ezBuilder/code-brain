@@ -594,13 +594,16 @@ def _draft_body_for_bash_head(head: str, count: int) -> str:
 
 
 def _adaptive_min_signal(signals: Signals, requested: int) -> int:
+    """Cold-start downgrade: when project signal volume is low, drop threshold to 2.
+    Only applies when caller is using DEFAULT (3) or lower — explicit higher requests
+    (e.g. hook-level adaptive bump from user-ignored surfacings) are respected as-is."""
     volume = (
         len(signals.decisions)
         + len(signals.todos_all)
         + sum(1 for a in signals.audit_actions if not a.startswith("memory."))
         + len(signals.global_codex_threads)
     )
-    if volume < 50 and requested > 2:
+    if volume < 50 and 2 < requested <= MIN_SIGNAL_DEFAULT:
         return 2
     return requested
 

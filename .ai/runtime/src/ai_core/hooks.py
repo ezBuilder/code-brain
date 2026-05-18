@@ -917,11 +917,14 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if hook_name not in INJECTION_HOOKS or root is None:
         return ""
     sections = [header]
-    routing = (
-        "Search routing: prefer MCP `code_query` / `context_pack` over Bash grep/find. "
-        "Each MCP query returns ranked snippets (default 5) instead of full grep dumps — "
-        "use grep only as fallback when MCP fails."
-    )
+    if _env_enabled("AI_ROUTING_HINT_COMPACT"):
+        routing = "Search routing: prefer MCP `code_query`/`context_pack` over grep."
+    else:
+        routing = (
+            "Search routing: prefer MCP `code_query` / `context_pack` over Bash grep/find. "
+            "Each MCP query returns ranked snippets (default 5) instead of full grep dumps — "
+            "use grep only as fallback when MCP fails."
+        )
     sections.append(routing)
     if hook_name == "SessionStart":
         try:

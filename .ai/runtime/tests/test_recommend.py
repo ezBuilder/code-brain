@@ -497,6 +497,163 @@ def test_surfacing_telemetry_no_acts_returns_none_age(tmp_root: Path):
     assert result["adaptive_bump"] > 0, "22+ ignored without any acts should bump adaptive above base"
 
 
+def _write_audit_year(root: Path, year: int, rows: list[dict]) -> None:
+    """Hand-write audit rows to .ai/memory/audit/<year>.jsonl, mimicking append_audit shape."""
+    audit_dir = root / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    path = audit_dir / f"{year}.jsonl"
+    lines = []
+    for i, row in enumerate(rows):
+        rec = {
+            "ts": f"{year}-06-{1 + (i % 28):02d}T12:00:00Z",
+            "monotonic_ns": i,
+            "action": row["action"],
+            "category": row.get("category", "memory"),
+            "payload": row.get("payload", {}),
+            "prev_sha": None,
+        }
+        lines.append(json.dumps(rec, sort_keys=True, separators=(",", ":")))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_surfacing_summary_aggregates_across_years(tmp_root: Path):
+    """_surfacing_summary must sum lifetime totals across all per-year audit files."""
+    from ai_core.obs import _surfacing_summary
+
+    _write_audit_year(
+        tmp_root,
+        2026,
+        [
+            {"action": "skill.recommend_pending", "payload": {"id": "sk-2026-a"}},
+            {"action": "skill.recommend_pending", "payload": {"id": "sk-2026-b"}},
+            {"action": "skill.recommend_pending", "payload": {"id": "sk-2026-c"}},
+        ],
+    )
+    _write_audit_year(
+        tmp_root,
+        2027,
+        [
+            {"action": "skill.accept_install", "payload": {"id": "sk-2026-a"}},
+            {"action": "agent.accept", "payload": {"id": "ag-2027-x"}},
+        ],
+    )
+
+    result = _surfacing_summary(tmp_root)
+    assert result["surfaced_lifetime"] == 3, (
+        f"expected 3 surfaced across 2026+2027, got {result['surfaced_lifetime']}"
+    )
+    assert result["accepted"] == 2, (
+        f"expected 2 accepts across 2026+2027, got {result['accepted']}"
+    )
+
+
+def test_resurface_after_reject_kpi(tmp_root: Path):
+    """resurface_after_reject_* counts rejects followed by recommend_pending within 7 days."""
+    from ai_core.obs import _surfacing_summary
+
+    # Row 0: reject sk-x at 2026-06-01
+    # Row 1: recommend_pending sk-x at 2026-06-02 (within 7d → resurface)
+    # Row 2: reject sk-y at 2026-06-03 (no subsequent recommend_pending)
+    _write_audit_year(
+        tmp_root,
+        2026,
+        [
+            {"action": "skill.reject", "payload": {"id": "sk-x"}},
+            {"action": "skill.recommend_pending", "payload": {"id": "sk-x"}},
+            {"action": "skill.reject", "payload": {"id": "sk-y"}},
+        ],
+    )
+
+    result = _surfacing_summary(tmp_root)
+    assert result["resurface_after_reject_count"] == 1, (
+        f"expected 1 resurface (sk-x), got {result['resurface_after_reject_count']}"
+    )
+    assert result["resurface_after_reject_rate"] == 0.5, (
+        f"expected rate 0.5 (1/2 rejects resurfaced), got {result['resurface_after_reject_rate']}"
+    )
+
+
+def test_resurface_after_reject_no_rejects(tmp_root: Path):
+    """No rejects → rate is None, count is 0."""
+    from ai_core.obs import _surfacing_summary
+
+    _write_audit_year(
+        tmp_root,
+        2026,
+        [
+            {"action": "skill.recommend_pending", "payload": {"id": "sk-x"}},
+            {"action": "skill.accept_install", "payload": {"id": "sk-x"}},
+        ],
+    )
+
+    result = _surfacing_summary(tmp_root)
+    assert result["resurface_after_reject_count"] == 0
+    assert result["resurface_after_reject_rate"] is None
+
+
+def test_resurface_after_reject_resurface_before_reject_not_counted(tmp_root: Path):
+    """recommend_pending occurring BEFORE a reject must not count as resurface."""
+    from ai_core.obs import _surfacing_summary
+
+    # recommend_pending at day 1, reject at day 2 — the recommend_pending precedes the reject,
+    # so it cannot satisfy "subsequent recommend_pending after reject".
+    _write_audit_year(
+        tmp_root,
+        2026,
+        [
+            {"action": "skill.recommend_pending", "payload": {"id": "sk-x"}},
+            {"action": "skill.reject", "payload": {"id": "sk-x"}},
+        ],
+    )
+
+    result = _surfacing_summary(tmp_root)
+    assert result["resurface_after_reject_count"] == 0
+    assert result["resurface_after_reject_rate"] == 0.0
+
+
+def test_resurface_after_reject_multiple_rejects_same_id(tmp_root: Path):
+    """Same id rejected twice: each reject contributes to denominator; only resurface after each counts."""
+    from ai_core.obs import _surfacing_summary
+
+    # reject sk-x (day 1) → recommend_pending sk-x (day 2, within 7d → resurface #1)
+    # → reject sk-x again (day 3) → no further recommend_pending (no resurface for reject #2)
+    _write_audit_year(
+        tmp_root,
+        2026,
+        [
+            {"action": "skill.reject", "payload": {"id": "sk-x"}},
+            {"action": "skill.recommend_pending", "payload": {"id": "sk-x"}},
+            {"action": "skill.reject", "payload": {"id": "sk-x"}},
+        ],
+    )
+
+    result = _surfacing_summary(tmp_root)
+    # 2 rejects total, 1 of them was followed by a recommend_pending within 7d.
+    assert result["resurface_after_reject_count"] == 1
+    assert result["resurface_after_reject_rate"] == 0.5
+
+
+def test_recently_surfaced_ids_handles_year_boundary(tmp_root: Path):
+    """_recently_surfaced_ids must scan all per-year audit files within the cooldown window."""
+    from ai_core.hooks import _recently_surfaced_ids
+
+    _write_audit_year(
+        tmp_root,
+        2026,
+        [{"action": "skill.recommend_pending", "payload": {"id": "sk-2026-a"}}],
+    )
+    _write_audit_year(
+        tmp_root,
+        2027,
+        [{"action": "skill.recommend_pending", "payload": {"id": "sk-2027-b"}}],
+    )
+
+    # Use a very large cooldown so both seeded years fall inside the window regardless of test wall-clock.
+    recent = _recently_surfaced_ids(tmp_root, cooldown_hours=24 * 365 * 50)
+    assert "sk-2026-a" in recent, f"missing 2026 id in {recent}"
+    assert "sk-2027-b" in recent, f"missing 2027 id in {recent}"
+
+
 def test_federated_summary_context_skips_when_only_one_project(tmp_root: Path, monkeypatch):
     """federated section must not render unless scanned_projects >= 2."""
     from ai_core.hooks import _federated_summary_context
@@ -775,3 +932,321 @@ def test_catalog_compaction_skips_below_threshold(tmp_root: Path):
     assert result["ok"] is True
     assert result.get("skipped") == "below_threshold"
     assert result["after_lines"] == 0
+
+
+def test_e2e_autonomous_loop_full_cycle(tmp_root: Path, monkeypatch):
+    """End-to-end story: cold start surfaces -> adaptive bump -> inverse-adaptive cancels
+    -> cache invalidation -> obs telemetry sees the whole story.
+    Validates Tasks 1-5 work together as one autonomous-loop pipeline."""
+    import time
+    from ai_core.hooks import (
+        build_context,
+        _adaptive_min_signal_from_satisfaction,
+        _cached_recommend_invoke,
+    )
+    from ai_core.memory import append_audit
+    from ai_core.obs import _surfacing_summary
+    from ai_core.recommend import _adaptive_min_signal_lower, recommend
+
+    # Enable skill recommendations explicitly (opt-out env var must be unset/truthy).
+    monkeypatch.delenv("AI_SKILL_RECOMMENDATIONS", raising=False)
+    monkeypatch.delenv("AI_AGENT_RECOMMENDATIONS", raising=False)
+    monkeypatch.delenv("AI_PRECALL_RECOMMENDATIONS", raising=False)
+    monkeypatch.delenv("AI_RECOMMEND_COMPACT", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+
+    # ---- PHASE 1: Cold start --------------------------------------------------
+    _seed_decisions(tmp_root, "infra", 5)
+    ctx = build_context("SessionStart", {"agent": "claude"}, root=tmp_root)
+    assert "Skill recommendations available" in ctx, (
+        f"expected skill recommendations header in SessionStart context, got:\n{ctx}"
+    )
+    assert "Recommendation satisfaction:" in ctx, (
+        f"expected satisfaction summary after cold-start surfacing, got:\n{ctx}"
+    )
+    # At least one recommend_pending audit row written by the cold-start persist path.
+    audit_file = tmp_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    phase1_surfaced = sum(
+        1 for line in audit_file.read_text(encoding="utf-8").splitlines()
+        if '"skill.recommend_pending"' in line
+    )
+    assert phase1_surfaced >= 1, "cold start must persist at least one recommend_pending"
+
+    # ---- PHASE 2: Adaptive bump triggers -------------------------------------
+    # Seed 22 mock surfacings (no acts) → adaptive_min_signal bumps 3 → 4
+    for i in range(22):
+        append_audit(
+            tmp_root,
+            action="skill.recommend_pending",
+            category="memory",
+            payload={"id": f"sk-bump-{i}"},
+        )
+    bumped = _adaptive_min_signal_from_satisfaction(tmp_root, 3)
+    assert bumped == 4, (
+        f"22+ surfaced with zero acts should bump base 3 → 4, got {bumped}"
+    )
+
+    # ---- PHASE 3: Inverse-adaptive (T1) cancels the bump ---------------------
+    for i in range(5):
+        append_audit(
+            tmp_root,
+            action="skill.accept_install",
+            category="memory",
+            payload={"id": f"sk-accept-{i}"},
+        )
+    lowered = _adaptive_min_signal_lower(tmp_root, 3)
+    assert lowered == 2, (
+        f"5 accepts / 0 rejects = 100% accept ratio above 0.5 threshold; "
+        f"base 3 should lower to 2, got {lowered}"
+    )
+
+    # ---- PHASE 4: Cache invalidation ----------------------------------------
+    cache_dir = tmp_root / ".ai" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "skill_hot.json"
+    catalog_dep = tmp_root / ".ai" / "skills" / "catalog.jsonl"
+    catalog_dep.parent.mkdir(parents=True, exist_ok=True)
+    catalog_dep.write_text("", encoding="utf-8")
+
+    stale_payload = {
+        "min_signal": 3,
+        "extra": [True],
+        "result": {"candidates": [{"id": "sk-cached", "slug": "cached"}]},
+    }
+    cache_path.write_text(json.dumps(stale_payload), encoding="utf-8")
+    # Backdate the cache file so the dep can be stamped newer than it.
+    past = time.time() - 60
+    import os as _os_mod
+    _os_mod.utime(cache_path, (past, past))
+    # Touch dep so its mtime > cache mtime — must invalidate.
+    future = time.time() + 1
+    _os_mod.utime(catalog_dep, (future, future))
+
+    computed: list[bool] = []
+
+    def fresh_compute():
+        computed.append(True)
+        return {"candidates": [{"id": "sk-fresh", "slug": "fresh"}]}
+
+    fresh_result = _cached_recommend_invoke(
+        tmp_root,
+        cache_name="skill_hot",
+        deps=[catalog_dep],
+        compute=fresh_compute,
+        min_signal=3,
+        cache_key_extra=(True,),
+    )
+    assert computed == [True], "stale dep mtime must invalidate cache and force recompute"
+    assert fresh_result["candidates"][0]["id"] == "sk-fresh", (
+        f"expected fresh compute result, got {fresh_result!r}"
+    )
+
+    # ---- PHASE 5: Obs telemetry sees the whole story ------------------------
+    summary = _surfacing_summary(tmp_root)
+    # Phase 1 surfaced N (>=1) + Phase 2 added 22 = at least 22.
+    assert summary["surfaced_lifetime"] >= 22, (
+        f"expected >= 22 surfacings (22 from Phase 2 + Phase 1 cold-start), "
+        f"got {summary['surfaced_lifetime']}"
+    )
+    assert summary["accepted"] == 5, (
+        f"expected exactly 5 accepts from Phase 3, got {summary['accepted']}"
+    )
+    # All acts are accepts → ratio = 1.0
+    assert summary["accept_ratio"] == 1.0, (
+        f"5 accepts / 0 rejects → accept_ratio must be 1.0, got {summary['accept_ratio']!r}"
+    )
+    assert isinstance(summary["last_act_age_seconds"], int)
+    assert summary["last_act_age_seconds"] >= 0
+    # adaptive_bump must be present and well-defined.
+    assert "adaptive_bump" in summary
+    assert isinstance(summary["adaptive_bump"], int)
+    assert summary["adaptive_bump"] >= 0, (
+        "adaptive_bump is a non-negative int; with acts logged, bump should fall to 0"
+    )
+    # Acts present → bump path (which requires acted==0) is suppressed → bump == 0
+    assert summary["adaptive_bump"] == 0, (
+        f"with 5 acts logged, hooks._adaptive_min_signal_from_satisfaction must "
+        f"return base unchanged → adaptive_bump 0, got {summary['adaptive_bump']}"
+    )
+
+
+def test_atomic_cache_write_complete_or_absent(tmp_root: Path, monkeypatch):
+    """_write_bash_head_cache must be atomic: a failed serialization must leave the
+    target cache file either absent or fully-valid — never a half-written partial."""
+    import ai_core.recommend as recmod
+
+    cache_path = recmod._bash_head_cache_path(tmp_root)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Pre-seed cache with valid contents to ensure atomic write doesn't corrupt them.
+    cache_path.write_text('{"counts": {"git": 7}}', encoding="utf-8")
+    pre_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert pre_payload == {"counts": {"git": 7}}
+
+    from collections import Counter as _Counter
+
+    # Force json.dumps to raise mid-write — the atomic pattern writes to a tmp sidecar
+    # and only os.replace() to the canonical path on success. Serialization failure
+    # must therefore leave the pre-existing canonical file untouched.
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated serialization failure")
+
+    monkeypatch.setattr(recmod.json, "dumps", boom)
+
+    # _write_bash_head_cache only catches OSError; RuntimeError from json.dumps will
+    # propagate. The atomic guarantee is that the canonical cache_path is never
+    # corrupted by a partial write, regardless of how the write fails.
+    with pytest.raises(RuntimeError):
+        recmod._write_bash_head_cache(tmp_root, _Counter({"gh": 99}))
+
+    # Canonical cache must still parse and equal the pre-seeded contents.
+    raw = cache_path.read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert payload == {"counts": {"git": 7}}, (
+        f"failed write must not corrupt existing cache; got {payload!r}"
+    )
+    assert cache_path.exists()
+
+
+def test_silent_bash_heads_error_emits_audit(tmp_root: Path, monkeypatch):
+    """_candidates_from_bash_heads must no longer silently swallow exceptions — failures
+    in the underlying _gather_bash_heads must leave an 'agent.bash_heads_error' audit row."""
+    import ai_core.recommend as recmod
+    from ai_core import agent_recommend
+
+    def explode(_root):
+        raise RuntimeError("simulated bash_heads gather failure")
+
+    monkeypatch.setattr(recmod, "_gather_bash_heads", explode)
+
+    result = agent_recommend._candidates_from_bash_heads(tmp_root, min_signal=3)
+    assert result == [], "safe-default empty list must still be returned on failure"
+
+    audit_file = tmp_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    assert audit_file.exists(), "audit file must be created when bash_heads errors"
+    rows = [
+        json.loads(line)
+        for line in audit_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    matches = [r for r in rows if r.get("action") == "agent.bash_heads_error"]
+    assert matches, (
+        f"expected at least one 'agent.bash_heads_error' audit row; got actions="
+        f"{[r.get('action') for r in rows]}"
+    )
+    payload = matches[0].get("payload") or {}
+    assert "simulated bash_heads gather failure" in str(payload.get("error") or ""), (
+        f"audit payload must capture the exception message; got {payload!r}"
+    )
+
+
+def test_skill_cache_invalidates_when_audit_changes(tmp_root: Path, monkeypatch):
+    """T16: skill_hot deps must include the audit log so audit churn (which moves the
+    recommend_pending cooldown filter) re-runs compute() and invalidates the cache."""
+    import time
+    import os as _os_mod
+    from ai_core.hooks import _cached_recommend_invoke
+    from ai_core.memory import audit_path
+
+    # Seed catalog + audit so deps exist.
+    catalog_dep = tmp_root / ".ai" / "skills" / "catalog.jsonl"
+    catalog_dep.parent.mkdir(parents=True, exist_ok=True)
+    catalog_dep.write_text("", encoding="utf-8")
+    audit_dep = audit_path(tmp_root)
+    audit_dep.parent.mkdir(parents=True, exist_ok=True)
+    audit_dep.write_text("", encoding="utf-8")
+
+    deps = [catalog_dep, audit_dep]
+
+    compute_count = {"n": 0}
+
+    def fake_compute():
+        compute_count["n"] += 1
+        return {"candidates": [{"id": f"sk-{compute_count['n']}", "slug": "stub"}]}
+
+    # First call → cache miss → compute() runs and result is persisted.
+    first = _cached_recommend_invoke(
+        tmp_root,
+        cache_name="skill_hot",
+        deps=deps,
+        compute=fake_compute,
+        min_signal=3,
+        cache_key_extra=(True,),
+    )
+    assert compute_count["n"] == 1, "first call must run compute (cache cold)"
+    assert first["candidates"][0]["id"] == "sk-1"
+
+    cache_path = tmp_root / ".ai" / "cache" / "skill_hot.json"
+    assert cache_path.exists(), "first call must persist cache"
+
+    # Second call without touching deps → cache hit, compute must NOT re-run.
+    second = _cached_recommend_invoke(
+        tmp_root,
+        cache_name="skill_hot",
+        deps=deps,
+        compute=fake_compute,
+        min_signal=3,
+        cache_key_extra=(True,),
+    )
+    assert compute_count["n"] == 1, "warm cache must NOT re-invoke compute()"
+    assert second["candidates"][0]["id"] == "sk-1"
+
+    # Backdate the cache so we can bump audit mtime past it; touch audit.
+    past = time.time() - 60
+    _os_mod.utime(cache_path, (past, past))
+    future = time.time() + 1
+    _os_mod.utime(audit_dep, (future, future))
+
+    # Third call → audit mtime > cache mtime → cache must invalidate, compute re-runs.
+    third = _cached_recommend_invoke(
+        tmp_root,
+        cache_name="skill_hot",
+        deps=deps,
+        compute=fake_compute,
+        min_signal=3,
+        cache_key_extra=(True,),
+    )
+    assert compute_count["n"] == 2, (
+        f"audit mtime bump must invalidate cache and force recompute; "
+        f"compute ran {compute_count['n']} time(s)"
+    )
+    assert third["candidates"][0]["id"] == "sk-2"
+
+
+def test_cache_tolerates_missing_dep_files(tmp_root: Path):
+    """T16: deps list may include paths that don't exist (e.g. ~/.codex/memories/raw_memories.md
+    on machines without codex installed). _cached_recommend_invoke must treat non-existent
+    deps as 'never stale' and serve cache hits."""
+    from ai_core.hooks import _cached_recommend_invoke
+
+    missing_dep = tmp_root / ".ai" / "definitely-not-a-real-file.jsonl"
+    assert not missing_dep.exists()
+
+    compute_count = {"n": 0}
+
+    def fake_compute():
+        compute_count["n"] += 1
+        return {"candidates": [{"id": "sk-only", "slug": "only"}]}
+
+    # First call → compute runs, cache persisted even with missing dep.
+    _cached_recommend_invoke(
+        tmp_root,
+        cache_name="skill_hot",
+        deps=[missing_dep],
+        compute=fake_compute,
+        min_signal=3,
+    )
+    assert compute_count["n"] == 1
+
+    # Second call → cache hit despite missing dep (non-existent files are tolerated).
+    _cached_recommend_invoke(
+        tmp_root,
+        cache_name="skill_hot",
+        deps=[missing_dep],
+        compute=fake_compute,
+        min_signal=3,
+    )
+    assert compute_count["n"] == 1, (
+        f"missing dep must not invalidate cache; compute ran {compute_count['n']} time(s)"
+    )

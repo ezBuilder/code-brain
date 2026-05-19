@@ -99,10 +99,17 @@ def test_git_grep_intercepts() -> None:
     assert result["reason"] == "long_output_binary:git-grep"
 
 
-def test_unbalanced_quotes_allows() -> None:
-    result = should_intercept('grep "broken pattern src/')
+def test_unbalanced_non_search_allows() -> None:
+    result = should_intercept('echo "broken')
     assert result["intercept"] is False
     assert result["reason"] == "shlex_failed"
+
+
+def test_unbalanced_recursive_grep_blocks() -> None:
+    result = should_intercept('grep -rn "broken pattern src/')
+    assert result["intercept"] is True
+    assert result["binary"] == "grep"
+    assert result["reason"] == "shlex_failed_broad_search:grep"
 
 
 def test_evaluate_non_bash_tool_allows() -> None:
@@ -116,6 +123,12 @@ def test_evaluate_bash_with_grep_recursive_blocks() -> None:
     assert result["action"] == "block"
     assert result["binary"] == "grep"
     assert result["suggestion"].startswith(".ai/bin/ai exec run -- ")
+
+
+def test_evaluate_codex_exec_command_blocks() -> None:
+    result = evaluate("functions.exec_command", {"command": "rg x"})
+    assert result["action"] == "block"
+    assert result["binary"] == "rg"
 
 
 def test_evaluate_bash_no_command_allows() -> None:

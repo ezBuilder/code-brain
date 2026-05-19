@@ -7,9 +7,18 @@ Stdlib-only (re, shlex). No file I/O. No side effects.
 from __future__ import annotations
 
 import shlex
+import re
 from typing import Any
 
 LONG_OUTPUT_BINARIES = ("grep", "egrep", "fgrep", "rg", "find", "tree", "ack", "ag")
+SHELL_TOOL_NAMES = {
+    "Bash",
+    "Shell",
+    "shell",
+    "exec_command",
+    "functions.exec_command",
+    "terminal",
+}
 
 HATCH_TOKENS = (
     "| wc",
@@ -42,6 +51,7 @@ RECURSIVE_GREP_FLAGS = (
 # Compound separators that signal a multi-step pipeline we won't unwind.
 _COMPOUND_SEPARATORS = ("&&", "||", ";", "|")
 _SHELL_WRAPPERS = ("bash", "sh", "zsh")
+_FALLBACK_SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 
 
 def _strip_path(arg0: str) -> str:
@@ -50,6 +60,52 @@ def _strip_path(arg0: str) -> str:
         return arg0
     # shlex preserves quoting; basename via rsplit on '/'
     return arg0.rsplit("/", 1)[-1]
+
+
+def _is_shell_tool(tool_name: str) -> bool:
+    normalized = _strip_path(str(tool_name or "")).strip()
+    return normalized in SHELL_TOOL_NAMES or normalized.endswith(".exec_command")
+
+
+def _fallback_intercept_unparsed_command(command_str: str) -> dict[str, Any] | None:
+    """Best-effort broad-search detection when shell tokenization fails."""
+    for raw_segment in _FALLBACK_SEGMENT_SPLIT.split(command_str):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        rough_tokens = segment.split()
+        if not rough_tokens:
+            continue
+        arg0 = _strip_path(rough_tokens[0].strip("\"'"))
+        if arg0 in _SHELL_WRAPPERS:
+            inner = " ".join(rough_tokens[1:])
+            if "-c" in inner:
+                nested = _fallback_intercept_unparsed_command(inner.split("-c", 1)[1])
+                if nested is not None:
+                    return nested
+            continue
+        if arg0 in ("rg", "find", "tree", "ack", "ag"):
+            return {
+                "intercept": True,
+                "binary": arg0,
+                "reason": f"shlex_failed_broad_search:{arg0}",
+                "suggested_command": _build_suggested(command_str),
+            }
+        if arg0 in ("grep", "egrep", "fgrep") and _is_recursive_grep(rough_tokens):
+            return {
+                "intercept": True,
+                "binary": arg0,
+                "reason": f"shlex_failed_broad_search:{arg0}",
+                "suggested_command": _build_suggested(command_str),
+            }
+        if arg0 == "git" and len(rough_tokens) >= 2 and rough_tokens[1] == "grep":
+            return {
+                "intercept": True,
+                "binary": "grep",
+                "reason": "shlex_failed_broad_search:git-grep",
+                "suggested_command": _build_suggested(command_str),
+            }
+    return None
 
 
 def _has_hatch(command_str: str) -> bool:
@@ -146,10 +202,14 @@ def should_intercept(command_str: str | None) -> dict[str, Any]:
             "suggested_command": None,
         }
 
-    # Tokenize; if shlex fails (unbalanced quotes, etc.) bail conservatively.
+    # Tokenize; if shlex fails (unbalanced quotes, etc.) still catch obvious
+    # broad-search invocations so malformed quoting cannot bypass routing.
     try:
         tokens = shlex.split(command_str)
     except ValueError:
+        fallback = _fallback_intercept_unparsed_command(command_str)
+        if fallback is not None:
+            return fallback
         return {
             "intercept": False,
             "binary": None,
@@ -315,7 +375,7 @@ def evaluate(
       6. Dry-run extra_rules match → observe (do not block; caller increments counter).
       7. Otherwise → allow.
     """
-    if tool_name != "Bash":
+    if not _is_shell_tool(tool_name):
         return {"action": "allow", "reason": "non_bash_tool"}
 
     if not isinstance(tool_input, dict) or "command" not in tool_input:

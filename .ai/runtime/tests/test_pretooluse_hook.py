@@ -85,6 +85,20 @@ def test_pretooluse_rg_blocks() -> None:
     assert payload.get("precall", {}).get("binary") == "rg"
 
 
+def test_pretooluse_codex_exec_command_blocks() -> None:
+    result = run_hook(
+        "PreToolUse",
+        {
+            "agent": "codex",
+            "tool_name": "functions.exec_command",
+            "tool_input": {"command": "rg pattern"},
+        },
+    )
+    payload = _parse_ok(result)
+    assert payload.get("decision") == "block"
+    assert payload.get("precall", {}).get("binary") == "rg"
+
+
 def test_pretooluse_find_blocks() -> None:
     cmd = 'find . -name "*.py"'
     result = run_hook(

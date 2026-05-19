@@ -436,15 +436,15 @@ from pathlib import Path
 
 dst = Path(sys.argv[1])
 managed_codex_hooks = {
-    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreToolUse', "statusMessage": "Checking Code Brain command routing"}]}],
-    "PostToolUse": [{"matcher": "Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostToolUse', "statusMessage": "Recording Code Brain tool result"}]}],
+    "PreToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreToolUse', "statusMessage": "Checking Code Brain command routing"}]}],
+    "PostToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostToolUse', "statusMessage": "Recording Code Brain tool result"}]}],
     "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SessionStart', "statusMessage": "Loading Code Brain session context"}]}],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" UserPromptSubmit', "statusMessage": "Loading Code Brain prompt context"}]}],
     "Stop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" Stop', "statusMessage": "Recording Code Brain stop event"}]}],
     "SubagentStop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SubagentStop', "statusMessage": "Recording Code Brain subagent stop"}]}],
     "PreCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreCompact', "statusMessage": "Saving Code Brain compact snapshot"}]}],
     "PostCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostCompact', "statusMessage": "Recording Code Brain compact completion"}]}],
-    "PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PermissionRequest', "statusMessage": "Checking Code Brain approval policy"}]}],
+    "PermissionRequest": [{"matcher": "Bash|Shell|exec_command|functions.exec_command", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PermissionRequest', "statusMessage": "Checking Code Brain approval policy"}]}],
 }
 if dst.exists():
     try:

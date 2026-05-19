@@ -540,6 +540,88 @@ def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
     )
 
 
+def _compact_meta_line(root: Path) -> str:
+    """Compact-mode unified one-liner combining federated + satisfaction data.
+
+    Format: "cb-meta: {surfaced} surfaced/{acted} acted (adaptive +{N}); fed {n} proj — {pat}({c})"
+    Returns "" when both sides have no data; renders only the side(s) with data.
+    """
+    # --- satisfaction side -------------------------------------------------
+    sat_part = ""
+    audit_file = root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    if audit_file.exists():
+        surfaced = 0
+        acted = 0
+        try:
+            for line in audit_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                act = str(rec.get("action") or "")
+                if not act.startswith(("skill.", "agent.", "precall.")):
+                    continue
+                tail = act.split(".", 1)[1]
+                if tail == "recommend_pending":
+                    surfaced += 1
+                elif tail.startswith("accept") or tail == "reject":
+                    acted += 1
+        except OSError:
+            surfaced = 0
+            acted = 0
+        if surfaced > 0 or acted > 0:
+            adaptive_bump = _adaptive_min_signal_from_satisfaction(root, 3) - 3
+            adaptive_suffix = f" (adaptive +{adaptive_bump})" if adaptive_bump > 0 else ""
+            sat_part = f"{surfaced} surfaced/{acted} acted{adaptive_suffix}"
+
+    # --- federated side ----------------------------------------------------
+    fed_part = ""
+    try:
+        from .federated import cross_project_summary
+
+        summary = cross_project_summary(root)
+    except Exception:
+        summary = None
+    if isinstance(summary, dict) and summary.get("scanned_projects", 0) >= 2:
+        scanned = summary.get("scanned_projects", 0)
+        top_label = ""
+        bigrams = summary.get("common_todo_patterns") or []
+        if isinstance(bigrams, list):
+            top = [b for b in bigrams if isinstance(b, dict) and b.get("projects", 0) >= 2]
+            if top:
+                b = top[0]
+                top_label = f"{b.get('bigram')}({b.get('projects')})"
+        if not top_label:
+            kinds = summary.get("common_precall_kinds") or []
+            if isinstance(kinds, list):
+                top_kinds = [k for k in kinds if isinstance(k, dict) and k.get("projects", 0) >= 2]
+                if top_kinds:
+                    k = top_kinds[0]
+                    top_label = f"{k.get('kind')}({k.get('projects')})"
+        if top_label:
+            fed_part = f"fed {scanned} proj — {top_label}"
+        else:
+            fed_part = f"fed {scanned} proj"
+
+    if not sat_part and not fed_part:
+        return ""
+    if sat_part and fed_part:
+        line = f"cb-meta: {sat_part}; {fed_part}"
+    elif sat_part:
+        line = f"cb-meta: {sat_part}"
+    else:
+        line = f"cb-meta: {fed_part}"
+    # Trim trailing punctuation and clamp to 200 bytes.
+    line = line.rstrip(".; ")
+    encoded = line.encode("utf-8")
+    if len(encoded) > 200:
+        line = encoded[:197].decode("utf-8", errors="ignore") + "..."
+    return line
+
+
 def read_payload(stdin: str | None = None) -> dict[str, Any]:
     raw = stdin if stdin is not None else sys.stdin.read()
     if not raw.strip():
@@ -978,12 +1060,18 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     precall_recommendations = _precall_recommendation_context(root, hook_name, payload)
     if precall_recommendations:
         sections.append(precall_recommendations)
-    federated = _federated_summary_context(root, hook_name)
-    if federated:
-        sections.append(federated)
-    satisfaction = _satisfaction_summary_context(root, hook_name)
-    if satisfaction:
-        sections.append(satisfaction)
+    if _is_compact_mode():
+        if hook_name in SKILL_RECOMMENDATION_HOOKS:
+            meta = _compact_meta_line(root)
+            if meta:
+                sections.append(meta)
+    else:
+        federated = _federated_summary_context(root, hook_name)
+        if federated:
+            sections.append(federated)
+        satisfaction = _satisfaction_summary_context(root, hook_name)
+        if satisfaction:
+            sections.append(satisfaction)
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
         sections.append("Session-current tail:\n" + session_tail)

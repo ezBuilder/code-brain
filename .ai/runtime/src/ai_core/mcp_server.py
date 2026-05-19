@@ -396,6 +396,36 @@ TOOLS: tuple[dict[str, Any], ...] = (
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
 TOOL_NAMES = frozenset(MCP_METHODS)
 
+# tools/list payload is static within a process lifetime (TOOLS is a module-level
+# constant). Profiling on real projects showed tools/list being called 100+ times
+# per session with a ~8KB response — pure waste. Cache once and reuse.
+#
+# Safety:
+#  - The cached value is the inner "result" payload (a dict {"tools": [...]}).
+#  - handle_request wraps it in _ok(request_id, cached) — request_id is fresh.
+#  - redact_value walks the response and returns a fresh copy, so the cached
+#    payload itself is never mutated by downstream callers.
+_TOOLS_LIST_CACHE: dict[str, Any] | None = None
+
+
+def _build_tools_list_payload() -> dict[str, Any]:
+    """Build the tools/list result payload. Pure function over module constants."""
+    return {"tools": [dict(tool) for tool in TOOLS]}
+
+
+def _get_tools_list_payload() -> dict[str, Any]:
+    """Return the cached tools/list payload, building it on first call."""
+    global _TOOLS_LIST_CACHE
+    if _TOOLS_LIST_CACHE is None:
+        _TOOLS_LIST_CACHE = _build_tools_list_payload()
+    return _TOOLS_LIST_CACHE
+
+
+def _invalidate_tools_list_cache() -> None:
+    """Reset the tools/list cache. Reserved for hot-reload / test scenarios."""
+    global _TOOLS_LIST_CACHE
+    _TOOLS_LIST_CACHE = None
+
 
 def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run the underlying handler for a tool by name. Raises KeyError if unknown."""
@@ -705,6 +735,7 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
     params = request.get("params") or {}
     request_id = request.get("id")
     is_notification = "id" not in request
+    audit_tool_name: str | None = None
 
     try:
         # Notifications — no response per JSON-RPC 2.0.
@@ -723,10 +754,11 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
         elif method == "ping":
             response = _ok(request_id, {})
         elif method == "tools/list":
-            response = _ok(request_id, {"tools": [dict(tool) for tool in TOOLS]})
+            response = _ok(request_id, _get_tools_list_payload())
         elif method == "tools/call":
             name = params.get("name")
             arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+            audit_tool_name = name if isinstance(name, str) else None
             if not isinstance(name, str) or name not in TOOL_NAMES:
                 response = _err(request_id, -32602, f"unknown tool: {name!r}")
             else:
@@ -763,6 +795,7 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
             response = _ok(request_id, {"resourceTemplates": []})
         elif isinstance(method, str) and method in TOOL_NAMES:
             # Legacy direct dispatch: e.g. {"method": "obs_usage", ...}
+            audit_tool_name = method
             result = _dispatch_tool(root, method, params if isinstance(params, dict) else {})
             response = _ok(request_id, result)
         else:
@@ -770,7 +803,15 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
     except Exception as exc:
         response = _err(request_id, -32000, str(exc))
 
-    record_mcp_request(root, method, request, response, start, response.get("result") if isinstance(response, dict) else None)
+    record_mcp_request(
+        root,
+        method,
+        request,
+        response,
+        start,
+        response.get("result") if isinstance(response, dict) else None,
+        tool_name=audit_tool_name,
+    )
     return None if is_notification else redact_value(response)
 
 
@@ -781,21 +822,23 @@ def record_mcp_request(
     response: dict[str, Any],
     start: float,
     result: Any,
+    *,
+    tool_name: str | None = None,
 ) -> None:
     if is_ci():
         return
     try:
-        append_event(
-            root,
-            {
-                "hook": "mcp.request",
-                "method": method,
-                "elapsed_ms": int((time.perf_counter() - start) * 1000),
-                "request_bytes": len(json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")),
-                "response_bytes": len(json.dumps(response, ensure_ascii=False, sort_keys=True).encode("utf-8")),
-                "results_count": len(result.get("results", [])) if isinstance(result, dict) else None,
-            },
-        )
+        event = {
+            "hook": "mcp.request",
+            "method": method,
+            "elapsed_ms": int((time.perf_counter() - start) * 1000),
+            "request_bytes": len(json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+            "response_bytes": len(json.dumps(response, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+            "results_count": len(result.get("results", [])) if isinstance(result, dict) else None,
+        }
+        if tool_name:
+            event["tool_name"] = tool_name
+        append_event(root, event)
     except Exception:
         # mcp.request audit is best-effort; never fail the JSON-RPC response on it.
         pass

@@ -555,6 +555,94 @@ def _skill_recommendation_context(root: Path, hook_name: str, payload: dict[str,
     )
 
 
+def _try_autonomous_accept(root: Path, trigger: str) -> None:
+    """T36: opt-in (AI_AUTONOMOUS_ACCEPT=1). Accept at most one strongest-signal
+    pending skill candidate per Stop hook. Seeds the accept_ratio KPI that
+    otherwise stays None forever, unlocking adaptive_min_signal_lower.
+
+    Eligibility (all required):
+      - candidate is pending (not accepted/rejected/installed)
+      - raw signal_strength >= AI_AUTONOMOUS_ACCEPT_MIN_STRENGTH (default 30)
+      - haven't auto-accepted within the last AI_AUTONOMOUS_ACCEPT_COOLDOWN_HOURS
+        (default 24) to avoid runaway installs.
+    Records:
+      - audit row `skill.auto_accept` so the user can grep / audit / `ai recommend
+        skills reject` to undo.
+    """
+    try:
+        cooldown_hours = float(_os.environ.get("AI_AUTONOMOUS_ACCEPT_COOLDOWN_HOURS", "24"))
+    except (TypeError, ValueError):
+        cooldown_hours = 24.0
+    try:
+        min_strength = int(_os.environ.get("AI_AUTONOMOUS_ACCEPT_MIN_STRENGTH", "30"))
+    except (TypeError, ValueError):
+        min_strength = 30
+
+    # cooldown check via audit
+    audit_files = all_audit_files(root)
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
+    for af in audit_files:
+        try:
+            for line in af.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line or "skill.auto_accept" not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = str(rec.get("ts") or "")
+                try:
+                    parsed = (datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
+                              if ts.endswith("Z") else datetime.fromisoformat(ts))
+                except ValueError:
+                    continue
+                if parsed >= cutoff:
+                    return  # already auto-accepted recently
+        except OSError:
+            continue
+
+    # find strongest eligible candidate
+    try:
+        from .recommend import list_catalog, accept as _accept
+    except Exception:
+        return
+    candidates = list_catalog(root)
+    best = None
+    best_strength = -1
+    for entry in candidates:
+        if entry.status != "pending":
+            continue
+        sigs = (entry.evidence or {}).get("signals") or []
+        if not sigs:
+            continue
+        first = str(sigs[0])
+        if ":" not in first:
+            continue
+        try:
+            s = int(first.split(":", 1)[1])
+        except ValueError:
+            continue
+        if s < min_strength:
+            continue
+        if s > best_strength:
+            best = entry
+            best_strength = s
+    if best is None:
+        return
+    result = _accept(root, best.id)
+    from .memory import append_audit
+    append_audit(
+        root, action="skill.auto_accept", category="memory",
+        payload={
+            "id": best.id, "slug": best.slug, "strength": best_strength,
+            "trigger": trigger, "ok": bool(result.get("ok")),
+            "reason": result.get("reason"),
+        },
+    )
+
+
 def _agent_recommendation_context(root: Path, hook_name: str, payload: dict[str, Any]) -> str:
     def invoke(r: Path, ms: int, _pl: dict[str, Any]) -> dict[str, Any]:
         def compute() -> dict[str, Any]:
@@ -942,6 +1030,14 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                             root, action="memtier.auto_page_out", category="memory",
                             payload={"trigger": effective_hook},
                         )
+                except Exception:
+                    pass
+            # T36 autonomous accept: when AI_AUTONOMOUS_ACCEPT=1, accept one
+            # strong-signal recommendation per Stop. Seeds the accept_ratio KPI
+            # that otherwise stays None forever, unlocking adaptive learning.
+            if _env_enabled("AI_AUTONOMOUS_ACCEPT"):
+                try:
+                    _try_autonomous_accept(root, effective_hook)
                 except Exception:
                     pass
         try:

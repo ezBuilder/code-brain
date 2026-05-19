@@ -448,7 +448,7 @@ def _insert_chunk_embedding(conn: sqlite3.Connection, chunk_id: int, text: str, 
     from . import embedding as _emb
     from datetime import datetime, timezone
 
-    if _emb.is_enabled():
+    if _emb.is_active_for(root):
         vec = _emb.embed(text[:4096], root)  # cap input to limit memory/CPU
         if vec is not None:
             import struct
@@ -592,7 +592,7 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
     # "lexical 100-500 → dense 20-100 → rerank 5-20" recipe — sized to corpus).
     try:
         from . import embedding as _emb
-        dense_active = _emb.is_enabled() and _emb.is_model_present(root)
+        dense_active = _emb.is_active_for(root)
     except Exception:
         dense_active = False
     candidate_limit = max(limit * 8, 40) if dense_active else limit

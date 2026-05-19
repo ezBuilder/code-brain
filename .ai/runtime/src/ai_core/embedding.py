@@ -36,16 +36,33 @@ _MODEL_FILES = {
 
 
 def is_enabled() -> bool:
-    """True only when user opted in via AI_SEARCH_DENSE AND deps importable."""
-    if os.environ.get("AI_SEARCH_DENSE", "0").lower() not in {"1", "true", "yes", "on"}:
+    """Legacy: env-only check. Kept for backward compat; prefer is_active_for(root)."""
+    raw = os.environ.get("AI_SEARCH_DENSE", "").lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return _deps_present()
+    if raw in {"0", "false", "no", "off"}:
         return False
-    try:
-        import onnxruntime  # noqa: F401
-        import tokenizers  # noqa: F401
-        import numpy  # noqa: F401
-        return True
-    except ImportError:
+    return False  # unset → off when no root context available
+
+
+def is_active_for(root: Path) -> bool:
+    """True when dense search should fire for `root`.
+
+    Decision tree:
+      AI_SEARCH_DENSE=1/true   → on iff deps importable
+      AI_SEARCH_DENSE=0/false  → off
+      AI_SEARCH_DENSE unset    → auto: on iff deps importable AND model files present
+                                  (i.e., already-paid setup; no surprise network calls)
+    """
+    raw = os.environ.get("AI_SEARCH_DENSE", "").lower()
+    if raw in {"0", "false", "no", "off"}:
         return False
+    if raw in {"1", "true", "yes", "on"}:
+        return _deps_present()
+    # auto-detect — only fire when both halves of the activation cost are
+    # already paid (deps installed + model downloaded). Never trigger a
+    # network call or pip install implicitly.
+    return _deps_present() and is_model_present(root)
 
 
 def model_cache_dir(root: Path) -> Path:
@@ -111,7 +128,7 @@ def embed_batch(texts: list[str], root: Path) -> list[list[float]] | None:
       3. mean-pool with attention mask
       4. L2-normalize → unit vectors
     """
-    if not is_enabled():
+    if not is_active_for(root):
         return None
     if not texts:
         return []
@@ -157,7 +174,8 @@ def reset_runtime_cache() -> None:
 def status(root: Path) -> dict[str, Any]:
     """Health snapshot for obs."""
     return {
-        "enabled": is_enabled(),
+        "enabled": is_enabled(),                # legacy env-only check
+        "active": is_active_for(root),          # actual decision used by embed()
         "model_name": MODEL_NAME,
         "embedding_dim": EMBEDDING_DIM,
         "deps_importable": _deps_present(),

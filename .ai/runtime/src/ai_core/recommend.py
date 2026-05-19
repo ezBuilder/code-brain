@@ -889,6 +889,64 @@ def upsert_pending_candidate(root: Path, candidate: Candidate) -> CatalogEntry:
     return entry
 
 
+def _collect_occupied_slug_space(root: Path) -> set[str]:
+    """T40: every slug-shaped identifier already serving the user, normalized
+    to a canonical form so near-duplicates like 'git-runbook' vs 'gitrunbook'
+    map together. Sources:
+      - catalog slugs (.ai/skills/catalog.jsonl, any status)
+      - installed slash commands (.claude/commands/*.md)
+      - installed sub-agents (.claude/agents/*.md)
+      - cb-* skill convention (plugin marketplace skills if locally vended)
+    """
+    out: set[str] = set()
+    try:
+        for entry in list_catalog(root):
+            if entry.slug:
+                out.add(_canonical_slug(entry.slug))
+    except Exception:
+        pass
+    for sub in (".claude/commands", ".claude/agents"):
+        d = root / sub
+        if d.is_dir():
+            for f in d.glob("*.md"):
+                out.add(_canonical_slug(f.stem))
+    return out
+
+
+def _canonical_slug(slug: str) -> str:
+    """Reduce a slug to a comparison-friendly form: lowercase, alnum-only."""
+    return re.sub(r"[^a-z0-9]", "", slug.lower())
+
+
+def _slug_overlaps_existing(new_slug: str, occupied: set[str]) -> bool:
+    """True if `new_slug` is the same root concept as something in `occupied`.
+
+    Conservative overlap: canonical equality OR shared 6+ char prefix OR one
+    is a substring of the other AND both share their first 4+ chars. This
+    catches 'git-runbook' vs 'git-helper' vs 'gitops' as a single family while
+    leaving genuinely different commands ('git', 'kubectl') untouched.
+    """
+    cn = _canonical_slug(new_slug)
+    if not cn:
+        return False
+    for ex in occupied:
+        if not ex:
+            continue
+        if cn == ex:
+            return True
+        # shared prefix family (e.g. git*, kubectl*)
+        common = 0
+        for a, b in zip(cn, ex):
+            if a != b:
+                break
+            common += 1
+        if common >= 6:
+            return True
+        if common >= 4 and (cn in ex or ex in cn):
+            return True
+    return False
+
+
 def recommend(
     root: Path,
     *,
@@ -907,12 +965,24 @@ def recommend(
     slug_status: dict[str, str] = {}
     for e in existing.values():
         slug_status[e.slug] = e.status
+    # T40: collect ALL slug-shaped identifiers already serving the user so
+    # newly proposed candidates can be deduped against them, not just against
+    # the local catalog. Sources:
+    #   - catalog slugs (any status, including installed)
+    #   - existing user-owned .claude/commands/*.md basenames
+    #   - existing user-owned .claude/agents/*.md basenames
+    occupied_slugs = _collect_occupied_slug_space(root)
     out: list[dict[str, Any]] = []
     for c in cands:
         if c.id in existing and existing[c.id].status not in {"pending"}:
             continue
         prior_slug_status = slug_status.get(c.slug)
         if prior_slug_status in {"rejected", "installed", "uninstalled"}:
+            continue
+        # T40 fuzzy overlap: skip if user already has a substantially-similar
+        # slash command / agent — prevents endless near-duplicates like
+        # "git-runbook" vs "git-helper" vs "git-workflow".
+        if _slug_overlaps_existing(c.slug, occupied_slugs):
             continue
         if c.id not in existing and persist:
             upsert_pending_candidate(root, c)

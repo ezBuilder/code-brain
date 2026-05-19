@@ -1706,3 +1706,44 @@ def test_cache_tolerates_missing_dep_files(tmp_root: Path):
     assert compute_count["n"] == 1, (
         f"missing dep must not invalidate cache; compute ran {compute_count['n']} time(s)"
     )
+
+
+def test_health_layers_additive_shape(tmp_root: Path):
+    """T32: health_summary must surface advanced layers without removing existing keys."""
+    from ai_core.obs import health_summary
+    payload = health_summary(tmp_root)
+    # Existing keys preserved
+    for key in ("ok", "doctor", "worker", "queue", "release_artifacts", "index", "surfacing"):
+        assert key in payload, f"missing legacy key {key}"
+    # New 'layers' present
+    assert "layers" in payload
+    layers = payload["layers"]
+    for sub in ("embedding", "codegraph", "memory_tier", "ast_verify"):
+        assert sub in layers, f"missing layer {sub}"
+    # ast_verify is the cheap one — should always succeed
+    assert layers["ast_verify"]["present"] is True
+
+
+def test_health_layers_codegraph_shape(tmp_root: Path):
+    """T32: codegraph layer reports symbol_count / call_edge_count / top_callees."""
+    from ai_core.obs import _advanced_layers_summary
+    layers = _advanced_layers_summary(tmp_root)
+    cg = layers.get("codegraph")
+    # tmp_root has no schema yet → either None (graceful) or zeros
+    if cg is not None:
+        assert "symbol_count" in cg
+        assert "call_edge_count" in cg
+        assert "top_callees" in cg
+        assert isinstance(cg["top_callees"], list)
+
+
+def test_health_layers_memory_tier_shape(tmp_root: Path):
+    """T32: memory_tier layer reports tiers histogram + page_out_recommended."""
+    from ai_core.obs import _advanced_layers_summary
+    layers = _advanced_layers_summary(tmp_root)
+    mt = layers.get("memory_tier")
+    assert mt is not None
+    assert "tiers" in mt
+    assert "page_out_recommended" in mt
+    for tier in ("hot", "warm", "cold"):
+        assert tier in mt["tiers"]

@@ -282,8 +282,63 @@ def health_summary(root: Path) -> dict[str, Any]:
         "release_artifacts": release_artifact_summary(root),
         "index": index_summary(root),
         "surfacing": _surfacing_summary(root),
+        "layers": _advanced_layers_summary(root),
     }
     return redact_value(payload)
+
+
+def _advanced_layers_summary(root: Path) -> dict[str, Any]:
+    """Health snapshot for T28-T31 next-gen modules. Each section fails-soft to None
+    if its module is unavailable — never crashes the health endpoint."""
+    out: dict[str, Any] = {
+        "embedding": None,
+        "codegraph": None,
+        "memory_tier": None,
+        "ast_verify": None,
+    }
+    # T28 — dense embedding
+    try:
+        from . import embedding as _emb
+        out["embedding"] = _emb.status(root)
+    except Exception:
+        pass
+    # T29 — codegraph
+    try:
+        from .search import connect, init_schema
+        with connect(root) as conn:
+            init_schema(conn)
+            sym_count = int(conn.execute("select count(*) from code_symbols").fetchone()[0])
+            call_count = int(conn.execute("select count(*) from code_calls").fetchone()[0])
+            hotspots = conn.execute(
+                "select callee, count(*) as n from code_calls "
+                "group by callee order by n desc, callee asc limit 3"
+            ).fetchall()
+        out["codegraph"] = {
+            "symbol_count": sym_count,
+            "call_edge_count": call_count,
+            "top_callees": [{"callee": r["callee"], "n": int(r["n"])} for r in hotspots],
+        }
+    except Exception:
+        pass
+    # T30 — memory tier
+    try:
+        from . import memory_tier as _mt
+        cls = _mt.classify(root)
+        pres = _mt.hot_pressure(root)
+        out["memory_tier"] = {
+            "tiers": cls["tiers"],
+            "totals": cls["totals"],
+            "page_out_recommended": pres["page_out_recommended"],
+        }
+    except Exception:
+        pass
+    # T31 — AST policy gate (module presence only; checker is on-demand)
+    try:
+        from . import ast_verify as _av  # noqa: F401
+        out["ast_verify"] = {"present": True}
+    except Exception:
+        out["ast_verify"] = {"present": False}
+    return out
 
 
 def _surfacing_summary(root: Path) -> dict[str, Any]:

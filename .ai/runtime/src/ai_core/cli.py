@@ -197,6 +197,10 @@ def build_parser() -> argparse.ArgumentParser:
     memory_session_append = memory_session_sub.add_parser("append")
     memory_session_append.add_argument("--text", required=True)
     memory_session_append.add_argument("--json", action="store_true", dest="command_json")
+    memory_tier = memory_sub.add_parser("tier", help="MemGPT-style hot/warm/cold classification (T30)")
+    memory_tier.add_argument("--json", action="store_true", dest="command_json")
+    memory_pressure = memory_sub.add_parser("pressure", help="hot-tier pressure (page-out signal)")
+    memory_pressure.add_argument("--json", action="store_true", dest="command_json")
     audit = sub.add_parser("audit")
     audit_sub = audit.add_subparsers(dest="audit_command", required=True)
     audit_append = audit_sub.add_parser("append")
@@ -651,6 +655,14 @@ def main(argv: list[str] | None = None) -> int:
             payload = append_session_note(root, text=args.text)
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "tier":
+            from . import memory_tier as _mt
+            emit(_mt.classify(root), as_json=as_json)
+            return OK
+        if args.command == "memory" and args.memory_command == "pressure":
+            from . import memory_tier as _mt
+            emit(_mt.hot_pressure(root), as_json=as_json)
+            return OK
         if args.command == "audit" and args.audit_command == "append":
             reject_ci_write("audit")
             payload = append_audit(root, action=args.action, category=args.category, payload=read_payload())

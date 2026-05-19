@@ -463,6 +463,40 @@ def test_surfacing_summary_in_obs_health(tmp_root: Path):
     assert "skill_hot" in result["cache_age_seconds"]
 
 
+def test_surfacing_telemetry_includes_adaptive_and_last_act(tmp_root: Path):
+    """Surfacing summary must expose adaptive_bump, last_act_age_seconds, stale_count_7d."""
+    from ai_core.memory import append_audit
+    from ai_core.obs import _surfacing_summary
+
+    # 22 surfaced (would trigger adaptive +1 if untouched)
+    for i in range(22):
+        append_audit(tmp_root, action="skill.recommend_pending", category="memory", payload={"id": f"sk-{i}"})
+    # one acceptance breaks the adaptive bump trigger
+    append_audit(tmp_root, action="skill.accept_install", category="memory", payload={"id": "sk-0"})
+
+    result = _surfacing_summary(tmp_root)
+    assert "adaptive_bump" in result
+    assert result["adaptive_bump"] >= 0, "adaptive_bump must be a non-negative int (well-defined)"
+    # An acceptance just happened → last_act_age_seconds is a non-negative int
+    assert isinstance(result["last_act_age_seconds"], int)
+    assert result["last_act_age_seconds"] >= 0
+    # Just-seeded audit rows can't be 7d stale yet
+    assert result["stale_count_7d"] == 0
+
+
+def test_surfacing_telemetry_no_acts_returns_none_age(tmp_root: Path):
+    """No accept/reject acts → last_act_age_seconds is None; 22+ ignored bumps adaptive."""
+    from ai_core.memory import append_audit
+    from ai_core.obs import _surfacing_summary
+
+    for i in range(22):
+        append_audit(tmp_root, action="skill.recommend_pending", category="memory", payload={"id": f"sk-{i}"})
+
+    result = _surfacing_summary(tmp_root)
+    assert result["last_act_age_seconds"] is None
+    assert result["adaptive_bump"] > 0, "22+ ignored without any acts should bump adaptive above base"
+
+
 def test_federated_summary_context_skips_when_only_one_project(tmp_root: Path, monkeypatch):
     """federated section must not render unless scanned_projects >= 2."""
     from ai_core.hooks import _federated_summary_context
@@ -564,6 +598,34 @@ def test_session_note_rotates_when_exceeds_size_cap(tmp_root: Path, monkeypatch)
     assert len(content.encode("utf-8")) < 2048 + 200
 
 
+def test_agent_bash_heads_seeds_helper_candidates(tmp_root: Path, monkeypatch):
+    """agent_recommend.cluster_candidates must mine bash invocation heads via the cached
+    recommend._gather_bash_heads helper. Threshold is min_signal*4 (stricter than the skill
+    recommender) so low-volume heads must be filtered out."""
+    from collections import Counter as _Counter
+
+    import ai_core.recommend as recmod
+    from ai_core import agent_recommend
+
+    # 50 >= 3*4=12 (kept); 30 >= 12 (kept); 8 < 12 (filtered out)
+    monkeypatch.setattr(
+        recmod, "_gather_bash_heads",
+        lambda _root: _Counter({"git": 50, "ai": 30, "uv": 8}),
+    )
+
+    cands = agent_recommend.cluster_candidates(tmp_root, min_signal=3, limit=10)
+    slugs = {c.slug for c in cands}
+    signals_per_slug = {c.slug: c.evidence.get("signals") for c in cands}
+
+    assert "git-helper" in slugs, f"expected git-helper candidate; got slugs={slugs}"
+    assert signals_per_slug["git-helper"] == ["bash_heads:50"], (
+        f"git-helper must carry signal bash_heads:50; got {signals_per_slug['git-helper']}"
+    )
+    assert "uv-helper" not in slugs, (
+        f"uv:8 is below min_signal*4=12 — must not seed candidate; got slugs={slugs}"
+    )
+
+
 def test_slow_hook_appends_audit_record(tmp_root: Path, monkeypatch):
     """Hooks exceeding HOT_PATH_TARGET_MS should append a 'hook.slow' audit row for self-monitoring."""
     import ai_core.hooks as hooksmod
@@ -581,3 +643,135 @@ def test_slow_hook_appends_audit_record(tmp_root: Path, monkeypatch):
             found = True
             break
     assert found, "expected hook.slow audit record when elapsed_ms > target"
+
+
+def test_compact_mode_combines_federated_and_satisfaction(tmp_root: Path, monkeypatch):
+    """AI_RECOMMEND_COMPACT=1 must replace federated+satisfaction sections with one cb-meta line."""
+    from ai_core.hooks import build_context
+    from ai_core.memory import append_audit
+
+    monkeypatch.setenv("AI_RECOMMEND_COMPACT", "1")
+
+    for i in range(5):
+        append_audit(
+            tmp_root,
+            action="skill.recommend_pending",
+            category="memory",
+            payload={"id": f"sk-{i}"},
+        )
+
+    def fake_summary(_root, **_kw):
+        return {
+            "scanned_projects": 3,
+            "common_todo_patterns": [{"bigram": "deploy nightly", "projects": 4}],
+            "common_precall_kinds": [],
+        }
+
+    monkeypatch.setattr("ai_core.federated.cross_project_summary", fake_summary)
+
+    ctx = build_context("SessionStart", {"agent": "claude"}, root=tmp_root)
+
+    assert "cb-meta:" in ctx, f"expected combined cb-meta line, got:\n{ctx}"
+    assert "Federated patterns from" not in ctx, "verbose federated form must be suppressed in compact mode"
+    assert "Recommendation satisfaction:" not in ctx, "verbose satisfaction form must be suppressed in compact mode"
+    # Sanity: both halves of the combined line are present.
+    assert "5 surfaced" in ctx
+    assert "fed 3 proj" in ctx
+    assert "deploy nightly(4)" in ctx
+
+
+def test_inverse_adaptive_lowers_when_accept_ratio_healthy(tmp_root: Path):
+    """5+ acts with accept_ratio > 0.5 should drop min_signal by 1 (floor at 1).
+    Symmetric inverse of hooks._adaptive_min_signal_from_satisfaction."""
+    from ai_core.memory import append_audit
+    from ai_core.recommend import _adaptive_min_signal_lower
+
+    # Baseline — no audit, no change
+    assert _adaptive_min_signal_lower(tmp_root, 3) == 3
+
+    # Seed 5 accepts + 2 rejects → 5/7 ≈ 0.71 > 0.5, total_acted=7 >= 5
+    for i in range(5):
+        append_audit(tmp_root, action="skill.accept_install", category="memory", payload={"id": f"sk-{i}"})
+    for i in range(2):
+        append_audit(tmp_root, action="agent.reject", category="memory", payload={"id": f"ag-{i}"})
+
+    assert _adaptive_min_signal_lower(tmp_root, 3) == 2, (
+        "5 accepts + 2 rejects = healthy ratio; base 3 should lower to 2"
+    )
+    assert _adaptive_min_signal_lower(tmp_root, 1) == 1, "floor is 1, never below"
+
+
+def test_inverse_adaptive_respects_low_total_acted(tmp_root: Path):
+    """Below threshold (default 5) total_acted should not trigger lower."""
+    from ai_core.memory import append_audit
+    from ai_core.recommend import _adaptive_min_signal_lower
+
+    for i in range(3):
+        append_audit(tmp_root, action="skill.accept_install", category="memory", payload={"id": f"sk-{i}"})
+
+    # 3 acts < threshold 5 → no change
+    assert _adaptive_min_signal_lower(tmp_root, 3) == 3
+
+
+def test_catalog_compaction_dedups_by_id(tmp_root: Path, monkeypatch):
+    """50 lines with 5 unique ids → compact keeps 5 latest records."""
+    from ai_core.recommend import catalog_path, compact_skill_catalog
+
+    monkeypatch.setenv("AI_CATALOG_COMPACT_THRESHOLD_BYTES", "0")  # force compaction regardless of size
+
+    path = catalog_path(tmp_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write 50 lines across 5 ids; the last record per id is the "latest"
+    lines = []
+    for round_i in range(10):
+        for id_i in range(5):
+            rec = {
+                "id": f"sk-{id_i:08x}",
+                "slug": f"slug-{id_i}",
+                "status": "pending" if round_i < 9 else "installed",
+                "round": round_i,
+            }
+            lines.append(json.dumps(rec, ensure_ascii=False, sort_keys=True))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    before_size = path.stat().st_size
+    result = compact_skill_catalog(tmp_root)
+    assert result["ok"] is True
+    assert result["before_lines"] == 50
+    assert result["after_lines"] == 5
+    assert result["saved_bytes"] > 0
+
+    remaining = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    assert len(remaining) == 5
+    # All survivors must be the latest round (status=installed, round=9)
+    for rec in remaining:
+        assert rec["status"] == "installed"
+        assert rec["round"] == 9
+
+    # Audit row recorded
+    audit_file = tmp_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    assert audit_file.exists()
+    assert any(
+        '"skill.catalog_compacted"' in line
+        for line in audit_file.read_text(encoding="utf-8").splitlines()
+    )
+
+    # File shrank
+    assert path.stat().st_size < before_size
+
+
+def test_catalog_compaction_skips_below_threshold(tmp_root: Path):
+    """Files below threshold (default 256KB) should be skipped and report reason."""
+    from ai_core.recommend import catalog_path, compact_skill_catalog
+
+    path = catalog_path(tmp_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"id": "sk-a", "slug": "a", "status": "pending"}) + "\n", encoding="utf-8")
+
+    result = compact_skill_catalog(tmp_root)
+    assert result["ok"] is True
+    assert result.get("skipped") == "below_threshold"
+    assert result["after_lines"] == 0

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -606,6 +607,150 @@ def _adaptive_min_signal(signals: Signals, requested: int) -> int:
     if volume < 50 and 2 < requested <= MIN_SIGNAL_DEFAULT:
         return 2
     return requested
+
+
+def _adaptive_min_signal_lower(root: Path, base: int) -> int:
+    """Inverse of hooks._adaptive_min_signal_from_satisfaction: when the user is happily
+    accepting more than half of acted recommendations across >= threshold acts, drop
+    min_signal by 1 so we surface more candidates. Floors at 1. Symmetric path to the
+    noise-reduction bump in hooks.py."""
+    try:
+        threshold = int(os.environ.get("AI_ADAPTIVE_HEALTHY_THRESHOLD", "5"))
+    except (TypeError, ValueError):
+        threshold = 5
+    if threshold <= 0:
+        return base
+    audit_dir = root / ".ai" / "memory" / "audit"
+    if not audit_dir.is_dir():
+        return base
+    accepted = 0
+    rejected = 0
+    try:
+        for audit_file in sorted(audit_dir.glob("*.jsonl")):
+            try:
+                text = audit_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                act = str(rec.get("action") or "")
+                if not act.startswith(("skill.", "agent.", "precall.")):
+                    continue
+                tail = act.split(".", 1)[1]
+                if tail.startswith("accept"):
+                    accepted += 1
+                elif tail == "reject":
+                    rejected += 1
+    except OSError:
+        return base
+    total_acted = accepted + rejected
+    if total_acted >= threshold and accepted / total_acted > 0.5:
+        return max(base - 1, 1)
+    return base
+
+
+def compact_skill_catalog(root: Path) -> dict[str, Any]:
+    """Rewrite catalog.jsonl keeping only the latest record per id. Skips files below
+    AI_CATALOG_COMPACT_THRESHOLD_BYTES (default 256KB). Atomic via .tmp + os.replace.
+
+    Returns {ok, before_lines, after_lines, saved_bytes}. When skipped, includes
+    `skipped` reason and zero deltas."""
+    try:
+        threshold_bytes = int(os.environ.get("AI_CATALOG_COMPACT_THRESHOLD_BYTES", str(256 * 1024)))
+    except (TypeError, ValueError):
+        threshold_bytes = 256 * 1024
+    path = catalog_path(root)
+    if not path.exists():
+        return {
+            "ok": True,
+            "before_lines": 0,
+            "after_lines": 0,
+            "saved_bytes": 0,
+            "skipped": "missing",
+        }
+    try:
+        size_before = path.stat().st_size
+    except OSError:
+        size_before = 0
+    if size_before < threshold_bytes:
+        return {
+            "ok": True,
+            "before_lines": 0,
+            "after_lines": 0,
+            "saved_bytes": 0,
+            "skipped": "below_threshold",
+        }
+    latest_by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    before_lines = 0
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"ok": False, "reason": f"read_error:{exc}"}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        before_lines += 1
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        rid = rec.get("id")
+        if not rid:
+            continue
+        rid = str(rid)
+        if rid not in latest_by_id:
+            order.append(rid)
+        latest_by_id[rid] = rec
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            for rid in order:
+                fh.write(json.dumps(latest_by_id[rid], ensure_ascii=False, sort_keys=True))
+                fh.write("\n")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return {"ok": False, "reason": f"write_error:{exc}"}
+    try:
+        size_after = path.stat().st_size
+    except OSError:
+        size_after = size_before
+    after_lines = len(order)
+    saved_bytes = max(size_before - size_after, 0)
+    result = {
+        "ok": True,
+        "before_lines": before_lines,
+        "after_lines": after_lines,
+        "saved_bytes": saved_bytes,
+    }
+    try:
+        append_audit(
+            root,
+            action="skill.catalog_compacted",
+            category="memory",
+            payload={
+                "before_lines": before_lines,
+                "after_lines": after_lines,
+                "saved_bytes": saved_bytes,
+            },
+        )
+    except Exception:
+        pass
+    return result
 
 
 def _is_path_like_task_group(text: str) -> bool:

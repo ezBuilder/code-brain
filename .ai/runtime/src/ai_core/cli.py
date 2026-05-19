@@ -242,6 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_skills.add_argument("--no-global", action="store_true", dest="no_global")
     recommend_skills.add_argument("--min-signal", type=int, default=3, dest="min_signal")
     recommend_skills.add_argument("--json", action="store_true", dest="command_json")
+    recommend_skills.add_argument("--compact", action="store_true", dest="compact")
     rec_accept = recommend_skills_sub.add_parser("accept")
     rec_accept.add_argument("candidate_id")
     rec_accept.add_argument("--json", action="store_true", dest="command_json")
@@ -649,6 +650,12 @@ def main(argv: list[str] | None = None) -> int:
             if sub_cmd == "reject":
                 reject_ci_write("skills")
                 payload = rec_reject_fn(root, args.candidate_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if getattr(args, "compact", False):
+                reject_ci_write("skills")
+                from .recommend import compact_skill_catalog
+                payload = compact_skill_catalog(root)
                 emit(payload, as_json=as_json)
                 return OK if payload.get("ok") else GENERIC_ERROR
             payload = rec_run(

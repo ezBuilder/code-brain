@@ -369,6 +369,10 @@ def build_parser() -> argparse.ArgumentParser:
     cg_hotspots = code_graph_sub.add_parser("hotspots", help="most-called callees in the index")
     cg_hotspots.add_argument("--limit", type=int, default=20)
     cg_hotspots.add_argument("--json", action="store_true", dest="command_json")
+    code_verify = code_sub.add_parser("verify", help="AST-based policy gate (T31)")
+    code_verify.add_argument("source", nargs="?", help="file path; omit to read from stdin")
+    code_verify.add_argument("--stdin", action="store_true")
+    code_verify.add_argument("--json", action="store_true", dest="command_json")
     context = sub.add_parser("context")
     context_sub = context.add_subparsers(dest="context_command", required=True)
     context_pack_parser = context_sub.add_parser("pack")
@@ -910,6 +914,15 @@ def main(argv: list[str] | None = None) -> int:
             if gcmd == "hotspots":
                 emit(_cg.hotspot_callees(root, limit=args.limit), as_json=as_json)
                 return OK
+        if args.command == "code" and args.code_command == "verify":
+            from . import ast_verify as _av
+            if args.stdin or not args.source:
+                src = sys.stdin.read()
+                report = _av.verify_source(src).to_dict()
+            else:
+                report = _av.verify_file(args.source).to_dict()
+            emit(report, as_json=as_json)
+            return OK if report["ok"] else GENERIC_ERROR
         if args.command == "context" and args.context_command == "pack":
             payload = context_pack(root, args.query, limit=args.limit)
             emit(payload, as_json=as_json)

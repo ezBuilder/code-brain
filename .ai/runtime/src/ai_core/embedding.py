@@ -57,21 +57,101 @@ def is_model_present(root: Path) -> bool:
     return (cache / "model.onnx").exists() and (cache / "tokenizer.json").exists()
 
 
-def embed(text: str) -> list[float] | None:
-    """Return 384-dim embedding for `text`, or None if dense disabled.
+# Process-level runtime cache so we don't re-create the ONNX session
+# (slow: ~300ms cold) or tokenizer for every query.
+_RUNTIME_CACHE: dict[str, Any] = {}
+_MAX_SEQ_LEN = 256
 
-    Stub — full implementation lands in step 3.
+
+def _get_runtime(root: Path):
+    """Lazily load (onnx_session, tokenizer). Cached per cache_dir.
+
+    Returns (session, tokenizer) or None if model files are missing or any
+    optional dep import fails. Never raises — callers expect None on failure.
+    """
+    cache = model_cache_dir(root)
+    key = str(cache)
+    if key in _RUNTIME_CACHE:
+        return _RUNTIME_CACHE[key]
+    if not is_model_present(root):
+        return None
+    try:
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+    except ImportError:
+        return None
+    try:
+        sess = ort.InferenceSession(
+            str(cache / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        tok = Tokenizer.from_file(str(cache / "tokenizer.json"))
+        tok.enable_truncation(max_length=_MAX_SEQ_LEN)
+        tok.enable_padding(length=None, pad_id=0)
+    except Exception:
+        return None
+    _RUNTIME_CACHE[key] = (sess, tok)
+    return _RUNTIME_CACHE[key]
+
+
+def embed(text: str, root: Path) -> list[float] | None:
+    """384-dim embedding for `text`. Returns None when dense disabled / model absent."""
+    out = embed_batch([text], root)
+    if not out:
+        return None
+    return out[0]
+
+
+def embed_batch(texts: list[str], root: Path) -> list[list[float]] | None:
+    """Batched embeddings. None if dense disabled or model unavailable.
+
+    Implements the standard sentence-transformers recipe:
+      1. tokenize → input_ids, attention_mask
+      2. onnx forward → last_hidden_state
+      3. mean-pool with attention mask
+      4. L2-normalize → unit vectors
     """
     if not is_enabled():
         return None
-    return None  # not yet implemented
-
-
-def embed_batch(texts: list[str]) -> list[list[float]] | None:
-    """Batched embedding for indexer. Returns list-of-vectors or None if disabled."""
-    if not is_enabled():
+    if not texts:
+        return []
+    runtime = _get_runtime(root)
+    if runtime is None:
         return None
-    return None  # not yet implemented
+    sess, tok = runtime
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        encodings = tok.encode_batch(list(texts))
+        ids = np.asarray([e.ids for e in encodings], dtype=np.int64)
+        mask = np.asarray([e.attention_mask for e in encodings], dtype=np.int64)
+        # Some MiniLM ONNX exports also require token_type_ids; supply zeros.
+        feed = {"input_ids": ids, "attention_mask": mask}
+        try:
+            input_names = {i.name for i in sess.get_inputs()}
+        except Exception:
+            input_names = set()
+        if "token_type_ids" in input_names:
+            feed["token_type_ids"] = np.zeros_like(ids)
+        outputs = sess.run(None, feed)
+        last_hidden = outputs[0]  # (batch, seq, dim)
+        mask_f = mask.astype(np.float32)[..., None]
+        summed = (last_hidden * mask_f).sum(axis=1)
+        counts = np.clip(mask_f.sum(axis=1), a_min=1.0, a_max=None)
+        pooled = summed / counts
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        normalized = (pooled / norms).astype(np.float32)
+        return normalized.tolist()
+    except Exception:
+        return None
+
+
+def reset_runtime_cache() -> None:
+    """Test helper: drop the process-level session cache."""
+    _RUNTIME_CACHE.clear()
 
 
 def status(root: Path) -> dict[str, Any]:

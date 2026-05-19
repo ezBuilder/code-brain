@@ -121,7 +121,11 @@ def _spawn_background_rebuild(root: Path) -> None:
 
 
 def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
-    """Return candidate IDs whose recommend_pending audit event landed within cooldown_hours."""
+    """Return candidate IDs whose recommend_pending audit event landed within cooldown_hours.
+
+    Binary fallback cooldown — kept intact for when Ebbinghaus decay is disabled
+    (AI_COOLDOWN_HALF_LIFE_HOURS=0).
+    """
     if cooldown_hours <= 0:
         return set()
     audit_files = all_audit_files(root)
@@ -162,6 +166,149 @@ def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
             if isinstance(cid, str) and cid:
                 recent.add(cid)
     return recent
+
+
+def _cooldown_score(age_hours: float, half_life_hours: float) -> float:
+    """Ebbinghaus exponential-decay cooldown weight in [0, 1].
+
+    score = 0.5 ** (age / half_life)
+
+    - age_hours <= 0       → 1.0 (just surfaced; full penalty)
+    - half_life_hours <= 0 → 0.0 (Ebbinghaus disabled; no penalty)
+    """
+    if half_life_hours <= 0:
+        return 0.0
+    if age_hours <= 0:
+        return 1.0
+    return 0.5 ** (age_hours / half_life_hours)
+
+
+def _cooldown_weights(root: Path, half_life_hours: float) -> dict[str, float]:
+    """Build {candidate_id: decay_weight in [0,1]} from recommend_pending audit events.
+
+    For each candidate id, use the most-recent recommend_pending ts to compute its
+    current age in hours, then map via _cooldown_score(age, half_life).
+
+    Disabled (returns empty dict) when half_life_hours <= 0.
+    """
+    if half_life_hours <= 0:
+        return {}
+    audit_files = all_audit_files(root)
+    if not audit_files:
+        return {}
+    from datetime import datetime, timezone
+
+    latest: dict[str, datetime] = {}
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            act = str(rec.get("action") or "")
+            if not act.endswith(".recommend_pending"):
+                continue
+            ts = str(rec.get("ts") or "")
+            if not ts:
+                continue
+            try:
+                if ts.endswith("Z"):
+                    parsed = datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
+                else:
+                    parsed = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            cid = (rec.get("payload") or {}).get("id")
+            if not isinstance(cid, str) or not cid:
+                continue
+            prev = latest.get(cid)
+            if prev is None or parsed > prev:
+                latest[cid] = parsed
+
+    if not latest:
+        return {}
+    now = datetime.now(timezone.utc)
+    weights: dict[str, float] = {}
+    for cid, ts in latest.items():
+        age_seconds = (now - ts).total_seconds()
+        age_hours = age_seconds / 3600.0
+        weights[cid] = _cooldown_score(age_hours, half_life_hours)
+    return weights
+
+
+def _adaptive_half_life(root: Path, base_half_life: float) -> float:
+    """Adapt the cooldown half-life from accept/reject behaviour.
+
+    - healthy acceptance (acted >= 5 AND accept_ratio > 0.5) → base/2 (faster re-surface)
+    - passive ignore (acted == 0 AND surfaced >= 20)         → base*2 (longer silence)
+    - else                                                    → base
+    """
+    if base_half_life <= 0:
+        return base_half_life
+    audit_files = all_audit_files(root)
+    if not audit_files:
+        return base_half_life
+    accepted = 0
+    rejected = 0
+    surfaced = 0
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            act = str(rec.get("action") or "")
+            if not act.startswith(("skill.", "agent.", "precall.")):
+                continue
+            tail = act.split(".", 1)[1]
+            if tail == "recommend_pending":
+                surfaced += 1
+            elif tail.startswith("accept"):
+                accepted += 1
+            elif tail == "reject":
+                rejected += 1
+    total_acted = accepted + rejected
+    if total_acted >= 5 and accepted / total_acted > 0.5:
+        return base_half_life / 2.0
+    if total_acted == 0 and surfaced >= 20:
+        return base_half_life * 2.0
+    return base_half_life
+
+
+def _candidate_raw_strength(cand: dict[str, Any]) -> int:
+    """Extract the raw signal count from a candidate dict's evidence.signals[0].
+
+    Mirrors recommend._signal_strength but operates on the serialized dict shape
+    that hooks.py sees from invoke() callbacks. Signals look like 'decisions:5',
+    'audit:12', 'bash_heads:53', etc.
+    """
+    evidence = cand.get("evidence")
+    if not isinstance(evidence, dict):
+        return 0
+    sigs = evidence.get("signals")
+    if not isinstance(sigs, list) or not sigs:
+        return 0
+    first = str(sigs[0])
+    if ":" not in first:
+        return 0
+    try:
+        return int(first.split(":", 1)[1])
+    except ValueError:
+        return 0
 
 
 def _candidate_summary_line(cand: dict[str, Any], label_field: str, desc_field: str | tuple[str, ...]) -> str:
@@ -263,11 +410,24 @@ def _recommendation_section(
     except (TypeError, ValueError):
         base_min_signal = 3
     min_signal = _adaptive_min_signal_from_satisfaction(root, base_min_signal)
+    # Ebbinghaus exponential-decay cooldown (default) replaces the binary 24h cliff.
+    # Set AI_COOLDOWN_HALF_LIFE_HOURS=0 to disable and fall back to the legacy
+    # AI_RECOMMEND_COOLDOWN_HOURS binary set.
     try:
-        cooldown_hours = float(_os.environ.get("AI_RECOMMEND_COOLDOWN_HOURS", "24"))
+        env_half_life = float(_os.environ.get("AI_COOLDOWN_HALF_LIFE_HOURS", "12"))
     except (TypeError, ValueError):
-        cooldown_hours = 24.0
-    recent_ids = _recently_surfaced_ids(root, cooldown_hours)
+        env_half_life = 12.0
+    recent_ids: set[str] = set()
+    cooldown_weights: dict[str, float] = {}
+    if env_half_life > 0:
+        half_life = _adaptive_half_life(root, env_half_life)
+        cooldown_weights = _cooldown_weights(root, half_life)
+    else:
+        try:
+            cooldown_hours = float(_os.environ.get("AI_RECOMMEND_COOLDOWN_HOURS", "24"))
+        except (TypeError, ValueError):
+            cooldown_hours = 24.0
+        recent_ids = _recently_surfaced_ids(root, cooldown_hours)
     try:
         result = invoke(root, min_signal, payload)
     except Exception:
@@ -280,7 +440,13 @@ def _recommendation_section(
         if not isinstance(cand, dict):
             continue
         cid = str(cand.get("id") or "")
-        if cid and cid in recent_ids:
+        if cooldown_weights:
+            decay = cooldown_weights.get(cid, 0.0)
+            raw_strength = _candidate_raw_strength(cand)
+            effective = raw_strength * (1.0 - decay)
+            if effective < min_signal:
+                continue
+        elif cid and cid in recent_ids:
             continue
         fresh.append(cand)
     if not fresh:

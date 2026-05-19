@@ -654,6 +654,218 @@ def test_recently_surfaced_ids_handles_year_boundary(tmp_root: Path):
     assert "sk-2027-b" in recent, f"missing 2027 id in {recent}"
 
 
+def test_cooldown_decay_score():
+    """Ebbinghaus _cooldown_score follows 0.5^(age/half_life) with edge cases."""
+    from ai_core.hooks import _cooldown_score
+
+    assert _cooldown_score(0, 12) == 1.0
+    assert abs(_cooldown_score(12, 12) - 0.5) < 1e-9
+    assert abs(_cooldown_score(24, 12) - 0.25) < 1e-9
+    assert abs(_cooldown_score(36, 12) - 0.125) < 1e-9
+    # half_life <= 0 disables → zero weight regardless of age
+    assert _cooldown_score(100, 0) == 0.0
+    assert _cooldown_score(100, -5) == 0.0
+    # age <= 0 → full weight
+    assert _cooldown_score(-1, 12) == 1.0
+
+
+def test_cooldown_score_drops_with_age(tmp_root: Path):
+    """For a fixed half_life, older recommend_pending events yield smaller weights."""
+    from datetime import datetime, timedelta, timezone
+
+    from ai_core.hooks import _cooldown_weights
+
+    audit_dir = tmp_root / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    rows = []
+    # Recent, medium, old (in hours)
+    for cid, age_hours in (("sk-recent", 1), ("sk-mid", 12), ("sk-old", 48)):
+        ts = (now - timedelta(hours=age_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rows.append(
+            {
+                "ts": ts,
+                "monotonic_ns": age_hours,
+                "action": "skill.recommend_pending",
+                "category": "memory",
+                "payload": {"id": cid},
+                "prev_sha": None,
+            }
+        )
+    year = now.year
+    (audit_dir / f"{year}.jsonl").write_text(
+        "\n".join(json.dumps(r, sort_keys=True, separators=(",", ":")) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    weights = _cooldown_weights(tmp_root, half_life_hours=12)
+    assert set(weights.keys()) == {"sk-recent", "sk-mid", "sk-old"}
+    # Monotonic decrease as age grows
+    assert weights["sk-recent"] > weights["sk-mid"] > weights["sk-old"]
+    # Reasonable bands: 1h → close to 1, 12h ≈ 0.5, 48h tiny
+    assert weights["sk-recent"] > 0.9
+    assert 0.4 < weights["sk-mid"] < 0.6
+    assert weights["sk-old"] < 0.1
+
+    # Disabled half_life returns empty dict
+    assert _cooldown_weights(tmp_root, half_life_hours=0) == {}
+    assert _cooldown_weights(tmp_root, half_life_hours=-1) == {}
+
+
+def test_cooldown_adapts_halflife_to_healthy_acceptance(tmp_root: Path):
+    """5+ acts and accept_ratio>0.5 → base/2; 0 acted with 20+ surfaced → base*2."""
+    from ai_core.hooks import _adaptive_half_life
+    from ai_core.memory import append_audit
+
+    # Empty audit → returns base unchanged
+    assert _adaptive_half_life(tmp_root, 12) == 12
+
+    # Seed: 5 accepts + 2 rejects → 5/7 ≈ 0.71 > 0.5 with total_acted=7 >= 5
+    for i in range(5):
+        append_audit(
+            tmp_root, action="skill.accept_install", category="memory", payload={"id": f"sk-acc-{i}"}
+        )
+    for i in range(2):
+        append_audit(
+            tmp_root, action="agent.reject", category="memory", payload={"id": f"ag-rej-{i}"}
+        )
+    assert _adaptive_half_life(tmp_root, 12) == 6.0, (
+        "healthy accept ratio with >= 5 acted should halve the half_life"
+    )
+
+    # Disabled base passes through
+    assert _adaptive_half_life(tmp_root, 0) == 0
+
+
+def test_cooldown_adapts_halflife_passive_ignore(tmp_root: Path):
+    """0 acted AND 20+ surfaced → base * 2 (longer silence)."""
+    from ai_core.hooks import _adaptive_half_life
+    from ai_core.memory import append_audit
+
+    for i in range(20):
+        append_audit(
+            tmp_root,
+            action="skill.recommend_pending",
+            category="memory",
+            payload={"id": f"sk-ign-{i}"},
+        )
+    assert _adaptive_half_life(tmp_root, 12) == 24.0
+
+
+def test_recommendation_section_uses_ebbinghaus_decay(tmp_root: Path, monkeypatch):
+    """When weight*strength < min_signal, candidate must be dropped via decay
+    instead of the binary recent-id filter."""
+    from datetime import datetime, timezone
+
+    import ai_core.hooks as hooksmod
+
+    # Force adaptive_min_signal off (no audit-driven bump beyond base 3)
+    monkeypatch.delenv("AI_COOLDOWN_HALF_LIFE_HOURS", raising=False)  # default 12
+
+    # Seed a very-recent recommend_pending for an id so weight ≈ 1.0 → effective ≈ 0
+    audit_dir = tmp_root / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    rec = {
+        "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "monotonic_ns": 1,
+        "action": "skill.recommend_pending",
+        "category": "memory",
+        "payload": {"id": "sk-blocked"},
+        "prev_sha": None,
+    }
+    (audit_dir / f"{now.year}.jsonl").write_text(
+        json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    candidate_blocked = {
+        "id": "sk-blocked",
+        "slug": "blocked",
+        "description": "blocked candidate",
+        "evidence": {"signals": ["decisions:3"]},
+    }
+    candidate_fresh = {
+        "id": "sk-fresh",
+        "slug": "fresh",
+        "description": "fresh candidate",
+        "evidence": {"signals": ["decisions:3"]},
+    }
+
+    def fake_invoke(_root, _ms, _pl):
+        return {"candidates": [candidate_blocked, candidate_fresh]}
+
+    out = hooksmod._recommendation_section(
+        tmp_root,
+        "SessionStart",
+        {},
+        env_toggle="X_TEST_EBBINGHAUS",
+        env_min_signal="X_TEST_MIN_SIGNAL",
+        invoke=fake_invoke,
+        header="h",
+        approval_line="a",
+        label_field="slug",
+        desc_field="description",
+    )
+    # sk-blocked should be filtered by decay (weight ≈ 1.0 → effective ≈ 0 < min_signal 3),
+    # sk-fresh has no audit history → weight 0 → effective 3 >= min_signal 3, kept.
+    assert "sk-fresh" in out
+    assert "sk-blocked" not in out
+
+
+def test_recommendation_section_falls_back_to_binary_when_ebbinghaus_disabled(
+    tmp_root: Path, monkeypatch
+):
+    """AI_COOLDOWN_HALF_LIFE_HOURS=0 disables Ebbinghaus and re-enables binary 24h block."""
+    from datetime import datetime, timezone
+
+    import ai_core.hooks as hooksmod
+
+    monkeypatch.setenv("AI_COOLDOWN_HALF_LIFE_HOURS", "0")
+    monkeypatch.setenv("AI_RECOMMEND_COOLDOWN_HOURS", "24")
+
+    audit_dir = tmp_root / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    rec = {
+        "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "monotonic_ns": 1,
+        "action": "skill.recommend_pending",
+        "category": "memory",
+        "payload": {"id": "sk-binary-blocked"},
+        "prev_sha": None,
+    }
+    (audit_dir / f"{now.year}.jsonl").write_text(
+        json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    cand = {
+        "id": "sk-binary-blocked",
+        "slug": "bb",
+        "description": "bb desc",
+        "evidence": {"signals": ["decisions:99"]},
+    }
+
+    def fake_invoke(_root, _ms, _pl):
+        return {"candidates": [cand]}
+
+    out = hooksmod._recommendation_section(
+        tmp_root,
+        "SessionStart",
+        {},
+        env_toggle="X_TEST_BINARY",
+        env_min_signal="X_TEST_MIN_SIGNAL",
+        invoke=fake_invoke,
+        header="h",
+        approval_line="a",
+        label_field="slug",
+        desc_field="description",
+    )
+    # Even though strength=99, binary fallback must still block (id in recent_ids).
+    assert "sk-binary-blocked" not in out, f"binary fallback should block, got {out!r}"
+
+
 def test_federated_summary_context_skips_when_only_one_project(tmp_root: Path, monkeypatch):
     """federated section must not render unless scanned_projects >= 2."""
     from ai_core.hooks import _federated_summary_context
@@ -1212,6 +1424,154 @@ def test_skill_cache_invalidates_when_audit_changes(tmp_root: Path, monkeypatch)
         f"compute ran {compute_count['n']} time(s)"
     )
     assert third["candidates"][0]["id"] == "sk-2"
+
+
+def _write_audit_rows_with_ts(root: Path, year: int, rows: list[dict]) -> None:
+    """Hand-write audit rows with caller-supplied 'ts' (full ISO Z timestamp).
+
+    Used by latency tests that need second-level control over event ts.
+    """
+    audit_dir = root / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    path = audit_dir / f"{year}.jsonl"
+    lines = []
+    for i, row in enumerate(rows):
+        rec = {
+            "ts": row["ts"],
+            "monotonic_ns": i,
+            "action": row["action"],
+            "category": row.get("category", "memory"),
+            "payload": row.get("payload", {}),
+            "prev_sha": None,
+        }
+        lines.append(json.dumps(rec, sort_keys=True, separators=(",", ":")))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_source_acceptance_imbalance(tmp_root: Path):
+    """Per-source accept rate: skill 5/5=1.0, agent 1/3≈0.333, precall absent/None."""
+    from ai_core.memory import append_audit
+    from ai_core.obs import _surfacing_summary
+
+    for i in range(5):
+        append_audit(tmp_root, action="skill.accept_install", category="memory", payload={"id": f"sk-{i}"})
+    for i in range(2):
+        append_audit(tmp_root, action="agent.reject", category="memory", payload={"id": f"ag-{i}"})
+    append_audit(tmp_root, action="agent.accept_install", category="memory", payload={"id": "ag-x"})
+
+    result = _surfacing_summary(tmp_root)
+    rates = result["source_accept_rate"]
+    assert rates["skill"] == 1.0, f"skill 5/5 should be 1.0, got {rates['skill']!r}"
+    assert abs(rates["agent"] - 0.333) < 0.01, f"agent 1/3 ≈ 0.333, got {rates['agent']!r}"
+    # precall had no events → either absent or None
+    assert rates.get("precall") is None, f"precall absent or None expected, got {rates.get('precall')!r}"
+
+
+def test_action_latency_p75(tmp_root: Path):
+    """5 paired (pending, accept) events with delays 10/20/30/40/50s → p75 = 40s."""
+    from ai_core.obs import _surfacing_summary
+
+    rows = []
+    delays = [10, 20, 30, 40, 50]
+    for i, delay in enumerate(delays):
+        base_min = i  # spread each pair into its own minute to avoid id collisions
+        rows.append({
+            "action": "skill.recommend_pending",
+            "payload": {"id": f"sk-lat-{i}"},
+            "ts": f"2026-06-01T12:{base_min:02d}:00Z",
+        })
+        # accept timestamp = pending ts + delay seconds
+        rows.append({
+            "action": "skill.accept_install",
+            "payload": {"id": f"sk-lat-{i}"},
+            "ts": f"2026-06-01T12:{base_min:02d}:{delay:02d}Z",
+        })
+    _write_audit_rows_with_ts(tmp_root, 2026, rows)
+
+    result = _surfacing_summary(tmp_root)
+    # int(0.75 * 5) = 3 → sorted[3] = 40
+    assert result["action_latency_p75_seconds"] == 40, (
+        f"expected p75=40s, got {result['action_latency_p75_seconds']!r}"
+    )
+
+
+def test_action_latency_p75_below_sample_threshold(tmp_root: Path):
+    """4 paired events < 5 sample threshold → returns None."""
+    from ai_core.obs import _surfacing_summary
+
+    rows = []
+    for i, delay in enumerate([10, 20, 30, 40]):
+        rows.append({
+            "action": "skill.recommend_pending",
+            "payload": {"id": f"sk-edge-{i}"},
+            "ts": f"2026-06-01T12:{i:02d}:00Z",
+        })
+        rows.append({
+            "action": "skill.accept_install",
+            "payload": {"id": f"sk-edge-{i}"},
+            "ts": f"2026-06-01T12:{i:02d}:{delay:02d}Z",
+        })
+    _write_audit_rows_with_ts(tmp_root, 2026, rows)
+
+    result = _surfacing_summary(tmp_root)
+    assert result["action_latency_p75_seconds"] is None, (
+        f"< 5 samples should return None, got {result['action_latency_p75_seconds']!r}"
+    )
+
+
+def test_top_resurfaced_ids(tmp_root: Path):
+    """sk-aaa 4×, sk-bbb 2×, sk-ccc 1× → top entry is sk-aaa with count 4, list len ≤ 5."""
+    from ai_core.memory import append_audit
+    from ai_core.obs import _surfacing_summary
+
+    for _ in range(4):
+        append_audit(tmp_root, action="skill.recommend_pending", category="memory", payload={"id": "sk-aaa"})
+    for _ in range(2):
+        append_audit(tmp_root, action="skill.recommend_pending", category="memory", payload={"id": "sk-bbb"})
+    append_audit(tmp_root, action="skill.recommend_pending", category="memory", payload={"id": "sk-ccc"})
+
+    result = _surfacing_summary(tmp_root)
+    top = result["top_resurfaced_ids"]
+    assert len(top) <= 5, f"top_resurfaced_ids must be ≤5, got {len(top)}"
+    assert top[0]["id"] == "sk-aaa" and top[0]["count"] == 4, (
+        f"expected sk-aaa with count 4 at index 0, got {top[0]!r}"
+    )
+
+
+def test_stale_surfaced_ratio(tmp_root: Path):
+    """20 recommend_pending; 5 with ts > 7d old (no acts) → stale_surfaced_ratio == 0.25."""
+    from ai_core.obs import _surfacing_summary
+
+    # 5 stale (year 2020 — definitely >7d old) + 15 fresh (year 2026 same as test wall clock fixture)
+    # All without any accept/reject acts.
+    # For the 15 "fresh" rows we still need timestamps that are <7d old relative to wall-clock.
+    # Use current-date proxy via a near-now ISO ts; tests run with currentDate 2026-05-19 but
+    # we cannot rely on that — instead use timestamps that are "now-ish" by reading datetime.now.
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    rows = []
+    # 5 stale rows, ts well in the past
+    for i in range(5):
+        rows.append({
+            "action": "skill.recommend_pending",
+            "payload": {"id": f"sk-stale-{i}"},
+            "ts": "2020-01-01T00:00:00Z",
+        })
+    # 15 fresh rows, ts == now
+    for i in range(15):
+        rows.append({
+            "action": "skill.recommend_pending",
+            "payload": {"id": f"sk-fresh-{i}"},
+            "ts": now_iso,
+        })
+    _write_audit_rows_with_ts(tmp_root, 2026, rows)
+
+    result = _surfacing_summary(tmp_root)
+    assert result["surfaced_lifetime"] == 20
+    assert result["stale_count_7d"] == 5
+    assert result["stale_surfaced_ratio"] == 0.25, (
+        f"expected 5/20 = 0.25, got {result['stale_surfaced_ratio']!r}"
+    )
 
 
 def test_cache_tolerates_missing_dep_files(tmp_root: Path):

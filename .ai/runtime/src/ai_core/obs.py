@@ -11,6 +11,7 @@ from typing import Any
 
 from . import __version__
 from .doctor import as_payload, run_checks
+from .memory import all_audit_files
 from .redact import redact_value
 
 
@@ -291,56 +292,84 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
     import time
     from datetime import datetime, timedelta, timezone
 
-    audit_file = root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    audit_files = all_audit_files(root)
     counts = {"surfaced": 0, "accepted": 0, "rejected": 0}
     now_dt = datetime.now(timezone.utc)
     stale_cutoff = now_dt - timedelta(days=7)
+    resurface_window = timedelta(days=7)
     acted_ids: set[str] = set()
     surfaced_records: list[tuple[datetime, str]] = []
+    # Per-id chronological event log for resurface-after-reject computation.
+    # Stores (ts, kind) where kind in {"reject", "recommend_pending"}.
+    id_events: dict[str, list[tuple[datetime, str]]] = {}
     last_act_dt: datetime | None = None
-    if audit_file.exists():
+    for audit_file in audit_files:
         try:
-            for line in audit_file.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                act = str(rec.get("action") or "")
-                if not act.startswith(("skill.", "agent.", "precall.")):
-                    continue
-                tail = act.split(".", 1)[1]
-                pid = (rec.get("payload") or {}).get("id") if isinstance(rec.get("payload"), dict) else None
-                ts_raw = str(rec.get("ts") or "")
-                parsed_ts: datetime | None = None
-                if ts_raw:
-                    try:
-                        parsed_ts = (
-                            datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
-                            if ts_raw.endswith("Z") else datetime.fromisoformat(ts_raw)
-                        )
-                    except ValueError:
-                        parsed_ts = None
-                if tail == "recommend_pending":
-                    counts["surfaced"] += 1
-                    if parsed_ts is not None and isinstance(pid, str):
-                        surfaced_records.append((parsed_ts, pid))
-                elif tail.startswith("accept"):
-                    counts["accepted"] += 1
-                    if isinstance(pid, str):
-                        acted_ids.add(pid)
-                    if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
-                        last_act_dt = parsed_ts
-                elif tail == "reject":
-                    counts["rejected"] += 1
-                    if isinstance(pid, str):
-                        acted_ids.add(pid)
-                    if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
-                        last_act_dt = parsed_ts
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            pass
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            act = str(rec.get("action") or "")
+            if not act.startswith(("skill.", "agent.", "precall.")):
+                continue
+            tail = act.split(".", 1)[1]
+            pid = (rec.get("payload") or {}).get("id") if isinstance(rec.get("payload"), dict) else None
+            ts_raw = str(rec.get("ts") or "")
+            parsed_ts: datetime | None = None
+            if ts_raw:
+                try:
+                    parsed_ts = (
+                        datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
+                        if ts_raw.endswith("Z") else datetime.fromisoformat(ts_raw)
+                    )
+                except ValueError:
+                    parsed_ts = None
+            if tail == "recommend_pending":
+                counts["surfaced"] += 1
+                if parsed_ts is not None and isinstance(pid, str):
+                    surfaced_records.append((parsed_ts, pid))
+                    id_events.setdefault(pid, []).append((parsed_ts, "recommend_pending"))
+            elif tail.startswith("accept"):
+                counts["accepted"] += 1
+                if isinstance(pid, str):
+                    acted_ids.add(pid)
+                if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
+                    last_act_dt = parsed_ts
+            elif tail == "reject":
+                counts["rejected"] += 1
+                if isinstance(pid, str):
+                    acted_ids.add(pid)
+                    if parsed_ts is not None:
+                        id_events.setdefault(pid, []).append((parsed_ts, "reject"))
+                if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
+                    last_act_dt = parsed_ts
+    # resurface_after_reject: for each reject (with parsed ts), check if any
+    # subsequent recommend_pending for the same id occurs within 7 days.
+    total_rejected_with_ts = 0
+    resurfaced_count = 0
+    for pid, events in id_events.items():
+        events_sorted = sorted(events, key=lambda x: x[0])
+        for idx, (ts_evt, kind) in enumerate(events_sorted):
+            if kind != "reject":
+                continue
+            total_rejected_with_ts += 1
+            for ts_next, kind_next in events_sorted[idx + 1:]:
+                if kind_next == "recommend_pending" and (ts_next - ts_evt) < resurface_window:
+                    resurfaced_count += 1
+                    break
+    if total_rejected_with_ts:
+        resurface_after_reject_rate: float | None = round(
+            resurfaced_count / total_rejected_with_ts, 3
+        )
+    else:
+        resurface_after_reject_rate = None
     total_acted = counts["accepted"] + counts["rejected"]
     accept_ratio = round(counts["accepted"] / total_acted, 3) if total_acted else None
     caches = {}
@@ -378,6 +407,8 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
         "adaptive_bump": adaptive_bump,
         "last_act_age_seconds": last_act_age_seconds,
         "stale_count_7d": stale_count_7d,
+        "resurface_after_reject_count": resurfaced_count,
+        "resurface_after_reject_rate": resurface_after_reject_rate,
     }
 
 

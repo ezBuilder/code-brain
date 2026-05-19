@@ -215,6 +215,19 @@ def audit_path(root: Path, *, at: datetime | None = None) -> Path:
     return root / ".ai" / "memory" / "audit" / f"{effective.year}.jsonl"
 
 
+def all_audit_files(root: Path) -> list[Path]:
+    """Return all per-year audit jsonl files sorted ascending.
+
+    Used by lifetime-totals call sites (e.g. surfacing summary, adaptive
+    min_signal) that must aggregate across year boundaries. Returns an empty
+    list when the audit directory is missing.
+    """
+    d = root / ".ai" / "memory" / "audit"
+    if not d.is_dir():
+        return []
+    return sorted(d.glob("*.jsonl"))
+
+
 def append_audit(root: Path, *, action: str, category: str, payload: dict[str, Any]) -> dict[str, Any]:
     timestamp = datetime.now(timezone.utc)
     path = audit_path(root, at=timestamp)

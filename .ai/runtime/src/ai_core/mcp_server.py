@@ -56,6 +56,64 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "code_graph_callers",
+        "description": "Function-call graph reverse lookup: who calls this qualname? Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "qualname": {"type": "string", "description": "Function/method qualname (e.g. 'append_audit' or 'C.method')"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["qualname"],
+        },
+    },
+    {
+        "name": "code_graph_callees",
+        "description": "Function-call graph forward lookup: what does this qualname call? Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "qualname": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["qualname"],
+        },
+    },
+    {
+        "name": "code_graph_symbol",
+        "description": "Locate function/class definitions by qualname fragment. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Substring to match against qualname (LIKE %name%)"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "code_graph_hotspots",
+        "description": "Most-called callees across the indexed codebase. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "default": 20}},
+        },
+    },
+    {
+        "name": "code_verify",
+        "description": "AST-based policy gate: rejects forbidden imports/calls/sandbox escapes. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"source": {"type": "string", "description": "Python source to verify"}},
+            "required": ["source"],
+        },
+    },
+    {
+        "name": "memory_tier",
+        "description": "MemGPT-style hot/warm/cold memory classification + page-out signal. Read-only.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "ai_status",
         "description": "Worker health envelope.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -434,6 +492,26 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":
         return context_pack(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
+    if name == "code_graph_callers":
+        from .codegraph import query_callers
+        return query_callers(root, str(args.get("qualname", "")), limit=int(args.get("limit", 20) or 20))
+    if name == "code_graph_callees":
+        from .codegraph import query_callees
+        return query_callees(root, str(args.get("qualname", "")), limit=int(args.get("limit", 20) or 20))
+    if name == "code_graph_symbol":
+        from .codegraph import find_symbol
+        return find_symbol(root, str(args.get("name", "")), limit=int(args.get("limit", 20) or 20))
+    if name == "code_graph_hotspots":
+        from .codegraph import hotspot_callees
+        return hotspot_callees(root, limit=int(args.get("limit", 20) or 20))
+    if name == "code_verify":
+        from .ast_verify import verify_source
+        return verify_source(str(args.get("source", ""))).to_dict()
+    if name == "memory_tier":
+        from .memory_tier import classify, hot_pressure
+        cls = classify(root)
+        pres = hot_pressure(root)
+        return {**cls, "pressure": pres}
     if name == "ai_status":
         return health(root)
     if name == "ai_request_rebuild":

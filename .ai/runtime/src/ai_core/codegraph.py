@@ -154,6 +154,82 @@ def _resolve_call_target(node: ast.AST) -> str | None:
     return None
 
 
+def query_callers(root: Path, qualname: str, *, limit: int = 20) -> dict:
+    """Return rows where callee == qualname (exact match)."""
+    from .search import connect, init_schema
+
+    with connect(root) as conn:
+        init_schema(conn)
+        rows = conn.execute(
+            "select path, caller, callee, lineno from code_calls "
+            "where callee = ? order by path, lineno limit ?",
+            (qualname, limit),
+        ).fetchall()
+    return {
+        "ok": True,
+        "callee": qualname,
+        "count": len(rows),
+        "callers": [dict(r) for r in rows],
+    }
+
+
+def query_callees(root: Path, qualname: str, *, limit: int = 20) -> dict:
+    """Return rows where caller == qualname (exact match)."""
+    from .search import connect, init_schema
+
+    with connect(root) as conn:
+        init_schema(conn)
+        rows = conn.execute(
+            "select path, caller, callee, lineno from code_calls "
+            "where caller = ? order by lineno limit ?",
+            (qualname, limit),
+        ).fetchall()
+    return {
+        "ok": True,
+        "caller": qualname,
+        "count": len(rows),
+        "callees": [dict(r) for r in rows],
+    }
+
+
+def find_symbol(root: Path, name: str, *, limit: int = 20) -> dict:
+    """LIKE-match qualname; matches both exact and fragment (e.g. 'recommend')."""
+    from .search import connect, init_schema
+
+    pat = f"%{name}%"
+    with connect(root) as conn:
+        init_schema(conn)
+        rows = conn.execute(
+            "select path, qualname, kind, lineno, end_lineno, parent from code_symbols "
+            "where qualname like ? order by length(qualname), path, lineno limit ?",
+            (pat, limit),
+        ).fetchall()
+    return {
+        "ok": True,
+        "needle": name,
+        "count": len(rows),
+        "symbols": [dict(r) for r in rows],
+    }
+
+
+def hotspot_callees(root: Path, *, limit: int = 20) -> dict:
+    """Most-frequently-called callees across the indexed codebase."""
+    from .search import connect, init_schema
+
+    with connect(root) as conn:
+        init_schema(conn)
+        rows = conn.execute(
+            "select callee, count(*) as n from code_calls "
+            "group by callee order by n desc, callee asc limit ?",
+            (limit,),
+        ).fetchall()
+    return {
+        "ok": True,
+        "count": len(rows),
+        "hotspots": [{"callee": r["callee"], "calls": r["n"]} for r in rows],
+    }
+
+
 def iter_python_files(root: Path) -> Iterator[Path]:
     """Yield project Python files, skipping common cache/venv dirs and hidden files."""
     skip_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build", ".ai"}

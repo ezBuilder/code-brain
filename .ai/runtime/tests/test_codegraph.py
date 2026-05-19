@@ -126,3 +126,37 @@ def test_extract_symbols_on_real_codegraph_module():
     assert "extract_symbols" in qns
     assert "extract_calls" in qns
     assert "_walk_symbols" in qns
+
+
+def test_query_functions_end_to_end(tmp_path: Path):
+    """codegraph CLI helpers — exercise full indexing + retrieval cycle."""
+    from ai_core.codegraph import (
+        query_callers, query_callees, find_symbol, hotspot_callees,
+    )
+    from ai_core.search import rebuild
+
+    src1 = tmp_path / "src" / "a.py"
+    src1.parent.mkdir(parents=True)
+    src1.write_text(
+        "def alpha():\n    helper()\n    helper()\n\n"
+        "def helper():\n    pass\n",
+        encoding="utf-8",
+    )
+    src2 = tmp_path / "src" / "b.py"
+    src2.write_text(
+        "def beta():\n    alpha()\n    helper()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".ai" / "cache").mkdir(parents=True)
+    rebuild(tmp_path)
+
+    callers = query_callers(tmp_path, "helper", limit=10)
+    assert callers["count"] >= 3
+    callees = query_callees(tmp_path, "alpha", limit=10)
+    callee_names = {c["callee"] for c in callees["callees"]}
+    assert "helper" in callee_names
+    syms = find_symbol(tmp_path, "alpha", limit=10)
+    assert any(s["qualname"] == "alpha" for s in syms["symbols"])
+    hot = hotspot_callees(tmp_path, limit=10)
+    hot_names = {h["callee"] for h in hot["hotspots"]}
+    assert "helper" in hot_names

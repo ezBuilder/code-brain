@@ -345,6 +345,23 @@ def build_parser() -> argparse.ArgumentParser:
     code_query.add_argument("query")
     code_query.add_argument("--limit", type=int, default=5)
     code_query.add_argument("--json", action="store_true", dest="command_json")
+    code_graph = code_sub.add_parser("graph", help="function-call graph queries (T29 step C)")
+    code_graph_sub = code_graph.add_subparsers(dest="graph_command", required=True)
+    cg_callers = code_graph_sub.add_parser("callers", help="who calls this function?")
+    cg_callers.add_argument("qualname")
+    cg_callers.add_argument("--limit", type=int, default=20)
+    cg_callers.add_argument("--json", action="store_true", dest="command_json")
+    cg_callees = code_graph_sub.add_parser("callees", help="what does this function call?")
+    cg_callees.add_argument("qualname")
+    cg_callees.add_argument("--limit", type=int, default=20)
+    cg_callees.add_argument("--json", action="store_true", dest="command_json")
+    cg_symbol = code_graph_sub.add_parser("symbol", help="locate symbol(s) by name fragment")
+    cg_symbol.add_argument("name")
+    cg_symbol.add_argument("--limit", type=int, default=20)
+    cg_symbol.add_argument("--json", action="store_true", dest="command_json")
+    cg_hotspots = code_graph_sub.add_parser("hotspots", help="most-called callees in the index")
+    cg_hotspots.add_argument("--limit", type=int, default=20)
+    cg_hotspots.add_argument("--json", action="store_true", dest="command_json")
     context = sub.add_parser("context")
     context_sub = context.add_subparsers(dest="context_command", required=True)
     context_pack_parser = context_sub.add_parser("pack")
@@ -859,6 +876,21 @@ def main(argv: list[str] | None = None) -> int:
             payload = query(root, args.query, limit=args.limit)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "code" and args.code_command == "graph":
+            from . import codegraph as _cg
+            gcmd = args.graph_command
+            if gcmd == "callers":
+                emit(_cg.query_callers(root, args.qualname, limit=args.limit), as_json=as_json)
+                return OK
+            if gcmd == "callees":
+                emit(_cg.query_callees(root, args.qualname, limit=args.limit), as_json=as_json)
+                return OK
+            if gcmd == "symbol":
+                emit(_cg.find_symbol(root, args.name, limit=args.limit), as_json=as_json)
+                return OK
+            if gcmd == "hotspots":
+                emit(_cg.hotspot_callees(root, limit=args.limit), as_json=as_json)
+                return OK
         if args.command == "context" and args.context_command == "pack":
             payload = context_pack(root, args.query, limit=args.limit)
             emit(payload, as_json=as_json)

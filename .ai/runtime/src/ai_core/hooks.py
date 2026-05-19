@@ -1269,6 +1269,20 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         satisfaction = _satisfaction_summary_context(root, hook_name)
         if satisfaction:
             sections.append(satisfaction)
+    if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_MEMORY_TIER_SUMMARY"):
+        try:
+            from .memory_tier import classify as _classify, hot_pressure as _pressure
+            cls = _classify(root)
+            pres = _pressure(root)
+            hot = cls["tiers"]["hot"]["audit_events"]
+            warm = cls["tiers"]["warm"]["audit_events"]
+            cold = cls["tiers"]["cold"]["audit_events"]
+            sline = f"cb-mem: hot={hot} warm={warm} cold={cold} | session={int(pres['session_md_ratio']*100)}%"
+            if pres.get("page_out_recommended"):
+                sline += " ⚠page-out"
+            sections.append(sline)
+        except Exception:
+            pass
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
         sections.append("Session-current tail:\n" + session_tail)

@@ -78,3 +78,36 @@ def test_pressure_flag_when_session_large(tmp_root: Path, monkeypatch):
     p = mt.hot_pressure(tmp_root)
     assert p["session_md_ratio"] >= 0.8
     assert p["page_out_recommended"] is True
+
+
+def test_page_out_dry_run_idempotent(tmp_root: Path):
+    """dry-run must not move anything."""
+    from ai_core.memory_tier import page_out
+    sessions_dir = tmp_root / ".ai" / "memory" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / "old-sess").mkdir()
+    import os, time
+    old = time.time() - 60 * 86400  # 60 days old
+    os.utime(sessions_dir / "old-sess", (old, old))
+    payload = page_out(tmp_root, dry_run=True)
+    assert payload["ok"] is True
+    assert (sessions_dir / "old-sess").exists()  # still there
+    assert payload["archived"]["dry_run"] is True
+    assert "old-sess" in payload["archived"]["moved"]  # would move
+
+
+def test_page_out_actually_archives_old_sessions(tmp_root: Path):
+    from ai_core.memory_tier import page_out
+    sessions_dir = tmp_root / ".ai" / "memory" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / "old-sess").mkdir()
+    (sessions_dir / "old-sess" / "snap.json").write_text("{}", encoding="utf-8")
+    (sessions_dir / "fresh-sess").mkdir()
+    import os, time
+    old = time.time() - 60 * 86400
+    os.utime(sessions_dir / "old-sess", (old, old))
+    payload = page_out(tmp_root, dry_run=False)
+    assert (sessions_dir / "fresh-sess").exists()
+    assert not (sessions_dir / "old-sess").exists()
+    assert (sessions_dir / ".archive" / "old-sess").exists()
+    assert "old-sess" in payload["archived"]["moved"]

@@ -201,6 +201,9 @@ def build_parser() -> argparse.ArgumentParser:
     memory_tier.add_argument("--json", action="store_true", dest="command_json")
     memory_pressure = memory_sub.add_parser("pressure", help="hot-tier pressure (page-out signal)")
     memory_pressure.add_argument("--json", action="store_true", dest="command_json")
+    memory_pageout = memory_sub.add_parser("page-out", help="rotate session + archive old sessions (T30 step B)")
+    memory_pageout.add_argument("--dry-run", action="store_true")
+    memory_pageout.add_argument("--json", action="store_true", dest="command_json")
     audit = sub.add_parser("audit")
     audit_sub = audit.add_subparsers(dest="audit_command", required=True)
     audit_append = audit_sub.add_parser("append")
@@ -662,6 +665,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "memory" and args.memory_command == "pressure":
             from . import memory_tier as _mt
             emit(_mt.hot_pressure(root), as_json=as_json)
+            return OK
+        if args.command == "memory" and args.memory_command == "page-out":
+            from . import memory_tier as _mt
+            emit(_mt.page_out(root, dry_run=bool(args.dry_run)), as_json=as_json)
             return OK
         if args.command == "audit" and args.audit_command == "append":
             reject_ci_write("audit")

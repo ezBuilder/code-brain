@@ -175,6 +175,90 @@ def classify(root: Path) -> dict[str, Any]:
     }
 
 
+def archive_old_sessions(root: Path, *, age_days: float = 30.0, dry_run: bool = False) -> dict[str, Any]:
+    """Move per-session snapshot directories older than `age_days` to
+    .ai/memory/sessions/.archive/ — page-out for the cold tier.
+    Safe: never deletes anything; only mtime-based rename. Returns a manifest.
+    """
+    import shutil
+    import time
+
+    sessions_dir = root / ".ai" / "memory" / "sessions"
+    if not sessions_dir.is_dir():
+        return {"ok": True, "moved": [], "kept": [], "archive_dir": None, "dry_run": dry_run}
+
+    archive_dir = sessions_dir / ".archive"
+    cutoff = time.time() - age_days * 86400.0
+    moved: list[str] = []
+    kept: list[str] = []
+
+    for child in sorted(sessions_dir.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            kept.append(child.name)
+            continue
+        try:
+            mt = child.stat().st_mtime
+        except OSError:
+            continue
+        if mt >= cutoff:
+            kept.append(child.name)
+            continue
+        if dry_run:
+            moved.append(child.name)
+            continue
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(child), str(archive_dir / child.name))
+            moved.append(child.name)
+        except (OSError, shutil.Error):
+            kept.append(child.name)
+
+    return {
+        "ok": True,
+        "moved": moved,
+        "kept": kept,
+        "archive_dir": str(archive_dir.relative_to(root)) if archive_dir.exists() else None,
+        "age_days": age_days,
+        "dry_run": dry_run,
+    }
+
+
+def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    """High-level page-out: rotate session-current if pressured + archive
+    sessions older than AI_MEMORY_ARCHIVE_DAYS (default 30)."""
+    from .memory import (
+        _SESSION_NOTE_MAX_BYTES, _SESSION_NOTE_KEEP_BYTES, session_current_path,
+    )
+
+    age_days = _env_float("AI_MEMORY_ARCHIVE_DAYS", 30.0)
+    result: dict[str, Any] = {"ok": True, "dry_run": dry_run}
+
+    spath = session_current_path(root)
+    rotated = False
+    if spath.exists():
+        size = spath.stat().st_size
+        if size >= int(_SESSION_NOTE_MAX_BYTES * 0.8):
+            if dry_run:
+                rotated = True
+            else:
+                try:
+                    raw = spath.read_bytes()
+                    tail = raw[-_SESSION_NOTE_KEEP_BYTES:]
+                    nl = tail.find(b"\n")
+                    if nl >= 0:
+                        tail = tail[nl + 1:]
+                    spath.write_bytes(b"# Current Session\n\n[rotated by page_out]\n" + tail)
+                    rotated = True
+                except OSError:
+                    pass
+    result["session_rotated"] = rotated
+    result["session_size_after"] = spath.stat().st_size if spath.exists() else 0
+
+    arch = archive_old_sessions(root, age_days=age_days, dry_run=dry_run)
+    result["archived"] = arch
+    return result
+
+
 def hot_pressure(root: Path) -> dict[str, Any]:
     """Quick health summary — is the hot tier approaching its limits?
 

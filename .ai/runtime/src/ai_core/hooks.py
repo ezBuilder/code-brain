@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from .memory import (
+    all_audit_files,
     append_event,
+    audit_path,
     read_jsonl_open_todos as _read_jsonl_open_todos,
     read_jsonl_tail as _read_jsonl_tail,
     read_text_tail as _read_text_tail,
@@ -122,14 +124,18 @@ def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
     """Return candidate IDs whose recommend_pending audit event landed within cooldown_hours."""
     if cooldown_hours <= 0:
         return set()
-    audit_file = root / ".ai" / "memory" / "audit" / "2026.jsonl"
-    if not audit_file.exists():
+    audit_files = all_audit_files(root)
+    if not audit_files:
         return set()
     from datetime import datetime, timedelta, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
     recent: set[str] = set()
-    try:
-        for line in audit_file.read_text(encoding="utf-8", errors="replace").splitlines():
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -155,8 +161,6 @@ def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
             cid = (rec.get("payload") or {}).get("id")
             if isinstance(cid, str) and cid:
                 recent.add(cid)
-    except OSError:
-        return set()
     return recent
 
 
@@ -186,13 +190,17 @@ def _adaptive_min_signal_from_satisfaction(root: Path, base: int) -> int:
         threshold = 20
     if threshold <= 0:
         return base
-    audit_file = root / ".ai" / "memory" / "audit" / "2026.jsonl"
-    if not audit_file.exists():
+    audit_files = all_audit_files(root)
+    if not audit_files:
         return base
     surfaced = 0
     acted = 0
-    try:
-        for line in audit_file.read_text(encoding="utf-8", errors="replace").splitlines():
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -208,8 +216,6 @@ def _adaptive_min_signal_from_satisfaction(root: Path, base: int) -> int:
                 surfaced += 1
             elif tail.startswith("accept") or tail == "reject":
                 acted += 1
-    except OSError:
-        return base
     if surfaced >= threshold * 2 and acted == 0:
         return base + 2
     if surfaced >= threshold and acted == 0:
@@ -327,10 +333,13 @@ def _cached_recommend_invoke(
     result = compute()
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(
             json.dumps({"min_signal": min_signal, "extra": list(cache_key_extra), "result": result}),
             encoding="utf-8",
         )
+        import os as _os_atomic
+        _os_atomic.replace(tmp, cache_path)
     except OSError:
         pass
     return result
@@ -345,10 +354,18 @@ def _skill_recommendation_context(root: Path, hook_name: str, payload: dict[str,
 
             return recommend(r, limit=3, include_global=True, min_signal=ms, persist=persist)
 
+        # include_global hardcoded True in compute() above; cache_key safe with only persist.
+        deps = [
+            r / ".ai" / "skills" / "catalog.jsonl",
+            r / ".ai" / "memory" / "decisions.jsonl",
+            audit_path(r),
+            r / ".ai" / "memory" / "session-current.md",
+            Path("~/.codex/memories/raw_memories.md").expanduser(),
+        ]
         return _cached_recommend_invoke(
             r,
             cache_name="skill_hot",
-            deps=[r / ".ai" / "skills" / "catalog.jsonl", r / ".ai" / "memory" / "decisions.jsonl"],
+            deps=deps,
             compute=compute,
             min_signal=ms,
             cache_key_extra=(bool(persist),),
@@ -375,10 +392,16 @@ def _agent_recommendation_context(root: Path, hook_name: str, payload: dict[str,
 
             return agent_recommend(r, limit=3, min_signal=ms)
 
+        deps = [
+            r / ".ai" / "agents_catalog" / "catalog.jsonl",
+            r / ".ai" / "memory" / "decisions.jsonl",
+            audit_path(r),
+            r / ".ai" / "memory" / "session-current.md",
+        ]
         return _cached_recommend_invoke(
             r,
             cache_name="agent_hot",
-            deps=[r / ".ai" / "agents_catalog" / "catalog.jsonl", r / ".ai" / "memory" / "decisions.jsonl"],
+            deps=deps,
             compute=compute,
             min_signal=ms,
         )
@@ -404,11 +427,16 @@ def _precall_recommendation_context(root: Path, hook_name: str, payload: dict[st
 
             return precall_recommend(r, limit=3, min_signal=ms)
 
+        deps = [
+            r / ".ai" / "memory" / "events" / "events.jsonl",
+            r / ".ai" / "memory" / "precall_catalog" / "catalog.jsonl",
+            audit_path(r),
+            r / ".ai" / "memory" / "session-current.md",
+        ]
         return _cached_recommend_invoke(
             r,
             cache_name="precall_hot",
-            deps=[r / ".ai" / "memory" / "events" / "events.jsonl",
-                  r / ".ai" / "memory" / "precall_catalog" / "catalog.jsonl"],
+            deps=deps,
             compute=compute,
             min_signal=ms,
         )
@@ -471,8 +499,8 @@ def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
         return ""
     if _env_disabled("AI_SATISFACTION_SUMMARY"):
         return ""
-    audit_file = root / ".ai" / "memory" / "audit" / "2026.jsonl"
-    if not audit_file.exists():
+    audit_files = all_audit_files(root)
+    if not audit_files:
         return ""
     from datetime import datetime, timedelta, timezone
     try:
@@ -483,8 +511,12 @@ def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
     counts = {"surfaced": 0, "accepted": 0, "rejected": 0, "stale": 0}
     acted_ids: set[str] = set()
     surfaced_records: list[tuple[datetime, str]] = []
-    try:
-        for line in audit_file.read_text(encoding="utf-8", errors="replace").splitlines():
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -517,8 +549,6 @@ def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
                 counts["rejected"] += 1
                 if isinstance(pid, str):
                     acted_ids.add(pid)
-    except OSError:
-        return ""
     for ts, pid in surfaced_records:
         if pid not in acted_ids and ts < stale_cutoff:
             counts["stale"] += 1
@@ -548,12 +578,16 @@ def _compact_meta_line(root: Path) -> str:
     """
     # --- satisfaction side -------------------------------------------------
     sat_part = ""
-    audit_file = root / ".ai" / "memory" / "audit" / "2026.jsonl"
-    if audit_file.exists():
+    audit_files = all_audit_files(root)
+    if audit_files:
         surfaced = 0
         acted = 0
-        try:
-            for line in audit_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        for audit_file in audit_files:
+            try:
+                content = audit_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in content.splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -569,9 +603,6 @@ def _compact_meta_line(root: Path) -> str:
                     surfaced += 1
                 elif tail.startswith("accept") or tail == "reject":
                     acted += 1
-        except OSError:
-            surfaced = 0
-            acted = 0
         if surfaced > 0 or acted > 0:
             adaptive_bump = _adaptive_min_signal_from_satisfaction(root, 3) - 3
             adaptive_suffix = f" (adaptive +{adaptive_bump})" if adaptive_bump > 0 else ""

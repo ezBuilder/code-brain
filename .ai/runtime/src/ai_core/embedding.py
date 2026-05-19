@@ -16,6 +16,7 @@ Architecture (per T26 PoC plan):
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -48,21 +49,71 @@ def is_enabled() -> bool:
 def is_active_for(root: Path) -> bool:
     """True when dense search should fire for `root`.
 
+    Default policy = ON whenever the system can support it. When deps are
+    present but the ONNX model is missing, we trigger a one-shot background
+    install (idempotent via .install-lock marker) and return False for this
+    call only — the next session will find the model and light up.
+
     Decision tree:
       AI_SEARCH_DENSE=1/true   → on iff deps importable
-      AI_SEARCH_DENSE=0/false  → off
-      AI_SEARCH_DENSE unset    → auto: on iff deps importable AND model files present
-                                  (i.e., already-paid setup; no surprise network calls)
+      AI_SEARCH_DENSE=0/false  → off (explicit opt-out)
+      AI_SEARCH_DENSE unset    → ON iff deps + model present;
+                                  if deps present but model missing AND
+                                  AI_SEARCH_DENSE_AUTO_INSTALL != 0 →
+                                  spawn one-shot background download
+                                  (~25MB), return False for THIS call.
     """
     raw = os.environ.get("AI_SEARCH_DENSE", "").lower()
     if raw in {"0", "false", "no", "off"}:
         return False
     if raw in {"1", "true", "yes", "on"}:
         return _deps_present()
-    # auto-detect — only fire when both halves of the activation cost are
-    # already paid (deps installed + model downloaded). Never trigger a
-    # network call or pip install implicitly.
-    return _deps_present() and is_model_present(root)
+    # default: opportunistic activation
+    if not _deps_present():
+        return False
+    if is_model_present(root):
+        return True
+    # deps ready, model missing — fire-and-forget background install (once)
+    if os.environ.get("AI_SEARCH_DENSE_AUTO_INSTALL", "1").lower() in {"1", "true", "yes", "on"}:
+        _maybe_spawn_background_install(root)
+    return False
+
+
+def _maybe_spawn_background_install(root: Path) -> None:
+    """Spawn `ai embedding install` in the background, idempotent per-root.
+
+    Uses a lock file so concurrent SessionStart calls don't pile up multiple
+    downloads.
+    """
+    import subprocess
+    import sys
+    lock = model_cache_dir(root) / ".install-lock"
+    if lock.exists():
+        try:
+            age = time.time() - lock.stat().st_mtime
+            if age < 3600:  # another install attempted within the last hour
+                return
+        except OSError:
+            return
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("running", encoding="utf-8")
+    except OSError:
+        return
+    ai_bin = root / ".ai" / "bin" / "ai"
+    if not ai_bin.exists():
+        return
+    try:
+        from .portable import detached_popen_kwargs
+
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [str(ai_bin), "embedding", "install", "--json"],
+                stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
+                **detached_popen_kwargs(),
+            )
+    except Exception:
+        pass
 
 
 def model_cache_dir(root: Path) -> Path:

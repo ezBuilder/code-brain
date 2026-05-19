@@ -1032,10 +1032,11 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                         )
                 except Exception:
                     pass
-            # T36 autonomous accept: when AI_AUTONOMOUS_ACCEPT=1, accept one
-            # strong-signal recommendation per Stop. Seeds the accept_ratio KPI
-            # that otherwise stays None forever, unlocking adaptive learning.
-            if _env_enabled("AI_AUTONOMOUS_ACCEPT"):
+            # T36 autonomous accept (default ON per user mandate "초기값은 모든
+            # 기능 활성화"). Opt out via AI_AUTONOMOUS_ACCEPT=0. Picks at most
+            # one strong-signal candidate per Stop and seeds the accept_ratio
+            # KPI that otherwise stays None forever.
+            if not _env_disabled("AI_AUTONOMOUS_ACCEPT"):
                 try:
                     _try_autonomous_accept(root, effective_hook)
                 except Exception:

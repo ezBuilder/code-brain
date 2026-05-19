@@ -180,11 +180,34 @@ def _candidates_from_bash_heads(
     re-parse transcripts. Threshold is stricter (min_signal*4) than the skill recommender
     because sub-agent helpers carry more weight than slash-command runbooks.
     """
-    from .recommend import _gather_bash_heads
+    try:
+        from .recommend import _gather_bash_heads
+    except Exception as exc:
+        try:
+            from .memory import append_audit
+            append_audit(
+                root,
+                action="agent.bash_heads_error",
+                category="memory",
+                payload={"error": str(exc)[:200], "stage": "import"},
+            )
+        except Exception:
+            pass
+        return []
 
     try:
         counts = _gather_bash_heads(root)
-    except Exception:
+    except Exception as exc:
+        try:
+            from .memory import append_audit
+            append_audit(
+                root,
+                action="agent.bash_heads_error",
+                category="memory",
+                payload={"error": str(exc)[:200], "stage": "invoke"},
+            )
+        except Exception:
+            pass
         return []
     threshold = min_signal * 4
     out: list[AgentCandidate] = []

@@ -303,6 +303,13 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
     # Stores (ts, kind) where kind in {"reject", "recommend_pending"}.
     id_events: dict[str, list[tuple[datetime, str]]] = {}
     last_act_dt: datetime | None = None
+    # T25 — per-source accept/reject counters (skill | agent | precall).
+    per_source: dict[str, dict[str, int]] = {}
+    # T25 — per-id earliest pending ts for action latency pairing (id -> earliest recommend_pending ts unpaired).
+    pending_ts_by_id: dict[str, datetime] = {}
+    latency_seconds: list[float] = []
+    # T25 — lifetime recommend_pending count per id (for resurface count).
+    pending_count_by_id: dict[str, int] = {}
     for audit_file in audit_files:
         try:
             content = audit_file.read_text(encoding="utf-8", errors="replace")
@@ -319,6 +326,7 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
             act = str(rec.get("action") or "")
             if not act.startswith(("skill.", "agent.", "precall.")):
                 continue
+            source = act.split(".", 1)[0]  # T25: "skill" | "agent" | "precall"
             tail = act.split(".", 1)[1]
             pid = (rec.get("payload") or {}).get("id") if isinstance(rec.get("payload"), dict) else None
             ts_raw = str(rec.get("ts") or "")
@@ -333,21 +341,42 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
                     parsed_ts = None
             if tail == "recommend_pending":
                 counts["surfaced"] += 1
+                if isinstance(pid, str):
+                    pending_count_by_id[pid] = pending_count_by_id.get(pid, 0) + 1
                 if parsed_ts is not None and isinstance(pid, str):
                     surfaced_records.append((parsed_ts, pid))
                     id_events.setdefault(pid, []).append((parsed_ts, "recommend_pending"))
+                    # T25 latency: remember earliest unpaired pending ts for this id.
+                    if pid not in pending_ts_by_id:
+                        pending_ts_by_id[pid] = parsed_ts
             elif tail.startswith("accept"):
                 counts["accepted"] += 1
+                # T25 source bucket
+                bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
+                bucket["accepted"] += 1
                 if isinstance(pid, str):
                     acted_ids.add(pid)
+                    # T25 latency: pair with earliest pending for this id, if any.
+                    if parsed_ts is not None and pid in pending_ts_by_id:
+                        delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
+                        if delta >= 0:
+                            latency_seconds.append(delta)
                 if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
                     last_act_dt = parsed_ts
             elif tail == "reject":
                 counts["rejected"] += 1
+                # T25 source bucket
+                bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
+                bucket["rejected"] += 1
                 if isinstance(pid, str):
                     acted_ids.add(pid)
                     if parsed_ts is not None:
                         id_events.setdefault(pid, []).append((parsed_ts, "reject"))
+                    # T25 latency: a reject also closes the pending pairing.
+                    if parsed_ts is not None and pid in pending_ts_by_id:
+                        delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
+                        if delta >= 0:
+                            latency_seconds.append(delta)
                 if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
                     last_act_dt = parsed_ts
     # resurface_after_reject: for each reject (with parsed ts), check if any
@@ -398,6 +427,33 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
     for ts, pid in surfaced_records:
         if pid not in acted_ids and ts < stale_cutoff:
             stale_count_7d += 1
+    # ---- T25 additive KPIs ------------------------------------------------
+    # 1) per-source accept rate
+    source_accept_rate: dict[str, float | None] = {}
+    for src, bucket in per_source.items():
+        denom = bucket["accepted"] + bucket["rejected"]
+        source_accept_rate[src] = (
+            round(bucket["accepted"] / denom, 3) if denom > 0 else None
+        )
+    # 2) action latency p75 (None if < 5 samples)
+    if len(latency_seconds) >= 5:
+        sorted_lat = sorted(latency_seconds)
+        idx = int(0.75 * len(sorted_lat))
+        if idx >= len(sorted_lat):
+            idx = len(sorted_lat) - 1
+        action_latency_p75_seconds: int | None = int(sorted_lat[idx])
+    else:
+        action_latency_p75_seconds = None
+    # 3) top resurfaced ids (top 5 by recommend_pending count)
+    top_resurfaced_ids = [
+        {"id": pid, "count": c}
+        for pid, c in sorted(pending_count_by_id.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    ]
+    # 4) stale_surfaced_ratio
+    surfaced_total = counts["surfaced"]
+    stale_surfaced_ratio: float | None = (
+        round(stale_count_7d / surfaced_total, 3) if surfaced_total > 0 else None
+    )
     return {
         "surfaced_lifetime": counts["surfaced"],
         "accepted": counts["accepted"],
@@ -409,6 +465,11 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
         "stale_count_7d": stale_count_7d,
         "resurface_after_reject_count": resurfaced_count,
         "resurface_after_reject_rate": resurface_after_reject_rate,
+        # T25 additive KPIs:
+        "source_accept_rate": source_accept_rate,
+        "action_latency_p75_seconds": action_latency_p75_seconds,
+        "top_resurfaced_ids": top_resurfaced_ids,
+        "stale_surfaced_ratio": stale_surfaced_ratio,
     }
 
 

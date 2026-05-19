@@ -102,8 +102,12 @@ def _spawn_background_rebuild(root: Path) -> None:
     ai_bin_ps = root / ".ai" / "bin" / "ai.ps1"
     if IS_WINDOWS and ai_bin_ps.exists():
         cmd = ["powershell", "-NoProfile", "-File", str(ai_bin_ps), "index", "rebuild", "--single-flight", "--json"]
+        if _env_enabled("AI_REBUILD_INCREMENTAL", default="1"):
+            cmd.append("--incremental")
     elif ai_bin_unix.exists():
         cmd = [str(ai_bin_unix), "index", "rebuild", "--single-flight", "--json"]
+        if _env_enabled("AI_REBUILD_INCREMENTAL", default="1"):
+            cmd.append("--incremental")
     else:
         return
     try:

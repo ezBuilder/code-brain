@@ -279,6 +279,16 @@ def install_model(root: Path, *, verify_only: bool = False) -> dict[str, Any]:
         result["ok"] = not result["errors"]
         return result
 
+    # macOS Python often can't find the system CA bundle (Apple ships its own
+    # which Python 3.11+ uses via the framework, but homebrew/pyenv builds
+    # commonly fail with CERTIFICATE_VERIFY_FAILED). Wire in certifi explicitly.
+    import ssl
+    try:
+        import certifi  # listed in pyproject dependencies
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ssl_ctx = ssl.create_default_context()
+
     for name, url in _MODEL_FILES.items():
         target = cache / name
         if target.exists() and target.stat().st_size > 0:
@@ -286,7 +296,7 @@ def install_model(root: Path, *, verify_only: bool = False) -> dict[str, Any]:
             continue
         tmp = target.with_suffix(target.suffix + ".tmp")
         try:
-            with urllib.request.urlopen(url, timeout=120) as resp, open(tmp, "wb") as out:
+            with urllib.request.urlopen(url, timeout=120, context=ssl_ctx) as resp, open(tmp, "wb") as out:
                 while True:
                     block = resp.read(65536)
                     if not block:

@@ -1426,6 +1426,102 @@ def test_skill_cache_invalidates_when_audit_changes(tmp_root: Path, monkeypatch)
     assert third["candidates"][0]["id"] == "sk-2"
 
 
+def test_agent_cache_invalidates_when_decisions_or_audit_changes(tmp_root: Path):
+    """T16+T27: agent_hot must invalidate on agents_catalog OR decisions OR audit mtime."""
+    import time
+    import os as _os_mod
+    from ai_core.hooks import _cached_recommend_invoke
+    from ai_core.memory import audit_path
+
+    catalog_dep = tmp_root / ".ai" / "agents_catalog" / "catalog.jsonl"
+    catalog_dep.parent.mkdir(parents=True, exist_ok=True)
+    catalog_dep.write_text("", encoding="utf-8")
+    decisions_dep = tmp_root / ".ai" / "memory" / "decisions.jsonl"
+    decisions_dep.parent.mkdir(parents=True, exist_ok=True)
+    decisions_dep.write_text("", encoding="utf-8")
+    audit_dep = audit_path(tmp_root)
+    audit_dep.parent.mkdir(parents=True, exist_ok=True)
+    audit_dep.write_text("", encoding="utf-8")
+
+    deps = [catalog_dep, decisions_dep, audit_dep]
+    compute_count = {"n": 0}
+
+    def fake_compute():
+        compute_count["n"] += 1
+        return {"candidates": [{"id": f"ag-{compute_count['n']}", "slug": "stub"}]}
+
+    # cold → compute
+    _cached_recommend_invoke(tmp_root, cache_name="agent_hot", deps=deps, compute=fake_compute, min_signal=3)
+    assert compute_count["n"] == 1
+    cache_path = tmp_root / ".ai" / "cache" / "agent_hot.json"
+    assert cache_path.exists()
+
+    # warm → no recompute
+    _cached_recommend_invoke(tmp_root, cache_name="agent_hot", deps=deps, compute=fake_compute, min_signal=3)
+    assert compute_count["n"] == 1
+
+    # touch decisions → invalidate
+    past = time.time() - 60
+    _os_mod.utime(cache_path, (past, past))
+    future = time.time() + 1
+    _os_mod.utime(decisions_dep, (future, future))
+    _cached_recommend_invoke(tmp_root, cache_name="agent_hot", deps=deps, compute=fake_compute, min_signal=3)
+    assert compute_count["n"] == 2, "decisions mtime bump must invalidate agent_hot"
+
+    # touch audit (after another backdate) → invalidate again
+    _os_mod.utime(cache_path, (past, past))
+    _os_mod.utime(audit_dep, (future + 2, future + 2))
+    _cached_recommend_invoke(tmp_root, cache_name="agent_hot", deps=deps, compute=fake_compute, min_signal=3)
+    assert compute_count["n"] == 3, "audit mtime bump must invalidate agent_hot"
+
+
+def test_precall_cache_invalidates_when_events_or_catalog_changes(tmp_root: Path):
+    """T16: precall_hot must invalidate on events.jsonl OR precall catalog OR audit mtime."""
+    import time
+    import os as _os_mod
+    from ai_core.hooks import _cached_recommend_invoke
+    from ai_core.memory import audit_path
+
+    events_dep = tmp_root / ".ai" / "memory" / "events" / "events.jsonl"
+    events_dep.parent.mkdir(parents=True, exist_ok=True)
+    events_dep.write_text("", encoding="utf-8")
+    catalog_dep = tmp_root / ".ai" / "memory" / "precall_catalog" / "catalog.jsonl"
+    catalog_dep.parent.mkdir(parents=True, exist_ok=True)
+    catalog_dep.write_text("", encoding="utf-8")
+    audit_dep = audit_path(tmp_root)
+    audit_dep.parent.mkdir(parents=True, exist_ok=True)
+    audit_dep.write_text("", encoding="utf-8")
+
+    deps = [events_dep, catalog_dep, audit_dep]
+    compute_count = {"n": 0}
+
+    def fake_compute():
+        compute_count["n"] += 1
+        return {"candidates": [{"id": f"pc-{compute_count['n']}", "kind": "stub"}]}
+
+    _cached_recommend_invoke(tmp_root, cache_name="precall_hot", deps=deps, compute=fake_compute, min_signal=3)
+    assert compute_count["n"] == 1
+    cache_path = tmp_root / ".ai" / "cache" / "precall_hot.json"
+    assert cache_path.exists()
+
+    _cached_recommend_invoke(tmp_root, cache_name="precall_hot", deps=deps, compute=fake_compute, min_signal=3)
+    assert compute_count["n"] == 1, "warm cache must not recompute"
+
+    # touch events.jsonl → invalidate
+    past = time.time() - 60
+    _os_mod.utime(cache_path, (past, past))
+    future = time.time() + 1
+    _os_mod.utime(events_dep, (future, future))
+    _cached_recommend_invoke(tmp_root, cache_name="precall_hot", deps=deps, compute=fake_compute, min_signal=3)
+    assert compute_count["n"] == 2, "events.jsonl mtime bump must invalidate precall_hot"
+
+    # touch precall catalog → invalidate
+    _os_mod.utime(cache_path, (past, past))
+    _os_mod.utime(catalog_dep, (future + 2, future + 2))
+    _cached_recommend_invoke(tmp_root, cache_name="precall_hot", deps=deps, compute=fake_compute, min_signal=3)
+    assert compute_count["n"] == 3, "precall_catalog mtime bump must invalidate precall_hot"
+
+
 def _write_audit_rows_with_ts(root: Path, year: int, rows: list[dict]) -> None:
     """Hand-write audit rows with caller-supplied 'ts' (full ISO Z timestamp).
 

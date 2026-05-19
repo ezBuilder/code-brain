@@ -171,6 +171,50 @@ def _gather_codex_keywords(root: Path) -> Counter[str]:
     return counts
 
 
+def _candidates_from_bash_heads(
+    root: Path, *, min_signal: int
+) -> list[AgentCandidate]:
+    """Mine bash invocation heads (git, gh, kubectl, ...) for high-confidence sub-agent candidates.
+
+    Reuses recommend._gather_bash_heads (cached, stale-while-revalidate) so this does not
+    re-parse transcripts. Threshold is stricter (min_signal*4) than the skill recommender
+    because sub-agent helpers carry more weight than slash-command runbooks.
+    """
+    from .recommend import _gather_bash_heads
+
+    try:
+        counts = _gather_bash_heads(root)
+    except Exception:
+        return []
+    threshold = min_signal * 4
+    out: list[AgentCandidate] = []
+    for head, count in counts.most_common(8):
+        if count < threshold:
+            continue
+        slug = _slugify(f"{head}-helper")
+        desc = f"'{head}' 도메인 sub-agent — 트랜스크립트에서 {count}회 반복 호출."
+        body = _draft_agent_body(
+            slug,
+            f"the '{head}' workflow domain",
+            evidence_lines=[f"`{head}` invoked {count}×"],
+        )
+        if _danger_match(body):
+            continue
+        cid = _candidate_id(slug, body)
+        out.append(
+            AgentCandidate(
+                id=cid, slug=slug, description=desc, body=body,
+                evidence={
+                    "signals": [f"bash_heads:{count}"],
+                    "rationale": f"`{head}` 트랜스크립트 {count}회 호출",
+                },
+            )
+        )
+        if len(out) >= 3:
+            break
+    return out
+
+
 def _adaptive_min_signal(
     intents: Counter[str], tags: Counter[str], keywords: Counter[str], requested: int
 ) -> int:
@@ -208,6 +252,7 @@ def cluster_candidates(
     intents = _gather_subagent_intents(root)
     tags = _gather_decision_tags(root)
     keywords = _gather_codex_keywords(root)
+    requested_min_signal = min_signal
     min_signal = _adaptive_min_signal(intents, tags, keywords, min_signal)
     for sub_type, count in intents.most_common():
         if count < min_signal:
@@ -268,6 +313,10 @@ def cluster_candidates(
                 evidence={"signals": [f"codex_keywords:{count}"], "rationale": f"keyword '{kw}' {count} codex threads"},
             )
         )
+
+    # bash_heads are high-confidence: use the caller's requested min_signal (not the
+    # cold-start downgraded value) so the *4 multiplier yields a meaningful threshold.
+    out.extend(_candidates_from_bash_heads(root, min_signal=requested_min_signal))
 
     seen_slugs = set()
     deduped = []

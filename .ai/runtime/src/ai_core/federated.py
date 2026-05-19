@@ -12,11 +12,27 @@ project.
 from __future__ import annotations
 
 import json
+import os
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from .memory import read_jsonl_all, read_jsonl_tail
+
+
+_FEDERATED_CACHE_TTL_SECONDS = 300
+
+
+def _federated_cache_path(root: Path) -> Path:
+    return root / ".ai" / "cache" / "federated_hot.json"
+
+
+def _federated_cache_enabled() -> bool:
+    val = os.environ.get("AI_FEDERATED_CACHE")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "no", "off")
 
 
 def discover_installations(home: Path | None = None) -> list[Path]:
@@ -94,8 +110,8 @@ def gather_cross_project_signals(
     }
 
 
-def cross_project_summary(self_root: Path, *, home: Path | None = None) -> dict[str, Any]:
-    """Top-level summary suitable for `cb-federated` slash command output."""
+def _compute_cross_project_summary(self_root: Path, *, home: Path | None = None) -> dict[str, Any]:
+    """Compute fresh cross-project summary (no cache)."""
     sig = gather_cross_project_signals(self_root, home=home)
     n = sig.get("scanned_projects", 0)
     if n == 0:
@@ -124,3 +140,55 @@ def cross_project_summary(self_root: Path, *, home: Path | None = None) -> dict[
             if v >= 2
         ],
     }
+
+
+def _write_federated_cache(cache_path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write JSON payload to cache_path via .tmp + os.replace."""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, cache_path)
+    except OSError:
+        pass
+
+
+def _audit_index_newer_than(cache_mtime: float, *, home: Path | None = None) -> bool:
+    """Return True if any scanned project's audit-index.jsonl is newer than cache_mtime."""
+    for proj in discover_installations(home=home):
+        idx = proj / ".ai" / "memory" / "audit-index.jsonl"
+        try:
+            if idx.exists() and idx.stat().st_mtime > cache_mtime:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def cross_project_summary(self_root: Path, *, home: Path | None = None) -> dict[str, Any]:
+    """Top-level summary suitable for `cb-federated` slash command output.
+
+    Stale-while-revalidate cache wrapper around ``_compute_cross_project_summary``.
+    Cache is invalidated when older than ``_FEDERATED_CACHE_TTL_SECONDS`` or when
+    any scanned project's ``audit-index.jsonl`` is newer than the cache file.
+
+    Bypass via ``AI_FEDERATED_CACHE=0`` (or false/no/off).
+    """
+    if not _federated_cache_enabled():
+        return _compute_cross_project_summary(self_root, home=home)
+
+    cache_path = _federated_cache_path(self_root)
+    try:
+        if cache_path.exists():
+            st = cache_path.stat()
+            age = time.time() - st.st_mtime
+            if age < _FEDERATED_CACHE_TTL_SECONDS and not _audit_index_newer_than(st.st_mtime, home=home):
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    return payload
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+
+    fresh = _compute_cross_project_summary(self_root, home=home)
+    _write_federated_cache(cache_path, fresh)
+    return fresh

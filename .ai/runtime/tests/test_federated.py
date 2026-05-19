@@ -9,7 +9,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
+from ai_core import federated as federated_mod  # noqa: E402
 from ai_core.federated import (  # noqa: E402
+    _federated_cache_path,
     cross_project_summary,
     discover_installations,
     gather_cross_project_signals,
@@ -71,3 +73,44 @@ def test_no_raw_text_leak(tmp_path: Path):
     # raw text from other project's todo should never appear in the federated payload
     assert "/Users/foo" not in flat
     assert "secret-file" not in flat
+
+
+def test_federated_cache_hit_returns_cached_value(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("AI_FEDERATED_CACHE", raising=False)
+    self_proj = _make_proj(tmp_path, "self_cache", decisions_tags=["release"])
+    _make_proj(tmp_path, "other_a", decisions_tags=["release", "release"])
+    _make_proj(tmp_path, "other_b", decisions_tags=["release"])
+
+    # First call populates the cache.
+    first = cross_project_summary(self_proj, home=tmp_path)
+    cache_path = _federated_cache_path(self_proj)
+    assert cache_path.exists()
+
+    # Force any subsequent compute to fail — cache must still be served.
+    def _boom(*a, **kw):
+        raise AssertionError("compute should not be called when cache is fresh")
+
+    monkeypatch.setattr(federated_mod, "_compute_cross_project_summary", _boom)
+    second = cross_project_summary(self_proj, home=tmp_path)
+    assert second == first
+
+
+def test_federated_cache_disabled_by_env(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("AI_FEDERATED_CACHE", "0")
+    self_proj = _make_proj(tmp_path, "self_off", decisions_tags=["release"])
+    _make_proj(tmp_path, "other_x", decisions_tags=["release", "release"])
+
+    counter = {"n": 0}
+    real_compute = federated_mod._compute_cross_project_summary
+
+    def _counting_compute(self_root, *, home=None):
+        counter["n"] += 1
+        return real_compute(self_root, home=home)
+
+    monkeypatch.setattr(federated_mod, "_compute_cross_project_summary", _counting_compute)
+
+    cross_project_summary(self_proj, home=tmp_path)
+    cross_project_summary(self_proj, home=tmp_path)
+    assert counter["n"] == 2
+    # Cache file must not be written when env disables caching.
+    assert not _federated_cache_path(self_proj).exists()

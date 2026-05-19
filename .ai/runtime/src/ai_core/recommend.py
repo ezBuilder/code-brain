@@ -175,7 +175,8 @@ def gather_signals(
 _BASH_DOMAIN_TOOLS = {
     "git", "gh", "kubectl", "docker", "docker-compose", "npm", "pnpm", "yarn",
     "cargo", "pytest", "uv", "hatch", "poetry", "pip", "make", "terraform",
-    "ansible", "aws", "gcloud", "az", "helm", "bun", "deno", "ai",
+    "ansible", "aws", "gcloud", "az", "helm", "bun", "deno", "ai", "codex",
+    "fd", "rg", "ripgrep", "jq",
 }
 
 
@@ -216,7 +217,10 @@ def _write_bash_head_cache(root: Path, counts: Counter[str]) -> None:
     cache_path = _bash_head_cache_path(root)
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps({"counts": dict(counts)}), encoding="utf-8")
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"counts": dict(counts)}), encoding="utf-8")
+        import os as _os_atomic
+        _os_atomic.replace(tmp, cache_path)
     except OSError:
         pass
 
@@ -597,7 +601,11 @@ def _draft_body_for_bash_head(head: str, count: int) -> str:
 def _adaptive_min_signal(signals: Signals, requested: int) -> int:
     """Cold-start downgrade: when project signal volume is low, drop threshold to 2.
     Only applies when caller is using DEFAULT (3) or lower — explicit higher requests
-    (e.g. hook-level adaptive bump from user-ignored surfacings) are respected as-is."""
+    (e.g. hook-level adaptive bump from user-ignored surfacings) are respected as-is.
+
+    Invariant: called ONLY from recommend() — cluster_candidates() receives the
+    already-adapted min_signal. Do not re-apply inside cluster_candidates or
+    candidate-mining helpers; that would double-discount the threshold."""
     volume = (
         len(signals.decisions)
         + len(signals.todos_all)
@@ -765,12 +773,7 @@ def _is_path_like_task_group(text: str) -> bool:
 
 # ---------- draft body composition ----------
 
-_BODY_RULES_FOOTER = (
-    "규칙:\n"
-    "- 표·박스·이모지·헤더 금지. 평문만.\n"
-    "- 위 형식 외 한 글자도 추가하지 않는다.\n"
-    "- shell 명령은 *참조 텍스트*로만 인용 (자동 실행 금지).\n"
-)
+_BODY_RULES_FOOTER = "규칙: 평문만; shell은 참조 인용만 (실행 금지).\n"
 
 
 def _draft_body_for_decision_tag(tag: str, sources: list[str]) -> str:

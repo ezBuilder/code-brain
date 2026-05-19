@@ -251,6 +251,47 @@ def test_slug_dedup_after_reject(tmp_root: Path):
     )
 
 
+def test_t42_same_slug_pending_refreshes_in_place(tmp_root: Path):
+    """T42: when evidence drifts for an already-pending slug, the catalog
+    must REFRESH the original entry (same id, updated body/evidence) rather
+    than spawn a duplicate pending row — preventing the ai-runbook 58회 vs
+    59회 vs 60회 churn the user explicitly forbade."""
+    # First pending: 4 decisions
+    _seed_decisions(tmp_root, "deploy", 4)
+    first = recommend(tmp_root, include_global=False, min_signal=3)
+    assert first["candidates"], "seed yielded no candidate"
+    first_cand = first["candidates"][0]
+    first_id = first_cand["id"]
+    slug = first_cand["slug"]
+    pending_after_first = [
+        e for e in list_catalog(tmp_root) if e.slug == slug and e.status == "pending"
+    ]
+    assert len(pending_after_first) == 1, "expected exactly one pending row"
+    original_created_at = pending_after_first[0].created_at
+
+    # More decisions → body changes → new c.id, BUT same slug + still pending
+    _seed_decisions(tmp_root, "deploy", 3)
+    second = recommend(tmp_root, include_global=False, min_signal=3)
+    pending_after_second = [
+        e for e in list_catalog(tmp_root) if e.slug == slug and e.status == "pending"
+    ]
+    assert len(pending_after_second) == 1, (
+        f"T42 broken: {len(pending_after_second)} pending rows for slug={slug}; "
+        "refresh path should keep exactly one"
+    )
+    # original id is preserved; created_at frozen
+    refreshed = pending_after_second[0]
+    assert refreshed.id == first_id, "refresh must preserve original id"
+    assert refreshed.created_at == original_created_at, (
+        "refresh must preserve original created_at"
+    )
+    # output id reflects the catalog's actual entry id
+    assert second["candidates"], "second recommend yielded no candidate"
+    assert second["candidates"][0]["id"] == first_id, (
+        "recommend() must return the catalog id (original), not the drifted c.id"
+    )
+
+
 def test_slug_dedup_after_install(tmp_root: Path):
     _seed_decisions(tmp_root, "deploy", 4)
     first = recommend(tmp_root, include_global=False, min_signal=3)
@@ -999,9 +1040,12 @@ def test_slow_hook_appends_audit_record(tmp_root: Path, monkeypatch):
     """Hooks exceeding HOT_PATH_TARGET_MS should append a 'hook.slow' audit row for self-monitoring."""
     import ai_core.hooks as hooksmod
 
-    # Force a slow hook by intercepting build_context to sleep just under measurement
+    # Force a slow hook by intercepting build_context to sleep just under measurement.
+    # NOTE: HOT_PATH_TARGET_MS must be < 0 (not 0) — elapsed_ms is int-floored, so
+    # a sub-millisecond hook on a warm cache produces elapsed_ms=0 and `0 > 0` fails.
+    # Setting -1 makes "any non-negative elapsed_ms" trigger the slow path reliably.
     monkeypatch.setattr(hooksmod, "_spawn_background_rebuild", lambda *_: None)
-    monkeypatch.setattr(hooksmod, "HOT_PATH_TARGET_MS", 0)
+    monkeypatch.setattr(hooksmod, "HOT_PATH_TARGET_MS", -1)
 
     hooksmod.handle_hook(tmp_root, "UserPromptSubmit", {"session_id": "slow"})
     audit_file = tmp_root / ".ai" / "memory" / "audit" / "2026.jsonl"

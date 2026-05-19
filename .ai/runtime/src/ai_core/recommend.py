@@ -862,10 +862,53 @@ def _persist_entry(root: Path, entry: CatalogEntry) -> None:
 
 
 def upsert_pending_candidate(root: Path, candidate: Candidate) -> CatalogEntry:
+    """Persist a candidate. T42: when a same-slug PENDING entry already exists
+    (different id because evidence/body changed), treat the new candidate as
+    *evidence drift* on the existing pending entry — refresh body / evidence
+    in place under the original id rather than spawning a duplicate row. This
+    is the explicit "skill enhancement mode" the user mandated to stop the
+    infinite-duplicate-skill churn (e.g. ai-runbook 58회 vs 59회 vs 60회 ...).
+    """
     body_sha = _sha256(candidate.body)
-    existing = {e.id: e for e in list_catalog(root)}
-    if candidate.id in existing:
-        return existing[candidate.id]
+    existing_list = list_catalog(root)
+    existing_by_id = {e.id: e for e in existing_list}
+    if candidate.id in existing_by_id:
+        return existing_by_id[candidate.id]
+    # T42 evidence drift: same slug, still pending, but new body fingerprint
+    same_slug_pending = next(
+        (
+            e
+            for e in existing_list
+            if e.slug == candidate.slug and e.status == "pending"
+        ),
+        None,
+    )
+    if same_slug_pending is not None:
+        refreshed = CatalogEntry(
+            id=same_slug_pending.id,  # preserve original id
+            slug=candidate.slug,
+            status="pending",
+            draft={
+                "description": candidate.description,
+                "body": candidate.body,
+            },
+            evidence=candidate.evidence,
+            created_at=same_slug_pending.created_at,  # preserve original ts
+            installed_paths=[],
+            body_sha256=body_sha,
+        )
+        _persist_entry(root, refreshed)
+        append_audit(
+            root,
+            action="skill.recommend_refresh",
+            category="memory",
+            payload={
+                "id": refreshed.id,
+                "slug": refreshed.slug,
+                "shadowed_new_id": candidate.id,
+            },
+        )
+        return refreshed
     entry = CatalogEntry(
         id=candidate.id,
         slug=candidate.slug,
@@ -979,16 +1022,22 @@ def recommend(
         prior_slug_status = slug_status.get(c.slug)
         if prior_slug_status in {"rejected", "installed", "uninstalled"}:
             continue
-        # T40 fuzzy overlap: skip if user already has a substantially-similar
-        # slash command / agent — prevents endless near-duplicates like
-        # "git-runbook" vs "git-helper" vs "git-workflow".
-        if _slug_overlaps_existing(c.slug, occupied_slugs):
+        # T40 fuzzy overlap vs OTHER slugs only. T42: exclude this candidate's
+        # own slug from the occupied set so a same-slug pending entry can be
+        # refreshed (skill-enhancement mode) instead of being blocked as a
+        # near-duplicate of itself.
+        own_canonical = _canonical_slug(c.slug)
+        other_occupied = {s for s in occupied_slugs if s != own_canonical}
+        if _slug_overlaps_existing(c.slug, other_occupied):
             continue
-        if c.id not in existing and persist:
-            upsert_pending_candidate(root, c)
+        if persist:
+            entry = upsert_pending_candidate(root, c)
+            out_id = entry.id  # may differ from c.id when T42 refresh kicks in
+        else:
+            out_id = c.id
         out.append(
             {
-                "id": c.id,
+                "id": out_id,
                 "slug": c.slug,
                 "status": "pending",
                 "description": c.description,

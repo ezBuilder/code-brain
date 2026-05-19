@@ -929,6 +929,21 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                         append_session_note(root, text=f"[{effective_hook}] {first_line}")
                     except Exception:
                         pass
+            # T35 autonomous page-out: when MemGPT pressure breaches threshold,
+            # the agent should not wait for a human `ai memory page-out` call.
+            if not _env_disabled("AI_AUTO_PAGE_OUT"):
+                try:
+                    from .memory_tier import hot_pressure, page_out
+
+                    if hot_pressure(root).get("page_out_recommended"):
+                        page_out(root, dry_run=False)
+                        from .memory import append_audit
+                        append_audit(
+                            root, action="memtier.auto_page_out", category="memory",
+                            payload={"trigger": effective_hook},
+                        )
+                except Exception:
+                    pass
         try:
             _handle_lifecycle_event(root, effective_hook, payload)
         except Exception:
@@ -1285,6 +1300,18 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             if pres.get("page_out_recommended"):
                 sline += " ⚠page-out"
             sections.append(sline)
+        except Exception:
+            pass
+    # T35 codegraph hotspot teaser — surfaces the top-3 most-called callees so
+    # downstream agents can `code_graph_callers <name>` without prior knowledge.
+    if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_CODEGRAPH_SUMMARY"):
+        try:
+            from .codegraph import hotspot_callees
+            hot = hotspot_callees(root, limit=3)
+            entries = hot.get("hotspots") or []
+            if entries:
+                top = ", ".join(f"{h['callee']}({h['calls']})" for h in entries)
+                sections.append(f"cb-graph: top callees — {top}. MCP: code_graph_callers/callees/symbol/hotspots.")
         except Exception:
             pass
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)

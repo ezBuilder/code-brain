@@ -18,7 +18,7 @@ This repository uses `.ai/` as the single repo-local source for AI agent context
 - The same routing applies inside hook `additionalContext` injection: SessionStart and UserPromptSubmit hooks remind agents of this preference and surface a prior-session resume snapshot when present.
 - Memory queries (decisions, todos, prior session narrative) go through MCP `memory_query` / `context_pack`. Do not re-implement memory recall via shell tools.
 
-**Auto-routing (when hooks are registered)**: with `.claude/settings.json` (Claude Code) or `.codex/hooks.json` (Codex CLI) registered, the `PreToolUse` hook intercepts `Bash` calls that match long-output patterns (`grep -r`, `rg`, `find`, `tree`, `ack`, `ag`) and *blocks* them with a deny reason that points the agent to `mcp__code-brain__sandbox_execute` or `ai exec run -- <original>`. Single-file `grep`, piped-to-`head`/`tail`/`wc`, and `2>/dev/null`-suppressed commands are allowed through. Operators can disable auto-routing by removing the `PreToolUse` block from `.claude/settings.json`.
+**Auto-routing (when hooks are registered)**: with `.claude/settings.json` (Claude Code) or `.codex/hooks.json` (Codex CLI) registered, the `PreToolUse` hook intercepts shell calls that match long-output patterns (`grep -r`, `rg`, `find`, `tree`, `ack`, `ag`, `git grep`, and shell-wrapper/compound forms) and *blocks* them with a deny reason that points the agent to `mcp__code-brain__sandbox_execute` or `ai exec run -- <original>`. Single-file non-recursive `grep`, `| wc`, and stdout-to-`/dev/null` forms are allowed through; `| head`/`tail` is still blocked for broad searches. Operators can disable auto-routing by removing the `PreToolUse` block from `.claude/settings.json` or `.codex/hooks.json`.
 
 **Codex runtime fallback**: some Codex Desktop/API sessions may read `AGENTS.md` and expose MCP tools without firing `.codex/hooks.json` automatically. In that case, agents must still apply the same routing manually: use Code Brain MCP first, use `.ai/bin/ai ...` CLI fallback second, and avoid broad shell search/output dumps unless Code Brain is unavailable or stale.
 
@@ -32,7 +32,7 @@ Code Brain's main value is *cross-session context sharing* — but it only works
 - **`mcp__code-brain__append_session_note(text)`** — append a short milestone line to `session-current.md` (visible to the next session via SessionStart hook). Examples: "Round 92 PreToolUse 차단 검증 완료", "navio 재배포 ok".
 
 Why proactive logging matters:
-- The next session's `SessionStart` hook auto-injects the last 5 decisions, last 5 open todos, last 8 lines of session-current.md, and the prior-session resume snapshot into `additionalContext`.
+- The next session's `SessionStart` hook auto-injects the last 5 decisions, last 5 open todos, last 8 lines of session-current.md, and the prior-session resume snapshot including the latest session tail into `additionalContext`. Session-start injection has a larger default budget than prompt-start injection (`AI_SESSION_START_MAX_BYTES`, default 12 KB) because it is the high-value recovery point.
 - If you don't log, the next session sees an empty memory layer and Code Brain's central feature delivers nothing.
 - Hook injection bytes/call is the leading indicator: when low, log more.
 

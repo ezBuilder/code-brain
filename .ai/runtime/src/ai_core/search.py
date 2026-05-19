@@ -210,7 +210,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"pragma user_version={SCHEMA_VERSION}")
 
 
-def rebuild(root: Path, *, single_flight: bool = False) -> dict[str, Any]:
+def rebuild(root: Path, *, single_flight: bool = False, incremental: bool = False) -> dict[str, Any]:
     if single_flight:
         from .portable import lock_exclusive_nonblocking, unlock
         lock_path = root / ".ai" / "cache" / ".rebuild.lock"
@@ -225,7 +225,7 @@ def rebuild(root: Path, *, single_flight: bool = False) -> dict[str, Any]:
                     "db_path": db_path(root).relative_to(root).as_posix(),
                 }
             try:
-                return _rebuild_inner(root)
+                return _rebuild_incremental_inner(root) if incremental else _rebuild_inner(root)
             finally:
                 unlock(lock_fd)
         finally:
@@ -233,7 +233,130 @@ def rebuild(root: Path, *, single_flight: bool = False) -> dict[str, Any]:
                 lock_fd.close()
             except Exception:
                 pass
-    return _rebuild_inner(root)
+    return _rebuild_incremental_inner(root) if incremental else _rebuild_inner(root)
+
+
+def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
+    """Re-index only files whose redacted-content sha256 has changed.
+
+    Drops chunks for deleted files; updates chunks for changed files; leaves
+    unchanged files untouched. Codegraph + embedding row are rebuilt for the
+    changed set too (drop + insert) so they never diverge from the FTS row.
+
+    Limitation: chunks_fts is a contentless FTS5 virtual table, which does
+    not support row-level DELETE. To work around this, we 'delete-all' the
+    FTS table once and re-populate it from chunks for both unchanged and
+    changed rows. embedding + codegraph data is the expensive part and
+    those *are* truly incremental.
+
+    If the schema is out of date or empty, falls back to full rebuild.
+    """
+    db_p = db_path(root)
+    if not db_p.exists():
+        return _rebuild_inner(root)
+
+    with connect(root) as conn:
+        try:
+            init_schema(conn, migrate_legacy=False)
+        except RuntimeError:
+            # legacy schema → caller must do a full rebuild
+            return _rebuild_inner(root)
+        existing = {
+            row["path"]: (int(row["id"]), str(row["sha256"]))
+            for row in conn.execute("select id, path, sha256 from chunks").fetchall()
+        }
+        if not existing:
+            return _rebuild_inner(root)
+
+        conn.execute("begin immediate")
+        # Wipe the FTS index once; we'll repopulate it from `chunks` afterwards
+        # (contentless FTS5 disallows row DELETE, so this is the only safe path).
+        conn.execute("insert into chunks_fts(chunks_fts) values('delete-all')")
+        seen: set[str] = set()
+        changed = 0
+        added = 0
+        unchanged = 0
+        for path in iter_text_files(root):
+            rel = path.relative_to(root).as_posix()
+            seen.add(rel)
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            redacted = redact_value(content)
+            digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+            existing_pair = existing.get(rel)
+            if existing_pair is not None and existing_pair[1] == digest:
+                # chunks row is up to date; just refill the FTS row so search works
+                conn.execute(
+                    "insert into chunks_fts(rowid, path, content) values (?, ?, ?)",
+                    (existing_pair[0], rel, redacted),
+                )
+                unchanged += 1
+                continue
+            # need to (re)write this file: drop dependent tables (NOT chunks_fts;
+            # we already wiped it). chunks row identity is replaced so embedding +
+            # codegraph re-insert below picks up the new chunk_id.
+            if existing_pair is not None:
+                _delete_chunk_rows_keep_fts(conn, existing_pair[0])
+            summary = summarize(redacted)
+            cursor = conn.execute(
+                "insert into chunks(path, sha256, summary) values (?, ?, ?)",
+                (rel, digest, summary),
+            )
+            chunk_id = int(cursor.lastrowid)
+            conn.execute(
+                "insert into chunks_fts(rowid, path, content) values (?, ?, ?)",
+                (chunk_id, rel, redacted),
+            )
+            conn.execute(
+                "insert into chunk_meta(chunk_id, kind, bytes, line_count) values (?, ?, ?, ?)",
+                (chunk_id, "file", len(redacted.encode("utf-8")), redacted.count("\n") + 1),
+            )
+            conn.execute(
+                "insert into summaries(path, summary) values (?, ?)",
+                (rel, summary),
+            )
+            conn.execute(
+                "insert into provenance(path, processor, model_hash, prompt_version, chunker_version, confidence) values (?, ?, ?, ?, ?, ?)",
+                (rel, "code-brain-local", None, "extractive-v1", "1", 1.0),
+            )
+            _insert_chunk_embedding(conn, chunk_id, redacted, root)
+            _insert_codegraph_for_path(conn, rel, redacted, path)
+            if existing_pair is not None:
+                changed += 1
+            else:
+                added += 1
+        # cleanup deleted files (chunks_fts already wiped + repopulated above)
+        deleted = 0
+        for rel, (cid, _digest) in existing.items():
+            if rel not in seen:
+                _delete_chunk_rows_keep_fts(conn, cid)
+                conn.execute("delete from summaries where path = ?", (rel,))
+                conn.execute("delete from provenance where path = ?", (rel,))
+                conn.execute("delete from code_symbols where path = ?", (rel,))
+                conn.execute("delete from code_calls where path = ?", (rel,))
+                deleted += 1
+        conn.commit()
+    return {
+        "ok": True,
+        "db_path": db_p.relative_to(root).as_posix(),
+        "incremental": True,
+        "unchanged": unchanged,
+        "changed": changed,
+        "added": added,
+        "deleted": deleted,
+        "indexed": unchanged + changed + added,
+    }
+
+
+def _delete_chunk_rows_keep_fts(conn: sqlite3.Connection, chunk_id: int) -> None:
+    """Delete chunk-dependent rows. Used by the incremental rebuild path,
+    where chunks_fts is wiped wholesale at the start of the cycle (FTS5
+    contentless DELETE limitation)."""
+    conn.execute("delete from chunk_meta where chunk_id = ?", (chunk_id,))
+    conn.execute("delete from embeddings_vec0 where chunk_id = ?", (chunk_id,))
+    conn.execute("delete from chunks where id = ?", (chunk_id,))
 
 
 def _rebuild_inner(root: Path) -> dict[str, Any]:

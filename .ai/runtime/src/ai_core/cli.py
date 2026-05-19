@@ -241,6 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="single_flight",
         help="non-blocking flock on .ai/cache/.rebuild.lock; skip if another rebuild is in progress",
     )
+    index_rebuild.add_argument(
+        "--incremental",
+        action="store_true",
+        help="reindex only files whose redacted-content sha256 changed (T33)",
+    )
     recommend_parser = sub.add_parser("recommend")
     recommend_sub = recommend_parser.add_subparsers(dest="recommend_command", required=True)
     recommend_skills = recommend_sub.add_parser("skills")
@@ -686,7 +691,11 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "index" and args.index_command == "rebuild":
             reject_ci_write("index")
-            payload = rebuild(root, single_flight=getattr(args, "single_flight", False))
+            payload = rebuild(
+                root,
+                single_flight=getattr(args, "single_flight", False),
+                incremental=getattr(args, "incremental", False),
+            )
             emit(payload, as_json=as_json)
             return OK
         if args.command == "recommend" and args.recommend_command == "skills":

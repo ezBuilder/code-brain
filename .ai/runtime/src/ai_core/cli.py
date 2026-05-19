@@ -287,6 +287,16 @@ def build_parser() -> argparse.ArgumentParser:
     fed_summary = federated_sub.add_parser("summary")
     fed_summary.add_argument("--json", action="store_true", dest="command_json")
 
+    embedding_parser = sub.add_parser("embedding", help="dense semantic-search model management (opt-in)")
+    embedding_sub = embedding_parser.add_subparsers(dest="embedding_command", required=True)
+    emb_status = embedding_sub.add_parser("status", help="show dense embedding readiness")
+    emb_status.add_argument("--json", action="store_true", dest="command_json")
+    emb_install = embedding_sub.add_parser("install", help="download ONNX MiniLM model (~25MB, one-shot)")
+    emb_install.add_argument("--verify", action="store_true", help="only check presence")
+    emb_install.add_argument("--json", action="store_true", dest="command_json")
+    emb_uninstall = embedding_sub.add_parser("uninstall", help="remove cached model files")
+    emb_uninstall.add_argument("--json", action="store_true", dest="command_json")
+
     agents_parser = sub.add_parser("agents")
     agents_sub = agents_parser.add_subparsers(dest="agents_command", required=True)
     ag_recommend = agents_sub.add_parser("recommend")
@@ -725,6 +735,20 @@ def main(argv: list[str] | None = None) -> int:
             payload = cross_project_summary(root)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "embedding":
+            from . import embedding as emb_mod
+            cmd = args.embedding_command
+            if cmd == "status":
+                emit(emb_mod.status(root), as_json=as_json)
+                return OK
+            if cmd == "install":
+                payload = emb_mod.install_model(root, verify_only=bool(args.verify))
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else 1
+            if cmd == "uninstall":
+                payload = emb_mod.uninstall_model(root)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else 1
         if args.command == "agents":
             from .agent_recommend import (
                 accept as ag_accept_fn,

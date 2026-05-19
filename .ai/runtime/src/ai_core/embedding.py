@@ -22,6 +22,18 @@ from typing import Any
 EMBEDDING_DIM = 384
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Xenova publishes an ONNX-quantized export of MiniLM-L6 specifically for
+# offline/local consumption (~25MB quantized vs ~80MB fp32). Single explicit
+# download — never reached at query time.
+_MODEL_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx"
+_TOKENIZER_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+_CONFIG_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/config.json"
+_MODEL_FILES = {
+    "model.onnx": _MODEL_URL,
+    "tokenizer.json": _TOKENIZER_URL,
+    "config.json": _CONFIG_URL,
+}
+
 
 def is_enabled() -> bool:
     """True only when user opted in via AI_SEARCH_DENSE AND deps importable."""
@@ -82,3 +94,78 @@ def _deps_present() -> bool:
         return True
     except ImportError:
         return False
+
+
+def install_model(root: Path, *, verify_only: bool = False) -> dict[str, Any]:
+    """One-shot model fetch from Hugging Face Hub.
+
+    This is the ONLY function in this module that touches the network. It is
+    intended to be called once via `ai embedding install` — after success, all
+    subsequent calls are fully offline.
+
+    Returns {"ok": bool, "downloaded": [...], "skipped": [...], "errors": [...]}.
+    `verify_only=True` reports state without downloading.
+    """
+    import urllib.request
+    import urllib.error
+
+    cache = model_cache_dir(root)
+    cache.mkdir(parents=True, exist_ok=True)
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "cache_dir": str(cache),
+        "downloaded": [],
+        "skipped": [],
+        "errors": [],
+    }
+
+    if verify_only:
+        for name in _MODEL_FILES:
+            target = cache / name
+            if target.exists() and target.stat().st_size > 0:
+                result["skipped"].append(name)
+            else:
+                result["errors"].append({"file": name, "reason": "missing"})
+        result["ok"] = not result["errors"]
+        return result
+
+    for name, url in _MODEL_FILES.items():
+        target = cache / name
+        if target.exists() and target.stat().st_size > 0:
+            result["skipped"].append(name)
+            continue
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        try:
+            with urllib.request.urlopen(url, timeout=120) as resp, open(tmp, "wb") as out:
+                while True:
+                    block = resp.read(65536)
+                    if not block:
+                        break
+                    out.write(block)
+            os.replace(tmp, target)
+            result["downloaded"].append({"file": name, "bytes": target.stat().st_size})
+        except (urllib.error.URLError, OSError) as exc:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            result["errors"].append({"file": name, "reason": str(exc)[:200]})
+            result["ok"] = False
+
+    return result
+
+
+def uninstall_model(root: Path) -> dict[str, Any]:
+    """Delete the cached model dir. Safe even if absent."""
+    import shutil
+
+    cache = model_cache_dir(root)
+    existed = cache.exists()
+    if existed:
+        try:
+            shutil.rmtree(cache)
+        except OSError as exc:
+            return {"ok": False, "reason": str(exc)[:200]}
+    return {"ok": True, "removed": existed, "cache_dir": str(cache)}

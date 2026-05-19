@@ -12,7 +12,7 @@ from typing import Any
 from .config import load_config
 from .redact import redact_value
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 import os as _os
 try:
     SNIPPET_MAX_BYTES = max(80, min(2048, int(_os.environ.get("AI_SNIPPET_MAX_BYTES", "240"))))
@@ -139,6 +139,8 @@ def drop_schema(conn: sqlite3.Connection) -> None:
         drop table if exists summaries;
         drop table if exists provenance;
         drop table if exists embeddings_vec0;
+        drop table if exists code_symbols;
+        drop table if exists code_calls;
         drop table if exists chunks;
         """
     )
@@ -183,6 +185,26 @@ def create_schema(conn: sqlite3.Connection) -> None:
           created_at text
         );
         create index if not exists embeddings_vec0_model_idx on embeddings_vec0(model_name);
+        create table if not exists code_symbols (
+          id integer primary key,
+          path text not null,
+          qualname text not null,
+          kind text not null,
+          lineno integer not null,
+          end_lineno integer not null,
+          parent text
+        );
+        create index if not exists code_symbols_path_idx on code_symbols(path);
+        create index if not exists code_symbols_qualname_idx on code_symbols(qualname);
+        create table if not exists code_calls (
+          id integer primary key,
+          path text not null,
+          caller text not null,
+          callee text not null,
+          lineno integer not null
+        );
+        create index if not exists code_calls_callee_idx on code_calls(callee);
+        create index if not exists code_calls_caller_idx on code_calls(caller);
         """
     )
     conn.execute(f"pragma user_version={SCHEMA_VERSION}")
@@ -246,10 +268,49 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
                 (rel, "code-brain-local", None, "extractive-v1", "1", 1.0),
             )
             _insert_chunk_embedding(conn, chunk_id, redacted, root)
+            _insert_codegraph_for_path(conn, rel, redacted, path)
             indexed += 1
         conn.commit()
         conn.execute("vacuum")
     return {"ok": True, "db_path": db_path(root).relative_to(root).as_posix(), "indexed": indexed}
+
+
+def _codegraph_enabled() -> bool:
+    raw = os.environ.get("AI_SEARCH_CODEGRAPH", "1")
+    return str(raw).strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text: str, abs_path: Path) -> None:
+    """Insert function/class symbols + call edges for Python source files.
+
+    Default ON (AI_SEARCH_CODEGRAPH=1). Skips non-Python and any file the AST
+    parser rejects (best-effort indexer behavior).
+    """
+    if not _codegraph_enabled():
+        return
+    if not rel.endswith(".py"):
+        return
+    try:
+        from .codegraph import extract_symbols, extract_calls
+    except Exception:
+        return
+    try:
+        syms = extract_symbols(redacted_text, path=rel)
+        for s in syms:
+            conn.execute(
+                "insert into code_symbols(path, qualname, kind, lineno, end_lineno, parent) "
+                "values (?, ?, ?, ?, ?, ?)",
+                (s.path, s.qualname, s.kind, s.lineno, s.end_lineno, s.parent),
+            )
+        calls = extract_calls(redacted_text, path=rel)
+        for c in calls:
+            conn.execute(
+                "insert into code_calls(path, caller, callee, lineno) values (?, ?, ?, ?)",
+                (c.path, c.caller, c.callee, c.lineno),
+            )
+    except Exception:
+        # Indexer must continue even if one file misbehaves.
+        return
 
 
 def _insert_chunk_embedding(conn: sqlite3.Connection, chunk_id: int, text: str, root: Path) -> None:

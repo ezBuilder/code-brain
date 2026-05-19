@@ -399,11 +399,19 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
     if retriever != "bm25":
         raise RuntimeError(f"search retriever '{retriever}' is not implemented; use retriever: bm25")
     path_weight, content_weight = _bm25_weights()
+    # Pull a wider candidate pool when dense rerank is enabled (per Codex report's
+    # "lexical 100-500 → dense 20-100 → rerank 5-20" recipe — sized to corpus).
+    try:
+        from . import embedding as _emb
+        dense_active = _emb.is_enabled() and _emb.is_model_present(root)
+    except Exception:
+        dense_active = False
+    candidate_limit = max(limit * 8, 40) if dense_active else limit
     with connect(root) as conn:
         init_schema(conn)
         rows = conn.execute(
             """
-            select c.path, c.sha256, c.summary, p.processor,
+            select c.id, c.path, c.sha256, c.summary, p.processor,
                    p.model_hash, p.prompt_version, p.chunker_version, p.confidence
             from chunks_fts
             join chunks c on c.id = chunks_fts.rowid
@@ -412,10 +420,32 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
             order by bm25(chunks_fts, ?, ?)
             limit ?
             """,
-            (escape_fts_query(text), path_weight, content_weight, limit),
+            (escape_fts_query(text), path_weight, content_weight, candidate_limit),
         ).fetchall()
-    fts_results = [
-        {
+        # If dense active, fetch vectors for the candidates so we can rerank.
+        vectors_by_id: dict[int, list[float]] = {}
+        if dense_active and rows:
+            chunk_ids = [int(r["id"]) for r in rows]
+            placeholders = ",".join("?" * len(chunk_ids))
+            vec_rows = conn.execute(
+                f"select chunk_id, vector from embeddings_vec0 "
+                f"where chunk_id in ({placeholders}) and vector is not null",
+                chunk_ids,
+            ).fetchall()
+            import struct as _struct
+            for vr in vec_rows:
+                blob = vr["vector"]
+                if not blob:
+                    continue
+                try:
+                    floats = list(_struct.unpack(f"<{len(blob)//4}f", blob))
+                    vectors_by_id[int(vr["chunk_id"])] = floats
+                except Exception:
+                    continue
+    fts_results: list[dict[str, Any]] = []
+    for row in rows:
+        fts_results.append({
+            "id": int(row["id"]),
             "path": row["path"],
             "snippet": snippet_from_file(root, row["path"], text, fallback=row["summary"], expected_sha=row["sha256"]),
             "provenance": {
@@ -425,9 +455,49 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
                 "chunker_version": row["chunker_version"],
                 "confidence": row["confidence"],
             },
-        }
-        for row in rows
-    ]
+        })
+
+    dense_used = False
+    if dense_active and vectors_by_id:
+        try:
+            qvec = _emb.embed(text, root)
+        except Exception:
+            qvec = None
+        if qvec is not None:
+            # Cosine sim — both vectors are L2-normalized in embed_batch.
+            def _cos(a: list[float], b: list[float]) -> float:
+                if len(a) != len(b):
+                    return 0.0
+                return sum(x * y for x, y in zip(a, b))
+            # RRF: combine BM25 rank (already sorted) with dense rank.
+            bm25_rank = {r["id"]: idx for idx, r in enumerate(fts_results)}
+            dense_scores = []
+            for r in fts_results:
+                vec = vectors_by_id.get(r["id"])
+                if vec is None:
+                    dense_scores.append((r["id"], -1.0))
+                else:
+                    dense_scores.append((r["id"], _cos(qvec, vec)))
+            dense_scores.sort(key=lambda x: -x[1])
+            dense_rank = {cid: idx for idx, (cid, _s) in enumerate(dense_scores)}
+            # RRF k=60 standard
+            RRF_K = 60
+            combined = []
+            for r in fts_results:
+                cid = r["id"]
+                bm_r = bm25_rank.get(cid, candidate_limit)
+                dn_r = dense_rank.get(cid, candidate_limit)
+                fused = 1.0 / (RRF_K + bm_r + 1) + 1.0 / (RRF_K + dn_r + 1)
+                row_copy = dict(r)
+                row_copy["_rrf"] = fused
+                combined.append(row_copy)
+            combined.sort(key=lambda x: -x["_rrf"])
+            fts_results = combined
+            dense_used = True
+    # Strip internal fields before returning.
+    for r in fts_results:
+        r.pop("id", None)
+        r.pop("_rrf", None)
     fallback_used = False
     if _rg_fallback_enabled() and (not fts_results or _looks_like_code_symbol(text)):
         rg_hits = _rg_fallback(root, text, limit=limit)
@@ -450,6 +520,7 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
         "query": text,
         "results": fts_results[:limit],
         "rg_fallback": fallback_used,
+        "dense_rerank": dense_used,
     }
 
 

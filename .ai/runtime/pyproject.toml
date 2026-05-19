@@ -8,6 +8,15 @@ dependencies = [
   "pytest>=8.0",
 ]
 
+[project.optional-dependencies]
+# Dense semantic search via ONNX MiniLM (offline-first, ~80MB model + ~3MB runtime).
+# Activated by AI_SEARCH_DENSE=1 once installed. Install:  pip install -e ".[dense]"
+dense = [
+  "onnxruntime>=1.18",
+  "tokenizers>=0.19",
+  "numpy>=1.26",
+]
+
 [project.scripts]
 ai = "ai_core.cli:main"
 

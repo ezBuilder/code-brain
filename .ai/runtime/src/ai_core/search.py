@@ -12,7 +12,7 @@ from typing import Any
 from .config import load_config
 from .redact import redact_value
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 import os as _os
 try:
     SNIPPET_MAX_BYTES = max(80, min(2048, int(_os.environ.get("AI_SNIPPET_MAX_BYTES", "240"))))
@@ -176,8 +176,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists embeddings_vec0 (
           chunk_id integer primary key,
-          disabled_reason text not null default 'embeddings_default_off'
+          disabled_reason text not null default 'embeddings_default_off',
+          vector blob,
+          model_name text,
+          vector_dim integer,
+          created_at text
         );
+        create index if not exists embeddings_vec0_model_idx on embeddings_vec0(model_name);
         """
     )
     conn.execute(f"pragma user_version={SCHEMA_VERSION}")
@@ -240,11 +245,34 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
                 "insert into provenance(path, processor, model_hash, prompt_version, chunker_version, confidence) values (?, ?, ?, ?, ?, ?)",
                 (rel, "code-brain-local", None, "extractive-v1", "1", 1.0),
             )
-            conn.execute("insert into embeddings_vec0(chunk_id) values (?)", (chunk_id,))
+            _insert_chunk_embedding(conn, chunk_id, redacted, root)
             indexed += 1
         conn.commit()
         conn.execute("vacuum")
     return {"ok": True, "db_path": db_path(root).relative_to(root).as_posix(), "indexed": indexed}
+
+
+def _insert_chunk_embedding(conn: sqlite3.Connection, chunk_id: int, text: str, root: Path) -> None:
+    """Insert embeddings_vec0 row. When AI_SEARCH_DENSE enabled + model present,
+    compute the dense vector inline and store as BLOB. Otherwise insert a
+    placeholder row (vector=NULL) to preserve foreign-key-style 1:1 with chunks."""
+    from . import embedding as _emb
+    from datetime import datetime, timezone
+
+    if _emb.is_enabled():
+        vec = _emb.embed(text[:4096], root)  # cap input to limit memory/CPU
+        if vec is not None:
+            import struct
+            payload = struct.pack(f"<{len(vec)}f", *vec)
+            conn.execute(
+                "insert into embeddings_vec0(chunk_id, disabled_reason, vector, model_name, vector_dim, created_at) "
+                "values (?, ?, ?, ?, ?, ?)",
+                (chunk_id, "active", payload, _emb.MODEL_NAME, len(vec),
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            return
+    # default / fallback path — placeholder row, no vector
+    conn.execute("insert into embeddings_vec0(chunk_id) values (?)", (chunk_id,))
 
 
 def _bm25_weights() -> tuple[float, float]:

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import re
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -244,10 +247,130 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
     return {"ok": True, "db_path": db_path(root).relative_to(root).as_posix(), "indexed": indexed}
 
 
+def _bm25_weights() -> tuple[float, float]:
+    """Read FTS5 BM25 column weights from env, with safe defaults."""
+    def _read(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
+            return default
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return default
+        if val != val:  # NaN
+            return default
+        return val
+
+    return (
+        _read("AI_SEARCH_BM25_PATH_WEIGHT", 2.0),
+        _read("AI_SEARCH_BM25_CONTENT_WEIGHT", 1.0),
+    )
+
+
+def _looks_like_code_symbol(q: str) -> bool:
+    """Heuristic: does the query look like a code symbol / path / ticket?"""
+    if not isinstance(q, str) or not q.strip():
+        return False
+    if re.search(r"[a-z][A-Z]", q):
+        return True
+    if "_" in q and " " not in q.strip():
+        return True
+    if "/" in q or q.endswith((".py", ".ts", ".tsx", ".js", ".rs", ".go", ".md")):
+        return True
+    if re.match(r"^[A-Z]+-?\d+", q):
+        return True
+    return False
+
+
+def _rg_fallback_enabled() -> bool:
+    raw = os.environ.get("AI_SEARCH_RG_FALLBACK", "1")
+    return str(raw).strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[str, Any]]:
+    """Run ripgrep as an exact-match fallback. Returns [] if rg missing or fails."""
+    if not _rg_fallback_enabled():
+        return []
+    rg_bin = shutil.which("rg")
+    if not rg_bin:
+        return []
+    q = (query_text or "").strip()
+    if not q:
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                rg_bin,
+                q,
+                str(root),
+                "--line-number",
+                "--with-filename",
+                "--smart-case",
+                "--max-count",
+                "3",
+                "--max-columns",
+                "200",
+                "--no-heading",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if not proc.stdout:
+        return []
+    results: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for idx, line in enumerate(proc.stdout.splitlines()):
+        if not line:
+            continue
+        # Format: path:lineno:content
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        raw_path, lineno_str, preview = parts[0], parts[1], parts[2]
+        try:
+            lineno = int(lineno_str)
+        except ValueError:
+            continue
+        try:
+            abs_path = Path(raw_path).resolve()
+            rel_path = abs_path.relative_to(root.resolve()).as_posix()
+        except (ValueError, OSError):
+            rel_path = raw_path
+        if rel_path in seen_paths:
+            continue
+        seen_paths.add(rel_path)
+        preview_clean = preview.strip()
+        if len(preview_clean) > SNIPPET_MAX_BYTES:
+            preview_clean = preview_clean[:SNIPPET_MAX_BYTES]
+        results.append({
+            "path": rel_path,
+            "snippet": f"L{lineno}: {preview_clean}",
+            "line": lineno,
+            "content": preview_clean,
+            "rank": -0.0001 * (idx + 1),
+            "source": "rg",
+            "provenance": {
+                "processor": "ripgrep-fallback",
+                "model_hash": None,
+                "prompt_version": None,
+                "chunker_version": "rg-1",
+                "confidence": 0.5,
+            },
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
 def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
     retriever = configured_retriever(root)
     if retriever != "bm25":
         raise RuntimeError(f"search retriever '{retriever}' is not implemented; use retriever: bm25")
+    path_weight, content_weight = _bm25_weights()
     with connect(root) as conn:
         init_schema(conn)
         rows = conn.execute(
@@ -258,28 +381,47 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
             join chunks c on c.id = chunks_fts.rowid
             join provenance p on p.path = c.path
             where chunks_fts match ?
-            order by rank
+            order by bm25(chunks_fts, ?, ?)
             limit ?
             """,
-            (escape_fts_query(text), limit),
+            (escape_fts_query(text), path_weight, content_weight, limit),
         ).fetchall()
+    fts_results = [
+        {
+            "path": row["path"],
+            "snippet": snippet_from_file(root, row["path"], text, fallback=row["summary"], expected_sha=row["sha256"]),
+            "provenance": {
+                "processor": row["processor"],
+                "model_hash": row["model_hash"],
+                "prompt_version": row["prompt_version"],
+                "chunker_version": row["chunker_version"],
+                "confidence": row["confidence"],
+            },
+        }
+        for row in rows
+    ]
+    fallback_used = False
+    if _rg_fallback_enabled() and (not fts_results or _looks_like_code_symbol(text)):
+        rg_hits = _rg_fallback(root, text, limit=limit)
+        if rg_hits:
+            existing_paths = {item["path"] for item in fts_results}
+            for hit in rg_hits:
+                if hit["path"] in existing_paths:
+                    continue
+                fts_results.append({
+                    "path": hit["path"],
+                    "snippet": hit["snippet"],
+                    "provenance": hit["provenance"],
+                })
+                existing_paths.add(hit["path"])
+                if len(fts_results) >= limit:
+                    break
+            fallback_used = True
     return {
         "ok": True,
         "query": text,
-        "results": [
-            {
-                "path": row["path"],
-                "snippet": snippet_from_file(root, row["path"], text, fallback=row["summary"], expected_sha=row["sha256"]),
-                "provenance": {
-                    "processor": row["processor"],
-                    "model_hash": row["model_hash"],
-                    "prompt_version": row["prompt_version"],
-                    "chunker_version": row["chunker_version"],
-                    "confidence": row["confidence"],
-                },
-            }
-            for row in rows
-        ],
+        "results": fts_results[:limit],
+        "rg_fallback": fallback_used,
     }
 
 

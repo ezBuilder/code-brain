@@ -1413,18 +1413,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
         sections.append("Session-current tail:\n" + session_tail)
-    try:
-        from .config import load_config
-        from .remote_memory import cache_path
-
-        config = load_config(root)
-        remote = config.get("remote_memory", {}) if isinstance(config.get("remote_memory"), dict) else {}
-        if hook_name == "SessionStart" and bool(remote.get("inject_on_session_start", False)):
-            cached = _read_text_tail(cache_path(root), 12)
-            if cached:
-                sections.append("Remote memory cached summary (no network in hook):\n" + cached)
-    except Exception:
-        pass
+    # T37 — cloudflare remote_memory removed (.ai/ git sync handles cross-device).
     composed = "\n\n".join(sections)
     max_bytes = _max_injection_bytes_for(hook_name)
     if len(composed.encode("utf-8")) > max_bytes:

@@ -8,7 +8,7 @@ features:
   embeddings: false
   remote_llm: false
   external_notifications: false
-  remote_memory: true
+  remote_memory: false
 remote_memory:
   provider: cloudflare
   inject_on_session_start: false

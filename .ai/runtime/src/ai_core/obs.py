@@ -289,9 +289,15 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
     """Cumulative recommendation surfacing KPIs from audit log + cache freshness."""
     import json as _json
     import time
+    from datetime import datetime, timedelta, timezone
 
     audit_file = root / ".ai" / "memory" / "audit" / "2026.jsonl"
     counts = {"surfaced": 0, "accepted": 0, "rejected": 0}
+    now_dt = datetime.now(timezone.utc)
+    stale_cutoff = now_dt - timedelta(days=7)
+    acted_ids: set[str] = set()
+    surfaced_records: list[tuple[datetime, str]] = []
+    last_act_dt: datetime | None = None
     if audit_file.exists():
         try:
             for line in audit_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -306,12 +312,33 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
                 if not act.startswith(("skill.", "agent.", "precall.")):
                     continue
                 tail = act.split(".", 1)[1]
+                pid = (rec.get("payload") or {}).get("id") if isinstance(rec.get("payload"), dict) else None
+                ts_raw = str(rec.get("ts") or "")
+                parsed_ts: datetime | None = None
+                if ts_raw:
+                    try:
+                        parsed_ts = (
+                            datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
+                            if ts_raw.endswith("Z") else datetime.fromisoformat(ts_raw)
+                        )
+                    except ValueError:
+                        parsed_ts = None
                 if tail == "recommend_pending":
                     counts["surfaced"] += 1
+                    if parsed_ts is not None and isinstance(pid, str):
+                        surfaced_records.append((parsed_ts, pid))
                 elif tail.startswith("accept"):
                     counts["accepted"] += 1
+                    if isinstance(pid, str):
+                        acted_ids.add(pid)
+                    if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
+                        last_act_dt = parsed_ts
                 elif tail == "reject":
                     counts["rejected"] += 1
+                    if isinstance(pid, str):
+                        acted_ids.add(pid)
+                    if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
+                        last_act_dt = parsed_ts
         except OSError:
             pass
     total_acted = counts["accepted"] + counts["rejected"]
@@ -326,12 +353,31 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
                 caches[name] = None
         else:
             caches[name] = None
+    # adaptive_bump: current min_signal raise above base 3
+    try:
+        from .hooks import _adaptive_min_signal_from_satisfaction
+        adaptive_bump = _adaptive_min_signal_from_satisfaction(root, 3) - 3
+    except Exception:
+        adaptive_bump = 0
+    # last_act_age_seconds: seconds since most recent accept|reject; None if none
+    if last_act_dt is None:
+        last_act_age_seconds: int | None = None
+    else:
+        last_act_age_seconds = max(0, int((now_dt - last_act_dt).total_seconds()))
+    # stale_count_7d: surfaced candidates never acted on AND surfaced >7d ago
+    stale_count_7d = 0
+    for ts, pid in surfaced_records:
+        if pid not in acted_ids and ts < stale_cutoff:
+            stale_count_7d += 1
     return {
         "surfaced_lifetime": counts["surfaced"],
         "accepted": counts["accepted"],
         "rejected": counts["rejected"],
         "accept_ratio": accept_ratio,
         "cache_age_seconds": caches,
+        "adaptive_bump": adaptive_bump,
+        "last_act_age_seconds": last_act_age_seconds,
+        "stale_count_7d": stale_count_7d,
     }
 
 

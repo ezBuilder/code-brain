@@ -299,6 +299,11 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
             # codegraph re-insert below picks up the new chunk_id.
             if existing_pair is not None:
                 _delete_chunk_rows_keep_fts(conn, existing_pair[0])
+                # summaries/provenance/codegraph have path-keyed UNIQUE rows; clear them too
+                conn.execute("delete from summaries where path = ?", (rel,))
+                conn.execute("delete from provenance where path = ?", (rel,))
+                conn.execute("delete from code_symbols where path = ?", (rel,))
+                conn.execute("delete from code_calls where path = ?", (rel,))
             summary = summarize(redacted)
             cursor = conn.execute(
                 "insert into chunks(path, sha256, summary) values (?, ?, ?)",

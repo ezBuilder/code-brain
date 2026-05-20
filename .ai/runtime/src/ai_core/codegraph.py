@@ -161,7 +161,7 @@ def query_callers(root: Path, qualname: str, *, limit: int = 20) -> dict:
     with connect(root) as conn:
         init_schema(conn)
         rows = conn.execute(
-            "select path, caller, callee, lineno from code_calls "
+            "select path, caller, callee, lineno, lang from code_calls "
             "where callee = ? order by path, lineno limit ?",
             (qualname, limit),
         ).fetchall()
@@ -180,7 +180,7 @@ def query_callees(root: Path, qualname: str, *, limit: int = 20) -> dict:
     with connect(root) as conn:
         init_schema(conn)
         rows = conn.execute(
-            "select path, caller, callee, lineno from code_calls "
+            "select path, caller, callee, lineno, lang from code_calls "
             "where caller = ? order by lineno limit ?",
             (qualname, limit),
         ).fetchall()
@@ -200,7 +200,7 @@ def find_symbol(root: Path, name: str, *, limit: int = 20) -> dict:
     with connect(root) as conn:
         init_schema(conn)
         rows = conn.execute(
-            "select path, qualname, kind, lineno, end_lineno, parent from code_symbols "
+            "select path, qualname, kind, lineno, end_lineno, parent, lang from code_symbols "
             "where qualname like ? order by length(qualname), path, lineno limit ?",
             (pat, limit),
         ).fetchall()

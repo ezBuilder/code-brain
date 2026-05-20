@@ -142,3 +142,72 @@ def test_add_lesson_rejects_blank_required_fields(tmp_path: Path) -> None:
 
     assert payload == {"ok": False, "reason": "missing_required_field"}
     assert not (repo / ".ai" / "memory" / "lessons.jsonl").exists()
+
+
+def test_append_lesson_from_eval_fail_appends_jsonl(tmp_path: Path) -> None:
+    from ai_core.lessons import append_lesson, lessons_path
+
+    repo = make_repo(tmp_path)
+    secret = "sk-" + "x" * 20
+
+    payload = append_lesson(
+        repo,
+        kind="swe",
+        command=f"pytest test.py --token {secret}",
+        outcome="error",
+        details="duration_ms=1234",
+    )
+
+    assert payload["ok"] is True
+    record = payload["record"]
+    assert record["source"] == "eval_fail"
+    assert record["kind"] == "swe"
+    assert record["command"].startswith("pytest test.py --token")
+    assert "[REDACTED]" in record["command"]  # Secret should be redacted
+    assert secret not in record["command"]
+    assert record["outcome"] == "error"
+    assert record["details"] == "duration_ms=1234"
+    assert record["ts"].endswith("Z")
+
+    # Verify jsonl was appended
+    lines = lessons_path(repo).read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == record
+
+
+def test_append_lesson_rejects_blank_required_fields(tmp_path: Path) -> None:
+    from ai_core.lessons import append_lesson, lessons_path
+
+    repo = make_repo(tmp_path)
+
+    # Test blank kind
+    result = append_lesson(repo, kind="", command="cmd", outcome="fail")
+    assert result == {"ok": False, "reason": "missing_required_field"}
+
+    # Test blank command
+    result = append_lesson(repo, kind="swe", command="", outcome="fail")
+    assert result == {"ok": False, "reason": "missing_required_field"}
+
+    # Test blank outcome
+    result = append_lesson(repo, kind="swe", command="cmd", outcome="")
+    assert result == {"ok": False, "reason": "missing_required_field"}
+
+    # Verify nothing was appended
+    assert not lessons_path(repo).exists()
+
+
+def test_append_lesson_silent_fail_on_io_error(tmp_path: Path) -> None:
+    from ai_core.lessons import append_lesson
+
+    repo = make_repo(tmp_path)
+    lessons_dir = repo / ".ai" / "memory"
+
+    # Make the directory read-only to trigger an append failure
+    lessons_dir.chmod(0o444)
+    try:
+        result = append_lesson(repo, kind="swe", command="cmd", outcome="fail")
+        # Silent fail: should return ok=False but not raise
+        assert result["ok"] is False
+    finally:
+        # Clean up: restore permissions
+        lessons_dir.chmod(0o755)

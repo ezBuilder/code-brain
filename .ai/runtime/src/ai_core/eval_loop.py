@@ -73,6 +73,21 @@ def record_case(
         path.chmod(0o600)
     except OSError:
         pass
+
+    # Signal failure to lessons (separate try/except; must not block record_case)
+    if not _is_pass(redacted.get("outcome", "")):
+        try:
+            from . import lessons as lessons_module
+            lessons_module.append_lesson(
+                root,
+                kind=redacted["kind"],
+                command=redacted["command"],
+                outcome=redacted["outcome"],
+                details=f"duration_ms={redacted.get('duration_ms', 0)}",
+            )
+        except (OSError, ValueError, json.JSONDecodeError, Exception):
+            pass  # Silent fail: record_case always succeeds
+
     return {"ok": True, "case": redacted, "path": str(path)}
 
 

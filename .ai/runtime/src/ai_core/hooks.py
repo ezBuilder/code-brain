@@ -134,6 +134,110 @@ def _spawn_background_rebuild(root: Path) -> None:
         pass
 
 
+def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
+    """Spawn background idle-time jobs (memory page-out, audit fold, index refresh).
+
+    Fire-and-forget detached subprocess. Uses lock file (.ai/cache/sleep-time.lock)
+    to prevent duplicate spawns within 600 seconds. Opt-out via AI_SLEEP_TIME=0/off.
+
+    Returns:
+      {"ok": bool, "spawned": [...], "skipped": bool, "reason": str | None}
+
+    Errors are silently swallowed — hook response never fails.
+    """
+    import os
+    import subprocess
+
+    # Opt-out check
+    if _env_disabled("AI_SLEEP_TIME", default="1"):
+        return {"ok": True, "spawned": [], "skipped": True, "reason": "AI_SLEEP_TIME disabled"}
+
+    # Lock-based dedup (600s cooldown)
+    lock_path = root / ".ai" / "cache" / "sleep-time.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.exists():
+            age = time.time() - lock_path.stat().st_mtime
+            if age < 600:
+                return {"ok": True, "spawned": [], "skipped": True, "reason": "lock_recent"}
+    except OSError:
+        pass
+
+    # Update lock
+    try:
+        lock_path.write_text("running", encoding="utf-8")
+    except OSError:
+        pass
+
+    # Resolve ai binary
+    from .portable import IS_WINDOWS, detached_popen_kwargs
+
+    ai_bin_unix = root / ".ai" / "bin" / "ai"
+    ai_bin_ps = root / ".ai" / "bin" / "ai.ps1"
+
+    spawned: list[str] = []
+
+    # Job 1: memory page-out (includes audit fold per T1)
+    try:
+        from .process_janitor import cleanup_children, register_child
+
+        cleanup_children(root)
+        if IS_WINDOWS and ai_bin_ps.exists():
+            cmd = ["powershell", "-NoProfile", "-File", str(ai_bin_ps), "memory", "page-out", "--json"]
+        elif ai_bin_unix.exists():
+            cmd = [str(ai_bin_unix), "memory", "page-out", "--json"]
+        else:
+            return {"ok": False, "spawned": spawned, "skipped": False, "reason": "ai_bin_not_found"}
+
+        with open(os.devnull, "wb") as devnull:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=devnull,
+                stderr=devnull,
+                stdin=subprocess.DEVNULL,
+                cwd=str(root),
+                **detached_popen_kwargs(),
+            )
+        register_child(root, pid=proc.pid, kind="sleep_time_page_out", command=cmd)
+        spawned.append(f"page_out(pid={proc.pid})")
+    except Exception:
+        pass
+
+    # Job 2: index rebuild (optional, only if not just done in Stop handler)
+    try:
+        from .process_janitor import register_child
+
+        if IS_WINDOWS and ai_bin_ps.exists():
+            cmd = [
+                "powershell", "-NoProfile", "-File", str(ai_bin_ps),
+                "index", "rebuild", "--single-flight", "--incremental", "--json"
+            ]
+        elif ai_bin_unix.exists():
+            cmd = [
+                str(ai_bin_unix),
+                "index", "rebuild", "--single-flight", "--incremental", "--json"
+            ]
+        else:
+            pass  # skip if no binary
+
+        if ai_bin_unix.exists() or (IS_WINDOWS and ai_bin_ps.exists()):
+            with open(os.devnull, "wb") as devnull:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=devnull,
+                    stderr=devnull,
+                    stdin=subprocess.DEVNULL,
+                    cwd=str(root),
+                    **detached_popen_kwargs(),
+                )
+            register_child(root, pid=proc.pid, kind="sleep_time_index_rebuild", command=cmd)
+            spawned.append(f"index_rebuild(pid={proc.pid})")
+    except Exception:
+        pass
+
+    return {"ok": True, "spawned": spawned, "skipped": False, "reason": None}
+
+
 def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
     """Return candidate IDs whose recommend_pending audit event landed within cooldown_hours.
 
@@ -1151,6 +1255,12 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             _handle_lifecycle_event(root, effective_hook, payload)
         except Exception:
             pass
+        # T6: spawn sleep-time idle jobs after SessionEnd/Stop (memory page-out, audit fold, index refresh)
+        if effective_hook in {"Stop", "SessionEnd"}:
+            try:
+                _spawn_sleep_time_jobs(root)
+            except Exception:
+                pass
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     target_ms = _target_ms_for(effective_hook)
     if persisted and elapsed_ms > target_ms:

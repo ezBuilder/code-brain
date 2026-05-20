@@ -191,8 +191,17 @@ def check_index_freshness(root: Path) -> Check:
             rows = conn.execute("select path, sha256 from chunks order by path").fetchall()
     except sqlite3.Error as exc:
         return Check("index_freshness", False, f"index unreadable: {exc}")
+    seen: set[str] = set()
     for row in rows:
         rel_path = str(row["path"])
+        # Function-level chunks store "<file>:<qualname>"; file-level chunks
+        # cover freshness for the whole file. Skip the per-function rows so
+        # they don't appear as missing file paths.
+        if ":" in rel_path:
+            continue
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
         path = root / rel_path
         try:
             content = path.read_text(encoding="utf-8")

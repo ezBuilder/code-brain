@@ -74,3 +74,24 @@ def test_uninstall_safe_when_absent(tmp_path):
     result = emb.uninstall_model(tmp_path)
     assert result["ok"] is True
     assert result["removed"] is False
+
+
+def test_runtime_cache_has_bounded_cap():
+    """ONNX session cache must be bounded — prevents per-root memory leak."""
+    assert isinstance(emb._RUNTIME_CACHE_CAP, int)
+    assert emb._RUNTIME_CACHE_CAP >= 1
+
+
+def test_runtime_cache_lru_evicts_oldest():
+    """Filling past cap evicts oldest entries (LRU); newest survive."""
+    emb.reset_runtime_cache()
+    cap = emb._RUNTIME_CACHE_CAP
+    sentinel = ("sess", "tok")
+    for i in range(cap + 2):
+        emb._RUNTIME_CACHE[f"/fake/root-{i}"] = sentinel
+        emb._evict_to_cap()
+    assert len(emb._RUNTIME_CACHE) == cap
+    assert "/fake/root-0" not in emb._RUNTIME_CACHE
+    assert "/fake/root-1" not in emb._RUNTIME_CACHE
+    assert f"/fake/root-{cap + 1}" in emb._RUNTIME_CACHE
+    emb.reset_runtime_cache()

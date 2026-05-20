@@ -131,8 +131,19 @@ def is_model_present(root: Path) -> bool:
 
 # Process-level runtime cache so we don't re-create the ONNX session
 # (slow: ~300ms cold) or tokenizer for every query.
+#
+# Bounded LRU: each ONNX session holds ~25–80 MB. Long-running callers (MCP
+# server, test harness) can rotate across many roots; an unbounded dict would
+# leak that footprint per distinct root.
 _RUNTIME_CACHE: dict[str, Any] = {}
+_RUNTIME_CACHE_CAP = 2
 _MAX_SEQ_LEN = 256
+
+
+def _evict_to_cap() -> None:
+    """Drop oldest entries until ``_RUNTIME_CACHE`` is within capacity."""
+    while len(_RUNTIME_CACHE) > _RUNTIME_CACHE_CAP:
+        _RUNTIME_CACHE.pop(next(iter(_RUNTIME_CACHE)), None)
 
 
 def _get_runtime(root: Path):
@@ -144,6 +155,7 @@ def _get_runtime(root: Path):
     cache = model_cache_dir(root)
     key = str(cache)
     if key in _RUNTIME_CACHE:
+        _RUNTIME_CACHE[key] = _RUNTIME_CACHE.pop(key)  # LRU touch
         return _RUNTIME_CACHE[key]
     if not is_model_present(root):
         return None
@@ -163,6 +175,7 @@ def _get_runtime(root: Path):
     except Exception:
         return None
     _RUNTIME_CACHE[key] = (sess, tok)
+    _evict_to_cap()
     return _RUNTIME_CACHE[key]
 
 

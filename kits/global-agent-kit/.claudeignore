@@ -1,0 +1,14 @@
+.git/
+node_modules/
+.venv/
+.next/
+.nuxt/
+dist/
+build/
+coverage/
+.cache/
+.ai/cache/
+.ai/runtime/.venv/
+*.min.js
+*.map
+.DS_Store

@@ -15,9 +15,11 @@ from ai_core.search import (  # noqa: E402
     _looks_like_code_symbol,
     _rg_fallback,
     connect,
+    context_pack,
     init_schema,
     query,
     rebuild,
+    retrieval_policy_for_query,
 )
 
 
@@ -233,6 +235,39 @@ def test_symbol_detection() -> None:
     assert _looks_like_code_symbol("hello world") is False
     # snake_case rule fires; acceptable false positive for fallback bias.
     assert _looks_like_code_symbol("just_a_word") is True
+
+
+def test_retrieval_policy_for_query_is_pure_shape_decision() -> None:
+    graph_state = {"indexed_files": 4, "symbol_count": 2, "call_edge_count": 3}
+    bm25_only_state = {"indexed_files": 4, "symbol_count": 0, "call_edge_count": 0}
+
+    assert retrieval_policy_for_query("", graph_state) == "none"
+    assert retrieval_policy_for_query("anything", {"indexed_files": 0}) == "none"
+    assert retrieval_policy_for_query("plain language search", graph_state) == "bm25"
+    assert retrieval_policy_for_query("MyClassName", graph_state) == "hybrid"
+    assert retrieval_policy_for_query("callers for helper", graph_state) == "graph"
+    assert retrieval_policy_for_query("MyClassName", bm25_only_state) == "bm25"
+
+
+def test_query_and_context_pack_expose_retrieval_policy(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _write(
+        repo,
+        "src/service.py",
+        "def MyClassName():\n    helper()\n\n"
+        "def helper():\n    return 1\n",
+    )
+    rebuild(repo)
+
+    result = query(repo, "MyClassName", limit=5)
+    assert result["ok"] is True
+    assert result["retrieval_policy"] in {"bm25", "bm25+rg"}
+    assert result["recommended_retrieval_policy"] == "hybrid"
+
+    pack = context_pack(repo, "MyClassName", limit=5)
+    assert pack["retrieval_policy"] in {"bm25", "bm25+rg"}
+    assert pack["recommended_retrieval_policy"] == "hybrid"
+    assert pack["additionalContext"]
 
 
 def test_rg_fallback_helper_returns_empty_when_disabled(tmp_path: Path, monkeypatch) -> None:

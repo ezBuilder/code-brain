@@ -343,15 +343,22 @@ def check_audit_chain(root: Path) -> Check:
 
 
 def check_hot_path_slo(root: Path) -> Check:
-    from .hooks import HOT_PATH_TARGET_MS, handle_hook
+    from .hooks import HOT_PATH_TARGET_MS, SESSION_START_TARGET_MS, handle_hook
 
     samples = []
     for _ in range(10):
         payload = handle_hook(root, "DoctorSLOBaseline", {"agent": "doctor", "dry": True})
         samples.append(int(payload["elapsed_ms"]))
     p95 = sorted(samples)[max(0, int(len(samples) * 0.95) - 1)] if samples else 0
-    ok = p95 <= HOT_PATH_TARGET_MS
-    return Check("hot_path_slo", ok, f"p95_ms={p95}, target_ms={HOT_PATH_TARGET_MS}")
+    start_payload = handle_hook(root, "SessionStart", {"agent": "doctor", "dry": True})
+    start_ms = int(start_payload["elapsed_ms"])
+    ok = p95 <= HOT_PATH_TARGET_MS and start_ms <= SESSION_START_TARGET_MS
+    return Check(
+        "hot_path_slo",
+        ok,
+        f"p95_ms={p95}, target_ms={HOT_PATH_TARGET_MS}, session_start_ms={start_ms}, "
+        f"session_start_target_ms={SESSION_START_TARGET_MS}",
+    )
 
 
 def check_secret_scan(root: Path) -> Check:

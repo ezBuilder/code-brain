@@ -62,7 +62,7 @@ def run_ai_input(
 
 def _copy_repo_ignore(src: str, names: list[str]) -> set[str]:
     rel = Path(src).resolve()
-    blocked = {".git", ".venv", ".pytest_cache", "__pycache__", "cache"}
+    blocked = {".git", ".venv", ".pytest_cache", "__pycache__", "cache", "kits"}
     if rel.name == ".claude":
         return {n for n in names if n != "commands"}
     return {n for n in names if n in blocked}
@@ -79,6 +79,12 @@ def copy_repo(tmp_path: Path) -> Path:
         ".ai/memory/audit/*.jsonl",
         ".ai/memory/events/*.jsonl",
         ".ai/memory/inbox/*.json",
+        ".ai/memory/decisions.jsonl",
+        ".ai/memory/todos.jsonl",
+        ".ai/memory/session-current.md",
+        ".ai/skills/catalog.jsonl",
+        ".ai/agents_catalog/catalog.jsonl",
+        ".ai/precall_rules/catalog.jsonl",
         ".ai/cache/logs/*.jsonl",
         ".ai/cache/diagnostics/*",
         ".ai/cache/run/queue.recovery.json",
@@ -625,7 +631,7 @@ def test_code_index_schema_v2_does_not_store_full_content(tmp_path: Path) -> Non
     with sqlite3.connect(db) as conn:
         user_version = conn.execute("pragma user_version").fetchone()[0]
         columns = [row[1] for row in conn.execute("pragma table_info(chunks)").fetchall()]
-    assert user_version == 3
+    assert user_version == 5
     assert "content" not in columns
     query_result = run_ai("code", "query", "worker", "--json", cwd=repo)
     payload = json.loads(query_result.stdout)
@@ -679,7 +685,7 @@ def test_code_index_migrates_legacy_content_schema(tmp_path: Path) -> None:
     with sqlite3.connect(db) as conn:
         columns = [row[1] for row in conn.execute("pragma table_info(chunks)").fetchall()]
         user_version = conn.execute("pragma user_version").fetchone()[0]
-    assert user_version == 3
+    assert user_version == 5
     assert "content" not in columns
     assert "summary" in columns
 
@@ -1055,7 +1061,7 @@ def test_obs_search_reports_cache_and_measured_context_bytes(tmp_path: Path) -> 
     query = payload["query"]
     assert payload["ok"] is True
     assert payload["exists"] is True
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 5
     assert payload["retriever"] == "bm25"
     assert payload["sqlite_bytes"] > 0
     assert payload["indexed_files"] > 0
@@ -2558,6 +2564,27 @@ def test_memory_todo_add_then_close(tmp_path: Path) -> None:
     assert last["close_reason"] == "done in R93"
 
 
+def test_memory_todo_close_uses_latest_status_per_id(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    todo_path = repo / ".ai" / "memory" / "todos.jsonl"
+    todo_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": "todo-stale", "title": "stale task", "status": "open"}),
+                json.dumps({"id": "todo-stale", "title": "stale task", "status": "done"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = run_ai("memory", "todo", "close", "--match", "stale task", "--json", cwd=repo)
+    assert result.returncode != 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["reason"] == "no_match"
+
+
 def test_memory_session_append_writes_markdown(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     init_package_repo(repo)
@@ -3095,6 +3122,18 @@ def test_user_prompt_submit_hook_includes_routing_when_memory_empty(tmp_path: Pa
     ctx = response["additionalContext"]
     assert "Search routing" in ctx
     assert "Recent decisions" not in ctx
+
+
+def test_user_prompt_submit_harness_request_injects_directive(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    payload = json.dumps({"agent": "claude", "dry": True, "prompt": "하네스 적용해서 95%까지 자율 개선해"})
+    result = run_ai_input("hook", "UserPromptSubmit", "--json", stdin=payload, cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    ctx = json.loads(result.stdout)["additionalContext"]
+    assert "Explicit harness request detected" in ctx
+    assert "Do not wait for a separate `ai harness` command" in ctx
+    assert "target=95%" in ctx
 
 
 def test_agents_md_documents_search_routing() -> None:

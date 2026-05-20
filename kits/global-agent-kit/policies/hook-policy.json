@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "hard_deny": {
+    "commands": [
+      "\\brm\\s+-rf\\s+(/|~|\\*|\\.)",
+      "\\bgit\\s+reset\\s+--hard\\b",
+      "\\bgit\\s+clean\\s+-fd\\b",
+      "\\bdropdb\\b",
+      "\\bdrop\\s+database\\b",
+      "\\bprisma\\s+migrate\\s+reset\\b",
+      "\\bsequelize\\s+db:drop\\b",
+      "\\bkubectl\\s+delete\\b",
+      "\\bterraform\\s+destroy\\b"
+    ],
+    "paths": [
+      "(^|/)\\.env($|\\.)",
+      "(^|/)secrets?/",
+      "credentials\\.json$",
+      "\\.pem$",
+      "\\.key$",
+      "id_rsa$",
+      "id_ed25519$"
+    ]
+  },
+  "approval_required": {
+    "commands": [
+      "\\bgit\\s+(commit|push|merge|rebase)\\b",
+      "\\bgh\\s+repo\\s+create\\b",
+      "\\bgh\\s+workflow\\s+run\\b",
+      "\\b(npm|pnpm|yarn)\\s+(install|add|publish)\\b",
+      "\\b(pip\\s+install|uv\\s+add)\\b"
+    ],
+    "request_keywords": [
+      "production",
+      "deploy",
+      "billing",
+      "auth",
+      "permission",
+      "delete data",
+      "database reset",
+      "secret",
+      "token",
+      "oauth"
+    ]
+  },
+  "workflow_nudges": {
+    "research_first_keywords": [
+      "latest",
+      "recent",
+      "current",
+      "recommend",
+      "library",
+      "plugin",
+      "mcp",
+      "hook",
+      "skill"
+    ],
+    "verification_keywords": [
+      "fix",
+      "bug",
+      "implement",
+      "upgrade",
+      "refactor",
+      "release"
+    ]
+  }
+}

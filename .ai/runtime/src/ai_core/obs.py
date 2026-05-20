@@ -103,6 +103,21 @@ def usage_report(root: Path, *, include_sessions: bool = False) -> dict[str, Any
     events = event_observability(root)
     claude = claude_usage_summary(root)
     codex = codex_usage_summary(root)
+    # T46: derive KPI block from raw claude summary (pre-compact) so it stays
+    # stable regardless of include_sessions. codex is left as a hook for now;
+    # codex pricing/cache semantics differ and are not folded into these KPIs.
+    claude_tokens = claude.get("tokens", {}) if isinstance(claude.get("tokens"), dict) else {}
+    cache_metrics = _cache_hit_metrics(claude_tokens)
+    claude_messages = int(claude.get("messages") or 0)
+    claude_total_tokens = int(claude.get("total_observed_tokens") or 0)
+    tokens_per_message = (
+        round(claude_total_tokens / claude_messages, 3) if claude_messages > 0 else 0
+    )
+    kpi = {
+        "claude_cache_hit_ratio": cache_metrics["cache_hit_ratio"],
+        "tokens_per_message": tokens_per_message,
+        "effective_input_tokens": cache_metrics["effective_input_tokens"],
+    }
     if not include_sessions:
         claude = _usage_totals_only(claude)
         codex = _usage_totals_only(codex)
@@ -112,11 +127,41 @@ def usage_report(root: Path, *, include_sessions: bool = False) -> dict[str, Any
             "claude": claude,
             "codex": codex,
         },
+        "kpi": kpi,
         "measured_code_brain_effect": events,
         "claims": {
             "token_usage": "actual only when sourced from agent session transcripts",
             "context_reduction": "measured in bytes only; no token-saving estimate is emitted",
         },
+    }
+
+
+def _cache_hit_metrics(tokens: dict[str, Any]) -> dict[str, Any]:
+    """Compute Claude cache-hit KPI block from a transcript ``tokens`` dict.
+
+    Returns a fixed shape regardless of input — zero denominators yield
+    ``cache_hit_ratio == 0.0`` instead of raising. ``effective_input_tokens``
+    approximates Anthropic's pricing: cache reads cost ~10% of an uncached
+    input token and cache writes cost ~1.25x. Output tokens are not included
+    here (this metric is input-side only).
+    """
+    input_tokens = int(tokens.get("input_tokens", 0) or 0)
+    cache_read = int(tokens.get("cache_read_input_tokens", 0) or 0)
+    cache_creation = int(tokens.get("cache_creation_input_tokens", 0) or 0)
+    total_input_with_cache = input_tokens + cache_read + cache_creation
+    if total_input_with_cache > 0:
+        cache_hit_ratio = round(cache_read / total_input_with_cache, 4)
+    else:
+        cache_hit_ratio = 0.0
+    effective_input_tokens = round(
+        input_tokens + cache_read * 0.1 + cache_creation * 1.25, 3
+    )
+    return {
+        "cache_hit_ratio": cache_hit_ratio,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+        "effective_input_tokens": effective_input_tokens,
+        "total_input_with_cache": total_input_with_cache,
     }
 
 
@@ -221,14 +266,19 @@ def event_observability(root: Path) -> dict[str, Any]:
 
 
 def _usage_totals_only(payload: dict[str, Any]) -> dict[str, Any]:
+    tokens = payload.get("tokens", {}) if isinstance(payload.get("tokens"), dict) else {}
     compact = {
         "ok": payload.get("ok"),
         "source": payload.get("source"),
         "sessions_scanned": payload.get("sessions_scanned", 0),
         "sessions_matched": payload.get("sessions_matched", 0),
         "messages": payload.get("messages", 0),
-        "tokens": payload.get("tokens", {}),
+        "tokens": tokens,
         "total_observed_tokens": payload.get("total_observed_tokens", 0),
+        # T46: surface claude cache-hit KPI alongside totals. Codex token dicts
+        # use different field names so its metrics will all be zero — kept for
+        # shape stability; codex-side semantics will be wired separately.
+        "cache_metrics": _cache_hit_metrics(tokens),
     }
     for key in ("user_messages", "agent_messages", "turns"):
         if key in payload:

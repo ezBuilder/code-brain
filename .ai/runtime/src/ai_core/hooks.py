@@ -20,6 +20,7 @@ from .redact import redact_value
 import os as _os
 
 HOT_PATH_TARGET_MS = 200
+SESSION_START_TARGET_MS = 1500
 INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit"}
 AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop"}
 CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart"}
@@ -61,6 +62,12 @@ def _max_injection_bytes_for(hook_name: str) -> int:
     if hook_name == "SessionStart":
         return SESSION_START_MAX_INJECTION_BYTES
     return MAX_INJECTION_BYTES
+
+
+def _target_ms_for(hook_name: str) -> int:
+    if hook_name == "SessionStart":
+        return SESSION_START_TARGET_MS
+    return HOT_PATH_TARGET_MS
 
 
 def _maybe_apply_delta(root: Path, hook_name: str, full_context: str) -> tuple[str, bool, int]:
@@ -111,8 +118,10 @@ def _spawn_background_rebuild(root: Path) -> None:
     else:
         return
     try:
+        from .process_janitor import cleanup_children, register_child
+        cleanup_children(root)
         with open(os.devnull, "wb") as devnull:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdout=devnull,
                 stderr=devnull,
@@ -120,6 +129,7 @@ def _spawn_background_rebuild(root: Path) -> None:
                 cwd=str(root),
                 **detached_popen_kwargs(),
             )
+        register_child(root, pid=proc.pid, kind="index_rebuild", command=cmd)
     except Exception:
         pass
 
@@ -172,28 +182,41 @@ def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
     return recent
 
 
-def _cooldown_score(age_hours: float, half_life_hours: float) -> float:
+def _cooldown_score(age_hours: float, half_life_hours: float, importance: float = 1.0) -> float:
     """Ebbinghaus exponential-decay cooldown weight in [0, 1].
 
-    score = 0.5 ** (age / half_life)
+    score = 0.5 ** (age / (half_life * max(importance, 0.1)))
 
     - age_hours <= 0       → 1.0 (just surfaced; full penalty)
     - half_life_hours <= 0 → 0.0 (Ebbinghaus disabled; no penalty)
+    - importance == 1.0    → legacy behaviour (bit-identical)
+    - importance > 1.0     → effective half-life is longer, decay is slower
+    - importance < 1.0     → effective half-life is shorter, decay is faster
+    - importance <= 0      → clamped to 0.1 floor to avoid division-by-zero
     """
     if half_life_hours <= 0:
         return 0.0
     if age_hours <= 0:
         return 1.0
-    return 0.5 ** (age_hours / half_life_hours)
+    effective_half_life = half_life_hours * max(importance, 0.1)
+    return 0.5 ** (age_hours / effective_half_life)
 
 
-def _cooldown_weights(root: Path, half_life_hours: float) -> dict[str, float]:
+def _cooldown_weights(
+    root: Path,
+    half_life_hours: float,
+    importance_fn: "Callable[[str], float] | None" = None,
+) -> dict[str, float]:
     """Build {candidate_id: decay_weight in [0,1]} from recommend_pending audit events.
 
     For each candidate id, use the most-recent recommend_pending ts to compute its
-    current age in hours, then map via _cooldown_score(age, half_life).
+    current age in hours, then map via _cooldown_score(age, half_life, importance).
 
     Disabled (returns empty dict) when half_life_hours <= 0.
+
+    importance_fn: optional callable(candidate_id) -> float. If None, every
+    candidate gets importance=1.0 (legacy behaviour). Returning >1.0 slows
+    decay for important candidates; <1.0 speeds it up.
     """
     if half_life_hours <= 0:
         return {}
@@ -243,7 +266,13 @@ def _cooldown_weights(root: Path, half_life_hours: float) -> dict[str, float]:
     for cid, ts in latest.items():
         age_seconds = (now - ts).total_seconds()
         age_hours = age_seconds / 3600.0
-        weights[cid] = _cooldown_score(age_hours, half_life_hours)
+        importance = 1.0
+        if importance_fn is not None:
+            try:
+                importance = float(importance_fn(cid))
+            except Exception:
+                importance = 1.0
+        weights[cid] = _cooldown_score(age_hours, half_life_hours, importance)
     return weights
 
 
@@ -313,6 +342,21 @@ def _candidate_raw_strength(cand: dict[str, Any]) -> int:
         return int(first.split(":", 1)[1])
     except ValueError:
         return 0
+
+
+def _importance_from_strength(raw_strength: int) -> float:
+    """Map raw signal count to a half-life multiplier in [1.0, ~2.75].
+
+    FSFM/YourMemory: strongly-evidenced candidates persist longer in cooldown so
+    one-off weak signals are re-surfaced faster than repeatedly-seen patterns.
+    raw=0 → 1.0, raw=1 → ~1.25, raw=8 → ~1.79, raw=64 → ~2.5.
+    Capped so a single hot candidate cannot dominate the queue forever.
+    """
+    import math
+
+    if raw_strength <= 0:
+        return 1.0
+    return min(2.75, 1.0 + math.log2(1 + raw_strength) / 4.0)
 
 
 def _candidate_summary_line(cand: dict[str, Any], label_field: str, desc_field: str | tuple[str, ...]) -> str:
@@ -439,6 +483,29 @@ def _recommendation_section(
     candidates = result.get("candidates") if isinstance(result, dict) else []
     if not isinstance(candidates, list) or not candidates:
         return ""
+    # T43: candidate-level importance signal. Explicit `"importance"` key wins;
+    # otherwise fall back to raw evidence strength so frequently-evidenced
+    # candidates decay slower (FSFM/YourMemory).
+    def _cand_importance(cid_lookup: str) -> float:
+        for c in candidates:
+            if not isinstance(c, dict) or str(c.get("id") or "") != cid_lookup:
+                continue
+            raw = c.get("importance")
+            if raw is not None:
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    pass
+            return _importance_from_strength(_candidate_raw_strength(c))
+        return 1.0
+
+    if cooldown_weights and env_half_life > 0:
+        # Re-compute weights using the per-candidate importance hook. The
+        # earlier call (above) without importance_fn used legacy weights;
+        # we replace it here once we know which candidates the recommender
+        # returned. Safe no-op when no candidate sets `"importance"`.
+        cooldown_weights = _cooldown_weights(root, half_life, _cand_importance)
+
     fresh: list[dict[str, Any]] = []
     for cand in candidates:
         if not isinstance(cand, dict):
@@ -470,6 +537,46 @@ def _recommendation_section(
 
 
 _RECOMMEND_CACHE_TTL_SECONDS = 300
+
+
+def _audit_dependency_paths(root: Path) -> list[Path]:
+    """Files whose mtimes should invalidate hot recommendation caches."""
+    paths = [
+        root / ".ai" / "memory" / "audit-index.jsonl",
+        audit_path(root),
+    ]
+    paths.extend(all_audit_files(root))
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _codex_global_memory_path() -> Path:
+    return Path("~/.codex/memories/raw_memories.md").expanduser()
+
+
+def _recommend_memory_deps(
+    root: Path,
+    *,
+    include_todos: bool = False,
+    include_codex_global: bool = False,
+) -> list[Path]:
+    deps = [
+        root / ".ai" / "memory" / "decisions.jsonl",
+        root / ".ai" / "memory" / "session-current.md",
+    ]
+    if include_todos:
+        deps.append(root / ".ai" / "memory" / "todos.jsonl")
+    if include_codex_global:
+        deps.append(_codex_global_memory_path())
+    deps.extend(_audit_dependency_paths(root))
+    return deps
 
 
 def _cached_recommend_invoke(
@@ -527,11 +634,8 @@ def _skill_recommendation_context(root: Path, hook_name: str, payload: dict[str,
         # include_global hardcoded True in compute() above; cache_key safe with only persist.
         deps = [
             r / ".ai" / "skills" / "catalog.jsonl",
-            r / ".ai" / "memory" / "decisions.jsonl",
-            audit_path(r),
-            r / ".ai" / "memory" / "session-current.md",
-            Path("~/.codex/memories/raw_memories.md").expanduser(),
         ]
+        deps.extend(_recommend_memory_deps(r, include_todos=True, include_codex_global=True))
         return _cached_recommend_invoke(
             r,
             cache_name="skill_hot",
@@ -652,10 +756,8 @@ def _agent_recommendation_context(root: Path, hook_name: str, payload: dict[str,
 
         deps = [
             r / ".ai" / "agents_catalog" / "catalog.jsonl",
-            r / ".ai" / "memory" / "decisions.jsonl",
-            audit_path(r),
-            r / ".ai" / "memory" / "session-current.md",
         ]
+        deps.extend(_recommend_memory_deps(r, include_todos=False, include_codex_global=True))
         return _cached_recommend_invoke(
             r,
             cache_name="agent_hot",
@@ -688,9 +790,8 @@ def _precall_recommendation_context(root: Path, hook_name: str, payload: dict[st
         deps = [
             r / ".ai" / "memory" / "events" / "events.jsonl",
             r / ".ai" / "memory" / "precall_catalog" / "catalog.jsonl",
-            audit_path(r),
-            r / ".ai" / "memory" / "session-current.md",
         ]
+        deps.extend(_recommend_memory_deps(r, include_todos=False, include_codex_global=False))
         return _cached_recommend_invoke(
             r,
             cache_name="precall_hot",
@@ -921,6 +1022,12 @@ def read_payload(stdin: str | None = None) -> dict[str, Any]:
 def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> dict[str, Any]:
     start = time.perf_counter()
     effective_hook = hook_name or payload.get("hook") or payload.get("event") or "unknown"
+    if effective_hook in {"SessionStart", "Stop", "SubagentStop"} and not (is_ci() or payload.get("dry") is True):
+        try:
+            from .process_janitor import cleanup_children
+            cleanup_children(root)
+        except Exception:
+            pass
 
     precall_decision: dict[str, Any] | None = None
     if effective_hook == "PreToolUse":
@@ -1032,11 +1139,10 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                         )
                 except Exception:
                     pass
-            # T36 autonomous accept (default ON per user mandate "초기값은 모든
-            # 기능 활성화"). Opt out via AI_AUTONOMOUS_ACCEPT=0. Picks at most
-            # one strong-signal candidate per Stop and seeds the accept_ratio
-            # KPI that otherwise stays None forever.
-            if not _env_disabled("AI_AUTONOMOUS_ACCEPT"):
+            # T36 autonomous accept is write-class and therefore opt-in only.
+            # Default automation still surfaces candidates; it does not install
+            # commands unless the operator explicitly sets AI_AUTONOMOUS_ACCEPT=1.
+            if _env_enabled("AI_AUTONOMOUS_ACCEPT", default="0"):
                 try:
                     _try_autonomous_accept(root, effective_hook)
                 except Exception:
@@ -1046,7 +1152,8 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         except Exception:
             pass
     elapsed_ms = int((time.perf_counter() - start) * 1000)
-    if persisted and elapsed_ms > HOT_PATH_TARGET_MS:
+    target_ms = _target_ms_for(effective_hook)
+    if persisted and elapsed_ms > target_ms:
         try:
             from .memory import append_audit
 
@@ -1054,7 +1161,7 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                 root,
                 action="hook.slow",
                 category="hook",
-                payload={"hook": effective_hook, "elapsed_ms": elapsed_ms, "target_ms": HOT_PATH_TARGET_MS},
+                payload={"hook": effective_hook, "elapsed_ms": elapsed_ms, "target_ms": target_ms},
             )
         except Exception:
             pass
@@ -1064,7 +1171,7 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         "mode": mode,
         "persisted": persisted,
         "elapsed_ms": elapsed_ms,
-        "target_ms": HOT_PATH_TARGET_MS,
+        "target_ms": target_ms,
         "additional_context_bytes": additional_context_bytes,
     }
     if effective_hook in CONTEXT_INJECTION_HOOKS:
@@ -1108,6 +1215,24 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     "Code Brain stores full output in .ai/cache/sandbox/<exec_id>.txt and returns a short summary "
                     "(first 30 + last 5 lines, total under 4 KB) to keep your context window small."
                 )
+    # T44: PostToolUse `updatedToolOutput` — Claude Code 2026 spec field. When a
+    # tool's stdout contains secrets (or long matches), we redact and surface
+    # the cleaned version via hookSpecificOutput.updatedToolOutput so the model
+    # never sees the raw secret. Opt out with AI_HOOK_REDACT_TOOL_OUTPUT=0.
+    if effective_hook == "PostToolUse" and not _env_disabled("AI_HOOK_REDACT_TOOL_OUTPUT"):
+        raw_tool_output: Any = None
+        if isinstance(payload.get("tool_response"), (str, dict, list)):
+            raw_tool_output = payload.get("tool_response")
+        elif isinstance(payload.get("tool_output"), (str, dict, list)):
+            raw_tool_output = payload.get("tool_output")
+        if raw_tool_output is not None:
+            cleaned = redact_value(raw_tool_output)
+            if cleaned != raw_tool_output:
+                existing = response.get("hookSpecificOutput")
+                if not isinstance(existing, dict):
+                    existing = {"hookEventName": effective_hook}
+                existing["updatedToolOutput"] = cleaned
+                response["hookSpecificOutput"] = existing
     return redact_value(response)
 
 
@@ -1143,13 +1268,16 @@ def codex_wire_output(response: dict[str, Any]) -> dict[str, Any]:
                 "additionalContext": str(additional_context),
             }
         }
-    if hook == "PostToolUse" and additional_context:
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": str(additional_context),
-            }
-        }
+    if hook == "PostToolUse":
+        # T44: preserve `updatedToolOutput` when redact stage produced one.
+        updated_tool_output = hook_specific.get("updatedToolOutput")
+        if additional_context or updated_tool_output is not None:
+            out: dict[str, Any] = {"hookEventName": "PostToolUse"}
+            if additional_context:
+                out["additionalContext"] = str(additional_context)
+            if updated_tool_output is not None:
+                out["updatedToolOutput"] = updated_tool_output
+            return {"hookSpecificOutput": out}
     if hook == "Stop":
         return {"continue": True}
     return {}
@@ -1322,6 +1450,28 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         )
     sections.append(routing)
     if hook_name == "SessionStart":
+        try:
+            from .codebase_map import build_codebase_map
+
+            map_payload = build_codebase_map(root, max_entries=12, include_untracked=False)
+            map_context = str(map_payload.get("additionalContext") or "")
+            if map_context:
+                sections.append(map_context)
+        except Exception:
+            pass
+        try:
+            from .autonomous_harness import context_line as _harness_context_line
+            sections.append(_harness_context_line(root))
+        except Exception:
+            pass
+    if hook_name == "UserPromptSubmit":
+        try:
+            from .autonomous_harness import directive as _harness_directive, requested as _harness_requested
+            if _harness_requested(payload):
+                sections.append(_harness_directive(root, explicit=True))
+        except Exception:
+            pass
+    elif hook_name == "SessionStart":
         try:
             from .session_resume import read_latest_snapshot
             current_sid = str(payload.get("session_id") or payload.get("sid") or "")

@@ -77,8 +77,22 @@ def _decisions_tail(root: Path) -> list[dict[str, Any]]:
 
 def _todos_open(root: Path) -> list[dict[str, Any]]:
     entries = _read_jsonl(root / ".ai" / "memory" / "todos.jsonl")
-    open_items: list[dict[str, Any]] = []
+    latest: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for item in entries:
+        eid = str(item.get("id") or "")
+        if not eid:
+            title = str(item.get("title") or item.get("text") or item.get("summary") or "").strip()
+            if title:
+                eid = f"legacy:{title}"
+        if not eid:
+            continue
+        if eid not in latest:
+            order.append(eid)
+        latest[eid] = item
+    open_items: list[dict[str, Any]] = []
+    for eid in order:
+        item = latest[eid]
         status = str(item.get("status", "")).strip().lower()
         if status in _DONE_STATUSES:
             continue

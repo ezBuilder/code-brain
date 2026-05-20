@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
 from ai_core.recommend import (  # noqa: E402
     Candidate,
+    CatalogEntry,
     accept,
     catalog_path,
     cluster_candidates,
@@ -34,6 +35,7 @@ from ai_core.memory import (  # noqa: E402
     decisions_path,
     todos_path,
 )
+from ai_core.hooks import handle_hook  # noqa: E402
 
 
 @pytest.fixture
@@ -79,6 +81,27 @@ def test_danger_match_detects_injection():
     assert _danger_match("normal body with regular text") is None
 
 
+def test_stop_hook_does_not_auto_accept_skills_by_default(tmp_root: Path, monkeypatch):
+    monkeypatch.delenv("AI_AUTONOMOUS_ACCEPT", raising=False)
+    entry = CatalogEntry(
+        id="sk-autotest",
+        slug="auto-test",
+        status="pending",
+        draft={"description": "Auto test", "body": "Run the safe workflow."},
+        evidence={"signals": ["decisions:99"]},
+        created_at="2026-05-20T00:00:00Z",
+        installed_paths=[],
+        body_sha256="",
+    )
+    append_jsonl(catalog_path(tmp_root), entry.to_record())
+
+    payload = handle_hook(tmp_root, "Stop", {"agent": "codex"})
+
+    assert payload["ok"] is True
+    assert not (tmp_root / ".claude" / "commands" / "auto-test.md").exists()
+    assert list_catalog(tmp_root)[0].status == "pending"
+
+
 def test_gather_signals_reads_decisions(tmp_root: Path):
     _seed_decisions(tmp_root, "infra", 5)
     sig = gather_signals(tmp_root, include_global=False)
@@ -113,6 +136,46 @@ def test_recommend_preview_can_skip_persist(tmp_root: Path):
     assert out["ok"]
     assert len(out["candidates"]) >= 1
     assert list_catalog(tmp_root) == []
+
+
+def test_recommend_suppresses_pending_same_slug_when_slug_installed(tmp_root: Path, monkeypatch: pytest.MonkeyPatch):
+    """A newer pending id must not resurface once the same slug is installed."""
+    installed = CatalogEntry(
+        id="sk-installed",
+        slug="ai-runbook",
+        status="installed",
+        draft={"description": "installed", "body": "body"},
+        evidence={},
+        created_at="2026-05-20T00:00:00Z",
+        installed_paths=[".claude/commands/ai-runbook.md"],
+        body_sha256="sha",
+    )
+    stale_pending = CatalogEntry(
+        id="sk-stale",
+        slug="ai-runbook",
+        status="pending",
+        draft={"description": "stale", "body": "old body"},
+        evidence={},
+        created_at="2026-05-20T00:00:01Z",
+        installed_paths=[],
+        body_sha256="old",
+    )
+    append_jsonl(catalog_path(tmp_root), installed.to_record())
+    append_jsonl(catalog_path(tmp_root), stale_pending.to_record())
+    candidate = Candidate(
+        id="sk-new",
+        slug="ai-runbook",
+        description="new",
+        body="new body",
+        evidence={"signals": ["bash_heads:99"]},
+    )
+    monkeypatch.setattr("ai_core.recommend.gather_signals", lambda *args, **kwargs: object())
+    monkeypatch.setattr("ai_core.recommend._adaptive_min_signal", lambda _signals, requested: requested)
+    monkeypatch.setattr("ai_core.recommend.cluster_candidates", lambda *args, **kwargs: [candidate])
+
+    out = recommend(tmp_root, include_global=False, min_signal=3)
+    assert out["ok"] is True
+    assert out["candidates"] == []
 
 
 def test_recommend_dedupes_after_reject(tmp_root: Path):
@@ -708,6 +771,69 @@ def test_cooldown_decay_score():
     assert _cooldown_score(100, -5) == 0.0
     # age <= 0 → full weight
     assert _cooldown_score(-1, 12) == 1.0
+
+
+def test_cooldown_score_importance_scaling():
+    """Importance > 1 extends effective half-life; importance < 1 shortens it."""
+    from ai_core.hooks import _cooldown_score, _importance_from_strength
+
+    # At age == half_life, baseline (importance=1) gives 0.5.
+    base = _cooldown_score(12, 12)
+    # Higher importance decays slower → larger weight at same age.
+    high = _cooldown_score(12, 12, importance=2.0)
+    assert high > base
+    # Lower importance decays faster → smaller weight at same age.
+    low = _cooldown_score(12, 12, importance=0.5)
+    assert low < base
+    # importance == 1 is bit-identical to legacy two-arg call.
+    assert _cooldown_score(12, 12, importance=1.0) == base
+    # importance <= 0 is clamped (no division-by-zero); finite weight.
+    clamped = _cooldown_score(12, 12, importance=0.0)
+    assert 0.0 < clamped < 1.0
+
+    # _importance_from_strength: raw=0 → 1.0; grows monotonically; capped.
+    assert _importance_from_strength(0) == 1.0
+    assert _importance_from_strength(1) > 1.0
+    assert _importance_from_strength(64) > _importance_from_strength(8)
+    assert _importance_from_strength(10_000) <= 2.75
+
+
+def test_cooldown_weights_respects_importance_fn(tmp_root: Path):
+    """A higher-importance candidate retains a larger decay weight than a peer of equal age."""
+    from datetime import datetime, timedelta, timezone
+
+    from ai_core.hooks import _cooldown_weights
+
+    audit_dir = tmp_root / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    rows = []
+    for cid in ("sk-strong", "sk-weak"):
+        ts = (now - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rows.append(
+            {
+                "ts": ts,
+                "monotonic_ns": 0,
+                "action": "skill.recommend_pending",
+                "category": "memory",
+                "payload": {"id": cid},
+                "prev_sha": None,
+            }
+        )
+    year = now.year
+    (audit_dir / f"{year}.jsonl").write_text(
+        "\n".join(json.dumps(r, sort_keys=True, separators=(",", ":")) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    def importance(cid: str) -> float:
+        return 2.5 if cid == "sk-strong" else 1.0
+
+    weights = _cooldown_weights(tmp_root, half_life_hours=12, importance_fn=importance)
+    assert weights["sk-strong"] > weights["sk-weak"]
+    # Legacy call without importance_fn is unchanged.
+    legacy = _cooldown_weights(tmp_root, half_life_hours=12)
+    assert abs(legacy["sk-strong"] - legacy["sk-weak"]) < 1e-9
 
 
 def test_cooldown_score_drops_with_age(tmp_root: Path):

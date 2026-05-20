@@ -88,6 +88,22 @@ def test_write_snapshot_filters_done_todos(tmp_path: Path) -> None:
     assert open_ids == ["t5", "t7", "t10", "t11", "t12"]
 
 
+def test_write_snapshot_uses_latest_todo_status_per_id(tmp_path: Path) -> None:
+    mem = _memory(tmp_path)
+    _write_jsonl(
+        mem / "todos.jsonl",
+        [
+            {"id": "t1", "status": "open", "text": "stale open"},
+            {"id": "t1", "status": "done", "text": "closed"},
+            {"id": "t2", "status": "open", "text": "still open"},
+        ],
+    )
+    write_snapshot(tmp_path, session_id="latest-todo", agent="codex")
+    payload = _read_snapshot(tmp_path, "latest-todo")
+    open_ids = [t["id"] for t in payload["todos_open"]]
+    assert open_ids == ["t2"]
+
+
 def test_write_snapshot_includes_session_tail_last_12_lines(tmp_path: Path) -> None:
     mem = _memory(tmp_path)
     lines = [f"line-{i}" for i in range(30)]

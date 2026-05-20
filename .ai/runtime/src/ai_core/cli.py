@@ -204,6 +204,20 @@ def build_parser() -> argparse.ArgumentParser:
     memory_pageout = memory_sub.add_parser("page-out", help="rotate session + archive old sessions (T30 step B)")
     memory_pageout.add_argument("--dry-run", action="store_true")
     memory_pageout.add_argument("--json", action="store_true", dest="command_json")
+    lessons = sub.add_parser("lessons")
+    lessons_sub = lessons.add_subparsers(dest="lessons_command", required=True)
+    lessons_add = lessons_sub.add_parser("add")
+    lessons_add.add_argument("--source", default="operator")
+    lessons_add.add_argument("--failure", required=True)
+    lessons_add.add_argument("--cause", required=True)
+    lessons_add.add_argument("--fix", required=True)
+    lessons_add.add_argument("--tag", action="append", default=[])
+    lessons_add.add_argument("--json", action="store_true", dest="command_json")
+    lessons_list = lessons_sub.add_parser("list")
+    lessons_list.add_argument("--limit", type=int, default=20)
+    lessons_list.add_argument("--json", action="store_true", dest="command_json")
+    lessons_summary = lessons_sub.add_parser("summary")
+    lessons_summary.add_argument("--json", action="store_true", dest="command_json")
     audit = sub.add_parser("audit")
     audit_sub = audit.add_subparsers(dest="audit_command", required=True)
     audit_append = audit_sub.add_parser("append")
@@ -299,6 +313,19 @@ def build_parser() -> argparse.ArgumentParser:
     fed_summary = federated_sub.add_parser("summary")
     fed_summary.add_argument("--json", action="store_true", dest="command_json")
 
+    eval_parser = sub.add_parser("eval")
+    eval_sub = eval_parser.add_subparsers(dest="eval_command", required=True)
+    eval_record = eval_sub.add_parser("record")
+    eval_record.add_argument("--id", dest="case_id")
+    eval_record.add_argument("--kind", required=True)
+    eval_record.add_argument("--command", required=True, dest="eval_case_command")
+    eval_record.add_argument("--outcome", required=True)
+    eval_record.add_argument("--duration-ms", required=True, type=int, dest="duration_ms")
+    eval_record.add_argument("--json", action="store_true", dest="command_json")
+    eval_summary = eval_sub.add_parser("summary")
+    eval_summary.add_argument("--latest", type=int, default=5)
+    eval_summary.add_argument("--json", action="store_true", dest="command_json")
+
     embedding_parser = sub.add_parser("embedding", help="dense semantic-search model management (opt-in)")
     embedding_sub = embedding_parser.add_subparsers(dest="embedding_command", required=True)
     emb_status = embedding_sub.add_parser("status", help="show dense embedding readiness")
@@ -356,6 +383,9 @@ def build_parser() -> argparse.ArgumentParser:
     code_verify.add_argument("source", nargs="?", help="file path; omit to read from stdin")
     code_verify.add_argument("--stdin", action="store_true")
     code_verify.add_argument("--json", action="store_true", dest="command_json")
+    code_map = code_sub.add_parser("map", help="live top-level codebase map with local commands")
+    code_map.add_argument("--limit", type=int, default=40)
+    code_map.add_argument("--json", action="store_true", dest="command_json")
     context = sub.add_parser("context")
     context_sub = context.add_subparsers(dest="context_command", required=True)
     context_pack_parser = context_sub.add_parser("pack")
@@ -374,6 +404,22 @@ def build_parser() -> argparse.ArgumentParser:
     session_start.add_argument("--json", action="store_true", dest="command_json")
     mcp = sub.add_parser("mcp")
     mcp.add_argument("--once-json")
+    release_gate = sub.add_parser("release-gate")
+    release_gate_sub = release_gate.add_subparsers(dest="release_gate_command", required=True)
+    release_gate_summary = release_gate_sub.add_parser("summary")
+    release_gate_summary.add_argument("--json", action="store_true", dest="command_json")
+    kit = sub.add_parser("kit")
+    kit_sub = kit.add_subparsers(dest="kit_command", required=True)
+    kit_status = kit_sub.add_parser("status")
+    kit_status.add_argument("--json", action="store_true", dest="command_json")
+    kit_validate = kit_sub.add_parser("validate")
+    kit_validate.add_argument("--json", action="store_true", dest="command_json")
+    runtime = sub.add_parser("runtime")
+    runtime_sub = runtime.add_subparsers(dest="runtime_command", required=True)
+    runtime_insights = runtime_sub.add_parser("insights")
+    runtime_insights.add_argument("--json", action="store_true", dest="command_json")
+    runtime_policy = runtime_sub.add_parser("context-policy")
+    runtime_policy.add_argument("--json", action="store_true", dest="command_json")
     report = sub.add_parser("report")
     report_sub = report.add_subparsers(dest="report_command", required=True)
     report_status = report_sub.add_parser("status")
@@ -657,6 +703,22 @@ def main(argv: list[str] | None = None) -> int:
             from . import memory_tier as _mt
             emit(_mt.page_out(root, dry_run=bool(args.dry_run)), as_json=as_json)
             return OK
+        if args.command == "lessons":
+            from .lessons import add_lesson, lesson_summary, list_lessons
+
+            if args.lessons_command == "add":
+                reject_ci_write("lessons")
+                payload = add_lesson(root, source=args.source, failure=args.failure, cause=args.cause, fix=args.fix, tags=args.tag)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.lessons_command == "list":
+                payload = list_lessons(root, limit=args.limit)
+                emit(payload, as_json=as_json)
+                return OK
+            if args.lessons_command == "summary":
+                payload = lesson_summary(root)
+                emit(payload, as_json=as_json)
+                return OK
         if args.command == "audit" and args.audit_command == "append":
             reject_ci_write("audit")
             payload = append_audit(root, action=args.action, category=args.category, payload=read_payload())
@@ -762,6 +824,24 @@ def main(argv: list[str] | None = None) -> int:
             payload = cross_project_summary(root)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "eval":
+            from .eval_loop import record_case, summarize_cases
+            if args.eval_command == "record":
+                reject_ci_write("eval")
+                payload = record_case(
+                    root,
+                    case_id=args.case_id,
+                    kind=args.kind,
+                    command=args.eval_case_command,
+                    outcome=args.outcome,
+                    duration_ms=args.duration_ms,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if args.eval_command == "summary":
+                payload = summarize_cases(root, latest_limit=args.latest)
+                emit(payload, as_json=as_json)
+                return OK
         if args.command == "embedding":
             from . import embedding as emb_mod
             cmd = args.embedding_command
@@ -870,6 +950,11 @@ def main(argv: list[str] | None = None) -> int:
                 report = _av.verify_file(args.source).to_dict()
             emit(report, as_json=as_json)
             return OK if report["ok"] else GENERIC_ERROR
+        if args.command == "code" and args.code_command == "map":
+            from .codebase_map import build_codebase_map
+
+            emit(build_codebase_map(root, max_entries=args.limit), as_json=as_json)
+            return OK
         if args.command == "context" and args.context_command == "pack":
             payload = context_pack(root, args.query, limit=args.limit)
             emit(payload, as_json=as_json)
@@ -896,6 +981,32 @@ def main(argv: list[str] | None = None) -> int:
                 emit(handle_request(root, json.loads(args.once_json)), as_json=True)
                 return OK
             return serve_stdio(root)
+        if args.command == "release-gate" and args.release_gate_command == "summary":
+            from .release_gate import summary as release_gate_summary
+
+            payload = release_gate_summary(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "kit":
+            from .global_kit import status as kit_status_fn, validate as kit_validate_fn
+
+            if args.kit_command == "status":
+                payload = kit_status_fn(root)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.kit_command == "validate":
+                payload = kit_validate_fn(root)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "runtime":
+            from .agent_runtime import context_policy as runtime_context_policy, insights as runtime_insights
+
+            if args.runtime_command == "insights":
+                emit(runtime_insights(root), as_json=as_json)
+                return OK
+            if args.runtime_command == "context-policy":
+                emit(runtime_context_policy(), as_json=as_json)
+                return OK
         if args.command == "report" and args.report_command == "status":
             from .report import status_exit_ok, status_report
 

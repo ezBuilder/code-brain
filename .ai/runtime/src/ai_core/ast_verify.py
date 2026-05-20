@@ -17,6 +17,7 @@ Read-only (returns a report); never executes anything.
 from __future__ import annotations
 
 import ast
+import os
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -173,6 +174,21 @@ def verify_source(source: str, *, allow_imports: Iterable[str] | None = None) ->
                     lineno=node.lineno, col_offset=node.col_offset,
                 ))
 
+    # T47: inline secret scan pass (toggle via AI_AST_VERIFY_SECRETS=0).
+    if os.environ.get("AI_AST_VERIFY_SECRETS", "1") != "0":
+        try:
+            from .secret_scan import scan_source as _scan_secrets
+        except Exception:  # pragma: no cover — defensive
+            _scan_secrets = None  # type: ignore[assignment]
+        if _scan_secrets is not None:
+            for f in _scan_secrets(source):
+                violations.append(Violation(
+                    kind="secret",
+                    detail=f"{f.detail}:{f.kind}",
+                    lineno=f.lineno,
+                    col_offset=f.col_offset,
+                ))
+
     return Report(ok=not violations, violations=violations)
 
 
@@ -186,4 +202,37 @@ def verify_file(path) -> Report:
         return Report(ok=False, violations=[Violation(
             kind="syntax", detail=f"unreadable: {exc}", lineno=0, col_offset=0,
         )])
-    return verify_source(source)
+    report = verify_source(source)
+
+    # T48: optional ast-grep multi-language pass on file path.
+    try:
+        from .astgrep_integration import astgrep_available, scan_path
+    except Exception:  # pragma: no cover — defensive
+        astgrep_available = None  # type: ignore[assignment]
+        scan_path = None  # type: ignore[assignment]
+    if astgrep_available is not None and scan_path is not None and astgrep_available():
+        try:
+            for finding in scan_path(p):
+                if not isinstance(finding, dict):
+                    continue
+                rule_id = str(finding.get("ruleId") or finding.get("rule_id") or "ast-grep")
+                msg = str(finding.get("message") or finding.get("text") or rule_id)
+                rng = finding.get("range") or {}
+                start = rng.get("start") if isinstance(rng, dict) else None
+                lineno = 1
+                col = 0
+                if isinstance(start, dict):
+                    lineno = int(start.get("line", 0) or 0) + 1
+                    col = int(start.get("column", 0) or 0)
+                report.violations.append(Violation(
+                    kind="ast_grep",
+                    detail=f"{rule_id}: {msg}",
+                    lineno=lineno,
+                    col_offset=col,
+                ))
+            if report.violations:
+                report.ok = False
+        except Exception:  # pragma: no cover — never let optional pass break verify
+            pass
+
+    return report

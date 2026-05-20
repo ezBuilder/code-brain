@@ -499,6 +499,41 @@ def _looks_like_code_symbol(q: str) -> bool:
     return False
 
 
+def retrieval_policy_for_query(query_text: str, index_state: dict[str, Any]) -> str:
+    """Choose a lightweight retrieval policy label without performing retrieval."""
+    q = (query_text or "").strip()
+    indexed_files = int(index_state.get("indexed_files") or 0)
+    if not q or indexed_files <= 0:
+        return "none"
+
+    symbol_count = int(index_state.get("symbol_count") or 0)
+    call_edge_count = int(index_state.get("call_edge_count") or 0)
+    graph_available = symbol_count > 0 or call_edge_count > 0
+    if not graph_available:
+        return "bm25"
+
+    q_lower = q.casefold()
+    graph_intent = bool(
+        re.search(r"\b(callers?|callees?|call-?graph|symbol|definition|references?)\b", q_lower)
+    )
+    if graph_intent:
+        return "graph"
+    if _looks_like_code_symbol(q):
+        return "hybrid"
+    return "bm25"
+
+
+def _index_state_from_conn(conn: sqlite3.Connection) -> dict[str, int]:
+    row = conn.execute("select count(*) as count from chunks").fetchone()
+    sym = conn.execute("select count(*) as count from code_symbols").fetchone()
+    calls = conn.execute("select count(*) as count from code_calls").fetchone()
+    return {
+        "indexed_files": int(row["count"]),
+        "symbol_count": int(sym["count"]),
+        "call_edge_count": int(calls["count"]),
+    }
+
+
 def _rg_fallback_enabled() -> bool:
     raw = os.environ.get("AI_SEARCH_RG_FALLBACK", "1")
     return str(raw).strip().lower() not in {"0", "off", "false", "no"}
@@ -540,6 +575,7 @@ def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[s
         return []
     results: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
+    allowed_paths = {path.relative_to(root).as_posix() for path in iter_text_files(root)}
     for idx, line in enumerate(proc.stdout.splitlines()):
         if not line:
             continue
@@ -557,6 +593,8 @@ def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[s
             rel_path = abs_path.relative_to(root.resolve()).as_posix()
         except (ValueError, OSError):
             rel_path = raw_path
+        if rel_path not in allowed_paths:
+            continue
         if rel_path in seen_paths:
             continue
         seen_paths.add(rel_path)
@@ -598,6 +636,8 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
     candidate_limit = max(limit * 8, 40) if dense_active else limit
     with connect(root) as conn:
         init_schema(conn)
+        index_state = _index_state_from_conn(conn)
+        recommended_policy = retrieval_policy_for_query(text, index_state)
         rows = conn.execute(
             """
             select c.id, c.path, c.sha256, c.summary, p.processor,
@@ -704,9 +744,16 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
                 if len(fts_results) >= limit:
                     break
             fallback_used = True
+    actual_policy = "bm25"
+    if dense_used:
+        actual_policy += "+dense"
+    if fallback_used:
+        actual_policy += "+rg"
     return {
         "ok": True,
         "query": text,
+        "retrieval_policy": actual_policy,
+        "recommended_retrieval_policy": recommended_policy,
         "results": fts_results[:limit],
         "rg_fallback": fallback_used,
         "dense_rerank": dense_used,

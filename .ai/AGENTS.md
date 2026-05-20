@@ -13,6 +13,7 @@ This repository uses `.ai/` as the single repo-local source for AI agent context
 ## Search Routing (Token Cost)
 
 - **Code search/discovery (indexed)**: prefer MCP `code_query` / `context_pack` over `Bash grep`/`rg`. BM25 returns top-5 snippets (~2 KB) vs full grep dumps (50–500 KB).
+- **Large-codebase orientation**: for broad or vague tasks, use `ai code map --json` first to see top-level areas, local AGENTS/CLAUDE files, and scoped test/build commands. Start in the narrowest matching subdirectory; do not load root-wide context when a subdirectory map is enough.
 - **Shell command execution with potentially long output**: use MCP `sandbox_execute` (or CLI `ai exec run -- <cmd>`) instead of running long-output commands directly via Bash. The sandbox returns a short summary (`exec_id`, total bytes/lines, first 30 + last 5 lines) and stores the full output. Fetch specific ranges with MCP `sandbox_fetch` (`exec_id`, `line_start`, `line_end` or `grep_pattern`).
 - Use `grep`/`rg` directly only as a fallback when MCP is unavailable, when the index is known stale (`ai obs search` exits 13), or for trivial single-file grep.
 - The same routing applies inside hook `additionalContext` injection: SessionStart and UserPromptSubmit hooks remind agents of this preference and surface a prior-session resume snapshot when present.

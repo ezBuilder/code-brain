@@ -89,7 +89,7 @@ is_managed_existing_file() {
   local rel="$1"
   local manifest
   manifest="$(manifest_path)"
-  [[ -f "$manifest" ]] && python - "$manifest" "$rel" <<'PY'
+  if [[ -f "$manifest" ]] && python - "$manifest" "$rel" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -99,6 +99,11 @@ rel = sys.argv[2]
 payload = json.loads(manifest.read_text(encoding="utf-8"))
 raise SystemExit(0 if rel in payload.get("files", []) else 1)
 PY
+  then
+    return 0
+  fi
+  local target="$TARGET_ROOT/$rel"
+  [[ -f "$target" ]] && grep -q "managed-by: code-brain" "$target"
 }
 
 copy_file() {

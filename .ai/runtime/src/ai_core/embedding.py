@@ -105,13 +105,17 @@ def _maybe_spawn_background_install(root: Path) -> None:
         return
     try:
         from .portable import detached_popen_kwargs
+        from .process_janitor import cleanup_children, register_child
+        cleanup_children(root, ttl_seconds=3600)
 
         with open(os.devnull, "wb") as devnull:
-            subprocess.Popen(
-                [str(ai_bin), "embedding", "install", "--json"],
+            cmd = [str(ai_bin), "embedding", "install", "--json"]
+            proc = subprocess.Popen(
+                cmd,
                 stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
                 **detached_popen_kwargs(),
             )
+        register_child(root, pid=proc.pid, kind="embedding_install", command=cmd)
     except Exception:
         pass
 

@@ -125,8 +125,8 @@ def close_todo(
     path = todos_path(root)
     if not path.exists():
         return {"ok": False, "reason": "no_todos"}
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    candidates: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -138,13 +138,19 @@ def close_todo(
         if not isinstance(entry, dict):
             continue
         eid = str(entry.get("id") or "")
-        if eid in seen:
+        if not eid:
+            title = str(entry.get("title") or entry.get("text") or entry.get("summary") or "").strip()
+            if title:
+                eid = f"legacy:{title}"
+        if not eid:
             continue
-        seen.add(eid)
-        candidates.append(entry)
+        if eid not in candidates:
+            order.append(eid)
+        candidates[eid] = entry
     target: dict[str, Any] | None = None
     needle = match.strip().lower()
-    for entry in reversed(candidates):
+    for eid in reversed(order):
+        entry = candidates[eid]
         cur_status = str(entry.get("status") or "open").lower()
         if cur_status in {"done", "closed", "completed", "cancelled", "canceled"}:
             continue
@@ -313,7 +319,8 @@ def read_jsonl_open_todos(path: Path, limit: int) -> list[dict[str, Any]]:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return []
-    open_items: list[dict[str, Any]] = []
+    latest: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for line in lines:
         line = line.strip()
         if not line:
@@ -324,6 +331,19 @@ def read_jsonl_open_todos(path: Path, limit: int) -> list[dict[str, Any]]:
             continue
         if not isinstance(entry, dict):
             continue
+        eid = str(entry.get("id") or "")
+        if not eid:
+            title = str(entry.get("title") or entry.get("text") or entry.get("summary") or "").strip()
+            if title:
+                eid = f"legacy:{title}"
+        if not eid:
+            continue
+        if eid not in latest:
+            order.append(eid)
+        latest[eid] = entry
+    open_items: list[dict[str, Any]] = []
+    for eid in order:
+        entry = latest[eid]
         status = str(entry.get("status") or entry.get("state") or "open").lower()
         if status in {"done", "closed", "completed", "cancelled", "canceled"}:
             continue

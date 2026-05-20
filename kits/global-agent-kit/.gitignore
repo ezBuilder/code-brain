@@ -1,0 +1,8 @@
+.DS_Store
+.claude/settings.local.json
+CLAUDE.local.md
+
+# local runtime state
+.ai/cache/
+.ai/runtime/.venv/
+dist/

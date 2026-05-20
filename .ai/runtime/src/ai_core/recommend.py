@@ -230,22 +230,40 @@ def _spawn_bash_head_cache_rebuild(root: Path) -> None:
     import os
     import subprocess
     import sys
+    import time
 
     try:
         from .portable import detached_popen_kwargs
+        from .process_janitor import cleanup_children, register_child
+        cleanup_children(root)
+
+        lock_path = _bash_head_cache_path(root).with_suffix(".lock")
+        try:
+            if lock_path.exists() and time.time() - lock_path.stat().st_mtime < 600:
+                return
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            return
+        except OSError:
+            pass
 
         cmd = [
             sys.executable, "-c",
             "from ai_core.recommend import _compute_bash_heads, _write_bash_head_cache; "
             "from pathlib import Path; "
-            f"r=Path({str(root)!r}); _write_bash_head_cache(r, _compute_bash_heads(r))",
+            "import os; "
+            f"r=Path({str(root)!r}); lock=Path({str(lock_path)!r}); "
+            "\ntry:\n    _write_bash_head_cache(r, _compute_bash_heads(r))\nfinally:\n    lock.unlink(missing_ok=True)",
         ]
         env = {**os.environ, "PYTHONPATH": str(root / ".ai" / "runtime" / "src")}
         with open(os.devnull, "wb") as devnull:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd, stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
                 env=env, **detached_popen_kwargs(),
             )
+        register_child(root, pid=proc.pid, kind="bash_head_cache", command=cmd)
     except Exception:
         pass
 
@@ -1006,8 +1024,11 @@ def recommend(
         return {"ok": True, "candidates": [], "note": "signals_below_threshold"}
     existing = {e.id: e for e in list_catalog(root)}
     slug_status: dict[str, str] = {}
+    terminal_slugs: set[str] = set()
     for e in existing.values():
         slug_status[e.slug] = e.status
+        if e.status in {"rejected", "installed", "uninstalled"}:
+            terminal_slugs.add(e.slug)
     # T40: collect ALL slug-shaped identifiers already serving the user so
     # newly proposed candidates can be deduped against them, not just against
     # the local catalog. Sources:
@@ -1018,6 +1039,8 @@ def recommend(
     out: list[dict[str, Any]] = []
     for c in cands:
         if c.id in existing and existing[c.id].status not in {"pending"}:
+            continue
+        if c.slug in terminal_slugs:
             continue
         prior_slug_status = slug_status.get(c.slug)
         if prior_slug_status in {"rejected", "installed", "uninstalled"}:

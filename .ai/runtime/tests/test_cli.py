@@ -62,7 +62,7 @@ def run_ai_input(
 
 def _copy_repo_ignore(src: str, names: list[str]) -> set[str]:
     rel = Path(src).resolve()
-    blocked = {".git", ".venv", ".pytest_cache", "__pycache__", "cache"}
+    blocked = {".git", ".venv", ".pytest_cache", "__pycache__", "cache", "kits"}
     if rel.name == ".claude":
         return {n for n in names if n != "commands"}
     return {n for n in names if n in blocked}
@@ -79,6 +79,12 @@ def copy_repo(tmp_path: Path) -> Path:
         ".ai/memory/audit/*.jsonl",
         ".ai/memory/events/*.jsonl",
         ".ai/memory/inbox/*.json",
+        ".ai/memory/decisions.jsonl",
+        ".ai/memory/todos.jsonl",
+        ".ai/memory/session-current.md",
+        ".ai/skills/catalog.jsonl",
+        ".ai/agents_catalog/catalog.jsonl",
+        ".ai/precall_rules/catalog.jsonl",
         ".ai/cache/logs/*.jsonl",
         ".ai/cache/diagnostics/*",
         ".ai/cache/run/queue.recovery.json",
@@ -264,6 +270,24 @@ def test_dep_advisory_release_gate_integration_invariants() -> None:
     assert "./scripts/dep-advisory.sh >/dev/null" in release_gate
     assert "dist/dep-advisory.json" in workflow
     assert "CODE_BRAIN_DEP_ADVISORY_OFFLINE=1 ./scripts/dep-advisory.sh" in docs_check
+
+
+def test_obs_usage_compact_by_default() -> None:
+    result = run_ai("obs", "usage", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    usage = payload["actual_token_usage"]
+    assert "sessions" not in usage["claude"]
+    assert "sessions" not in usage["codex"]
+
+
+def test_obs_usage_include_sessions_opt_in() -> None:
+    result = run_ai("obs", "usage", "--include-sessions", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    usage = payload["actual_token_usage"]
+    assert "sessions" in usage["claude"]
+    assert "sessions" in usage["codex"]
 
 
 def test_uv_lock_check_release_gate_integration_invariants() -> None:
@@ -607,7 +631,7 @@ def test_code_index_schema_v2_does_not_store_full_content(tmp_path: Path) -> Non
     with sqlite3.connect(db) as conn:
         user_version = conn.execute("pragma user_version").fetchone()[0]
         columns = [row[1] for row in conn.execute("pragma table_info(chunks)").fetchall()]
-    assert user_version == 3
+    assert user_version == 5
     assert "content" not in columns
     query_result = run_ai("code", "query", "worker", "--json", cwd=repo)
     payload = json.loads(query_result.stdout)
@@ -661,7 +685,7 @@ def test_code_index_migrates_legacy_content_schema(tmp_path: Path) -> None:
     with sqlite3.connect(db) as conn:
         columns = [row[1] for row in conn.execute("pragma table_info(chunks)").fetchall()]
         user_version = conn.execute("pragma user_version").fetchone()[0]
-    assert user_version == 3
+    assert user_version == 5
     assert "content" not in columns
     assert "summary" in columns
 
@@ -1037,7 +1061,7 @@ def test_obs_search_reports_cache_and_measured_context_bytes(tmp_path: Path) -> 
     query = payload["query"]
     assert payload["ok"] is True
     assert payload["exists"] is True
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 5
     assert payload["retriever"] == "bm25"
     assert payload["sqlite_bytes"] > 0
     assert payload["indexed_files"] > 0
@@ -2540,6 +2564,27 @@ def test_memory_todo_add_then_close(tmp_path: Path) -> None:
     assert last["close_reason"] == "done in R93"
 
 
+def test_memory_todo_close_uses_latest_status_per_id(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    todo_path = repo / ".ai" / "memory" / "todos.jsonl"
+    todo_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": "todo-stale", "title": "stale task", "status": "open"}),
+                json.dumps({"id": "todo-stale", "title": "stale task", "status": "done"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = run_ai("memory", "todo", "close", "--match", "stale task", "--json", cwd=repo)
+    assert result.returncode != 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["reason"] == "no_match"
+
+
 def test_memory_session_append_writes_markdown(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     init_package_repo(repo)
@@ -2679,8 +2724,8 @@ def test_event_observability_breaks_down_hook_and_mcp(tmp_path: Path) -> None:
         {"timestamp": "2026-05-08T00:00:03Z", "kind": "PreToolUse", "payload": {"hook": "PreToolUse", "additional_context_bytes": 180, "precall": {"action": "block", "binary": "grep"}, "decision": "block"}},
         {"timestamp": "2026-05-08T00:00:04Z", "kind": "PreToolUse", "payload": {"hook": "PreToolUse", "additional_context_bytes": 80, "precall": {"action": "allow", "reason": "hatch_detected"}}},
         {"timestamp": "2026-05-08T00:00:05Z", "kind": "PreToolUse", "payload": {"hook": "PreToolUse", "additional_context_bytes": 200, "precall": {"action": "block", "binary": "rg"}, "decision": "block"}},
-        {"timestamp": "2026-05-08T00:00:06Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "code_query", "request_bytes": 80, "response_bytes": 1500}},
-        {"timestamp": "2026-05-08T00:00:07Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "sandbox_execute", "request_bytes": 100, "response_bytes": 600}},
+        {"timestamp": "2026-05-08T00:00:06Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "tools/call", "tool_name": "code_query", "request_bytes": 80, "response_bytes": 1500}},
+        {"timestamp": "2026-05-08T00:00:07Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "tools/call", "tool_name": "sandbox_execute", "request_bytes": 100, "response_bytes": 600}},
         {"timestamp": "2026-05-08T00:00:08Z", "kind": "mcp.request", "payload": {"hook": "mcp.request", "method": "code_query", "request_bytes": 80, "response_bytes": 1200}},
     ]
     # Add a sandbox.execute event — should NOT count as hook_events.
@@ -2707,10 +2752,15 @@ def test_event_observability_breaks_down_hook_and_mcp(tmp_path: Path) -> None:
     assert hook_bd["PreToolUse"]["bytes_total"] == 460  # 180+80+200
 
     mcp_bd = result["mcp_breakdown"]
-    assert mcp_bd["code_query"]["count"] == 2
-    assert mcp_bd["code_query"]["response_bytes"] == 2700
-    assert mcp_bd["sandbox_execute"]["count"] == 1
-    assert mcp_bd["sandbox_execute"]["response_bytes"] == 600
+    assert mcp_bd["tools/call"]["count"] == 2
+    assert mcp_bd["tools/call"]["response_bytes"] == 2100
+    assert mcp_bd["code_query"]["count"] == 1
+    assert mcp_bd["code_query"]["response_bytes"] == 1200
+    mcp_tool_bd = result["mcp_tool_breakdown"]
+    assert mcp_tool_bd["code_query"]["count"] == 1
+    assert mcp_tool_bd["code_query"]["response_bytes"] == 1500
+    assert mcp_tool_bd["sandbox_execute"]["count"] == 1
+    assert mcp_tool_bd["sandbox_execute"]["response_bytes"] == 600
 
 
 def test_event_observability_empty_when_no_events_dir(tmp_path: Path) -> None:
@@ -2918,8 +2968,43 @@ def test_session_start_hook_injects_decisions_todos_session_tail(tmp_path: Path)
     assert "Already done" not in ctx
     assert "검색 라우팅 점검" in ctx
     assert response["additional_context_bytes"] == len(ctx.encode("utf-8"))
-    assert response["additional_context_bytes"] <= 4096
+    assert response["additional_context_bytes"] <= 12288
     assert response["elapsed_ms"] <= 200
+
+
+def test_session_start_hook_injects_prior_session_tail(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    snap_dir = repo / ".ai" / "memory" / "sessions" / "old-session"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    (snap_dir / "resume.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": "old-session",
+                "agent": "codex",
+                "written_at": "2026-05-08T01:23:45Z",
+                "decisions_tail": [],
+                "todos_open": [],
+                "session_tail": "\n".join(f"- prior milestone {i}" for i in range(12)),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_ai_input(
+        "hook",
+        "SessionStart",
+        "--json",
+        stdin=json.dumps({"agent": "codex", "dry": True, "session_id": "new-session"}),
+        cwd=repo,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    ctx = json.loads(result.stdout)["additionalContext"]
+    assert "Prior session resume" in ctx
+    assert "session tail:" in ctx
+    assert "prior milestone 11" in ctx
+    assert "prior milestone 3" not in ctx
 
 
 def test_session_start_hook_surfaces_skill_recommendations(tmp_path: Path) -> None:
@@ -2947,6 +3032,71 @@ def test_session_start_hook_surfaces_skill_recommendations(tmp_path: Path) -> No
     assert any(row.get("status") == "pending" for row in catalog_rows)
 
 
+def test_session_start_hook_satisfaction_summary_includes_surfaced_count(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    decisions = repo / ".ai" / "memory" / "decisions.jsonl"
+    rows = [
+        {"decided_at": f"2026-05-08T00:00:0{i}Z", "decision": f"deploy decision {i}", "tags": ["deploy"]}
+        for i in range(4)
+    ]
+    decisions.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    result = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    response = json.loads(result.stdout)
+    ctx = response["additionalContext"]
+    assert "Recommendation satisfaction:" in ctx
+    assert "surfaced" in ctx
+
+
+def test_session_start_hook_compact_mode_collapses_sections(tmp_path: Path, monkeypatch) -> None:
+    """AI_RECOMMEND_COMPACT=1 must collapse skill section to a single line — opt-in only."""
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    decisions = repo / ".ai" / "memory" / "decisions.jsonl"
+    rows = [
+        {"decided_at": f"2026-05-08T00:00:0{i}Z", "decision": f"compact decision {i}", "tags": ["compact"]}
+        for i in range(4)
+    ]
+    decisions.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_RECOMMEND_COMPACT", "1")
+    result = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    ctx = json.loads(result.stdout)["additionalContext"]
+    assert "cb-skill" in ctx, "compact mode must use 'cb-skill' prefix line"
+    assert "Skill recommendations available" not in ctx, "verbose header must be omitted in compact mode"
+
+
+def test_session_start_hook_cooldown_suppresses_repeat_surfacing(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    decisions = repo / ".ai" / "memory" / "decisions.jsonl"
+    rows = [
+        {"decided_at": f"2026-05-08T00:00:0{i}Z", "decision": f"qa decision {i}", "tags": ["qa"]}
+        for i in range(4)
+    ]
+    decisions.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    first = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert first.returncode == 0
+    assert "Skill recommendations available" in json.loads(first.stdout)["additionalContext"]
+    second = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert second.returncode == 0
+    ctx2 = json.loads(second.stdout)["additionalContext"]
+    assert "Skill recommendations available" not in ctx2, (
+        "cooldown should suppress identical surfacing on the next SessionStart"
+    )
+    assert "Recommendation satisfaction:" in ctx2
+
+
 def test_post_tool_use_hook_skips_injection(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     init_package_repo(repo)
@@ -2957,10 +3107,9 @@ def test_post_tool_use_hook_skips_injection(tmp_path: Path) -> None:
     result = run_ai_input("hook", "PostToolUse", "--json", stdin=payload, cwd=repo)
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
-    ctx = response["additionalContext"]
-    assert "Should NOT appear" not in ctx
-    assert "Recent decisions" not in ctx
-    assert "Search routing" not in ctx
+    assert response["additional_context_bytes"] == 0
+    assert "additionalContext" not in response
+    assert "hookSpecificOutput" not in response
 
 
 def test_user_prompt_submit_hook_includes_routing_when_memory_empty(tmp_path: Path) -> None:
@@ -2973,6 +3122,18 @@ def test_user_prompt_submit_hook_includes_routing_when_memory_empty(tmp_path: Pa
     ctx = response["additionalContext"]
     assert "Search routing" in ctx
     assert "Recent decisions" not in ctx
+
+
+def test_user_prompt_submit_harness_request_injects_directive(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    payload = json.dumps({"agent": "claude", "dry": True, "prompt": "하네스 적용해서 95%까지 자율 개선해"})
+    result = run_ai_input("hook", "UserPromptSubmit", "--json", stdin=payload, cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    ctx = json.loads(result.stdout)["additionalContext"]
+    assert "Explicit harness request detected" in ctx
+    assert "Do not wait for a separate `ai harness` command" in ctx
+    assert "target=95%" in ctx
 
 
 def test_agents_md_documents_search_routing() -> None:

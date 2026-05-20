@@ -56,14 +56,20 @@ def test_ack_intercepts() -> None:
     assert result["binary"] == "ack"
 
 
-def test_hatch_head_allows() -> None:
+def test_head_pipe_still_intercepts() -> None:
     result = should_intercept("grep -rn pattern src/ | head -50")
-    assert result["intercept"] is False
-    assert result["reason"] == "hatch_detected"
+    assert result["intercept"] is True
+    assert result["binary"] == "grep"
 
 
-def test_hatch_dev_null_allows() -> None:
+def test_stderr_dev_null_still_intercepts() -> None:
     result = should_intercept('find . -name "*.tmp" 2>/dev/null')
+    assert result["intercept"] is True
+    assert result["binary"] == "find"
+
+
+def test_stdout_dev_null_allows() -> None:
+    result = should_intercept('find . -name "*.tmp" >/dev/null')
     assert result["intercept"] is False
     assert result["reason"] == "hatch_detected"
 
@@ -74,16 +80,36 @@ def test_hatch_wc_allows() -> None:
     assert result["reason"] == "hatch_detected"
 
 
-def test_compound_command_allows() -> None:
+def test_compound_command_intercepts_broad_segment() -> None:
     result = should_intercept("cd src && grep -rn pattern .")
-    assert result["intercept"] is False
-    assert result["reason"] == "compound_command"
+    assert result["intercept"] is True
+    assert result["binary"] == "grep"
 
 
-def test_unbalanced_quotes_allows() -> None:
-    result = should_intercept('grep "broken pattern src/')
+def test_shell_wrapper_intercepts_inner_command() -> None:
+    result = should_intercept('bash -lc "rg pattern | head -20"')
+    assert result["intercept"] is True
+    assert result["binary"] == "rg"
+
+
+def test_git_grep_intercepts() -> None:
+    result = should_intercept("git grep pattern")
+    assert result["intercept"] is True
+    assert result["binary"] == "grep"
+    assert result["reason"] == "long_output_binary:git-grep"
+
+
+def test_unbalanced_non_search_allows() -> None:
+    result = should_intercept('echo "broken')
     assert result["intercept"] is False
     assert result["reason"] == "shlex_failed"
+
+
+def test_unbalanced_recursive_grep_blocks() -> None:
+    result = should_intercept('grep -rn "broken pattern src/')
+    assert result["intercept"] is True
+    assert result["binary"] == "grep"
+    assert result["reason"] == "shlex_failed_broad_search:grep"
 
 
 def test_evaluate_non_bash_tool_allows() -> None:
@@ -97,6 +123,12 @@ def test_evaluate_bash_with_grep_recursive_blocks() -> None:
     assert result["action"] == "block"
     assert result["binary"] == "grep"
     assert result["suggestion"].startswith(".ai/bin/ai exec run -- ")
+
+
+def test_evaluate_codex_exec_command_blocks() -> None:
+    result = evaluate("functions.exec_command", {"command": "rg x"})
+    assert result["action"] == "block"
+    assert result["binary"] == "rg"
 
 
 def test_evaluate_bash_no_command_allows() -> None:

@@ -70,6 +70,7 @@ def start_session(
     query_text: str | None = None,
     limit: int = 5,
 ) -> dict[str, Any]:
+    db_existed_before = db_path(root).exists()
     before = index_status(root)
     should_rebuild = rebuild_mode == "always" or (rebuild_mode == "auto" and before["stale"])
     index_payload: dict[str, Any] = {
@@ -108,4 +109,13 @@ def start_session(
             payload["resume"] = {"ok": True, "path": snapshot.get("path"), "session_id": session_id}
         except Exception as exc:
             payload["resume"] = {"ok": False, "reason": str(exc)[:200]}
+    elif not db_existed_before:
+        # A dry-run session is a read-only preview. Some diagnostics may open
+        # SQLite defensively; remove an empty just-created index so CI dry-runs
+        # do not leave persistent cache state behind.
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                db_path(root).with_name(db_path(root).name + suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
     return payload

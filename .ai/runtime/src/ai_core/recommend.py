@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -65,6 +66,7 @@ class Signals:
     session_tail: str = ""
     global_claude_titles: list[str] = field(default_factory=list)
     global_codex_threads: list[dict[str, Any]] = field(default_factory=list)
+    bash_head_counts: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass
@@ -166,7 +168,125 @@ def gather_signals(
         h = home or Path.home()
         sig.global_claude_titles = _gather_claude_global(h, root)
         sig.global_codex_threads = _gather_codex_global(h, root)
+        sig.bash_head_counts = _gather_bash_heads(root)
     return sig
+
+
+_BASH_DOMAIN_TOOLS = {
+    "git", "gh", "kubectl", "docker", "docker-compose", "npm", "pnpm", "yarn",
+    "cargo", "pytest", "uv", "hatch", "poetry", "pip", "make", "terraform",
+    "ansible", "aws", "gcloud", "az", "helm", "bun", "deno", "ai", "codex",
+    "fd", "rg", "ripgrep", "jq",
+}
+
+
+_BASH_HEAD_CACHE_TTL_SECONDS = 300
+
+
+def _bash_head_cache_path(root: Path) -> Path:
+    return root / ".ai" / "cache" / "bash_heads.json"
+
+
+def _compute_bash_heads(root: Path) -> Counter[str]:
+    try:
+        from .precall_recommend import gather_bash_invocations
+    except Exception:
+        return Counter()
+    try:
+        invs = gather_bash_invocations(root, include_transcripts=True)
+    except Exception:
+        return Counter()
+    counts: Counter[str] = Counter()
+    for cmd in invs:
+        cmd = (cmd or "").strip()
+        if not cmd or cmd.startswith("|"):
+            continue
+        parts = cmd.split()
+        i = 0
+        while i < len(parts) and ("=" in parts[i] or parts[i] in {"sudo", "time", "nohup", "exec", "env"}):
+            i += 1
+        if i >= len(parts):
+            continue
+        head = parts[i].split("/")[-1]
+        if head in _BASH_DOMAIN_TOOLS:
+            counts[head] += 1
+    return counts
+
+
+def _write_bash_head_cache(root: Path, counts: Counter[str]) -> None:
+    cache_path = _bash_head_cache_path(root)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"counts": dict(counts)}), encoding="utf-8")
+        import os as _os_atomic
+        _os_atomic.replace(tmp, cache_path)
+    except OSError:
+        pass
+
+
+def _spawn_bash_head_cache_rebuild(root: Path) -> None:
+    """Fire-and-forget background rebuild of bash_heads cache."""
+    import os
+    import subprocess
+    import sys
+    import time
+
+    try:
+        from .portable import detached_popen_kwargs
+        from .process_janitor import cleanup_children, register_child
+        cleanup_children(root)
+
+        lock_path = _bash_head_cache_path(root).with_suffix(".lock")
+        try:
+            if lock_path.exists() and time.time() - lock_path.stat().st_mtime < 600:
+                return
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            return
+        except OSError:
+            pass
+
+        cmd = [
+            sys.executable, "-c",
+            "from ai_core.recommend import _compute_bash_heads, _write_bash_head_cache; "
+            "from pathlib import Path; "
+            "import os; "
+            f"r=Path({str(root)!r}); lock=Path({str(lock_path)!r}); "
+            "\ntry:\n    _write_bash_head_cache(r, _compute_bash_heads(r))\nfinally:\n    lock.unlink(missing_ok=True)",
+        ]
+        env = {**os.environ, "PYTHONPATH": str(root / ".ai" / "runtime" / "src")}
+        with open(os.devnull, "wb") as devnull:
+            proc = subprocess.Popen(
+                cmd, stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
+                env=env, **detached_popen_kwargs(),
+            )
+        register_child(root, pid=proc.pid, kind="bash_head_cache", command=cmd)
+    except Exception:
+        pass
+
+
+def _gather_bash_heads(root: Path) -> Counter[str]:
+    """Stale-while-revalidate cache: use cache if present, schedule rebuild if stale or missing."""
+    import time
+
+    cache_path = _bash_head_cache_path(root)
+    if cache_path.exists():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            counts_dict = payload.get("counts") if isinstance(payload, dict) else None
+            age = time.time() - cache_path.stat().st_mtime
+            if isinstance(counts_dict, dict):
+                counts = Counter({str(k): int(v) for k, v in counts_dict.items() if isinstance(v, int)})
+                if age >= _BASH_HEAD_CACHE_TTL_SECONDS:
+                    _spawn_bash_head_cache_rebuild(root)
+                return counts
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    _spawn_bash_head_cache_rebuild(root)
+    return Counter()
 
 
 def _gather_claude_global(home: Path, root: Path) -> list[str]:
@@ -233,6 +353,8 @@ def cluster_candidates(
     candidates.extend(_candidates_from_todo_tokens(signals, min_signal=min_signal))
     candidates.extend(_candidates_from_audit_actions(signals, min_signal=min_signal))
     candidates.extend(_candidates_from_codex_groups(signals, min_signal=min_signal))
+    candidates.extend(_candidates_from_codex_keywords(signals, min_signal=min_signal))
+    candidates.extend(_candidates_from_bash_heads(signals, min_signal=min_signal))
 
     deduped: dict[str, Candidate] = {}
     for c in candidates:
@@ -242,8 +364,54 @@ def cluster_candidates(
             c.rejected_reason = "danger_pattern"
         deduped[c.id] = c
     ranked = [c for c in deduped.values() if c.rejected_reason is None]
-    ranked.sort(key=lambda c: -len(c.evidence.get("signals", [])))
+    norm = _per_signal_max(ranked)
+    ranked.sort(key=lambda c: (-_normalized_strength(c, norm), -_signal_strength(c), c.slug))
     return ranked[:limit]
+
+
+def _signal_strength(c: Candidate) -> int:
+    sigs = c.evidence.get("signals") or []
+    if not isinstance(sigs, list) or not sigs:
+        return 0
+    first = str(sigs[0])
+    if ":" not in first:
+        return 0
+    try:
+        return int(first.split(":", 1)[1])
+    except ValueError:
+        return 0
+
+
+def _signal_kind(c: Candidate) -> str:
+    sigs = c.evidence.get("signals") or []
+    if not isinstance(sigs, list) or not sigs:
+        return ""
+    first = str(sigs[0])
+    return first.split(":", 1)[0] if ":" in first else ""
+
+
+def _per_signal_max(cands: list[Candidate]) -> dict[str, int]:
+    """For each signal kind, find the max raw count across candidates — used for fair normalization."""
+    out: dict[str, int] = {}
+    for c in cands:
+        kind = _signal_kind(c)
+        if not kind:
+            continue
+        strength = _signal_strength(c)
+        if strength > out.get(kind, 0):
+            out[kind] = strength
+    return out
+
+
+def _normalized_strength(c: Candidate, per_kind_max: dict[str, int]) -> float:
+    """0..1 score: count / max(count_in_same_kind). Treats codex_keywords:3 (of 3 max) and bash_heads:53 (of 53 max) as equally strong."""
+    kind = _signal_kind(c)
+    if not kind:
+        return 0.0
+    m = per_kind_max.get(kind, 0)
+    if m <= 0:
+        return 0.0
+    return _signal_strength(c) / m
 
 
 def _evidence_snippets(items: Iterable[str], head: int = 3) -> list[str]:
@@ -334,7 +502,7 @@ def _candidates_from_audit_actions(signals: Signals, *, min_signal: int) -> list
     counts = Counter(signals.audit_actions)
     out: list[Candidate] = []
     for action, count in counts.most_common(8):
-        if count < min_signal * 2:
+        if count < min_signal:
             continue
         if action.startswith("memory."):
             continue
@@ -379,6 +547,238 @@ def _candidates_from_codex_groups(signals: Signals, *, min_signal: int) -> list[
     return out
 
 
+_CODEX_KEYWORD_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "into", "code",
+    "fix", "add", "use", "new", "all", "via", "etc", "any", "one",
+}
+
+
+def _candidates_from_codex_keywords(signals: Signals, *, min_signal: int) -> list[Candidate]:
+    if not signals.global_codex_threads:
+        return []
+    kw_counts: Counter[str] = Counter()
+    kw_outcomes: dict[str, list[str]] = {}
+    for thread in signals.global_codex_threads:
+        raw = str(thread.get("keywords") or "")
+        if not raw:
+            continue
+        outcome = str(thread.get("task_outcome") or "")
+        for token in re.split(r"[,;\s]+", raw):
+            t = token.strip().lower()
+            if len(t) < 3 or t in _CODEX_KEYWORD_STOPWORDS:
+                continue
+            kw_counts[t] += 1
+            kw_outcomes.setdefault(t, []).append(outcome)
+    out: list[Candidate] = []
+    for kw, count in kw_counts.most_common(12):
+        if count < min_signal:
+            continue
+        slug = _slugify(f"recall {kw} history")
+        evidence = {
+            "signals": [f"codex_keywords:{count}"],
+            "sources": _evidence_snippets(kw_outcomes.get(kw, [])),
+            "rationale": f"keyword '{kw}' tagged {count} codex threads",
+        }
+        body = _draft_body_for_codex_group(kw, evidence["sources"])
+        desc = f"'{kw}' 관련 과거 codex 작업 이력 한 줄 요약."
+        cid = _candidate_id(slug, body)
+        out.append(Candidate(id=cid, slug=slug, description=desc, body=body, evidence=evidence))
+    return out
+
+
+def _candidates_from_bash_heads(signals: Signals, *, min_signal: int) -> list[Candidate]:
+    bash_threshold = max(min_signal * 4, 10)
+    out: list[Candidate] = []
+    for head, count in signals.bash_head_counts.most_common(8):
+        if count < bash_threshold:
+            continue
+        slug = _slugify(f"{head}-runbook")
+        evidence = {
+            "signals": [f"bash_heads:{count}"],
+            "sources": [f"{head}"],
+            "rationale": f"`{head}` invoked {count}× across transcripts",
+        }
+        body = _draft_body_for_bash_head(head, count)
+        desc = f"'{head}' 워크플로우 런북 — 트랜스크립트에서 {count}회 반복 호출."
+        cid = _candidate_id(slug, body)
+        out.append(Candidate(id=cid, slug=slug, description=desc, body=body, evidence=evidence))
+    return out
+
+
+def _draft_body_for_bash_head(head: str, count: int) -> str:
+    body = (
+        f"이 슬래시 명령은 '{head}' 도메인 작업의 런북 진입점이다. "
+        "사용자가 호출하면 다음을 1회 출력 후 stop:\n\n"
+        f"'{head}' 런북 — 최근 트랜스크립트 {count}회 호출 이력\n\n"
+        f"다음 단계 제안: 사용자에게 '{head}로 무엇을 하시려는지' 물어본 후 추가 동작.\n\n"
+        + _BODY_RULES_FOOTER
+    )
+    return body[:MAX_BODY_BYTES]
+
+
+def _adaptive_min_signal(signals: Signals, requested: int) -> int:
+    """Cold-start downgrade: when project signal volume is low, drop threshold to 2.
+    Only applies when caller is using DEFAULT (3) or lower — explicit higher requests
+    (e.g. hook-level adaptive bump from user-ignored surfacings) are respected as-is.
+
+    Invariant: called ONLY from recommend() — cluster_candidates() receives the
+    already-adapted min_signal. Do not re-apply inside cluster_candidates or
+    candidate-mining helpers; that would double-discount the threshold."""
+    volume = (
+        len(signals.decisions)
+        + len(signals.todos_all)
+        + sum(1 for a in signals.audit_actions if not a.startswith("memory."))
+        + len(signals.global_codex_threads)
+    )
+    if volume < 50 and 2 < requested <= MIN_SIGNAL_DEFAULT:
+        return 2
+    return requested
+
+
+def _adaptive_min_signal_lower(root: Path, base: int) -> int:
+    """Inverse of hooks._adaptive_min_signal_from_satisfaction: when the user is happily
+    accepting more than half of acted recommendations across >= threshold acts, drop
+    min_signal by 1 so we surface more candidates. Floors at 1. Symmetric path to the
+    noise-reduction bump in hooks.py."""
+    try:
+        threshold = int(os.environ.get("AI_ADAPTIVE_HEALTHY_THRESHOLD", "5"))
+    except (TypeError, ValueError):
+        threshold = 5
+    if threshold <= 0:
+        return base
+    audit_dir = root / ".ai" / "memory" / "audit"
+    if not audit_dir.is_dir():
+        return base
+    accepted = 0
+    rejected = 0
+    try:
+        for audit_file in sorted(audit_dir.glob("*.jsonl")):
+            try:
+                text = audit_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                act = str(rec.get("action") or "")
+                if not act.startswith(("skill.", "agent.", "precall.")):
+                    continue
+                tail = act.split(".", 1)[1]
+                if tail.startswith("accept"):
+                    accepted += 1
+                elif tail == "reject":
+                    rejected += 1
+    except OSError:
+        return base
+    total_acted = accepted + rejected
+    if total_acted >= threshold and accepted / total_acted > 0.5:
+        return max(base - 1, 1)
+    return base
+
+
+def compact_skill_catalog(root: Path) -> dict[str, Any]:
+    """Rewrite catalog.jsonl keeping only the latest record per id. Skips files below
+    AI_CATALOG_COMPACT_THRESHOLD_BYTES (default 256KB). Atomic via .tmp + os.replace.
+
+    Returns {ok, before_lines, after_lines, saved_bytes}. When skipped, includes
+    `skipped` reason and zero deltas."""
+    try:
+        threshold_bytes = int(os.environ.get("AI_CATALOG_COMPACT_THRESHOLD_BYTES", str(256 * 1024)))
+    except (TypeError, ValueError):
+        threshold_bytes = 256 * 1024
+    path = catalog_path(root)
+    if not path.exists():
+        return {
+            "ok": True,
+            "before_lines": 0,
+            "after_lines": 0,
+            "saved_bytes": 0,
+            "skipped": "missing",
+        }
+    try:
+        size_before = path.stat().st_size
+    except OSError:
+        size_before = 0
+    if size_before < threshold_bytes:
+        return {
+            "ok": True,
+            "before_lines": 0,
+            "after_lines": 0,
+            "saved_bytes": 0,
+            "skipped": "below_threshold",
+        }
+    latest_by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    before_lines = 0
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"ok": False, "reason": f"read_error:{exc}"}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        before_lines += 1
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        rid = rec.get("id")
+        if not rid:
+            continue
+        rid = str(rid)
+        if rid not in latest_by_id:
+            order.append(rid)
+        latest_by_id[rid] = rec
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            for rid in order:
+                fh.write(json.dumps(latest_by_id[rid], ensure_ascii=False, sort_keys=True))
+                fh.write("\n")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return {"ok": False, "reason": f"write_error:{exc}"}
+    try:
+        size_after = path.stat().st_size
+    except OSError:
+        size_after = size_before
+    after_lines = len(order)
+    saved_bytes = max(size_before - size_after, 0)
+    result = {
+        "ok": True,
+        "before_lines": before_lines,
+        "after_lines": after_lines,
+        "saved_bytes": saved_bytes,
+    }
+    try:
+        append_audit(
+            root,
+            action="skill.catalog_compacted",
+            category="memory",
+            payload={
+                "before_lines": before_lines,
+                "after_lines": after_lines,
+                "saved_bytes": saved_bytes,
+            },
+        )
+    except Exception:
+        pass
+    return result
+
+
 def _is_path_like_task_group(text: str) -> bool:
     if text.startswith(("/", "~")):
         return True
@@ -391,12 +791,7 @@ def _is_path_like_task_group(text: str) -> bool:
 
 # ---------- draft body composition ----------
 
-_BODY_RULES_FOOTER = (
-    "규칙:\n"
-    "- 표·박스·이모지·헤더 금지. 평문만.\n"
-    "- 위 형식 외 한 글자도 추가하지 않는다.\n"
-    "- shell 명령은 *참조 텍스트*로만 인용 (자동 실행 금지).\n"
-)
+_BODY_RULES_FOOTER = "규칙: 평문만; shell은 참조 인용만 (실행 금지).\n"
 
 
 def _draft_body_for_decision_tag(tag: str, sources: list[str]) -> str:
@@ -485,10 +880,53 @@ def _persist_entry(root: Path, entry: CatalogEntry) -> None:
 
 
 def upsert_pending_candidate(root: Path, candidate: Candidate) -> CatalogEntry:
+    """Persist a candidate. T42: when a same-slug PENDING entry already exists
+    (different id because evidence/body changed), treat the new candidate as
+    *evidence drift* on the existing pending entry — refresh body / evidence
+    in place under the original id rather than spawning a duplicate row. This
+    is the explicit "skill enhancement mode" the user mandated to stop the
+    infinite-duplicate-skill churn (e.g. ai-runbook 58회 vs 59회 vs 60회 ...).
+    """
     body_sha = _sha256(candidate.body)
-    existing = {e.id: e for e in list_catalog(root)}
-    if candidate.id in existing:
-        return existing[candidate.id]
+    existing_list = list_catalog(root)
+    existing_by_id = {e.id: e for e in existing_list}
+    if candidate.id in existing_by_id:
+        return existing_by_id[candidate.id]
+    # T42 evidence drift: same slug, still pending, but new body fingerprint
+    same_slug_pending = next(
+        (
+            e
+            for e in existing_list
+            if e.slug == candidate.slug and e.status == "pending"
+        ),
+        None,
+    )
+    if same_slug_pending is not None:
+        refreshed = CatalogEntry(
+            id=same_slug_pending.id,  # preserve original id
+            slug=candidate.slug,
+            status="pending",
+            draft={
+                "description": candidate.description,
+                "body": candidate.body,
+            },
+            evidence=candidate.evidence,
+            created_at=same_slug_pending.created_at,  # preserve original ts
+            installed_paths=[],
+            body_sha256=body_sha,
+        )
+        _persist_entry(root, refreshed)
+        append_audit(
+            root,
+            action="skill.recommend_refresh",
+            category="memory",
+            payload={
+                "id": refreshed.id,
+                "slug": refreshed.slug,
+                "shadowed_new_id": candidate.id,
+            },
+        )
+        return refreshed
     entry = CatalogEntry(
         id=candidate.id,
         slug=candidate.slug,
@@ -512,6 +950,64 @@ def upsert_pending_candidate(root: Path, candidate: Candidate) -> CatalogEntry:
     return entry
 
 
+def _collect_occupied_slug_space(root: Path) -> set[str]:
+    """T40: every slug-shaped identifier already serving the user, normalized
+    to a canonical form so near-duplicates like 'git-runbook' vs 'gitrunbook'
+    map together. Sources:
+      - catalog slugs (.ai/skills/catalog.jsonl, any status)
+      - installed slash commands (.claude/commands/*.md)
+      - installed sub-agents (.claude/agents/*.md)
+      - cb-* skill convention (plugin marketplace skills if locally vended)
+    """
+    out: set[str] = set()
+    try:
+        for entry in list_catalog(root):
+            if entry.slug:
+                out.add(_canonical_slug(entry.slug))
+    except Exception:
+        pass
+    for sub in (".claude/commands", ".claude/agents"):
+        d = root / sub
+        if d.is_dir():
+            for f in d.glob("*.md"):
+                out.add(_canonical_slug(f.stem))
+    return out
+
+
+def _canonical_slug(slug: str) -> str:
+    """Reduce a slug to a comparison-friendly form: lowercase, alnum-only."""
+    return re.sub(r"[^a-z0-9]", "", slug.lower())
+
+
+def _slug_overlaps_existing(new_slug: str, occupied: set[str]) -> bool:
+    """True if `new_slug` is the same root concept as something in `occupied`.
+
+    Conservative overlap: canonical equality OR shared 6+ char prefix OR one
+    is a substring of the other AND both share their first 4+ chars. This
+    catches 'git-runbook' vs 'git-helper' vs 'gitops' as a single family while
+    leaving genuinely different commands ('git', 'kubectl') untouched.
+    """
+    cn = _canonical_slug(new_slug)
+    if not cn:
+        return False
+    for ex in occupied:
+        if not ex:
+            continue
+        if cn == ex:
+            return True
+        # shared prefix family (e.g. git*, kubectl*)
+        common = 0
+        for a, b in zip(cn, ex):
+            if a != b:
+                break
+            common += 1
+        if common >= 6:
+            return True
+        if common >= 4 and (cn in ex or ex in cn):
+            return True
+    return False
+
+
 def recommend(
     root: Path,
     *,
@@ -522,25 +1018,49 @@ def recommend(
     persist: bool = True,
 ) -> dict[str, Any]:
     signals = gather_signals(root, include_global=include_global, home=home)
-    cands = cluster_candidates(signals, limit=limit, min_signal=min_signal)
+    effective_min_signal = _adaptive_min_signal(signals, min_signal)
+    cands = cluster_candidates(signals, limit=limit, min_signal=effective_min_signal)
     if not cands:
         return {"ok": True, "candidates": [], "note": "signals_below_threshold"}
     existing = {e.id: e for e in list_catalog(root)}
     slug_status: dict[str, str] = {}
+    terminal_slugs: set[str] = set()
     for e in existing.values():
         slug_status[e.slug] = e.status
+        if e.status in {"rejected", "installed", "uninstalled"}:
+            terminal_slugs.add(e.slug)
+    # T40: collect ALL slug-shaped identifiers already serving the user so
+    # newly proposed candidates can be deduped against them, not just against
+    # the local catalog. Sources:
+    #   - catalog slugs (any status, including installed)
+    #   - existing user-owned .claude/commands/*.md basenames
+    #   - existing user-owned .claude/agents/*.md basenames
+    occupied_slugs = _collect_occupied_slug_space(root)
     out: list[dict[str, Any]] = []
     for c in cands:
         if c.id in existing and existing[c.id].status not in {"pending"}:
             continue
+        if c.slug in terminal_slugs:
+            continue
         prior_slug_status = slug_status.get(c.slug)
         if prior_slug_status in {"rejected", "installed", "uninstalled"}:
             continue
-        if c.id not in existing and persist:
-            upsert_pending_candidate(root, c)
+        # T40 fuzzy overlap vs OTHER slugs only. T42: exclude this candidate's
+        # own slug from the occupied set so a same-slug pending entry can be
+        # refreshed (skill-enhancement mode) instead of being blocked as a
+        # near-duplicate of itself.
+        own_canonical = _canonical_slug(c.slug)
+        other_occupied = {s for s in occupied_slugs if s != own_canonical}
+        if _slug_overlaps_existing(c.slug, other_occupied):
+            continue
+        if persist:
+            entry = upsert_pending_candidate(root, c)
+            out_id = entry.id  # may differ from c.id when T42 refresh kicks in
+        else:
+            out_id = c.id
         out.append(
             {
-                "id": c.id,
+                "id": out_id,
                 "slug": c.slug,
                 "status": "pending",
                 "description": c.description,

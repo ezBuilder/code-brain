@@ -4,6 +4,10 @@
 /runtime/**/*.pyc
 /cache/
 /tools/
+/agents_catalog/
+/skills/
+/precall_rules/
+/memory/sessions/
 /memory/queue/*.json
 /memory/queue/.tmp/*
 /memory/queue/processing/*

@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from .memory import (
+    all_audit_files,
     append_event,
+    audit_path,
     read_jsonl_open_todos as _read_jsonl_open_todos,
     read_jsonl_tail as _read_jsonl_tail,
     read_text_tail as _read_text_tail,
@@ -18,23 +20,54 @@ from .redact import redact_value
 import os as _os
 
 HOT_PATH_TARGET_MS = 200
+SESSION_START_TARGET_MS = 1500
 INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit"}
-AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop", "PostToolUse"}
-CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "PreToolUse", "PostToolUse"}
+AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop"}
+CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart"}
 SKILL_RECOMMENDATION_HOOKS = {"SessionStart"}
 try:
     MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "4096"))))
 except (ValueError, TypeError):
     MAX_INJECTION_BYTES = 4096
+try:
+    SESSION_START_MAX_INJECTION_BYTES = max(
+        MAX_INJECTION_BYTES,
+        min(32768, int(_os.environ.get("AI_SESSION_START_MAX_BYTES", "12288"))),
+    )
+except (ValueError, TypeError):
+    SESSION_START_MAX_INJECTION_BYTES = max(MAX_INJECTION_BYTES, 12288)
 DECISIONS_TAIL = 5
 TODOS_LIMIT = 5
 SESSION_TAIL_LINES = 8
-DELTA_NOTICE = "Code Brain context unchanged since last injection (delta-skipped)."
+PRIOR_SESSION_TAIL_LINES = 8
+DELTA_NOTICE_SHORT = "cb-ctx: Δ"
+DELTA_NOTICE_VERBOSE = "Code Brain context unchanged since last injection (delta-skipped)."
 SKILL_RECOMMENDATION_DISABLE_VALUES = {"0", "false", "no", "off"}
+_ENV_ENABLE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return _os.environ.get(name, default).lower() in _ENV_ENABLE_VALUES
+
+
+def _env_disabled(name: str, default: str = "1") -> bool:
+    return _os.environ.get(name, default).lower() in SKILL_RECOMMENDATION_DISABLE_VALUES
 
 
 def _injection_marker_path(root: Path) -> Path:
     return root / ".ai" / "cache" / "last_injection.sha"
+
+
+def _max_injection_bytes_for(hook_name: str) -> int:
+    if hook_name == "SessionStart":
+        return SESSION_START_MAX_INJECTION_BYTES
+    return MAX_INJECTION_BYTES
+
+
+def _target_ms_for(hook_name: str) -> int:
+    if hook_name == "SessionStart":
+        return SESSION_START_TARGET_MS
+    return HOT_PATH_TARGET_MS
 
 
 def _maybe_apply_delta(root: Path, hook_name: str, full_context: str) -> tuple[str, bool, int]:
@@ -61,7 +94,8 @@ def _maybe_apply_delta(root: Path, hook_name: str, full_context: str) -> tuple[s
     except OSError:
         pass
     if prev == sha and prev:
-        return DELTA_NOTICE, True, original_bytes
+        verbose = _env_enabled("AI_DELTA_NOTICE_VERBOSE")
+        return (DELTA_NOTICE_VERBOSE if verbose else DELTA_NOTICE_SHORT), True, original_bytes
     return full_context, False, original_bytes
 
 
@@ -75,13 +109,19 @@ def _spawn_background_rebuild(root: Path) -> None:
     ai_bin_ps = root / ".ai" / "bin" / "ai.ps1"
     if IS_WINDOWS and ai_bin_ps.exists():
         cmd = ["powershell", "-NoProfile", "-File", str(ai_bin_ps), "index", "rebuild", "--single-flight", "--json"]
+        if _env_enabled("AI_REBUILD_INCREMENTAL", default="1"):
+            cmd.append("--incremental")
     elif ai_bin_unix.exists():
         cmd = [str(ai_bin_unix), "index", "rebuild", "--single-flight", "--json"]
+        if _env_enabled("AI_REBUILD_INCREMENTAL", default="1"):
+            cmd.append("--incremental")
     else:
         return
     try:
+        from .process_janitor import cleanup_children, register_child
+        cleanup_children(root)
         with open(os.devnull, "wb") as devnull:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdout=devnull,
                 stderr=devnull,
@@ -89,48 +129,887 @@ def _spawn_background_rebuild(root: Path) -> None:
                 cwd=str(root),
                 **detached_popen_kwargs(),
             )
+        register_child(root, pid=proc.pid, kind="index_rebuild", command=cmd)
     except Exception:
         pass
 
 
-def _skill_recommendation_context(root: Path, hook_name: str, payload: dict[str, Any]) -> str:
+def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
+    """Return candidate IDs whose recommend_pending audit event landed within cooldown_hours.
+
+    Binary fallback cooldown — kept intact for when Ebbinghaus decay is disabled
+    (AI_COOLDOWN_HALF_LIFE_HOURS=0).
+    """
+    if cooldown_hours <= 0:
+        return set()
+    audit_files = all_audit_files(root)
+    if not audit_files:
+        return set()
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
+    recent: set[str] = set()
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            act = str(rec.get("action") or "")
+            if not act.endswith(".recommend_pending"):
+                continue
+            ts = str(rec.get("ts") or "")
+            if not ts:
+                continue
+            try:
+                if ts.endswith("Z"):
+                    parsed = datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
+                else:
+                    parsed = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            if parsed < cutoff:
+                continue
+            cid = (rec.get("payload") or {}).get("id")
+            if isinstance(cid, str) and cid:
+                recent.add(cid)
+    return recent
+
+
+def _cooldown_score(age_hours: float, half_life_hours: float, importance: float = 1.0) -> float:
+    """Ebbinghaus exponential-decay cooldown weight in [0, 1].
+
+    score = 0.5 ** (age / (half_life * max(importance, 0.1)))
+
+    - age_hours <= 0       → 1.0 (just surfaced; full penalty)
+    - half_life_hours <= 0 → 0.0 (Ebbinghaus disabled; no penalty)
+    - importance == 1.0    → legacy behaviour (bit-identical)
+    - importance > 1.0     → effective half-life is longer, decay is slower
+    - importance < 1.0     → effective half-life is shorter, decay is faster
+    - importance <= 0      → clamped to 0.1 floor to avoid division-by-zero
+    """
+    if half_life_hours <= 0:
+        return 0.0
+    if age_hours <= 0:
+        return 1.0
+    effective_half_life = half_life_hours * max(importance, 0.1)
+    return 0.5 ** (age_hours / effective_half_life)
+
+
+def _cooldown_weights(
+    root: Path,
+    half_life_hours: float,
+    importance_fn: "Callable[[str], float] | None" = None,
+) -> dict[str, float]:
+    """Build {candidate_id: decay_weight in [0,1]} from recommend_pending audit events.
+
+    For each candidate id, use the most-recent recommend_pending ts to compute its
+    current age in hours, then map via _cooldown_score(age, half_life, importance).
+
+    Disabled (returns empty dict) when half_life_hours <= 0.
+
+    importance_fn: optional callable(candidate_id) -> float. If None, every
+    candidate gets importance=1.0 (legacy behaviour). Returning >1.0 slows
+    decay for important candidates; <1.0 speeds it up.
+    """
+    if half_life_hours <= 0:
+        return {}
+    audit_files = all_audit_files(root)
+    if not audit_files:
+        return {}
+    from datetime import datetime, timezone
+
+    latest: dict[str, datetime] = {}
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            act = str(rec.get("action") or "")
+            if not act.endswith(".recommend_pending"):
+                continue
+            ts = str(rec.get("ts") or "")
+            if not ts:
+                continue
+            try:
+                if ts.endswith("Z"):
+                    parsed = datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
+                else:
+                    parsed = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            cid = (rec.get("payload") or {}).get("id")
+            if not isinstance(cid, str) or not cid:
+                continue
+            prev = latest.get(cid)
+            if prev is None or parsed > prev:
+                latest[cid] = parsed
+
+    if not latest:
+        return {}
+    now = datetime.now(timezone.utc)
+    weights: dict[str, float] = {}
+    for cid, ts in latest.items():
+        age_seconds = (now - ts).total_seconds()
+        age_hours = age_seconds / 3600.0
+        importance = 1.0
+        if importance_fn is not None:
+            try:
+                importance = float(importance_fn(cid))
+            except Exception:
+                importance = 1.0
+        weights[cid] = _cooldown_score(age_hours, half_life_hours, importance)
+    return weights
+
+
+def _adaptive_half_life(root: Path, base_half_life: float) -> float:
+    """Adapt the cooldown half-life from accept/reject behaviour.
+
+    - healthy acceptance (acted >= 5 AND accept_ratio > 0.5) → base/2 (faster re-surface)
+    - passive ignore (acted == 0 AND surfaced >= 20)         → base*2 (longer silence)
+    - else                                                    → base
+    """
+    if base_half_life <= 0:
+        return base_half_life
+    audit_files = all_audit_files(root)
+    if not audit_files:
+        return base_half_life
+    accepted = 0
+    rejected = 0
+    surfaced = 0
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            act = str(rec.get("action") or "")
+            if not act.startswith(("skill.", "agent.", "precall.")):
+                continue
+            tail = act.split(".", 1)[1]
+            if tail == "recommend_pending":
+                surfaced += 1
+            elif tail.startswith("accept"):
+                accepted += 1
+            elif tail == "reject":
+                rejected += 1
+    total_acted = accepted + rejected
+    if total_acted >= 5 and accepted / total_acted > 0.5:
+        return base_half_life / 2.0
+    if total_acted == 0 and surfaced >= 20:
+        return base_half_life * 2.0
+    return base_half_life
+
+
+def _candidate_raw_strength(cand: dict[str, Any]) -> int:
+    """Extract the raw signal count from a candidate dict's evidence.signals[0].
+
+    Mirrors recommend._signal_strength but operates on the serialized dict shape
+    that hooks.py sees from invoke() callbacks. Signals look like 'decisions:5',
+    'audit:12', 'bash_heads:53', etc.
+    """
+    evidence = cand.get("evidence")
+    if not isinstance(evidence, dict):
+        return 0
+    sigs = evidence.get("signals")
+    if not isinstance(sigs, list) or not sigs:
+        return 0
+    first = str(sigs[0])
+    if ":" not in first:
+        return 0
+    try:
+        return int(first.split(":", 1)[1])
+    except ValueError:
+        return 0
+
+
+def _importance_from_strength(raw_strength: int) -> float:
+    """Map raw signal count to a half-life multiplier in [1.0, ~2.75].
+
+    FSFM/YourMemory: strongly-evidenced candidates persist longer in cooldown so
+    one-off weak signals are re-surfaced faster than repeatedly-seen patterns.
+    raw=0 → 1.0, raw=1 → ~1.25, raw=8 → ~1.79, raw=64 → ~2.5.
+    Capped so a single hot candidate cannot dominate the queue forever.
+    """
+    import math
+
+    if raw_strength <= 0:
+        return 1.0
+    return min(2.75, 1.0 + math.log2(1 + raw_strength) / 4.0)
+
+
+def _candidate_summary_line(cand: dict[str, Any], label_field: str, desc_field: str | tuple[str, ...]) -> str:
+    cid = str(cand.get("id") or "")
+    label = str(cand.get(label_field) or "")
+    if isinstance(desc_field, tuple):
+        node: Any = cand
+        for key in desc_field:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        desc = str(node or "")[:120]
+    else:
+        desc = str(cand.get(desc_field) or "")[:120]
+    if not cid:
+        return ""
+    return f"  - {cid} | {label}: {desc}" if label else f"  - {cid}: {desc}"
+
+
+def _adaptive_min_signal_from_satisfaction(root: Path, base: int) -> int:
+    """If user has ignored many surfaced candidates without acting, raise threshold to reduce noise.
+    Returns base+1 once surfaced>=20 and acted==0 (passive ignore). Capped at base+2."""
+    try:
+        threshold = int(_os.environ.get("AI_ADAPTIVE_IGNORE_THRESHOLD", "20"))
+    except (TypeError, ValueError):
+        threshold = 20
+    if threshold <= 0:
+        return base
+    audit_files = all_audit_files(root)
+    if not audit_files:
+        return base
+    surfaced = 0
+    acted = 0
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            act = str(rec.get("action") or "")
+            if not act.startswith(("skill.", "agent.", "precall.")):
+                continue
+            tail = act.split(".", 1)[1]
+            if tail == "recommend_pending":
+                surfaced += 1
+            elif tail.startswith("accept") or tail == "reject":
+                acted += 1
+    if surfaced >= threshold * 2 and acted == 0:
+        return base + 2
+    if surfaced >= threshold and acted == 0:
+        return base + 1
+    return base
+
+
+def _is_compact_mode() -> bool:
+    return _env_enabled("AI_RECOMMEND_COMPACT")
+
+
+def _compact_section_line(source_short: str, fresh: list[dict[str, Any]], label_field: str, accept_cmd: str) -> str:
+    parts = []
+    for cand in fresh[:3]:
+        cid = str(cand.get("id") or "")
+        label = str(cand.get(label_field) or "")
+        if cid:
+            parts.append(f"{cid}={label}" if label else cid)
+    if not parts:
+        return ""
+    return f"{source_short} ({len(fresh)}): {', '.join(parts)} · {accept_cmd}"
+
+
+def _recommendation_section(
+    root: Path,
+    hook_name: str,
+    payload: dict[str, Any],
+    *,
+    env_toggle: str,
+    env_min_signal: str,
+    invoke: "callable",
+    header: str,
+    approval_line: str,
+    label_field: str,
+    desc_field: str | tuple[str, ...],
+    source_short: str = "",
+    accept_cmd_compact: str = "",
+) -> str:
     if hook_name not in SKILL_RECOMMENDATION_HOOKS:
         return ""
-    if _os.environ.get("AI_SKILL_RECOMMENDATIONS", "1").lower() in SKILL_RECOMMENDATION_DISABLE_VALUES:
+    if _env_disabled(env_toggle):
         return ""
     try:
-        min_signal = int(_os.environ.get("AI_SKILL_RECOMMEND_MIN_SIGNAL", "3"))
+        base_min_signal = int(_os.environ.get(env_min_signal, "3"))
     except (TypeError, ValueError):
-        min_signal = 3
-    persist = not (is_ci() or payload.get("dry") is True)
+        base_min_signal = 3
+    min_signal = _adaptive_min_signal_from_satisfaction(root, base_min_signal)
+    # Ebbinghaus exponential-decay cooldown (default) replaces the binary 24h cliff.
+    # Set AI_COOLDOWN_HALF_LIFE_HOURS=0 to disable and fall back to the legacy
+    # AI_RECOMMEND_COOLDOWN_HOURS binary set.
     try:
-        from .recommend import recommend
-
-        result = recommend(
-            root,
-            limit=3,
-            include_global=False,
-            min_signal=min_signal,
-            persist=persist,
-        )
+        env_half_life = float(_os.environ.get("AI_COOLDOWN_HALF_LIFE_HOURS", "12"))
+    except (TypeError, ValueError):
+        env_half_life = 12.0
+    recent_ids: set[str] = set()
+    cooldown_weights: dict[str, float] = {}
+    if env_half_life > 0:
+        half_life = _adaptive_half_life(root, env_half_life)
+        cooldown_weights = _cooldown_weights(root, half_life)
+    else:
+        try:
+            cooldown_hours = float(_os.environ.get("AI_RECOMMEND_COOLDOWN_HOURS", "24"))
+        except (TypeError, ValueError):
+            cooldown_hours = 24.0
+        recent_ids = _recently_surfaced_ids(root, cooldown_hours)
+    try:
+        result = invoke(root, min_signal, payload)
     except Exception:
         return ""
     candidates = result.get("candidates") if isinstance(result, dict) else []
     if not isinstance(candidates, list) or not candidates:
         return ""
-    lines = [
-        "Skill recommendations available. Surface these to the user; install only after explicit approval:",
-    ]
-    for cand in candidates[:3]:
+    # T43: candidate-level importance signal. Explicit `"importance"` key wins;
+    # otherwise fall back to raw evidence strength so frequently-evidenced
+    # candidates decay slower (FSFM/YourMemory).
+    def _cand_importance(cid_lookup: str) -> float:
+        for c in candidates:
+            if not isinstance(c, dict) or str(c.get("id") or "") != cid_lookup:
+                continue
+            raw = c.get("importance")
+            if raw is not None:
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    pass
+            return _importance_from_strength(_candidate_raw_strength(c))
+        return 1.0
+
+    if cooldown_weights and env_half_life > 0:
+        # Re-compute weights using the per-candidate importance hook. The
+        # earlier call (above) without importance_fn used legacy weights;
+        # we replace it here once we know which candidates the recommender
+        # returned. Safe no-op when no candidate sets `"importance"`.
+        cooldown_weights = _cooldown_weights(root, half_life, _cand_importance)
+
+    fresh: list[dict[str, Any]] = []
+    for cand in candidates:
         if not isinstance(cand, dict):
             continue
         cid = str(cand.get("id") or "")
-        slug = str(cand.get("slug") or "")
-        desc = str(cand.get("description") or "")[:120]
-        if cid and slug:
-            lines.append(f"  - {cid} | {slug}: {desc}")
-    lines.append("Approval: `ai recommend skills accept <id>`; reject noise with `ai recommend skills reject <id>`.")
-    return "\n".join(lines) if len(lines) > 2 else ""
+        if cooldown_weights:
+            decay = cooldown_weights.get(cid, 0.0)
+            raw_strength = _candidate_raw_strength(cand)
+            effective = raw_strength * (1.0 - decay)
+            if effective < min_signal:
+                continue
+        elif cid and cid in recent_ids:
+            continue
+        fresh.append(cand)
+    if not fresh:
+        return ""
+    if _is_compact_mode() and source_short and accept_cmd_compact:
+        line = _compact_section_line(source_short, fresh, label_field, accept_cmd_compact)
+        return line
+    lines = [header]
+    for cand in fresh[:3]:
+        line = _candidate_summary_line(cand, label_field, desc_field)
+        if line:
+            lines.append(line)
+    if len(lines) <= 1:
+        return ""
+    lines.append(approval_line)
+    return "\n".join(lines)
+
+
+_RECOMMEND_CACHE_TTL_SECONDS = 300
+
+
+def _audit_dependency_paths(root: Path) -> list[Path]:
+    """Files whose mtimes should invalidate hot recommendation caches."""
+    paths = [
+        root / ".ai" / "memory" / "audit-index.jsonl",
+        audit_path(root),
+    ]
+    paths.extend(all_audit_files(root))
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _codex_global_memory_path() -> Path:
+    return Path("~/.codex/memories/raw_memories.md").expanduser()
+
+
+def _recommend_memory_deps(
+    root: Path,
+    *,
+    include_todos: bool = False,
+    include_codex_global: bool = False,
+) -> list[Path]:
+    deps = [
+        root / ".ai" / "memory" / "decisions.jsonl",
+        root / ".ai" / "memory" / "session-current.md",
+    ]
+    if include_todos:
+        deps.append(root / ".ai" / "memory" / "todos.jsonl")
+    if include_codex_global:
+        deps.append(_codex_global_memory_path())
+    deps.extend(_audit_dependency_paths(root))
+    return deps
+
+
+def _cached_recommend_invoke(
+    root: Path,
+    *,
+    cache_name: str,
+    deps: list[Path],
+    compute: "callable",
+    min_signal: int,
+    cache_key_extra: tuple = (),
+) -> dict[str, Any]:
+    """Shared 5-minute TTL cache for skill/agent/precall recommend() — mtime-invalidated."""
+    import time
+
+    cache_path = root / ".ai" / "cache" / f"{cache_name}.json"
+    if cache_path.exists():
+        try:
+            cache_mt = cache_path.stat().st_mtime
+            age = time.time() - cache_mt
+            if age < _RECOMMEND_CACHE_TTL_SECONDS:
+                if all((not p.exists()) or p.stat().st_mtime <= cache_mt for p in deps):
+                    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("min_signal") == min_signal
+                        and tuple(payload.get("extra") or ()) == cache_key_extra
+                    ):
+                        return payload.get("result") or {"candidates": []}
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    result = compute()
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps({"min_signal": min_signal, "extra": list(cache_key_extra), "result": result}),
+            encoding="utf-8",
+        )
+        import os as _os_atomic
+        _os_atomic.replace(tmp, cache_path)
+    except OSError:
+        pass
+    return result
+
+
+def _skill_recommendation_context(root: Path, hook_name: str, payload: dict[str, Any]) -> str:
+    def invoke(r: Path, ms: int, pl: dict[str, Any]) -> dict[str, Any]:
+        persist = not (is_ci() or pl.get("dry") is True)
+
+        def compute() -> dict[str, Any]:
+            from .recommend import recommend
+
+            return recommend(r, limit=3, include_global=True, min_signal=ms, persist=persist)
+
+        # include_global hardcoded True in compute() above; cache_key safe with only persist.
+        deps = [
+            r / ".ai" / "skills" / "catalog.jsonl",
+        ]
+        deps.extend(_recommend_memory_deps(r, include_todos=True, include_codex_global=True))
+        return _cached_recommend_invoke(
+            r,
+            cache_name="skill_hot",
+            deps=deps,
+            compute=compute,
+            min_signal=ms,
+            cache_key_extra=(bool(persist),),
+        )
+
+    return _recommendation_section(
+        root, hook_name, payload,
+        env_toggle="AI_SKILL_RECOMMENDATIONS",
+        env_min_signal="AI_SKILL_RECOMMEND_MIN_SIGNAL",
+        invoke=invoke,
+        header="Skill recommendations available. Surface these to the user; install only after explicit approval:",
+        approval_line="Approval: `ai recommend skills accept <id>`; reject noise with `ai recommend skills reject <id>`.",
+        label_field="slug",
+        desc_field="description",
+        source_short="cb-skill",
+        accept_cmd_compact="`ai recommend skills accept <id>`",
+    )
+
+
+def _try_autonomous_accept(root: Path, trigger: str) -> None:
+    """T36: opt-in (AI_AUTONOMOUS_ACCEPT=1). Accept at most one strongest-signal
+    pending skill candidate per Stop hook. Seeds the accept_ratio KPI that
+    otherwise stays None forever, unlocking adaptive_min_signal_lower.
+
+    Eligibility (all required):
+      - candidate is pending (not accepted/rejected/installed)
+      - raw signal_strength >= AI_AUTONOMOUS_ACCEPT_MIN_STRENGTH (default 30)
+      - haven't auto-accepted within the last AI_AUTONOMOUS_ACCEPT_COOLDOWN_HOURS
+        (default 24) to avoid runaway installs.
+    Records:
+      - audit row `skill.auto_accept` so the user can grep / audit / `ai recommend
+        skills reject` to undo.
+    """
+    try:
+        cooldown_hours = float(_os.environ.get("AI_AUTONOMOUS_ACCEPT_COOLDOWN_HOURS", "24"))
+    except (TypeError, ValueError):
+        cooldown_hours = 24.0
+    try:
+        min_strength = int(_os.environ.get("AI_AUTONOMOUS_ACCEPT_MIN_STRENGTH", "30"))
+    except (TypeError, ValueError):
+        min_strength = 30
+
+    # cooldown check via audit
+    audit_files = all_audit_files(root)
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
+    for af in audit_files:
+        try:
+            for line in af.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line or "skill.auto_accept" not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = str(rec.get("ts") or "")
+                try:
+                    parsed = (datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
+                              if ts.endswith("Z") else datetime.fromisoformat(ts))
+                except ValueError:
+                    continue
+                if parsed >= cutoff:
+                    return  # already auto-accepted recently
+        except OSError:
+            continue
+
+    # find strongest eligible candidate
+    try:
+        from .recommend import list_catalog, accept as _accept
+    except Exception:
+        return
+    candidates = list_catalog(root)
+    best = None
+    best_strength = -1
+    for entry in candidates:
+        if entry.status != "pending":
+            continue
+        sigs = (entry.evidence or {}).get("signals") or []
+        if not sigs:
+            continue
+        first = str(sigs[0])
+        if ":" not in first:
+            continue
+        try:
+            s = int(first.split(":", 1)[1])
+        except ValueError:
+            continue
+        if s < min_strength:
+            continue
+        if s > best_strength:
+            best = entry
+            best_strength = s
+    if best is None:
+        return
+    result = _accept(root, best.id)
+    from .memory import append_audit
+    append_audit(
+        root, action="skill.auto_accept", category="memory",
+        payload={
+            "id": best.id, "slug": best.slug, "strength": best_strength,
+            "trigger": trigger, "ok": bool(result.get("ok")),
+            "reason": result.get("reason"),
+        },
+    )
+
+
+def _agent_recommendation_context(root: Path, hook_name: str, payload: dict[str, Any]) -> str:
+    def invoke(r: Path, ms: int, _pl: dict[str, Any]) -> dict[str, Any]:
+        def compute() -> dict[str, Any]:
+            from .agent_recommend import recommend as agent_recommend
+
+            return agent_recommend(r, limit=3, min_signal=ms)
+
+        deps = [
+            r / ".ai" / "agents_catalog" / "catalog.jsonl",
+        ]
+        deps.extend(_recommend_memory_deps(r, include_todos=False, include_codex_global=True))
+        return _cached_recommend_invoke(
+            r,
+            cache_name="agent_hot",
+            deps=deps,
+            compute=compute,
+            min_signal=ms,
+        )
+
+    return _recommendation_section(
+        root, hook_name, payload,
+        env_toggle="AI_AGENT_RECOMMENDATIONS",
+        env_min_signal="AI_AGENT_RECOMMEND_MIN_SIGNAL",
+        invoke=invoke,
+        header="Sub-agent recommendations available. Surface these to the user; install only after explicit approval:",
+        approval_line="Approval: `ai agents accept <id>`; reject noise with `ai agents reject <id>`.",
+        label_field="slug",
+        desc_field="description",
+        source_short="cb-agent",
+        accept_cmd_compact="`ai agents accept <id>`",
+    )
+
+
+def _precall_recommendation_context(root: Path, hook_name: str, payload: dict[str, Any]) -> str:
+    def invoke(r: Path, ms: int, _pl: dict[str, Any]) -> dict[str, Any]:
+        def compute() -> dict[str, Any]:
+            from .precall_recommend import recommend as precall_recommend
+
+            return precall_recommend(r, limit=3, min_signal=ms)
+
+        deps = [
+            r / ".ai" / "memory" / "events" / "events.jsonl",
+            r / ".ai" / "memory" / "precall_catalog" / "catalog.jsonl",
+        ]
+        deps.extend(_recommend_memory_deps(r, include_todos=False, include_codex_global=False))
+        return _cached_recommend_invoke(
+            r,
+            cache_name="precall_hot",
+            deps=deps,
+            compute=compute,
+            min_signal=ms,
+        )
+
+    return _recommendation_section(
+        root, hook_name, payload,
+        env_toggle="AI_PRECALL_RECOMMENDATIONS",
+        env_min_signal="AI_PRECALL_RECOMMEND_MIN_SIGNAL",
+        invoke=invoke,
+        header="Precall routing rule recommendations available. Surface these to the user; activate only after explicit approval:",
+        approval_line="Approval: `ai precall accept <id>` → `ai precall activate <id>`; reject noise with `ai precall reject <id>`.",
+        label_field="kind",
+        desc_field=("evidence", "rationale"),
+        source_short="cb-precall",
+        accept_cmd_compact="`ai precall accept <id>`",
+    )
+
+
+def _federated_summary_context(root: Path, hook_name: str) -> str:
+    if hook_name not in SKILL_RECOMMENDATION_HOOKS:
+        return ""
+    if _env_disabled("AI_FEDERATED_SUMMARY"):
+        return ""
+    try:
+        from .federated import cross_project_summary
+
+        summary = cross_project_summary(root)
+    except Exception:
+        return ""
+    if not isinstance(summary, dict) or summary.get("scanned_projects", 0) < 2:
+        return ""
+    parts: list[str] = []
+    bigrams = summary.get("common_todo_patterns") or []
+    if isinstance(bigrams, list):
+        top = [b for b in bigrams if isinstance(b, dict) and b.get("projects", 0) >= 2][:3]
+        if top:
+            parts.append(
+                "todos: "
+                + ", ".join(f"{b['bigram']}({b['projects']})" for b in top)
+            )
+    kinds = summary.get("common_precall_kinds") or []
+    if isinstance(kinds, list):
+        top_kinds = [k for k in kinds if isinstance(k, dict) and k.get("projects", 0) >= 2][:2]
+        if top_kinds:
+            parts.append(
+                "precall: "
+                + ", ".join(f"{k['kind']}({k['projects']})" for k in top_kinds)
+            )
+    if not parts:
+        return ""
+    scanned = summary.get("scanned_projects", 0)
+    return (
+        f"Federated patterns from {scanned} projects — {' | '.join(parts)}. "
+        "Inspect with `ai federated summary`."
+    )
+
+
+def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
+    if hook_name not in SKILL_RECOMMENDATION_HOOKS:
+        return ""
+    if _env_disabled("AI_SATISFACTION_SUMMARY"):
+        return ""
+    audit_files = all_audit_files(root)
+    if not audit_files:
+        return ""
+    from datetime import datetime, timedelta, timezone
+    try:
+        stale_days = float(_os.environ.get("AI_SATISFACTION_STALE_DAYS", "7"))
+    except (TypeError, ValueError):
+        stale_days = 7.0
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(days=stale_days)
+    counts = {"surfaced": 0, "accepted": 0, "rejected": 0, "stale": 0}
+    acted_ids: set[str] = set()
+    surfaced_records: list[tuple[datetime, str]] = []
+    for audit_file in audit_files:
+        try:
+            content = audit_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            act = str(rec.get("action") or "")
+            if not act.startswith(("skill.", "agent.", "precall.")):
+                continue
+            tail = act.split(".", 1)[1]
+            pid = (rec.get("payload") or {}).get("id")
+            if tail == "recommend_pending":
+                counts["surfaced"] += 1
+                ts = str(rec.get("ts") or "")
+                if ts and isinstance(pid, str):
+                    try:
+                        parsed = (
+                            datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
+                            if ts.endswith("Z") else datetime.fromisoformat(ts)
+                        )
+                        surfaced_records.append((parsed, pid))
+                    except ValueError:
+                        pass
+            elif tail.startswith("accept"):
+                counts["accepted"] += 1
+                if isinstance(pid, str):
+                    acted_ids.add(pid)
+            elif tail == "reject":
+                counts["rejected"] += 1
+                if isinstance(pid, str):
+                    acted_ids.add(pid)
+    for ts, pid in surfaced_records:
+        if pid not in acted_ids and ts < stale_cutoff:
+            counts["stale"] += 1
+    total_acted = counts["accepted"] + counts["rejected"]
+    if counts["surfaced"] == 0 and total_acted == 0:
+        return ""
+    stale_suffix = f", {counts['stale']} stale (>{int(stale_days)}d)" if counts["stale"] else ""
+    adaptive_bump = _adaptive_min_signal_from_satisfaction(root, 3) - 3
+    adaptive_suffix = f"; adaptive +{adaptive_bump} (auto-noise reduction)" if adaptive_bump > 0 else ""
+    if total_acted == 0:
+        return (
+            f"Recommendation satisfaction: {counts['surfaced']} surfaced, 0 acted{stale_suffix}{adaptive_suffix}. "
+            "Inspect: `ai recommend skills|agents|precall`; opt out: AI_*_RECOMMENDATIONS=0."
+        )
+    sat_pct = int(round(100 * counts["accepted"] / total_acted))
+    return (
+        f"Recommendation satisfaction: {sat_pct}% accept ({counts['accepted']}/{total_acted} acted, "
+        f"{counts['surfaced']} surfaced lifetime{stale_suffix})."
+    )
+
+
+def _compact_meta_line(root: Path) -> str:
+    """Compact-mode unified one-liner combining federated + satisfaction data.
+
+    Format: "cb-meta: {surfaced} surfaced/{acted} acted (adaptive +{N}); fed {n} proj — {pat}({c})"
+    Returns "" when both sides have no data; renders only the side(s) with data.
+    """
+    # --- satisfaction side -------------------------------------------------
+    sat_part = ""
+    audit_files = all_audit_files(root)
+    if audit_files:
+        surfaced = 0
+        acted = 0
+        for audit_file in audit_files:
+            try:
+                content = audit_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                act = str(rec.get("action") or "")
+                if not act.startswith(("skill.", "agent.", "precall.")):
+                    continue
+                tail = act.split(".", 1)[1]
+                if tail == "recommend_pending":
+                    surfaced += 1
+                elif tail.startswith("accept") or tail == "reject":
+                    acted += 1
+        if surfaced > 0 or acted > 0:
+            adaptive_bump = _adaptive_min_signal_from_satisfaction(root, 3) - 3
+            adaptive_suffix = f" (adaptive +{adaptive_bump})" if adaptive_bump > 0 else ""
+            sat_part = f"{surfaced} surfaced/{acted} acted{adaptive_suffix}"
+
+    # --- federated side ----------------------------------------------------
+    fed_part = ""
+    try:
+        from .federated import cross_project_summary
+
+        summary = cross_project_summary(root)
+    except Exception:
+        summary = None
+    if isinstance(summary, dict) and summary.get("scanned_projects", 0) >= 2:
+        scanned = summary.get("scanned_projects", 0)
+        top_label = ""
+        bigrams = summary.get("common_todo_patterns") or []
+        if isinstance(bigrams, list):
+            top = [b for b in bigrams if isinstance(b, dict) and b.get("projects", 0) >= 2]
+            if top:
+                b = top[0]
+                top_label = f"{b.get('bigram')}({b.get('projects')})"
+        if not top_label:
+            kinds = summary.get("common_precall_kinds") or []
+            if isinstance(kinds, list):
+                top_kinds = [k for k in kinds if isinstance(k, dict) and k.get("projects", 0) >= 2]
+                if top_kinds:
+                    k = top_kinds[0]
+                    top_label = f"{k.get('kind')}({k.get('projects')})"
+        if top_label:
+            fed_part = f"fed {scanned} proj — {top_label}"
+        else:
+            fed_part = f"fed {scanned} proj"
+
+    if not sat_part and not fed_part:
+        return ""
+    if sat_part and fed_part:
+        line = f"cb-meta: {sat_part}; {fed_part}"
+    elif sat_part:
+        line = f"cb-meta: {sat_part}"
+    else:
+        line = f"cb-meta: {fed_part}"
+    # Trim trailing punctuation and clamp to 200 bytes.
+    line = line.rstrip(".; ")
+    encoded = line.encode("utf-8")
+    if len(encoded) > 200:
+        line = encoded[:197].decode("utf-8", errors="ignore") + "..."
+    return line
 
 
 def read_payload(stdin: str | None = None) -> dict[str, Any]:
@@ -143,6 +1022,12 @@ def read_payload(stdin: str | None = None) -> dict[str, Any]:
 def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> dict[str, Any]:
     start = time.perf_counter()
     effective_hook = hook_name or payload.get("hook") or payload.get("event") or "unknown"
+    if effective_hook in {"SessionStart", "Stop", "SubagentStop"} and not (is_ci() or payload.get("dry") is True):
+        try:
+            from .process_janitor import cleanup_children
+            cleanup_children(root)
+        except Exception:
+            pass
 
     precall_decision: dict[str, Any] | None = None
     if effective_hook == "PreToolUse":
@@ -223,18 +1108,70 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         persisted = True
         if effective_hook in AUTO_REBUILD_HOOKS:
             _spawn_background_rebuild(root)
+            try:
+                from .recommend import _spawn_bash_head_cache_rebuild
+
+                _spawn_bash_head_cache_rebuild(root)
+            except Exception:
+                pass
+            if _env_enabled("AI_AUTO_SESSION_NOTE"):
+                last_msg = payload.get("last_assistant_message")
+                if isinstance(last_msg, str) and last_msg.strip():
+                    first_line = last_msg.strip().splitlines()[0][:200]
+                    try:
+                        from .memory import append_session_note
+
+                        append_session_note(root, text=f"[{effective_hook}] {first_line}")
+                    except Exception:
+                        pass
+            # T35 autonomous page-out: when MemGPT pressure breaches threshold,
+            # the agent should not wait for a human `ai memory page-out` call.
+            if not _env_disabled("AI_AUTO_PAGE_OUT"):
+                try:
+                    from .memory_tier import hot_pressure, page_out
+
+                    if hot_pressure(root).get("page_out_recommended"):
+                        page_out(root, dry_run=False)
+                        from .memory import append_audit
+                        append_audit(
+                            root, action="memtier.auto_page_out", category="memory",
+                            payload={"trigger": effective_hook},
+                        )
+                except Exception:
+                    pass
+            # T36 autonomous accept is write-class and therefore opt-in only.
+            # Default automation still surfaces candidates; it does not install
+            # commands unless the operator explicitly sets AI_AUTONOMOUS_ACCEPT=1.
+            if _env_enabled("AI_AUTONOMOUS_ACCEPT", default="0"):
+                try:
+                    _try_autonomous_accept(root, effective_hook)
+                except Exception:
+                    pass
         try:
             _handle_lifecycle_event(root, effective_hook, payload)
         except Exception:
             pass
     elapsed_ms = int((time.perf_counter() - start) * 1000)
+    target_ms = _target_ms_for(effective_hook)
+    if persisted and elapsed_ms > target_ms:
+        try:
+            from .memory import append_audit
+
+            append_audit(
+                root,
+                action="hook.slow",
+                category="hook",
+                payload={"hook": effective_hook, "elapsed_ms": elapsed_ms, "target_ms": target_ms},
+            )
+        except Exception:
+            pass
     response = {
         "ok": True,
         "hook": effective_hook,
         "mode": mode,
         "persisted": persisted,
         "elapsed_ms": elapsed_ms,
-        "target_ms": HOT_PATH_TARGET_MS,
+        "target_ms": target_ms,
         "additional_context_bytes": additional_context_bytes,
     }
     if effective_hook in CONTEXT_INJECTION_HOOKS:
@@ -278,6 +1215,24 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     "Code Brain stores full output in .ai/cache/sandbox/<exec_id>.txt and returns a short summary "
                     "(first 30 + last 5 lines, total under 4 KB) to keep your context window small."
                 )
+    # T44: PostToolUse `updatedToolOutput` — Claude Code 2026 spec field. When a
+    # tool's stdout contains secrets (or long matches), we redact and surface
+    # the cleaned version via hookSpecificOutput.updatedToolOutput so the model
+    # never sees the raw secret. Opt out with AI_HOOK_REDACT_TOOL_OUTPUT=0.
+    if effective_hook == "PostToolUse" and not _env_disabled("AI_HOOK_REDACT_TOOL_OUTPUT"):
+        raw_tool_output: Any = None
+        if isinstance(payload.get("tool_response"), (str, dict, list)):
+            raw_tool_output = payload.get("tool_response")
+        elif isinstance(payload.get("tool_output"), (str, dict, list)):
+            raw_tool_output = payload.get("tool_output")
+        if raw_tool_output is not None:
+            cleaned = redact_value(raw_tool_output)
+            if cleaned != raw_tool_output:
+                existing = response.get("hookSpecificOutput")
+                if not isinstance(existing, dict):
+                    existing = {"hookEventName": effective_hook}
+                existing["updatedToolOutput"] = cleaned
+                response["hookSpecificOutput"] = existing
     return redact_value(response)
 
 
@@ -313,13 +1268,16 @@ def codex_wire_output(response: dict[str, Any]) -> dict[str, Any]:
                 "additionalContext": str(additional_context),
             }
         }
-    if hook == "PostToolUse" and additional_context:
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": str(additional_context),
-            }
-        }
+    if hook == "PostToolUse":
+        # T44: preserve `updatedToolOutput` when redact stage produced one.
+        updated_tool_output = hook_specific.get("updatedToolOutput")
+        if additional_context or updated_tool_output is not None:
+            out: dict[str, Any] = {"hookEventName": "PostToolUse"}
+            if additional_context:
+                out["additionalContext"] = str(additional_context)
+            if updated_tool_output is not None:
+                out["updatedToolOutput"] = updated_tool_output
+            return {"hookSpecificOutput": out}
     if hook == "Stop":
         return {"continue": True}
     return {}
@@ -480,15 +1438,40 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
     header = f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={writes}."
     if hook_name not in INJECTION_HOOKS or root is None:
-        return header
+        return ""
     sections = [header]
-    routing = (
-        "Search routing: prefer MCP `code_query` / `context_pack` over Bash grep/find. "
-        "Each MCP query returns ranked snippets (default 5) instead of full grep dumps — "
-        "use grep only as fallback when MCP fails."
-    )
+    if _env_enabled("AI_ROUTING_HINT_COMPACT"):
+        routing = "Search routing: prefer MCP `code_query`/`context_pack` over grep."
+    else:
+        routing = (
+            "Search routing: prefer MCP `code_query` / `context_pack` over Bash grep/find. "
+            "Each MCP query returns ranked snippets (default 5) instead of full grep dumps — "
+            "use grep only as fallback when MCP fails."
+        )
     sections.append(routing)
     if hook_name == "SessionStart":
+        try:
+            from .codebase_map import build_codebase_map
+
+            map_payload = build_codebase_map(root, max_entries=12, include_untracked=False)
+            map_context = str(map_payload.get("additionalContext") or "")
+            if map_context:
+                sections.append(map_context)
+        except Exception:
+            pass
+        try:
+            from .autonomous_harness import context_line as _harness_context_line
+            sections.append(_harness_context_line(root))
+        except Exception:
+            pass
+    if hook_name == "UserPromptSubmit":
+        try:
+            from .autonomous_harness import directive as _harness_directive, requested as _harness_requested
+            if _harness_requested(payload):
+                sections.append(_harness_directive(root, explicit=True))
+        except Exception:
+            pass
+    elif hook_name == "SessionStart":
         try:
             from .session_resume import read_latest_snapshot
             current_sid = str(payload.get("session_id") or payload.get("sid") or "")
@@ -508,6 +1491,12 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             actions = prior.get("audit_tail_actions") or []
             if actions:
                 lines.append(f"  recent actions: {', '.join(str(a) for a in actions[-5:])}")
+            prior_tail = str(prior.get("session_tail") or "")
+            tail_lines = [line for line in prior_tail.splitlines() if line.strip()][-PRIOR_SESSION_TAIL_LINES:]
+            if tail_lines:
+                lines.append("  session tail:")
+                for line in tail_lines:
+                    lines.append(f"    {line[:220]}")
             sections.append("\n".join(lines))
     decisions = _read_jsonl_tail(root / ".ai" / "memory" / "decisions.jsonl", DECISIONS_TAIL)
     if decisions:
@@ -528,23 +1517,57 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     skill_recommendations = _skill_recommendation_context(root, hook_name, payload)
     if skill_recommendations:
         sections.append(skill_recommendations)
+    agent_recommendations = _agent_recommendation_context(root, hook_name, payload)
+    if agent_recommendations:
+        sections.append(agent_recommendations)
+    precall_recommendations = _precall_recommendation_context(root, hook_name, payload)
+    if precall_recommendations:
+        sections.append(precall_recommendations)
+    if _is_compact_mode():
+        if hook_name in SKILL_RECOMMENDATION_HOOKS:
+            meta = _compact_meta_line(root)
+            if meta:
+                sections.append(meta)
+    else:
+        federated = _federated_summary_context(root, hook_name)
+        if federated:
+            sections.append(federated)
+        satisfaction = _satisfaction_summary_context(root, hook_name)
+        if satisfaction:
+            sections.append(satisfaction)
+    if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_MEMORY_TIER_SUMMARY"):
+        try:
+            from .memory_tier import classify as _classify, hot_pressure as _pressure
+            cls = _classify(root)
+            pres = _pressure(root)
+            hot = cls["tiers"]["hot"]["audit_events"]
+            warm = cls["tiers"]["warm"]["audit_events"]
+            cold = cls["tiers"]["cold"]["audit_events"]
+            sline = f"cb-mem: hot={hot} warm={warm} cold={cold} | session={int(pres['session_md_ratio']*100)}%"
+            if pres.get("page_out_recommended"):
+                sline += " ⚠page-out"
+            sections.append(sline)
+        except Exception:
+            pass
+    # T35 codegraph hotspot teaser — surfaces the top-3 most-called callees so
+    # downstream agents can `code_graph_callers <name>` without prior knowledge.
+    if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_CODEGRAPH_SUMMARY"):
+        try:
+            from .codegraph import hotspot_callees
+            hot = hotspot_callees(root, limit=3)
+            entries = hot.get("hotspots") or []
+            if entries:
+                top = ", ".join(f"{h['callee']}({h['calls']})" for h in entries)
+                sections.append(f"cb-graph: top callees — {top}. MCP: code_graph_callers/callees/symbol/hotspots.")
+        except Exception:
+            pass
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
         sections.append("Session-current tail:\n" + session_tail)
-    try:
-        from .config import load_config
-        from .remote_memory import cache_path
-
-        config = load_config(root)
-        remote = config.get("remote_memory", {}) if isinstance(config.get("remote_memory"), dict) else {}
-        if hook_name == "SessionStart" and bool(remote.get("inject_on_session_start", False)):
-            cached = _read_text_tail(cache_path(root), 12)
-            if cached:
-                sections.append("Remote memory cached summary (no network in hook):\n" + cached)
-    except Exception:
-        pass
+    # T37 — cloudflare remote_memory removed (.ai/ git sync handles cross-device).
     composed = "\n\n".join(sections)
-    if len(composed.encode("utf-8")) > MAX_INJECTION_BYTES:
-        truncated = composed.encode("utf-8")[: MAX_INJECTION_BYTES - 3].decode("utf-8", errors="ignore") + "..."
+    max_bytes = _max_injection_bytes_for(hook_name)
+    if len(composed.encode("utf-8")) > max_bytes:
+        truncated = composed.encode("utf-8")[: max_bytes - 3].decode("utf-8", errors="ignore") + "..."
         composed = truncated
     return composed

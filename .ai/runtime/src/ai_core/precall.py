@@ -7,23 +7,32 @@ Stdlib-only (re, shlex). No file I/O. No side effects.
 from __future__ import annotations
 
 import shlex
+import re
 from typing import Any
 
 LONG_OUTPUT_BINARIES = ("grep", "egrep", "fgrep", "rg", "find", "tree", "ack", "ag")
+SHELL_TOOL_NAMES = {
+    "Bash",
+    "Shell",
+    "shell",
+    "exec_command",
+    "functions.exec_command",
+    "terminal",
+}
 
 HATCH_TOKENS = (
-    "| head",
-    "| tail",
     "| wc",
+    "| wc ",
+    "&>/dev/null",
+)
+USER_RULE_HATCH_TOKENS = (
+    *HATCH_TOKENS,
+    "| head",
+    "| head ",
+    "| tail",
+    "| tail ",
     "| less",
     "| more",
-    "| head ",
-    "| tail ",
-    "| wc ",
-    ">/dev/null",
-    "> /dev/null",
-    "&>/dev/null",
-    "2>/dev/null",
 )
 
 RECURSIVE_GREP_FLAGS = (
@@ -41,6 +50,8 @@ RECURSIVE_GREP_FLAGS = (
 
 # Compound separators that signal a multi-step pipeline we won't unwind.
 _COMPOUND_SEPARATORS = ("&&", "||", ";", "|")
+_SHELL_WRAPPERS = ("bash", "sh", "zsh")
+_FALLBACK_SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 
 
 def _strip_path(arg0: str) -> str:
@@ -51,12 +62,107 @@ def _strip_path(arg0: str) -> str:
     return arg0.rsplit("/", 1)[-1]
 
 
+def _is_shell_tool(tool_name: str) -> bool:
+    normalized = _strip_path(str(tool_name or "")).strip()
+    return normalized in SHELL_TOOL_NAMES or normalized.endswith(".exec_command")
+
+
+def _fallback_intercept_unparsed_command(command_str: str) -> dict[str, Any] | None:
+    """Best-effort broad-search detection when shell tokenization fails."""
+    for raw_segment in _FALLBACK_SEGMENT_SPLIT.split(command_str):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        rough_tokens = segment.split()
+        if not rough_tokens:
+            continue
+        arg0 = _strip_path(rough_tokens[0].strip("\"'"))
+        if arg0 in _SHELL_WRAPPERS:
+            inner = " ".join(rough_tokens[1:])
+            if "-c" in inner:
+                nested = _fallback_intercept_unparsed_command(inner.split("-c", 1)[1])
+                if nested is not None:
+                    return nested
+            continue
+        if arg0 in ("rg", "find", "tree", "ack", "ag"):
+            return {
+                "intercept": True,
+                "binary": arg0,
+                "reason": f"shlex_failed_broad_search:{arg0}",
+                "suggested_command": _build_suggested(command_str),
+            }
+        if arg0 in ("grep", "egrep", "fgrep") and _is_recursive_grep(rough_tokens):
+            return {
+                "intercept": True,
+                "binary": arg0,
+                "reason": f"shlex_failed_broad_search:{arg0}",
+                "suggested_command": _build_suggested(command_str),
+            }
+        if arg0 == "git" and len(rough_tokens) >= 2 and rough_tokens[1] == "grep":
+            return {
+                "intercept": True,
+                "binary": "grep",
+                "reason": "shlex_failed_broad_search:git-grep",
+                "suggested_command": _build_suggested(command_str),
+            }
+    return None
+
+
 def _has_hatch(command_str: str) -> bool:
-    return any(token in command_str for token in HATCH_TOKENS)
+    if any(token in command_str for token in HATCH_TOKENS):
+        return True
+    normalized = command_str.replace("> /dev/null", ">/dev/null")
+    return normalized.strip().startswith(">/dev/null") or " >/dev/null" in normalized
+
+
+def _has_user_rule_hatch(command_str: str) -> bool:
+    return _has_hatch(command_str) or any(token in command_str for token in USER_RULE_HATCH_TOKENS)
 
 
 def _has_compound(command_str: str) -> bool:
     return any(sep in command_str for sep in _COMPOUND_SEPARATORS)
+
+
+def _split_compound_segments(command_str: str) -> list[str]:
+    """Split a shell command into coarse segments outside quotes."""
+    try:
+        lexer = shlex.shlex(command_str, posix=True, punctuation_chars=True)
+    except TypeError:
+        return []
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for tok in tokens:
+        if tok in _COMPOUND_SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(tok)
+    if current:
+        segments.append(current)
+    if len(segments) <= 1:
+        return []
+    return [" ".join(shlex.quote(part) for part in segment) for segment in segments]
+
+
+def _shell_wrapped_command(tokens: list[str]) -> str | None:
+    """Return the command string passed to `sh -c` / `bash -lc`, if obvious."""
+    if not tokens:
+        return None
+    arg0 = _strip_path(tokens[0])
+    if arg0 not in _SHELL_WRAPPERS:
+        return None
+    for idx, tok in enumerate(tokens[1:], start=1):
+        if tok == "--":
+            continue
+        if tok.startswith("-") and "c" in tok and idx + 1 < len(tokens):
+            return tokens[idx + 1]
+    return None
 
 
 def _is_recursive_grep(tokens: list[str]) -> bool:
@@ -96,10 +202,14 @@ def should_intercept(command_str: str | None) -> dict[str, Any]:
             "suggested_command": None,
         }
 
-    # Tokenize; if shlex fails (unbalanced quotes, etc.) bail conservatively.
+    # Tokenize; if shlex fails (unbalanced quotes, etc.) still catch obvious
+    # broad-search invocations so malformed quoting cannot bypass routing.
     try:
         tokens = shlex.split(command_str)
     except ValueError:
+        fallback = _fallback_intercept_unparsed_command(command_str)
+        if fallback is not None:
+            return fallback
         return {
             "intercept": False,
             "binary": None,
@@ -115,7 +225,9 @@ def should_intercept(command_str: str | None) -> dict[str, Any]:
             "suggested_command": None,
         }
 
-    # 1. Hatch check (highest priority): if user already capped output, allow.
+    # 1. Hatch check (highest priority): allow only count/null-output forms.
+    # `| head` / `| tail` are intentionally not hatches; they still bypass
+    # indexed search/sandbox routing and only hide part of a broad command.
     if _has_hatch(command_str):
         return {
             "intercept": False,
@@ -124,8 +236,30 @@ def should_intercept(command_str: str | None) -> dict[str, Any]:
             "suggested_command": None,
         }
 
-    # 2. Compound command: conservative — don't intercept.
+    # 2. Shell wrappers: catch `bash -lc "rg foo"` / `sh -c "find ."` forms.
+    wrapped = _shell_wrapped_command(tokens)
+    if wrapped:
+        wrapped_decision = should_intercept(wrapped)
+        if wrapped_decision["intercept"]:
+            return {
+                "intercept": True,
+                "binary": wrapped_decision["binary"],
+                "reason": str(wrapped_decision["reason"]),
+                "suggested_command": _build_suggested(command_str),
+            }
+
+    # 3. Compound command: inspect each segment and block the whole command if
+    # any segment is broad output.
     if _has_compound(command_str):
+        for segment in _split_compound_segments(command_str):
+            segment_decision = should_intercept(segment)
+            if segment_decision["intercept"]:
+                return {
+                    "intercept": True,
+                    "binary": segment_decision["binary"],
+                    "reason": str(segment_decision["reason"]),
+                    "suggested_command": _build_suggested(command_str),
+                }
         return {
             "intercept": False,
             "binary": None,
@@ -133,7 +267,7 @@ def should_intercept(command_str: str | None) -> dict[str, Any]:
             "suggested_command": None,
         }
 
-    # 3. Binary detection on first token.
+    # 4. Binary detection on first token.
     arg0 = _strip_path(tokens[0])
 
     if arg0 == "rg":
@@ -183,17 +317,14 @@ def should_intercept(command_str: str | None) -> dict[str, Any]:
             "suggested_command": _build_suggested(command_str),
         }
 
-    # `git grep` with recursive flag — same as recursive grep.
+    # `git grep` scans the tracked tree by default, so treat it as broad search.
     if arg0 == "git" and len(tokens) >= 2 and tokens[1] == "grep":
-        # Treat tokens[1:] as the inner grep command for flag detection.
-        inner = tokens[1:]
-        if _is_recursive_grep(inner):
-            return {
-                "intercept": True,
-                "binary": "grep",
-                "reason": "long_output_binary:grep",
-                "suggested_command": _build_suggested(command_str),
-            }
+        return {
+            "intercept": True,
+            "binary": "grep",
+            "reason": "long_output_binary:git-grep",
+            "suggested_command": _build_suggested(command_str),
+        }
 
     return {
         "intercept": False,
@@ -238,13 +369,13 @@ def evaluate(
     Evaluation order (deterministic):
       1. Non-Bash tool → allow.
       2. Empty command → allow.
-      3. Hatch detected → allow (user already capped output; do NOT apply user rules).
-      4. Hard-coded long-output binary intercept → block (built-in always wins).
+      3. Hard-coded long-output binary intercept → block (built-in always wins).
+      4. Hatch detected → allow (user already capped output; do NOT apply user rules).
       5. Active extra_rules match → block (with rule_id).
       6. Dry-run extra_rules match → observe (do not block; caller increments counter).
       7. Otherwise → allow.
     """
-    if tool_name != "Bash":
+    if not _is_shell_tool(tool_name):
         return {"action": "allow", "reason": "non_bash_tool"}
 
     if not isinstance(tool_input, dict) or "command" not in tool_input:
@@ -254,9 +385,6 @@ def evaluate(
     if not command:
         return {"action": "allow", "reason": "empty_command"}
 
-    if _has_hatch(str(command)):
-        return {"action": "allow", "reason": "hatch_detected"}
-
     decision = should_intercept(command)
     if decision["intercept"]:
         return {
@@ -265,6 +393,9 @@ def evaluate(
             "suggestion": decision["suggested_command"],
             "binary": decision["binary"],
         }
+
+    if _has_user_rule_hatch(str(command)):
+        return {"action": "allow", "reason": "hatch_detected"}
 
     active = _match_extra_rules(str(command), extra_rules, statuses=("active",))
     if active is not None:

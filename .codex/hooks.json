@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" SessionStart",
+          "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; AI_SKILL_RECOMMENDATIONS=0 AI_AGENT_RECOMMENDATIONS=0 AI_PRECALL_RECOMMENDATIONS=0 \"$ROOT/.ai/bin/ai-hook\" SessionStart",
             "statusMessage": "Loading Code Brain session context"
           }
         ]

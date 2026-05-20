@@ -46,6 +46,8 @@ class AgentCandidate:
     description: str
     body: str
     evidence: dict[str, Any] = field(default_factory=dict)
+    model: str = "sonnet"
+    tools: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -58,6 +60,8 @@ class AgentCatalogEntry:
     body_sha256: str
     installed_paths: list[str]
     created_at: str
+    model: str = "sonnet"
+    tools: list[str] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -69,6 +73,8 @@ class AgentCatalogEntry:
             "body_sha256": self.body_sha256,
             "installed_paths": self.installed_paths,
             "created_at": self.created_at,
+            "model": self.model,
+            "tools": list(self.tools),
         }
 
 
@@ -138,6 +144,117 @@ def _gather_decision_tags(root: Path) -> Counter[str]:
     return counts
 
 
+_CODEX_KEYWORD_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "into", "code",
+    "fix", "add", "use", "new", "all", "via", "etc", "any", "one",
+}
+
+
+def _gather_codex_keywords(root: Path) -> Counter[str]:
+    """Codex thread keywords scoped to the current project — same source as recommend.py."""
+    path = Path("~/.codex/memories/raw_memories.md").expanduser()
+    if not path.exists():
+        return Counter()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return Counter()
+    counts: Counter[str] = Counter()
+    target = str(root)
+    blocks = re.split(r"^## Thread `", text, flags=re.MULTILINE)[1:]
+    for block in blocks:
+        m_cwd = re.search(r"^cwd:\s*(.+)$", block, re.MULTILINE)
+        if not m_cwd or not m_cwd.group(1).strip().startswith(target):
+            continue
+        m_kw = re.search(r"^keywords:\s*(.+)$", block, re.MULTILINE)
+        if not m_kw:
+            continue
+        for token in re.split(r"[,;\s]+", m_kw.group(1)):
+            t = token.strip().lower()
+            if len(t) < 3 or t in _CODEX_KEYWORD_STOPWORDS:
+                continue
+            counts[t] += 1
+    return counts
+
+
+def _candidates_from_bash_heads(
+    root: Path, *, min_signal: int
+) -> list[AgentCandidate]:
+    """Mine bash invocation heads (git, gh, kubectl, ...) for high-confidence sub-agent candidates.
+
+    Reuses recommend._gather_bash_heads (cached, stale-while-revalidate) so this does not
+    re-parse transcripts. Threshold is stricter (min_signal*4) than the skill recommender
+    because sub-agent helpers carry more weight than slash-command runbooks.
+    """
+    try:
+        from .recommend import _gather_bash_heads
+    except Exception as exc:
+        try:
+            from .memory import append_audit
+            append_audit(
+                root,
+                action="agent.bash_heads_error",
+                category="memory",
+                payload={"error": str(exc)[:200], "stage": "import"},
+            )
+        except Exception:
+            pass
+        return []
+
+    try:
+        counts = _gather_bash_heads(root)
+    except Exception as exc:
+        try:
+            from .memory import append_audit
+            append_audit(
+                root,
+                action="agent.bash_heads_error",
+                category="memory",
+                payload={"error": str(exc)[:200], "stage": "invoke"},
+            )
+        except Exception:
+            pass
+        return []
+    threshold = min_signal * 4
+    out: list[AgentCandidate] = []
+    for head, count in counts.most_common(8):
+        if count < threshold:
+            continue
+        slug = _slugify(f"{head}-helper")
+        desc = f"'{head}' 도메인 sub-agent — 트랜스크립트에서 {count}회 반복 호출."
+        body = _draft_agent_body(
+            slug,
+            f"the '{head}' workflow domain",
+            evidence_lines=[f"`{head}` invoked {count}×"],
+        )
+        if _danger_match(body):
+            continue
+        cid = _candidate_id(slug, body)
+        evidence = {
+            "signals": [f"bash_heads:{count}"],
+            "rationale": f"`{head}` 트랜스크립트 {count}회 호출",
+        }
+        model, tools = _classify_role(slug, evidence)
+        out.append(
+            AgentCandidate(
+                id=cid, slug=slug, description=desc, body=body,
+                evidence=evidence, model=model, tools=tools,
+            )
+        )
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _adaptive_min_signal(
+    intents: Counter[str], tags: Counter[str], keywords: Counter[str], requested: int
+) -> int:
+    volume = sum(intents.values()) + sum(tags.values()) + sum(keywords.values())
+    if volume < 20 and requested > 2:
+        return 2
+    return requested
+
+
 def _draft_agent_body(slug: str, focus_topic: str, evidence_lines: list[str]) -> str:
     """Compose a `.claude/agents/<slug>.md` body. Plain text per cb-* convention."""
     bullets = "\n".join(f"- {line}" for line in evidence_lines[:5])
@@ -153,6 +270,51 @@ def _draft_agent_body(slug: str, focus_topic: str, evidence_lines: list[str]) ->
     return body
 
 
+_READ_ONLY_TOKENS = ("explore", "search", "investigator", "find", "review", "inspect", "audit")
+_DECISION_TOKENS = ("plan", "design", "architect", "decide")
+_WRITE_TOKENS = ("implement", "refactor", "fix", "build", "migrate", "rewrite")
+_GENERAL_TOKENS = ("general", "helper", "assist")
+
+
+def _classify_role(slug: str, evidence: dict[str, Any]) -> tuple[str, list[str]]:
+    """Map (slug, evidence) → (model, tools) using simple slug-token heuristics.
+
+    Read-only roles get Haiku + a minimal read toolset. Decision roles get Sonnet with
+    no-write tools. Write-heavy roles get Sonnet with Edit/Write. Anything ambiguous gets
+    Sonnet + empty tool list (= no restriction). High-volume transcript signals (>=15)
+    downgrade the model to Haiku to save cost.
+    """
+    slug_l = (slug or "").lower()
+    model: str
+    tools: list[str]
+    if any(tok in slug_l for tok in _READ_ONLY_TOKENS):
+        model, tools = "haiku", ["Read", "Grep", "Glob", "Bash"]
+    elif any(tok in slug_l for tok in _WRITE_TOKENS):
+        model, tools = "sonnet", ["Read", "Edit", "Write", "Bash", "Grep", "Glob"]
+    elif any(tok in slug_l for tok in _DECISION_TOKENS):
+        model, tools = "sonnet", ["Read", "Grep", "Glob"]
+    elif any(tok in slug_l for tok in _GENERAL_TOKENS):
+        model, tools = "sonnet", []
+    else:
+        model, tools = "sonnet", []
+
+    # High-volume transcript signal → downgrade to Haiku (cost saver).
+    signals = (evidence or {}).get("signals") or []
+    if isinstance(signals, list):
+        for sig in signals:
+            if not isinstance(sig, str) or not sig.startswith("transcripts:"):
+                continue
+            try:
+                count = int(sig.split(":", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if count >= 15:
+                model = "haiku"
+            break
+
+    return model, tools
+
+
 # ---------- recommend ----------
 
 def cluster_candidates(
@@ -164,6 +326,10 @@ def cluster_candidates(
     out: list[AgentCandidate] = []
 
     intents = _gather_subagent_intents(root)
+    tags = _gather_decision_tags(root)
+    keywords = _gather_codex_keywords(root)
+    requested_min_signal = min_signal
+    min_signal = _adaptive_min_signal(intents, tags, keywords, min_signal)
     for sub_type, count in intents.most_common():
         if count < min_signal:
             continue
@@ -177,14 +343,15 @@ def cluster_candidates(
         if _danger_match(body):
             continue
         cid = _candidate_id(slug, body)
+        evidence = {"signals": [f"transcripts:{count}"], "rationale": f"`{sub_type}` 호출 {count}회"}
+        model, tools = _classify_role(slug, evidence)
         out.append(
             AgentCandidate(
                 id=cid, slug=slug, description=desc, body=body,
-                evidence={"signals": [f"transcripts:{count}"], "rationale": f"`{sub_type}` 호출 {count}회"},
+                evidence=evidence, model=model, tools=tools,
             )
         )
 
-    tags = _gather_decision_tags(root)
     for tag, count in tags.most_common():
         if count < min_signal:
             continue
@@ -198,12 +365,40 @@ def cluster_candidates(
         if _danger_match(body):
             continue
         cid = _candidate_id(slug, body)
+        evidence = {"signals": [f"decisions:{count}"], "rationale": f"tag '{tag}' {count} decisions"}
+        model, tools = _classify_role(slug, evidence)
         out.append(
             AgentCandidate(
                 id=cid, slug=slug, description=desc, body=body,
-                evidence={"signals": [f"decisions:{count}"], "rationale": f"tag '{tag}' {count} decisions"},
+                evidence=evidence, model=model, tools=tools,
             )
         )
+
+    for kw, count in keywords.most_common(12):
+        if count < min_signal:
+            continue
+        slug = _slugify(f"{kw}-investigator")
+        desc = f"'{kw}' 키워드가 {count}개 codex thread에서 반복 — 도메인 전용 investigator 후보."
+        body = _draft_agent_body(
+            slug,
+            f"the '{kw}' domain",
+            evidence_lines=[f"codex threads tagged '{kw}': {count}"],
+        )
+        if _danger_match(body):
+            continue
+        cid = _candidate_id(slug, body)
+        evidence = {"signals": [f"codex_keywords:{count}"], "rationale": f"keyword '{kw}' {count} codex threads"}
+        model, tools = _classify_role(slug, evidence)
+        out.append(
+            AgentCandidate(
+                id=cid, slug=slug, description=desc, body=body,
+                evidence=evidence, model=model, tools=tools,
+            )
+        )
+
+    # bash_heads are high-confidence: use the caller's requested min_signal (not the
+    # cold-start downgraded value) so the *4 multiplier yields a meaningful threshold.
+    out.extend(_candidates_from_bash_heads(root, min_signal=requested_min_signal))
 
     seen_slugs = set()
     deduped = []
@@ -239,6 +434,8 @@ def list_catalog(root: Path) -> list[AgentCatalogEntry]:
             body_sha256=str(rec.get("body_sha256") or ""),
             installed_paths=list(rec.get("installed_paths") or []),
             created_at=str(rec.get("created_at") or ""),
+            model=str(rec.get("model") or "sonnet"),
+            tools=list(rec.get("tools") or []),
         )
     return list(seen.values())
 
@@ -255,9 +452,16 @@ def recommend(
         return {"ok": True, "candidates": [], "note": "signals_below_threshold"}
     existing = {e.id: e for e in list_catalog(root)}
     seen_slugs = {e.slug: e.status for e in existing.values()}
+    terminal_slugs = {
+        e.slug
+        for e in existing.values()
+        if e.status in ("rejected", "installed", "uninstalled")
+    }
     out: list[dict[str, Any]] = []
     for c in cands:
         if c.id in existing and existing[c.id].status != "pending":
+            continue
+        if c.slug in terminal_slugs:
             continue
         if seen_slugs.get(c.slug) in ("rejected", "installed", "uninstalled"):
             continue
@@ -267,6 +471,7 @@ def recommend(
                 description=c.description, body=c.body,
                 body_sha256=_sha256(c.body),
                 installed_paths=[], created_at=now_iso(),
+                model=c.model, tools=list(c.tools),
             )
             _persist(root, entry)
             append_audit(
@@ -276,20 +481,35 @@ def recommend(
         out.append({
             "id": c.id, "slug": c.slug, "description": c.description,
             "body": c.body, "evidence": c.evidence, "status": "pending",
+            "model": c.model, "tools": list(c.tools),
         })
     return {"ok": True, "candidates": out}
 
 
-def _frontmatter(slug: str, description: str, cid: str, body_sha: str) -> str:
-    return (
-        "---\n"
-        f"name: {slug}\n"
-        f"description: {description[:160]}\n"
-        "managed-by: code-brain\n"
-        f"catalog-id: {cid}\n"
-        f"body-sha256: {body_sha}\n"
-        "---\n"
-    )
+def _frontmatter(
+    slug: str,
+    description: str,
+    cid: str,
+    body_sha: str,
+    *,
+    model: str | None = None,
+    tools: list[str] | None = None,
+) -> str:
+    lines = [
+        "---",
+        f"name: {slug}",
+        f"description: {description[:160]}",
+        "managed-by: code-brain",
+        f"catalog-id: {cid}",
+        f"body-sha256: {body_sha}",
+    ]
+    if model is not None:
+        lines.append(f"model: {model}")
+    if tools:
+        lines.append(f"tools: {', '.join(tools)}")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _read_marker(path: Path) -> dict[str, str]:
@@ -324,13 +544,18 @@ def accept(root: Path, candidate_id: str) -> dict[str, Any]:
             id=entry.id, slug=entry.slug, status="rejected",
             description=entry.description, body=body, body_sha256=_sha256(body),
             installed_paths=[], created_at=entry.created_at,
+            model=entry.model or "sonnet", tools=list(entry.tools or []),
         )
         _persist(root, rejected)
         return {"ok": False, "reason": "danger_pattern"}
     if not body.startswith("\n"):
         body = "\n" + body
     body_sha = _sha256(body)
-    fm = _frontmatter(entry.slug, entry.description, entry.id, body_sha)
+    fm = _frontmatter(
+        entry.slug, entry.description, entry.id, body_sha,
+        model=entry.model or "sonnet",
+        tools=list(entry.tools or []),
+    )
     target = root / ".claude" / "agents" / f"{entry.slug}.md"
     if target.exists():
         m = _read_marker(target)
@@ -343,6 +568,7 @@ def accept(root: Path, candidate_id: str) -> dict[str, Any]:
         id=entry.id, slug=entry.slug, status="installed",
         description=entry.description, body=body, body_sha256=body_sha,
         installed_paths=installed, created_at=entry.created_at,
+        model=entry.model or "sonnet", tools=list(entry.tools or []),
     )
     _persist(root, accepted)
     append_audit(
@@ -363,6 +589,7 @@ def reject(root: Path, candidate_id: str) -> dict[str, Any]:
         id=entry.id, slug=entry.slug, status="rejected",
         description=entry.description, body=entry.body, body_sha256=entry.body_sha256,
         installed_paths=[], created_at=entry.created_at,
+        model=entry.model or "sonnet", tools=list(entry.tools or []),
     )
     _persist(root, rejected)
     append_audit(root, action="agent.reject", category="memory", payload={"id": entry.id})
@@ -396,6 +623,7 @@ def uninstall(root: Path, slug: str, *, force: bool = False) -> dict[str, Any]:
         id=last.id, slug=last.slug, status="uninstalled",
         description=last.description, body=last.body, body_sha256=last.body_sha256,
         installed_paths=[], created_at=last.created_at,
+        model=last.model or "sonnet", tools=list(last.tools or []),
     )
     _persist(root, uninstalled)
     append_audit(
@@ -411,6 +639,7 @@ def list_visible(root: Path) -> list[dict[str, Any]]:
             "id": e.id, "slug": e.slug, "status": e.status,
             "description": e.description[:160], "installed_paths": e.installed_paths,
             "created_at": e.created_at,
+            "model": e.model or "sonnet", "tools": list(e.tools or []),
         }
         for e in list_catalog(root)
     ]

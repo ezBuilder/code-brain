@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
+from ai_core import search as search_mod  # noqa: E402
 from ai_core.search import (  # noqa: E402
     SCHEMA_VERSION,
+    _looks_like_code_symbol,
+    _rg_fallback,
     connect,
+    context_pack,
     init_schema,
     query,
     rebuild,
+    retrieval_policy_for_query,
 )
 
 
@@ -30,14 +38,14 @@ def _write(repo: Path, rel: str, content: str) -> Path:
     return path
 
 
-def test_schema_version_is_three(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 3
+def test_schema_version_is_five(tmp_path: Path) -> None:
+    assert SCHEMA_VERSION == 5
     repo = _make_repo(tmp_path)
     _write(repo, "doc.md", "hello world\n")
     rebuild(repo)
     with connect(repo) as conn:
         version = int(conn.execute("pragma user_version").fetchone()[0])
-    assert version == 3
+    assert version == 5
 
 
 def test_porter_stemming_matches_inflected_forms(tmp_path: Path) -> None:
@@ -64,7 +72,7 @@ def test_porter_stemming_matches_run_running_runs(tmp_path: Path) -> None:
         assert result["results"][0]["path"] == "doc.md"
 
 
-def test_legacy_v2_cache_auto_migrates_to_v3(tmp_path: Path) -> None:
+def test_legacy_v2_cache_auto_migrates_to_v4(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     with connect(repo) as conn:
         conn.executescript(
@@ -114,7 +122,7 @@ def test_legacy_v2_cache_auto_migrates_to_v3(tmp_path: Path) -> None:
         assert version_before == 2
         init_schema(conn, migrate_legacy=True)
         version_after = int(conn.execute("pragma user_version").fetchone()[0])
-        assert version_after == 3
+        assert version_after == 5
 
         tables = {
             row[0]
@@ -138,3 +146,142 @@ def test_diacritics_normalized(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert len(result["results"]) == 1
     assert result["results"][0]["path"] == "doc.md"
+
+
+def test_bm25_weights_path_higher_than_content(tmp_path: Path, monkeypatch) -> None:
+    # Disable rg fallback so the result ordering reflects pure BM25 ranking.
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    repo = _make_repo(tmp_path)
+    # Chunk A: term appears in path (filename "foo_alpha.py"), content lacks "alpha".
+    _write(repo, "foo_alpha.py", "something else here\n")
+    # Chunk B: term appears in content many times, but path does not contain "alpha".
+    _write(repo, "other.py", "alpha alpha alpha\n")
+    rebuild(repo)
+
+    # Baseline: equal weights -> content-heavy file wins.
+    monkeypatch.setenv("AI_SEARCH_BM25_PATH_WEIGHT", "1.0")
+    monkeypatch.setenv("AI_SEARCH_BM25_CONTENT_WEIGHT", "1.0")
+    baseline = query(repo, "alpha", limit=5)
+    baseline_paths = [item["path"] for item in baseline["results"]]
+    assert "foo_alpha.py" in baseline_paths
+    assert "other.py" in baseline_paths
+
+    # Boosted path weight -> path-match must rank at or above content-match.
+    monkeypatch.setenv("AI_SEARCH_BM25_PATH_WEIGHT", "10.0")
+    monkeypatch.setenv("AI_SEARCH_BM25_CONTENT_WEIGHT", "1.0")
+    boosted = query(repo, "alpha", limit=5)
+    boosted_paths = [item["path"] for item in boosted["results"]]
+    assert "foo_alpha.py" in boosted_paths
+    assert "other.py" in boosted_paths
+    # With path heavily weighted, path-match outranks content-only match.
+    assert boosted_paths.index("foo_alpha.py") <= boosted_paths.index("other.py")
+    # And boosting actually changed the ordering relative to baseline.
+    assert boosted_paths != baseline_paths or boosted_paths[0] == "foo_alpha.py"
+
+
+def test_rg_fallback_triggers_on_zero_fts_hits(tmp_path: Path, monkeypatch) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    _write(repo, "doc.md", "the word here is ordinary\n")
+    rebuild(repo)
+
+    calls: list[list] = []
+    original_run = search_mod.subprocess.run
+
+    def _spy_run(cmd, *args, **kwargs):
+        # Only record the rg invocation; let other subprocess calls (git ls-files
+        # in rebuild) pass through normally.
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("rg"):
+            calls.append(list(cmd))
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(search_mod.subprocess, "run", _spy_run)
+
+    result = query(repo, "ZeXyQuPlBazXYZ", limit=5)
+    assert result["ok"] is True
+    # rg was invoked because FTS5 returned zero hits.
+    assert any(str(c[0]).endswith("rg") for c in calls), f"rg not invoked; calls={calls}"
+
+
+def test_rg_fallback_respects_disable_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    repo = _make_repo(tmp_path)
+    _write(repo, "doc.md", "ordinary content\n")
+    rebuild(repo)
+
+    calls: list[list] = []
+    original_run = search_mod.subprocess.run
+
+    def _spy_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("rg"):
+            calls.append(list(cmd))
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(search_mod.subprocess, "run", _spy_run)
+
+    result = query(repo, "ZeXyQuPlBazXYZ", limit=5)
+    assert result["ok"] is True
+    assert result.get("rg_fallback") is False
+    assert calls == []
+
+
+def test_symbol_detection() -> None:
+    assert _looks_like_code_symbol("MyClassName") is True
+    assert _looks_like_code_symbol("snake_case_var") is True
+    assert _looks_like_code_symbol("src/file.py") is True
+    assert _looks_like_code_symbol("E1001") is True
+    assert _looks_like_code_symbol("hello world") is False
+    # snake_case rule fires; acceptable false positive for fallback bias.
+    assert _looks_like_code_symbol("just_a_word") is True
+
+
+def test_retrieval_policy_for_query_is_pure_shape_decision() -> None:
+    graph_state = {"indexed_files": 4, "symbol_count": 2, "call_edge_count": 3}
+    bm25_only_state = {"indexed_files": 4, "symbol_count": 0, "call_edge_count": 0}
+
+    assert retrieval_policy_for_query("", graph_state) == "none"
+    assert retrieval_policy_for_query("anything", {"indexed_files": 0}) == "none"
+    assert retrieval_policy_for_query("plain language search", graph_state) == "bm25"
+    assert retrieval_policy_for_query("MyClassName", graph_state) == "hybrid"
+    assert retrieval_policy_for_query("callers for helper", graph_state) == "graph"
+    assert retrieval_policy_for_query("MyClassName", bm25_only_state) == "bm25"
+
+
+def test_query_and_context_pack_expose_retrieval_policy(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _write(
+        repo,
+        "src/service.py",
+        "def MyClassName():\n    helper()\n\n"
+        "def helper():\n    return 1\n",
+    )
+    rebuild(repo)
+
+    result = query(repo, "MyClassName", limit=5)
+    assert result["ok"] is True
+    assert result["retrieval_policy"] in {"bm25", "bm25+rg"}
+    assert result["recommended_retrieval_policy"] == "hybrid"
+
+    pack = context_pack(repo, "MyClassName", limit=5)
+    assert pack["retrieval_policy"] in {"bm25", "bm25+rg"}
+    assert pack["recommended_retrieval_policy"] == "hybrid"
+    assert pack["additionalContext"]
+
+
+def test_rg_fallback_helper_returns_empty_when_disabled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    assert _rg_fallback(tmp_path, "anything") == []
+
+
+def test_bm25_weights_invalid_env_falls_back_to_defaults(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_BM25_PATH_WEIGHT", "not-a-float")
+    monkeypatch.setenv("AI_SEARCH_BM25_CONTENT_WEIGHT", "")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    repo = _make_repo(tmp_path)
+    _write(repo, "doc.md", "hello\n")
+    rebuild(repo)
+    result = query(repo, "hello")
+    assert result["ok"] is True
+    assert len(result["results"]) == 1

@@ -89,7 +89,7 @@ is_managed_existing_file() {
   local rel="$1"
   local manifest
   manifest="$(manifest_path)"
-  [[ -f "$manifest" ]] && python - "$manifest" "$rel" <<'PY'
+  if [[ -f "$manifest" ]] && python - "$manifest" "$rel" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -99,6 +99,11 @@ rel = sys.argv[2]
 payload = json.loads(manifest.read_text(encoding="utf-8"))
 raise SystemExit(0 if rel in payload.get("files", []) else 1)
 PY
+  then
+    return 0
+  fi
+  local target="$TARGET_ROOT/$rel"
+  [[ -f "$target" ]] && grep -q "managed-by: code-brain" "$target"
 }
 
 copy_file() {
@@ -131,7 +136,7 @@ umask 077
 cd "$(dirname "$0")"
 ./scripts/preflight.sh --check-only >/dev/null
 ./scripts/env-check.sh >/dev/null
-uv sync --project .ai/runtime
+uv sync --project .ai/runtime --extra dense
 if git rev-parse --git-dir >/dev/null 2>&1; then
   git config core.hooksPath .githooks
 fi
@@ -436,15 +441,15 @@ from pathlib import Path
 
 dst = Path(sys.argv[1])
 managed_codex_hooks = {
-    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreToolUse', "statusMessage": "Checking Code Brain command routing"}]}],
-    "PostToolUse": [{"matcher": "Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostToolUse', "statusMessage": "Recording Code Brain tool result"}]}],
+    "PreToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreToolUse', "statusMessage": "Checking Code Brain command routing"}]}],
+    "PostToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostToolUse', "statusMessage": "Recording Code Brain tool result"}]}],
     "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SessionStart', "statusMessage": "Loading Code Brain session context"}]}],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" UserPromptSubmit', "statusMessage": "Loading Code Brain prompt context"}]}],
     "Stop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" Stop', "statusMessage": "Recording Code Brain stop event"}]}],
     "SubagentStop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SubagentStop', "statusMessage": "Recording Code Brain subagent stop"}]}],
     "PreCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreCompact', "statusMessage": "Saving Code Brain compact snapshot"}]}],
     "PostCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostCompact', "statusMessage": "Recording Code Brain compact completion"}]}],
-    "PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PermissionRequest', "statusMessage": "Checking Code Brain approval policy"}]}],
+    "PermissionRequest": [{"matcher": "Bash|Shell|exec_command|functions.exec_command", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PermissionRequest', "statusMessage": "Checking Code Brain approval policy"}]}],
 }
 if dst.exists():
     try:

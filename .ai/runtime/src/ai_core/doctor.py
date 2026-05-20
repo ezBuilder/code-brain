@@ -145,11 +145,7 @@ def check_config(root: Path) -> Check:
     bad = [key for key in ("embeddings", "remote_llm", "external_notifications") if features.get(key) is not False]
     if bad:
         return Check("config", False, "default-off features enabled: " + ", ".join(bad))
-    remote = config.get("remote_memory", {})
-    if not isinstance(remote, dict):
-        return Check("config", False, "remote_memory config must be a mapping")
-    if remote.get("provider", "cloudflare") != "cloudflare":
-        return Check("config", False, f"unknown remote_memory provider: {remote.get('provider')}")
+    # remote_memory feature removed (T37) — .ai/ git sync replaces it.
     search = config.get("search", {})
     if not isinstance(search, dict):
         return Check("config", False, "search config must be a mapping")
@@ -347,15 +343,22 @@ def check_audit_chain(root: Path) -> Check:
 
 
 def check_hot_path_slo(root: Path) -> Check:
-    from .hooks import HOT_PATH_TARGET_MS, handle_hook
+    from .hooks import HOT_PATH_TARGET_MS, SESSION_START_TARGET_MS, handle_hook
 
     samples = []
     for _ in range(10):
         payload = handle_hook(root, "DoctorSLOBaseline", {"agent": "doctor", "dry": True})
         samples.append(int(payload["elapsed_ms"]))
     p95 = sorted(samples)[max(0, int(len(samples) * 0.95) - 1)] if samples else 0
-    ok = p95 <= HOT_PATH_TARGET_MS
-    return Check("hot_path_slo", ok, f"p95_ms={p95}, target_ms={HOT_PATH_TARGET_MS}")
+    start_payload = handle_hook(root, "SessionStart", {"agent": "doctor", "dry": True})
+    start_ms = int(start_payload["elapsed_ms"])
+    ok = p95 <= HOT_PATH_TARGET_MS and start_ms <= SESSION_START_TARGET_MS
+    return Check(
+        "hot_path_slo",
+        ok,
+        f"p95_ms={p95}, target_ms={HOT_PATH_TARGET_MS}, session_start_ms={start_ms}, "
+        f"session_start_target_ms={SESSION_START_TARGET_MS}",
+    )
 
 
 def check_secret_scan(root: Path) -> Check:

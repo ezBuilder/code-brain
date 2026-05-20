@@ -56,6 +56,64 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "code_graph_callers",
+        "description": "Function-call graph reverse lookup: who calls this qualname? Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "qualname": {"type": "string", "description": "Function/method qualname (e.g. 'append_audit' or 'C.method')"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["qualname"],
+        },
+    },
+    {
+        "name": "code_graph_callees",
+        "description": "Function-call graph forward lookup: what does this qualname call? Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "qualname": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["qualname"],
+        },
+    },
+    {
+        "name": "code_graph_symbol",
+        "description": "Locate function/class definitions by qualname fragment. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Substring to match against qualname (LIKE %name%)"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "code_graph_hotspots",
+        "description": "Most-called callees across the indexed codebase. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "default": 20}},
+        },
+    },
+    {
+        "name": "code_verify",
+        "description": "AST-based policy gate: rejects forbidden imports/calls/sandbox escapes. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"source": {"type": "string", "description": "Python source to verify"}},
+            "required": ["source"],
+        },
+    },
+    {
+        "name": "memory_tier",
+        "description": "MemGPT-style hot/warm/cold memory classification + page-out signal. Read-only.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "ai_status",
         "description": "Worker health envelope.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -68,7 +126,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "obs_usage",
         "description": "Token usage + Code Brain effect bytes. Read-only.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"include_sessions": {"type": "boolean", "default": False}},
+        },
     },
     {
         "name": "obs_health_summary",
@@ -337,61 +398,41 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "required": ["slug"],
         },
     },
-    {
-        "name": "remote_memory_recall",
-        "description": "Recall opt-in Cloudflare remote memory through the local adapter. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "project": {"type": "string", "default": "current"},
-                "top_k": {"type": "integer", "default": 5},
-                "scope": {"type": "string", "enum": ["global", "project"]},
-                "include_cross_project": {"type": "boolean", "default": False},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "remote_memory_remember",
-        "description": "Explicitly store a redacted note in opt-in Cloudflare remote memory. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string"},
-                "scope": {"type": "string", "enum": ["global", "project"], "default": "project"},
-                "project": {"type": "string", "default": "current"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "source_agent": {"type": "string", "default": "agent"},
-            },
-            "required": ["text"],
-        },
-    },
-    {
-        "name": "remote_memory_list_recent",
-        "description": "List recent opt-in remote memories scoped to current project plus global entries. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "project": {"type": "string", "default": "current"},
-                "n": {"type": "integer", "default": 10},
-                "include_cross_project": {"type": "boolean", "default": False},
-            },
-        },
-    },
-    {
-        "name": "remote_memory_forget",
-        "description": "Delete an opt-in remote memory by id. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-    },
+    # remote_memory_* tools removed (T37) — .ai/ git sync replaces Cloudflare round-trip.
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
 TOOL_NAMES = frozenset(MCP_METHODS)
+
+# tools/list payload is static within a process lifetime (TOOLS is a module-level
+# constant). Profiling on real projects showed tools/list being called 100+ times
+# per session with a ~8KB response — pure waste. Cache once and reuse.
+#
+# Safety:
+#  - The cached value is the inner "result" payload (a dict {"tools": [...]}).
+#  - handle_request wraps it in _ok(request_id, cached) — request_id is fresh.
+#  - redact_value walks the response and returns a fresh copy, so the cached
+#    payload itself is never mutated by downstream callers.
+_TOOLS_LIST_CACHE: dict[str, Any] | None = None
+
+
+def _build_tools_list_payload() -> dict[str, Any]:
+    """Build the tools/list result payload. Pure function over module constants."""
+    return {"tools": [dict(tool) for tool in TOOLS]}
+
+
+def _get_tools_list_payload() -> dict[str, Any]:
+    """Return the cached tools/list payload, building it on first call."""
+    global _TOOLS_LIST_CACHE
+    if _TOOLS_LIST_CACHE is None:
+        _TOOLS_LIST_CACHE = _build_tools_list_payload()
+    return _TOOLS_LIST_CACHE
+
+
+def _invalidate_tools_list_cache() -> None:
+    """Reset the tools/list cache. Reserved for hot-reload / test scenarios."""
+    global _TOOLS_LIST_CACHE
+    _TOOLS_LIST_CACHE = None
 
 
 def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -401,12 +442,32 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":
         return context_pack(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
+    if name == "code_graph_callers":
+        from .codegraph import query_callers
+        return query_callers(root, str(args.get("qualname", "")), limit=int(args.get("limit", 20) or 20))
+    if name == "code_graph_callees":
+        from .codegraph import query_callees
+        return query_callees(root, str(args.get("qualname", "")), limit=int(args.get("limit", 20) or 20))
+    if name == "code_graph_symbol":
+        from .codegraph import find_symbol
+        return find_symbol(root, str(args.get("name", "")), limit=int(args.get("limit", 20) or 20))
+    if name == "code_graph_hotspots":
+        from .codegraph import hotspot_callees
+        return hotspot_callees(root, limit=int(args.get("limit", 20) or 20))
+    if name == "code_verify":
+        from .ast_verify import verify_source
+        return verify_source(str(args.get("source", ""))).to_dict()
+    if name == "memory_tier":
+        from .memory_tier import classify, hot_pressure
+        cls = classify(root)
+        pres = hot_pressure(root)
+        return {**cls, "pressure": pres}
     if name == "ai_status":
         return health(root)
     if name == "ai_request_rebuild":
         return rebuild(root)
     if name == "obs_usage":
-        return usage_report(root)
+        return usage_report(root, include_sessions=bool(args.get("include_sessions", False)))
     if name == "obs_health_summary":
         return health_summary(root)
     if name == "obs_search":
@@ -569,50 +630,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         if not isinstance(slug, str) or not slug:
             raise ValueError("agents_uninstall requires slug string")
         return ag_uninstall_fn(root, slug, force=bool(args.get("force", False)))
-    if name == "remote_memory_recall":
-        from . import remote_memory as rm
-        query_text = args.get("query")
-        if not isinstance(query_text, str) or not query_text.strip():
-            raise ValueError("remote_memory_recall requires query string")
-        project = args.get("project")
-        return rm.recall(
-            root,
-            query=query_text,
-            project=None if project in (None, "current") else str(project),
-            top_k=int(args.get("top_k", 5) or 5),
-            include_cross_project=bool(args.get("include_cross_project", False)),
-            scope=str(args["scope"]) if isinstance(args.get("scope"), str) else None,
-        )
-    if name == "remote_memory_remember":
-        from . import remote_memory as rm
-        text = args.get("text")
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("remote_memory_remember requires text string")
-        project = args.get("project")
-        return rm.remember(
-            root,
-            text=text,
-            scope=str(args.get("scope", "project")),
-            project=None if project in (None, "current") else str(project),
-            tags=args.get("tags") if isinstance(args.get("tags"), list) else None,
-            source_agent=str(args.get("source_agent", "agent")),
-            source_surface="mcp",
-        )
-    if name == "remote_memory_list_recent":
-        from . import remote_memory as rm
-        project = args.get("project")
-        return rm.list_recent(
-            root,
-            project=None if project in (None, "current") else str(project),
-            n=int(args.get("n", 10) or 10),
-            include_cross_project=bool(args.get("include_cross_project", False)),
-        )
-    if name == "remote_memory_forget":
-        from . import remote_memory as rm
-        entry_id = args.get("id")
-        if not isinstance(entry_id, str) or not entry_id.strip():
-            raise ValueError("remote_memory_forget requires id string")
-        return rm.forget(root, entry_id=entry_id)
+    # remote_memory_* dispatchers removed (T37)
     raise KeyError(name)
 
 
@@ -702,6 +720,7 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
     params = request.get("params") or {}
     request_id = request.get("id")
     is_notification = "id" not in request
+    audit_tool_name: str | None = None
 
     try:
         # Notifications — no response per JSON-RPC 2.0.
@@ -720,10 +739,11 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
         elif method == "ping":
             response = _ok(request_id, {})
         elif method == "tools/list":
-            response = _ok(request_id, {"tools": [dict(tool) for tool in TOOLS]})
+            response = _ok(request_id, _get_tools_list_payload())
         elif method == "tools/call":
             name = params.get("name")
             arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+            audit_tool_name = name if isinstance(name, str) else None
             if not isinstance(name, str) or name not in TOOL_NAMES:
                 response = _err(request_id, -32602, f"unknown tool: {name!r}")
             else:
@@ -760,6 +780,7 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
             response = _ok(request_id, {"resourceTemplates": []})
         elif isinstance(method, str) and method in TOOL_NAMES:
             # Legacy direct dispatch: e.g. {"method": "obs_usage", ...}
+            audit_tool_name = method
             result = _dispatch_tool(root, method, params if isinstance(params, dict) else {})
             response = _ok(request_id, result)
         else:
@@ -767,7 +788,15 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
     except Exception as exc:
         response = _err(request_id, -32000, str(exc))
 
-    record_mcp_request(root, method, request, response, start, response.get("result") if isinstance(response, dict) else None)
+    record_mcp_request(
+        root,
+        method,
+        request,
+        response,
+        start,
+        response.get("result") if isinstance(response, dict) else None,
+        tool_name=audit_tool_name,
+    )
     return None if is_notification else redact_value(response)
 
 
@@ -778,21 +807,23 @@ def record_mcp_request(
     response: dict[str, Any],
     start: float,
     result: Any,
+    *,
+    tool_name: str | None = None,
 ) -> None:
     if is_ci():
         return
     try:
-        append_event(
-            root,
-            {
-                "hook": "mcp.request",
-                "method": method,
-                "elapsed_ms": int((time.perf_counter() - start) * 1000),
-                "request_bytes": len(json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")),
-                "response_bytes": len(json.dumps(response, ensure_ascii=False, sort_keys=True).encode("utf-8")),
-                "results_count": len(result.get("results", [])) if isinstance(result, dict) else None,
-            },
-        )
+        event = {
+            "hook": "mcp.request",
+            "method": method,
+            "elapsed_ms": int((time.perf_counter() - start) * 1000),
+            "request_bytes": len(json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+            "response_bytes": len(json.dumps(response, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+            "results_count": len(result.get("results", [])) if isinstance(result, dict) else None,
+        }
+        if tool_name:
+            event["tool_name"] = tool_name
+        append_event(root, event)
     except Exception:
         # mcp.request audit is best-effort; never fail the JSON-RPC response on it.
         pass

@@ -133,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
                             help="rebuild index before query if any result would be stale (write op)")
     obs_search.add_argument("--json", action="store_true", dest="command_json")
     obs_usage = obs_sub.add_parser("usage")
+    obs_usage.add_argument("--include-sessions", action="store_true", dest="include_sessions")
     obs_usage.add_argument("--json", action="store_true", dest="command_json")
     obs_slo = obs_sub.add_parser("slo")
     obs_slo.add_argument("--iterations", type=int, default=10)
@@ -196,6 +197,27 @@ def build_parser() -> argparse.ArgumentParser:
     memory_session_append = memory_session_sub.add_parser("append")
     memory_session_append.add_argument("--text", required=True)
     memory_session_append.add_argument("--json", action="store_true", dest="command_json")
+    memory_tier = memory_sub.add_parser("tier", help="MemGPT-style hot/warm/cold classification (T30)")
+    memory_tier.add_argument("--json", action="store_true", dest="command_json")
+    memory_pressure = memory_sub.add_parser("pressure", help="hot-tier pressure (page-out signal)")
+    memory_pressure.add_argument("--json", action="store_true", dest="command_json")
+    memory_pageout = memory_sub.add_parser("page-out", help="rotate session + archive old sessions (T30 step B)")
+    memory_pageout.add_argument("--dry-run", action="store_true")
+    memory_pageout.add_argument("--json", action="store_true", dest="command_json")
+    lessons = sub.add_parser("lessons")
+    lessons_sub = lessons.add_subparsers(dest="lessons_command", required=True)
+    lessons_add = lessons_sub.add_parser("add")
+    lessons_add.add_argument("--source", default="operator")
+    lessons_add.add_argument("--failure", required=True)
+    lessons_add.add_argument("--cause", required=True)
+    lessons_add.add_argument("--fix", required=True)
+    lessons_add.add_argument("--tag", action="append", default=[])
+    lessons_add.add_argument("--json", action="store_true", dest="command_json")
+    lessons_list = lessons_sub.add_parser("list")
+    lessons_list.add_argument("--limit", type=int, default=20)
+    lessons_list.add_argument("--json", action="store_true", dest="command_json")
+    lessons_summary = lessons_sub.add_parser("summary")
+    lessons_summary.add_argument("--json", action="store_true", dest="command_json")
     audit = sub.add_parser("audit")
     audit_sub = audit.add_subparsers(dest="audit_command", required=True)
     audit_append = audit_sub.add_parser("append")
@@ -233,6 +255,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="single_flight",
         help="non-blocking flock on .ai/cache/.rebuild.lock; skip if another rebuild is in progress",
     )
+    index_rebuild.add_argument(
+        "--incremental",
+        action="store_true",
+        help="reindex only files whose redacted-content sha256 changed (T33)",
+    )
     recommend_parser = sub.add_parser("recommend")
     recommend_sub = recommend_parser.add_subparsers(dest="recommend_command", required=True)
     recommend_skills = recommend_sub.add_parser("skills")
@@ -241,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_skills.add_argument("--no-global", action="store_true", dest="no_global")
     recommend_skills.add_argument("--min-signal", type=int, default=3, dest="min_signal")
     recommend_skills.add_argument("--json", action="store_true", dest="command_json")
+    recommend_skills.add_argument("--compact", action="store_true", dest="compact")
     rec_accept = recommend_skills_sub.add_parser("accept")
     rec_accept.add_argument("candidate_id")
     rec_accept.add_argument("--json", action="store_true", dest="command_json")
@@ -285,6 +313,29 @@ def build_parser() -> argparse.ArgumentParser:
     fed_summary = federated_sub.add_parser("summary")
     fed_summary.add_argument("--json", action="store_true", dest="command_json")
 
+    eval_parser = sub.add_parser("eval")
+    eval_sub = eval_parser.add_subparsers(dest="eval_command", required=True)
+    eval_record = eval_sub.add_parser("record")
+    eval_record.add_argument("--id", dest="case_id")
+    eval_record.add_argument("--kind", required=True)
+    eval_record.add_argument("--command", required=True, dest="eval_case_command")
+    eval_record.add_argument("--outcome", required=True)
+    eval_record.add_argument("--duration-ms", required=True, type=int, dest="duration_ms")
+    eval_record.add_argument("--json", action="store_true", dest="command_json")
+    eval_summary = eval_sub.add_parser("summary")
+    eval_summary.add_argument("--latest", type=int, default=5)
+    eval_summary.add_argument("--json", action="store_true", dest="command_json")
+
+    embedding_parser = sub.add_parser("embedding", help="dense semantic-search model management (opt-in)")
+    embedding_sub = embedding_parser.add_subparsers(dest="embedding_command", required=True)
+    emb_status = embedding_sub.add_parser("status", help="show dense embedding readiness")
+    emb_status.add_argument("--json", action="store_true", dest="command_json")
+    emb_install = embedding_sub.add_parser("install", help="download ONNX MiniLM model (~25MB, one-shot)")
+    emb_install.add_argument("--verify", action="store_true", help="only check presence")
+    emb_install.add_argument("--json", action="store_true", dest="command_json")
+    emb_uninstall = embedding_sub.add_parser("uninstall", help="remove cached model files")
+    emb_uninstall.add_argument("--json", action="store_true", dest="command_json")
+
     agents_parser = sub.add_parser("agents")
     agents_sub = agents_parser.add_subparsers(dest="agents_command", required=True)
     ag_recommend = agents_sub.add_parser("recommend")
@@ -304,35 +355,37 @@ def build_parser() -> argparse.ArgumentParser:
     ag_uninstall.add_argument("--force", action="store_true")
     ag_uninstall.add_argument("--json", action="store_true", dest="command_json")
 
-    remote_memory = sub.add_parser("remote-memory")
-    remote_memory_sub = remote_memory.add_subparsers(dest="remote_memory_command", required=True)
-    remote_status = remote_memory_sub.add_parser("status")
-    remote_status.add_argument("--json", action="store_true", dest="command_json")
-    remote_recall = remote_memory_sub.add_parser("recall")
-    remote_recall.add_argument("--query", required=True)
-    remote_recall.add_argument("--project", default="current")
-    remote_recall.add_argument("--top-k", type=int, default=5, dest="top_k")
-    remote_recall.add_argument("--scope", choices=["global", "project"])
-    remote_recall.add_argument("--include-cross-project", action="store_true", dest="include_cross_project")
-    remote_recall.add_argument("--json", action="store_true", dest="command_json")
-    remote_remember = remote_memory_sub.add_parser("remember")
-    remote_remember.add_argument("--text", required=True)
-    remote_remember.add_argument("--scope", choices=["global", "project"], default="project")
-    remote_remember.add_argument("--project", default="current")
-    remote_remember.add_argument("--tag", action="append", default=[])
-    remote_remember.add_argument("--source-agent", default="operator", dest="source_agent")
-    remote_remember.add_argument("--source-surface", default="cli", dest="source_surface")
-    remote_remember.add_argument("--json", action="store_true", dest="command_json")
-    remote_sync = remote_memory_sub.add_parser("sync")
-    remote_sync.add_argument("--direction", choices=["pull", "push"], required=True)
-    remote_sync.add_argument("--json", action="store_true", dest="command_json")
-
+    # remote-memory CLI removed (T37) — .ai/ git sync covers cross-device.
     code = sub.add_parser("code")
     code_sub = code.add_subparsers(dest="code_command", required=True)
     code_query = code_sub.add_parser("query")
     code_query.add_argument("query")
     code_query.add_argument("--limit", type=int, default=5)
     code_query.add_argument("--json", action="store_true", dest="command_json")
+    code_graph = code_sub.add_parser("graph", help="function-call graph queries (T29 step C)")
+    code_graph_sub = code_graph.add_subparsers(dest="graph_command", required=True)
+    cg_callers = code_graph_sub.add_parser("callers", help="who calls this function?")
+    cg_callers.add_argument("qualname")
+    cg_callers.add_argument("--limit", type=int, default=20)
+    cg_callers.add_argument("--json", action="store_true", dest="command_json")
+    cg_callees = code_graph_sub.add_parser("callees", help="what does this function call?")
+    cg_callees.add_argument("qualname")
+    cg_callees.add_argument("--limit", type=int, default=20)
+    cg_callees.add_argument("--json", action="store_true", dest="command_json")
+    cg_symbol = code_graph_sub.add_parser("symbol", help="locate symbol(s) by name fragment")
+    cg_symbol.add_argument("name")
+    cg_symbol.add_argument("--limit", type=int, default=20)
+    cg_symbol.add_argument("--json", action="store_true", dest="command_json")
+    cg_hotspots = code_graph_sub.add_parser("hotspots", help="most-called callees in the index")
+    cg_hotspots.add_argument("--limit", type=int, default=20)
+    cg_hotspots.add_argument("--json", action="store_true", dest="command_json")
+    code_verify = code_sub.add_parser("verify", help="AST-based policy gate (T31)")
+    code_verify.add_argument("source", nargs="?", help="file path; omit to read from stdin")
+    code_verify.add_argument("--stdin", action="store_true")
+    code_verify.add_argument("--json", action="store_true", dest="command_json")
+    code_map = code_sub.add_parser("map", help="live top-level codebase map with local commands")
+    code_map.add_argument("--limit", type=int, default=40)
+    code_map.add_argument("--json", action="store_true", dest="command_json")
     context = sub.add_parser("context")
     context_sub = context.add_subparsers(dest="context_command", required=True)
     context_pack_parser = context_sub.add_parser("pack")
@@ -351,6 +404,22 @@ def build_parser() -> argparse.ArgumentParser:
     session_start.add_argument("--json", action="store_true", dest="command_json")
     mcp = sub.add_parser("mcp")
     mcp.add_argument("--once-json")
+    release_gate = sub.add_parser("release-gate")
+    release_gate_sub = release_gate.add_subparsers(dest="release_gate_command", required=True)
+    release_gate_summary = release_gate_sub.add_parser("summary")
+    release_gate_summary.add_argument("--json", action="store_true", dest="command_json")
+    kit = sub.add_parser("kit")
+    kit_sub = kit.add_subparsers(dest="kit_command", required=True)
+    kit_status = kit_sub.add_parser("status")
+    kit_status.add_argument("--json", action="store_true", dest="command_json")
+    kit_validate = kit_sub.add_parser("validate")
+    kit_validate.add_argument("--json", action="store_true", dest="command_json")
+    runtime = sub.add_parser("runtime")
+    runtime_sub = runtime.add_subparsers(dest="runtime_command", required=True)
+    runtime_insights = runtime_sub.add_parser("insights")
+    runtime_insights.add_argument("--json", action="store_true", dest="command_json")
+    runtime_policy = runtime_sub.add_parser("context-policy")
+    runtime_policy.add_argument("--json", action="store_true", dest="command_json")
     report = sub.add_parser("report")
     report_sub = report.add_subparsers(dest="report_command", required=True)
     report_status = report_sub.add_parser("status")
@@ -534,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
                 return MANIFEST_DRIFT
             return OK
         if args.command == "obs" and args.obs_command == "usage":
-            payload = usage_report(root)
+            payload = usage_report(root, include_sessions=bool(getattr(args, "include_sessions", False)))
             emit(payload, as_json=as_json)
             return OK
         if args.command == "obs" and args.obs_command == "slo":
@@ -622,6 +691,34 @@ def main(argv: list[str] | None = None) -> int:
             payload = append_session_note(root, text=args.text)
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "tier":
+            from . import memory_tier as _mt
+            emit(_mt.classify(root), as_json=as_json)
+            return OK
+        if args.command == "memory" and args.memory_command == "pressure":
+            from . import memory_tier as _mt
+            emit(_mt.hot_pressure(root), as_json=as_json)
+            return OK
+        if args.command == "memory" and args.memory_command == "page-out":
+            from . import memory_tier as _mt
+            emit(_mt.page_out(root, dry_run=bool(args.dry_run)), as_json=as_json)
+            return OK
+        if args.command == "lessons":
+            from .lessons import add_lesson, lesson_summary, list_lessons
+
+            if args.lessons_command == "add":
+                reject_ci_write("lessons")
+                payload = add_lesson(root, source=args.source, failure=args.failure, cause=args.cause, fix=args.fix, tags=args.tag)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.lessons_command == "list":
+                payload = list_lessons(root, limit=args.limit)
+                emit(payload, as_json=as_json)
+                return OK
+            if args.lessons_command == "summary":
+                payload = lesson_summary(root)
+                emit(payload, as_json=as_json)
+                return OK
         if args.command == "audit" and args.audit_command == "append":
             reject_ci_write("audit")
             payload = append_audit(root, action=args.action, category=args.category, payload=read_payload())
@@ -634,7 +731,11 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "index" and args.index_command == "rebuild":
             reject_ci_write("index")
-            payload = rebuild(root, single_flight=getattr(args, "single_flight", False))
+            payload = rebuild(
+                root,
+                single_flight=getattr(args, "single_flight", False),
+                incremental=getattr(args, "incremental", False),
+            )
             emit(payload, as_json=as_json)
             return OK
         if args.command == "recommend" and args.recommend_command == "skills":
@@ -648,6 +749,12 @@ def main(argv: list[str] | None = None) -> int:
             if sub_cmd == "reject":
                 reject_ci_write("skills")
                 payload = rec_reject_fn(root, args.candidate_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if getattr(args, "compact", False):
+                reject_ci_write("skills")
+                from .recommend import compact_skill_catalog
+                payload = compact_skill_catalog(root)
                 emit(payload, as_json=as_json)
                 return OK if payload.get("ok") else GENERIC_ERROR
             payload = rec_run(
@@ -717,6 +824,38 @@ def main(argv: list[str] | None = None) -> int:
             payload = cross_project_summary(root)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "eval":
+            from .eval_loop import record_case, summarize_cases
+            if args.eval_command == "record":
+                reject_ci_write("eval")
+                payload = record_case(
+                    root,
+                    case_id=args.case_id,
+                    kind=args.kind,
+                    command=args.eval_case_command,
+                    outcome=args.outcome,
+                    duration_ms=args.duration_ms,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if args.eval_command == "summary":
+                payload = summarize_cases(root, latest_limit=args.latest)
+                emit(payload, as_json=as_json)
+                return OK
+        if args.command == "embedding":
+            from . import embedding as emb_mod
+            cmd = args.embedding_command
+            if cmd == "status":
+                emit(emb_mod.status(root), as_json=as_json)
+                return OK
+            if cmd == "install":
+                payload = emb_mod.install_model(root, verify_only=bool(args.verify))
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else 1
+            if cmd == "uninstall":
+                payload = emb_mod.uninstall_model(root)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else 1
         if args.command == "agents":
             from .agent_recommend import (
                 accept as ag_accept_fn,
@@ -749,47 +888,7 @@ def main(argv: list[str] | None = None) -> int:
                 payload = ag_uninstall_fn(root, args.slug, force=args.force)
                 emit(payload, as_json=as_json)
                 return OK if payload.get("ok") else GENERIC_ERROR
-        if args.command == "remote-memory":
-            from . import remote_memory as rm
-
-            project = None if getattr(args, "project", "current") == "current" else getattr(args, "project", None)
-            cmd = args.remote_memory_command
-            if cmd == "status":
-                payload = rm.status(root)
-                emit(payload, as_json=as_json)
-                return OK if payload.get("ok") or not payload.get("enabled") else CONFIG_INVALID
-            if cmd == "recall":
-                payload = rm.recall(
-                    root,
-                    query=args.query,
-                    project=project,
-                    top_k=args.top_k,
-                    include_cross_project=args.include_cross_project,
-                    scope=args.scope,
-                )
-                emit(payload, as_json=as_json)
-                return OK
-            if cmd == "remember":
-                reject_ci_write("remote_memory")
-                payload = rm.remember(
-                    root,
-                    text=args.text,
-                    scope=args.scope,
-                    project=project,
-                    tags=args.tag,
-                    source_agent=args.source_agent,
-                    source_surface=args.source_surface,
-                )
-                emit(payload, as_json=as_json)
-                return OK if payload.get("ok") else GENERIC_ERROR
-            if cmd == "sync":
-                if args.direction == "pull":
-                    reject_ci_write("remote_memory")
-                else:
-                    reject_ci_write("remote_memory")
-                payload = rm.sync(root, direction=args.direction)
-                emit(payload, as_json=as_json)
-                return OK if payload.get("ok") else GENERIC_ERROR
+        # remote-memory dispatch removed (T37)
         if args.command == "exec":
             from .sandbox import execute as sandbox_execute, fetch as sandbox_fetch, list_executions as sandbox_list, prune as sandbox_prune
 
@@ -827,6 +926,35 @@ def main(argv: list[str] | None = None) -> int:
             payload = query(root, args.query, limit=args.limit)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "code" and args.code_command == "graph":
+            from . import codegraph as _cg
+            gcmd = args.graph_command
+            if gcmd == "callers":
+                emit(_cg.query_callers(root, args.qualname, limit=args.limit), as_json=as_json)
+                return OK
+            if gcmd == "callees":
+                emit(_cg.query_callees(root, args.qualname, limit=args.limit), as_json=as_json)
+                return OK
+            if gcmd == "symbol":
+                emit(_cg.find_symbol(root, args.name, limit=args.limit), as_json=as_json)
+                return OK
+            if gcmd == "hotspots":
+                emit(_cg.hotspot_callees(root, limit=args.limit), as_json=as_json)
+                return OK
+        if args.command == "code" and args.code_command == "verify":
+            from . import ast_verify as _av
+            if args.stdin or not args.source:
+                src = sys.stdin.read()
+                report = _av.verify_source(src).to_dict()
+            else:
+                report = _av.verify_file(args.source).to_dict()
+            emit(report, as_json=as_json)
+            return OK if report["ok"] else GENERIC_ERROR
+        if args.command == "code" and args.code_command == "map":
+            from .codebase_map import build_codebase_map
+
+            emit(build_codebase_map(root, max_entries=args.limit), as_json=as_json)
+            return OK
         if args.command == "context" and args.context_command == "pack":
             payload = context_pack(root, args.query, limit=args.limit)
             emit(payload, as_json=as_json)
@@ -853,6 +981,32 @@ def main(argv: list[str] | None = None) -> int:
                 emit(handle_request(root, json.loads(args.once_json)), as_json=True)
                 return OK
             return serve_stdio(root)
+        if args.command == "release-gate" and args.release_gate_command == "summary":
+            from .release_gate import summary as release_gate_summary
+
+            payload = release_gate_summary(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "kit":
+            from .global_kit import status as kit_status_fn, validate as kit_validate_fn
+
+            if args.kit_command == "status":
+                payload = kit_status_fn(root)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.kit_command == "validate":
+                payload = kit_validate_fn(root)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "runtime":
+            from .agent_runtime import context_policy as runtime_context_policy, insights as runtime_insights
+
+            if args.runtime_command == "insights":
+                emit(runtime_insights(root), as_json=as_json)
+                return OK
+            if args.runtime_command == "context-policy":
+                emit(runtime_context_policy(), as_json=as_json)
+                return OK
         if args.command == "report" and args.report_command == "status":
             from .report import status_exit_ok, status_report
 

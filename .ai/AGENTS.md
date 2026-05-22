@@ -17,6 +17,19 @@ This repository uses `.ai/` as the single repo-local source for AI agent context
 - A plan must list: files to touch, the contract change, the rollback path. No "and then we'll see".
 - Plan approval covers only the scope written down. Discovering extra work → stop and ask, do not silently expand.
 
+## Session Scope (one job per session)
+
+- One feature, one fix, or one investigation per session. When the topic shifts, `/clear`; when context bloats, `/compact`.
+- Mixing unrelated work in one session pollutes the audit log, the resume snapshot, and downstream skill/precall recommendations — they get trained on noise.
+- If the user introduces a second task mid-session, ask whether to finish current scope first or branch into a new session. Do not silently start a third thread.
+
+## Memory Trust Boundary
+
+- `record_decision` entries are durable rules — treat like CLAUDE.md hard constraints. Do not contradict them without an explicit override decision.
+- `record_todo` and `append_session_note` are hints. Re-verify before acting in a new session; they can be stale, partial, or written by a confused prior agent.
+- Claude/Codex product-level memory (chat history summarization) captures user preferences, not code rules. Do not encode build/test/branching policy there — fix it in `CLAUDE.md`, `.ai/AGENTS.md`, or a `record_decision`.
+- When memory disagrees with the working tree, the working tree wins. Open a fresh decision rather than acting on stale recall.
+
 ## Subagent Routing
 
 - File location / "where is X defined?" / "which files reference Y?" → `Explore` (read-only, cheaper, protects main context).
@@ -64,20 +77,9 @@ All four operations are write-class: rejected in CI per existing `WRITE_COMMANDS
 
 ## Skill Recommendation (slash command synthesis)
 
-Code Brain mines accumulated memory (decisions, todos, audit, session notes; optionally project-filtered Claude/Codex global memory) and proposes per-project slash commands. The flow is *recommend → review → accept*; never auto-install.
+Code Brain proposes per-project slash commands from accumulated memory. Flow is *recommend → review → accept* — never auto-install. Surface candidates to the user and wait for approval. Drafts containing prompt-injection patterns auto-reject during `accept`.
 
-- **Proactive surfacing**: the `SessionStart` hook may inject a short "Skill recommendations available" block when local signals cross the threshold. The agent must show those candidates to the user and ask for approval before accepting. Do not silently install, reject, or promote.
-- **List candidates**: `ai recommend skills [--limit N] [--no-global] [--min-signal K] [--json]` — local-only, no LLM/network, no install. It may persist pending catalog entries so accept/reject can target stable ids. Returns `{candidates: [{id, slug, description, body, evidence}, ...]}`.
-- **Install one**: `ai recommend skills accept <id>` — writes `.claude/commands/<slug>.md` and `.codex/prompts/<slug>.md` with frontmatter `managed-by: code-brain` + `body-sha256` for drift tracking. Write-class.
-- **Dismiss**: `ai recommend skills reject <id>` — kept in catalog with status `rejected` so it is never re-suggested.
-- **List installed**: `ai skills list [--json]`
-- **Remove**: `ai skills uninstall <slug> [--force]` — refuses if disk content drifted from recorded sha (user edits) unless `--force`.
-
-MCP equivalents: `recommend_skills`, `recommend_skills_accept`, `recommend_skills_reject`, `skills_list`, `skills_uninstall`.
-
-Catalog persists at `.ai/skills/catalog.jsonl` (append-only, redacted). Excluded from FTS5 indexing via `SKIP_PATH_PREFIXES`.
-
-Danger patterns (`<system-reminder>`, `Ignore previous instructions`, etc.) in draft bodies cause auto-rejection during `accept` — global-memory inputs cannot inject prompts via this surface.
+Full mechanics (CLI, MCP, catalog format, safety): see `.ai/policies/skill-recommendation.md`.
 
 ## Hook Event Coverage
 
@@ -91,19 +93,9 @@ Hook responses follow the Claude Code spec via `hookSpecificOutput.{hookEventNam
 
 ## Precall Rule Recommendation
 
-In addition to slash-command recommendations, Code Brain mines accumulated PreToolUse Bash invocations (audit log + optional transcripts) and proposes user-defined precall rules — patterns that should be routed to Code Brain's sandbox or otherwise blocked.
+Code Brain mines PreToolUse Bash invocations and proposes precall rules that route or block matching commands. Lifecycle `pending → dry_run → active`. Active rules never override built-in `LONG_OUTPUT_BINARIES` interception. User overrides ≥3 auto-disable an active rule.
 
-Lifecycle: `pending → dry_run → active`. Active rules block matching commands. User overrides ≥3 within an active rule's lifetime auto-disable it.
-
-- `ai precall recommend [--limit N] [--min-signal K]` — read-only, surfaces candidates
-- `ai precall accept <id>` — promote pending → dry_run (passes safety probe + regex compile)
-- `ai precall activate <id> [--force]` — promote dry_run → active (refuses if observed < required, default 5)
-- `ai precall reject <id>` / `ai precall disable <id>` — terminal states
-- `ai precall list`
-
-Safety: anchored regex required (`^...`), catch-all rejected, sanity probe matches against a whitelist (`echo ok`, `ls`, `pwd`, `git status`, `true`, `cat README.md`) to refuse over-broad patterns. Active rules never override built-in `LONG_OUTPUT_BINARIES` interception or hatch detection.
-
-MCP equivalents: `precall_recommend`, `precall_list`, `precall_accept`, `precall_activate`, `precall_reject`, `precall_disable`.
+Full mechanics (CLI, MCP, regex safety probe): see `.ai/policies/precall-rules.md`.
 
 ## Hard Constraints
 

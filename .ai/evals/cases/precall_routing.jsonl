@@ -1,0 +1,5 @@
+{"id": "block-rg-recursive", "cmd": "rg -n foo .", "expect": [{"kind": "assert_blocked", "tool": "Bash", "pattern": "rg"}]}
+{"id": "block-grep-recursive", "cmd": "grep -r foo src/", "expect": [{"kind": "assert_blocked", "tool": "Bash", "pattern": "grep -r"}]}
+{"id": "allow-single-file-grep", "cmd": "grep foo README.md", "expect": [{"kind": "assert_no_match", "pattern": "permissionDecision.*deny"}]}
+{"id": "allow-wc", "cmd": "wc -l README.md", "expect": [{"kind": "assert_no_match", "pattern": "permissionDecision.*deny"}]}
+{"id": "block-find-recursive", "cmd": "find . -name '*.py'", "expect": [{"kind": "assert_blocked", "tool": "Bash", "pattern": "find"}]}

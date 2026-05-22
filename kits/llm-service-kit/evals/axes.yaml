@@ -1,0 +1,36 @@
+axes:
+  - id: spam_rate
+    measure: deterministic
+    source: moderation_log
+    formula: flagged_count / posted_count
+    target: "< 0.02"
+
+  - id: context_fit_rate
+    measure: llm_judge
+    sample_size: 50
+    source: posted_comments
+    judge_prompt: judge_prompt.md
+    target: "> 0.85"
+
+  - id: duplicate_rate
+    measure: deterministic
+    source: posted_comments
+    formula: pairs_with_jaccard_over_0.6 / total_pairs_in_window
+    window_days: 7
+    target: "< 0.05"
+
+  - id: ai_tell_rate
+    measure: regex_plus_judge
+    source: posted_comments
+    patterns:
+      - "(?i)as an ai"
+      - "(?i)i'?m happy to help"
+      - "(?i)great question"
+    judge_prompt: judge_prompt.md
+    target: "< 0.05"
+
+  - id: policy_violation_rate
+    measure: deterministic
+    source: pre_post_check
+    formula: blocked_count / candidate_count
+    target: "< 0.10"

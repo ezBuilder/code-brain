@@ -1,0 +1,4 @@
+{"id": "lock-in-korean-1", "prompt": "이걸로 가자. SQLite 대신 Postgres 쓰자.", "expect": [{"kind": "assert_action_logged", "action": "decision.record"}]}
+{"id": "lock-in-english-1", "prompt": "Let's go with the worker IPC approach.", "expect": [{"kind": "assert_action_logged", "action": "decision.record"}]}
+{"id": "non-decision-1", "prompt": "참고로 Postgres가 빠르긴 해.", "expect": [{"kind": "assert_no_match", "pattern": "decision.record"}]}
+{"id": "todo-not-decision-1", "prompt": "이건 다음 라운드에 처리하자.", "expect": [{"kind": "assert_action_logged", "action": "todo.record"}, {"kind": "assert_no_match", "pattern": "decision.record"}]}

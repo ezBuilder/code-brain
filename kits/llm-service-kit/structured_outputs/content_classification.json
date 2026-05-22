@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ContentClassification",
+  "description": "Output shape for classifying a blog post or social-media post before downstream actions (summarize, reply, ignore).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["category", "language", "isSpam", "topics"],
+  "properties": {
+    "category": {
+      "type": "string",
+      "enum": ["news", "tutorial", "opinion", "review", "ad", "personal", "other"]
+    },
+    "language": {
+      "type": "string",
+      "description": "BCP-47 tag, e.g. ko, en, ja."
+    },
+    "isSpam": { "type": "boolean" },
+    "topics": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 5,
+      "items": { "type": "string", "minLength": 1, "maxLength": 40 }
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 400,
+      "description": "Optional one-paragraph summary. Omit when category in {ad, other} or isSpam true."
+    }
+  }
+}

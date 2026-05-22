@@ -1,0 +1,2 @@
+{"custom_id": "post-0001", "params": {"model": "claude-sonnet-4-6", "max_tokens": 1024, "system": "You classify blog posts. Reply only with the requested JSON.", "messages": [{"role": "user", "content": "POST_BODY_HERE"}]}}
+{"custom_id": "post-0002", "params": {"model": "claude-sonnet-4-6", "max_tokens": 1024, "system": "You classify blog posts. Reply only with the requested JSON.", "messages": [{"role": "user", "content": "POST_BODY_HERE"}]}}

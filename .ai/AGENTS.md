@@ -10,6 +10,21 @@ This repository uses `.ai/` as the single repo-local source for AI agent context
 - The GitHub repository default branch is `develop`. Local checkouts must mirror this — agents should `git switch develop` at session start if found on another branch and no work is in flight.
 - When the user requests a merge to main: fast-forward `main` to `develop`, push, then `git switch develop` back immediately.
 
+## Plan-First Policy
+
+- New feature, refactor, or any change spanning >1 file → enter Plan mode first (or spawn `Plan` subagent), present the plan, wait for user approval before editing.
+- Single-file fix, typo, comment update, dependency bump, or work the user explicitly scopes ("just change X") → skip planning.
+- A plan must list: files to touch, the contract change, the rollback path. No "and then we'll see".
+- Plan approval covers only the scope written down. Discovering extra work → stop and ask, do not silently expand.
+
+## Subagent Routing
+
+- File location / "where is X defined?" / "which files reference Y?" → `Explore` (read-only, cheaper, protects main context).
+- Multi-step design, impact analysis, or migration sketch → `Plan`.
+- Independent parallel research (CI state + tests + docs + open PRs) → one message with multiple `Agent` calls.
+- Single-file Read or one Grep that resolves the question → no subagent; the overhead loses.
+- Hand the subagent a self-contained brief: goal, what's been ruled out, expected output shape, length cap.
+
 ## Search Routing (Token Cost)
 
 - **Code search/discovery (indexed)**: prefer MCP `code_query` / `context_pack` over `Bash grep`/`rg`. BM25 returns top-5 snippets (~2 KB) vs full grep dumps (50–500 KB).

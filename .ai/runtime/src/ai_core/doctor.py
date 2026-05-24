@@ -692,7 +692,11 @@ def secret_hits(root: Path) -> Iterable[str]:
             continue
         try:
             text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, OSError):
+            # PermissionError happens in mixed-ownership repos (e.g. Phalanx
+            # has root-owned .pipeline_output/*.json that cc can't read). The
+            # secret scan can't inspect what it can't read; skip rather than
+            # aborting doctor with a fatal error.
             continue
         for pattern in SECRET_PATTERNS:
             if pattern.search(text):

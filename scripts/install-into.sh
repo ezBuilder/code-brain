@@ -191,13 +191,15 @@ restore_managed_owner_if_root() {
     return 0
   fi
   local path
+  # Chown the entire .ai/ tree so any subdirectory created since the previous
+  # upgrade (precall_rules, skills, agents_catalog, ...) ends up readable by
+  # the target user. Restricting to a hand-maintained allowlist regressed
+  # before — when a new subdir was added in a later release, the original
+  # target owner lost read access on root-run upgrades.
+  if [[ -e "$TARGET_ROOT/.ai" ]]; then
+    chown -R "$owner_spec" "$TARGET_ROOT/.ai"
+  fi
   for path in \
-    "$TARGET_ROOT/.ai/bin" \
-    "$TARGET_ROOT/.ai/cache" \
-    "$TARGET_ROOT/.ai/memory" \
-    "$TARGET_ROOT/.ai/runtime" \
-    "$TARGET_ROOT/.ai/generated" \
-    "$TARGET_ROOT/.ai/skills" \
     "$TARGET_ROOT/.githooks" \
     "$TARGET_ROOT/.claude/commands" \
     "$TARGET_ROOT/.codex/prompts"
@@ -533,8 +535,8 @@ def H(event, matcher=None, msg=None):
     return [entry]
 
 managed_codex_hooks = {
-    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command", msg="Checking Code Brain command routing"),
-    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", msg="Recording Code Brain tool result"),
+    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|run_command", msg="Checking Code Brain command routing"),
+    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|run_command|replace_file_content|multi_replace_file_content|write_to_file|view_file|grep_search|list_dir", msg="Recording Code Brain tool result"),
     "SessionStart": H("SessionStart", matcher="startup|resume|clear", msg="Loading Code Brain session context"),
     "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
     "Stop": H("Stop", msg="Recording Code Brain stop event"),
@@ -542,7 +544,7 @@ managed_codex_hooks = {
     "SubagentStop": H("SubagentStop", msg="Recording Code Brain subagent stop"),
     "PreCompact": H("PreCompact", msg="Saving Code Brain compact snapshot"),
     "PostCompact": H("PostCompact", msg="Recording Code Brain compact completion"),
-    "PermissionRequest": H("PermissionRequest", matcher="Bash|Shell|exec_command|functions.exec_command", msg="Checking Code Brain approval policy"),
+    "PermissionRequest": H("PermissionRequest", matcher="Bash|Shell|exec_command|functions.exec_command|run_command|ask_permission", msg="Checking Code Brain approval policy"),
 }
 if dst.exists():
     try:
@@ -631,8 +633,8 @@ def H(event, matcher=None, msg=None):
     return [entry]
 
 managed = {
-    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command", msg="Checking Code Brain command routing"),
-    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", msg="Recording Code Brain tool result"),
+    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|run_command", msg="Checking Code Brain command routing"),
+    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|run_command|replace_file_content|multi_replace_file_content|write_to_file|view_file|grep_search|list_dir", msg="Recording Code Brain tool result"),
     "SessionStart": H("SessionStart", msg="Loading Code Brain session context"),
     "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
     "Stop": H("Stop", msg="Recording Code Brain stop event"),

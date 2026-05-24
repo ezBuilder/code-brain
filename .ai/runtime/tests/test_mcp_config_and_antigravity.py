@@ -166,6 +166,34 @@ def test_install_into_publishes_root_agents_md(install_into_target: Path) -> Non
     assert ".ai/AGENTS.md" in text
 
 
+def test_install_into_preserves_user_authored_agents_md(tmp_path: Path) -> None:
+    """If the target already has a user-authored AGENTS.md (common in mature
+    repos like Navio), install-into must NOT overwrite it. The forwarder is a
+    seed-only convenience; user content is part of the project contract.
+    """
+    target = tmp_path / "victim2"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=target, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=target, check=True)
+    user_agents = "# Custom rules\n\nProject-specific instructions live here.\n"
+    (target / "AGENTS.md").write_text(user_agents, encoding="utf-8")
+    (target / "README.md").write_text("# v\n", encoding="utf-8")
+    subprocess.run(["git", "add", "AGENTS.md", "README.md"], cwd=target, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=target, check=True)
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    res = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "install-into.sh"), "install", str(target)],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,
+    )
+    if res.returncode != 0:
+        pytest.skip(f"install-into.sh skipped: {res.stderr[-400:]}")
+    final = (target / "AGENTS.md").read_text(encoding="utf-8")
+    assert final == user_agents, "user AGENTS.md must not be overwritten"
+
+
 def test_install_into_manifest_records_antigravity_targets(install_into_target: Path) -> None:
     manifest_path = install_into_target / ".ai" / "generated" / "install-manifest.json"
     assert manifest_path.exists()

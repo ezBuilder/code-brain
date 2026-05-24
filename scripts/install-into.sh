@@ -57,7 +57,6 @@ managed_files() {
       .githooks \
       .claude/commands \
       .codex/prompts \
-      AGENTS.md \
       scripts/env-check.sh \
       scripts/preflight.sh
   ) | grep -vx ".ai/secret_scan_allowlist.txt" || true
@@ -66,8 +65,11 @@ managed_files() {
 
 # User-owned files seeded on first install but never managed afterwards.
 # Manifest does NOT track these — uninstall will leave them alone.
+# AGENTS.md is seeded as a thin forwarder when missing; if the target already
+# has a user-authored AGENTS.md (common in long-lived repos), we never touch
+# it — that file is part of the project's contract, not Code Brain's.
 seed_user_owned_files() {
-  local seeds=(".ai/secret_scan_allowlist.txt")
+  local seeds=(".ai/secret_scan_allowlist.txt" "AGENTS.md")
   for rel in "${seeds[@]}"; do
     local src="$SOURCE_ROOT/$rel"
     local dst="$TARGET_ROOT/$rel"

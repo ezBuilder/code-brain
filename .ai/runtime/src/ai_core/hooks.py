@@ -25,6 +25,41 @@ INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit", "SubagentStart"}
 AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop", "FileChanged"}
 CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "SubagentStart"}
 SKILL_RECOMMENDATION_HOOKS = {"SessionStart"}
+
+KNOWN_AGENTS = {"claude", "codex", "antigravity"}
+
+
+def normalize_agent(payload: dict[str, Any]) -> str:
+    """Map a hook payload's agent identifier to one of the canonical names.
+
+    Returns one of ``claude``, ``codex``, ``antigravity``, or ``unknown``. We
+    prefer an explicit ``agent`` (or ``agent_name``) field; otherwise we fall
+    back to environment variables each host sets (``CLAUDE_PROJECT_DIR`` for
+    Claude Code, ``CODEX_HOME`` for OpenAI Codex CLI, ``ANTIGRAVITY_CLI`` /
+    ``AGY_HOME`` for Google Antigravity). The result is used both for
+    inject-context headers and for obs/audit breakdown.
+    """
+    raw = payload.get("agent") or payload.get("agent_name") or ""
+    norm = str(raw).strip().lower()
+    aliases = {
+        "claude": "claude", "claude-code": "claude", "claudecode": "claude",
+        "codex": "codex", "codex-cli": "codex",
+        "antigravity": "antigravity", "agy": "antigravity", "antigravity-cli": "antigravity",
+    }
+    if norm in aliases:
+        return aliases[norm]
+    if norm and norm != "unknown":
+        return norm
+    env = _os.environ
+    if env.get("CLAUDE_PROJECT_DIR"):
+        return "claude"
+    if env.get("CODEX_HOME") or env.get("CODEX_TURN_ID"):
+        return "codex"
+    if env.get("ANTIGRAVITY_CLI") or env.get("AGY_HOME"):
+        return "antigravity"
+    return "unknown"
+
+
 try:
     MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "4096"))))
 except (ValueError, TypeError):
@@ -1406,7 +1441,7 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
 
     if hook_name in LIFECYCLE_SNAPSHOT_HOOKS:
         session_id = str(payload.get("session_id") or payload.get("sid") or "")
-        agent = str(payload.get("agent") or "unknown")
+        agent = normalize_agent(payload)
         if session_id:
             try:
                 from .session_resume import write_snapshot
@@ -1597,7 +1632,7 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
 
 
 def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None = None) -> str:
-    agent = payload.get("agent", "unknown")
+    agent = normalize_agent(payload)
     writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
     header = f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={writes}."
     if hook_name not in INJECTION_HOOKS or root is None:

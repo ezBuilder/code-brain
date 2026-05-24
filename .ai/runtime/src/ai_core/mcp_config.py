@@ -123,3 +123,38 @@ def merge_antigravity_mcp_json(target: Path, server_entry: dict[str, Any] | None
         server_name=CODE_BRAIN_SERVER_NAME,
         server_entry=server_entry if server_entry is not None else code_brain_stdio_entry(),
     )
+
+
+def antigravity_global_mcp_path(home: Path | None = None) -> Path:
+    """Resolve the canonical global ``mcp_config.json`` path for Antigravity CLI.
+
+    Antigravity 1.0.x persists user-global MCP servers at
+    ``~/.gemini/antigravity/mcp_config.json``; this helper centralizes that
+    location so install-into.sh, setup helpers, and tests agree.
+    """
+    base = home if home is not None else Path.home()
+    return base / ".gemini" / "antigravity" / "mcp_config.json"
+
+
+def install_global_antigravity_mcp(
+    wrapper_path: Path,
+    *,
+    home: Path | None = None,
+) -> Path:
+    """Register the Code Brain MCP wrapper in the user-global Antigravity config.
+
+    Antigravity 1.0.x does NOT yet read ``.agents/mcp_config.json`` from each
+    workspace, so multi-project MCP only works when the entry lives in the
+    user-global file *and* points at a wrapper that walks up from the spawning
+    cwd to find that workspace's ``.ai/bin/ai-mcp``.
+
+    Returns the resolved global config path so callers can log / chown it.
+    """
+    target = antigravity_global_mcp_path(home=home)
+    merge_into_target(
+        target=target,
+        dialect="antigravity",
+        server_name=CODE_BRAIN_SERVER_NAME,
+        server_entry={"command": str(wrapper_path), "args": [], "env": {}},
+    )
+    return target

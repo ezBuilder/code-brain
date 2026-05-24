@@ -81,6 +81,50 @@ def test_merge_antigravity_mcp_json_idempotent(tmp_path: Path) -> None:
     assert payload2["mcpServers"]["code-brain"]["command"] == ".ai/bin/ai-mcp"
 
 
+def test_install_global_antigravity_mcp_preserves_other_servers(tmp_path: Path) -> None:
+    """Registering the Code Brain wrapper into the user-global Antigravity
+    config must keep pre-existing servers (pencil, third-party) and only
+    overwrite the ``code-brain`` entry.
+    """
+    from ai_core.mcp_config import (
+        antigravity_global_mcp_path,
+        install_global_antigravity_mcp,
+    )
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    cfg = antigravity_global_mcp_path(home=fake_home)
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "pencil": {"command": "/opt/pencil/mcp", "args": ["--app", "antigravity"], "env": {}},
+                    "other": {"serverUrl": "https://x"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    wrapper = tmp_path / "bin" / "code-brain-mcp"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/bin/sh\nexec true\n", encoding="utf-8")
+
+    resolved = install_global_antigravity_mcp(wrapper, home=fake_home)
+    assert resolved == cfg
+
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    assert payload["mcpServers"]["code-brain"]["command"] == str(wrapper)
+    assert payload["mcpServers"]["pencil"]["command"] == "/opt/pencil/mcp"
+    assert payload["mcpServers"]["other"]["serverUrl"] == "https://x"
+
+    # Re-running must be a no-op (idempotent)
+    install_global_antigravity_mcp(wrapper, home=fake_home)
+    payload2 = json.loads(cfg.read_text(encoding="utf-8"))
+    assert payload == payload2
+
+
 def test_merge_into_target_rejects_unknown_dialect(tmp_path: Path) -> None:
     from ai_core.mcp_config import merge_into_target
 

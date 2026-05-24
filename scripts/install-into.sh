@@ -512,17 +512,37 @@ import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
+
+def cmd(event):
+    return 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" ' + event
+
+def cmd_win(event):
+    return (
+        'powershell -NoProfile -Command "$ROOT = (git rev-parse --show-toplevel 2>$null); '
+        'if (-not $ROOT) { $ROOT = (Get-Location).Path }; '
+        '& \\"$ROOT/.ai/bin/ai-hook.ps1\\" ' + event + '"'
+    )
+
+def H(event, matcher=None, msg=None):
+    handler = {"type": "command", "command": cmd(event), "commandWindows": cmd_win(event)}
+    if msg:
+        handler["statusMessage"] = msg
+    entry = {"hooks": [handler]}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    return [entry]
+
 managed_codex_hooks = {
-    "PreToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreToolUse', "statusMessage": "Checking Code Brain command routing"}]}],
-    "PostToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostToolUse', "statusMessage": "Recording Code Brain tool result"}]}],
-    "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SessionStart', "statusMessage": "Loading Code Brain session context"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" UserPromptSubmit', "statusMessage": "Loading Code Brain prompt context"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" Stop', "statusMessage": "Recording Code Brain stop event"}]}],
-    "SubagentStart": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SubagentStart', "statusMessage": "Loading Code Brain subagent context"}]}],
-    "SubagentStop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SubagentStop', "statusMessage": "Recording Code Brain subagent stop"}]}],
-    "PreCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreCompact', "statusMessage": "Saving Code Brain compact snapshot"}]}],
-    "PostCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostCompact', "statusMessage": "Recording Code Brain compact completion"}]}],
-    "PermissionRequest": [{"matcher": "Bash|Shell|exec_command|functions.exec_command", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PermissionRequest', "statusMessage": "Checking Code Brain approval policy"}]}],
+    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command", msg="Checking Code Brain command routing"),
+    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", msg="Recording Code Brain tool result"),
+    "SessionStart": H("SessionStart", matcher="startup|resume|clear", msg="Loading Code Brain session context"),
+    "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
+    "Stop": H("Stop", msg="Recording Code Brain stop event"),
+    "SubagentStart": H("SubagentStart", msg="Loading Code Brain subagent context"),
+    "SubagentStop": H("SubagentStop", msg="Recording Code Brain subagent stop"),
+    "PreCompact": H("PreCompact", msg="Saving Code Brain compact snapshot"),
+    "PostCompact": H("PostCompact", msg="Recording Code Brain compact completion"),
+    "PermissionRequest": H("PermissionRequest", matcher="Bash|Shell|exec_command|functions.exec_command", msg="Checking Code Brain approval policy"),
 }
 if dst.exists():
     try:
@@ -594,27 +614,32 @@ def cmd(event: str) -> str:
         f'"$ROOT/.ai/bin/ai-hook" {event}'
     )
 
+def cmd_win(event: str) -> str:
+    return (
+        "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); "
+        "if (-not $ROOT) { $ROOT = (Get-Location).Path }; "
+        f"& \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" {event}\""
+    )
+
+def H(event, matcher=None, msg=None):
+    handler = {"type": "command", "command": cmd(event), "commandWindows": cmd_win(event)}
+    if msg:
+        handler["statusMessage"] = msg
+    entry = {"hooks": [handler]}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    return [entry]
+
 managed = {
-    "PreToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command",
-                    "hooks": [{"type": "command", "command": cmd("PreToolUse"),
-                               "statusMessage": "Checking Code Brain command routing"}]}],
-    "PostToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep",
-                     "hooks": [{"type": "command", "command": cmd("PostToolUse"),
-                                "statusMessage": "Recording Code Brain tool result"}]}],
-    "SessionStart": [{"hooks": [{"type": "command", "command": cmd("SessionStart"),
-                                 "statusMessage": "Loading Code Brain session context"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("UserPromptSubmit"),
-                                     "statusMessage": "Loading Code Brain prompt context"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": cmd("Stop"),
-                         "statusMessage": "Recording Code Brain stop event"}]}],
-    "SubagentStart": [{"hooks": [{"type": "command", "command": cmd("SubagentStart"),
-                                  "statusMessage": "Loading Code Brain subagent context"}]}],
-    "SubagentStop": [{"hooks": [{"type": "command", "command": cmd("SubagentStop"),
-                                 "statusMessage": "Recording Code Brain subagent stop"}]}],
-    "PreCompact": [{"hooks": [{"type": "command", "command": cmd("PreCompact"),
-                               "statusMessage": "Saving Code Brain compact snapshot"}]}],
-    "PostCompact": [{"hooks": [{"type": "command", "command": cmd("PostCompact"),
-                                "statusMessage": "Recording Code Brain compact completion"}]}],
+    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command", msg="Checking Code Brain command routing"),
+    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", msg="Recording Code Brain tool result"),
+    "SessionStart": H("SessionStart", msg="Loading Code Brain session context"),
+    "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
+    "Stop": H("Stop", msg="Recording Code Brain stop event"),
+    "SubagentStart": H("SubagentStart", msg="Loading Code Brain subagent context"),
+    "SubagentStop": H("SubagentStop", msg="Recording Code Brain subagent stop"),
+    "PreCompact": H("PreCompact", msg="Saving Code Brain compact snapshot"),
+    "PostCompact": H("PostCompact", msg="Recording Code Brain compact completion"),
 }
 if dst.exists():
     try:

@@ -46,8 +46,46 @@ def run_checks(root: Path) -> list[Check]:
         check_diagnostics(root),
         check_skills_catalog(root),
         check_precall_rules(root),
+        check_antigravity_artifacts(root),
     ]
     return checks
+
+
+def check_antigravity_artifacts(root: Path) -> Check:
+    """Verify the workspace's Antigravity wiring is internally consistent.
+
+    Not a hard requirement — Antigravity install is optional — but when the
+    workspace HAS opted in (``.agents/`` exists), the two managed artifacts
+    must both be well-formed and point at this project's Code Brain.
+    """
+    agents_dir = root / ".agents"
+    if not agents_dir.exists():
+        return Check("antigravity_artifacts", True, "not installed")
+    mcp = agents_dir / "mcp_config.json"
+    hooks = agents_dir / "hooks.json"
+    issues: list[str] = []
+    if mcp.exists():
+        try:
+            import json as _json
+            payload = _json.loads(mcp.read_text(encoding="utf-8"))
+            servers = payload.get("mcpServers", {}) if isinstance(payload, dict) else {}
+            if "code-brain" not in servers:
+                issues.append("mcp_config.json missing code-brain server")
+        except Exception as exc:
+            issues.append(f"mcp_config.json unreadable: {exc}")
+    if hooks.exists():
+        try:
+            import json as _json
+            payload = _json.loads(hooks.read_text(encoding="utf-8"))
+            hook_block = payload.get("hooks", {}) if isinstance(payload, dict) else {}
+            for required in ("PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit"):
+                if required not in hook_block:
+                    issues.append(f"hooks.json missing event {required}")
+        except Exception as exc:
+            issues.append(f"hooks.json unreadable: {exc}")
+    if issues:
+        return Check("antigravity_artifacts", False, "; ".join(issues[:5]))
+    return Check("antigravity_artifacts", True, "ok")
 
 
 def check_precall_rules(root: Path) -> Check:

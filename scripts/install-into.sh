@@ -440,6 +440,21 @@ managed = {
     "InstructionsLoaded": [
         {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook InstructionsLoaded"}]}
     ],
+    "SubagentStart": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SubagentStart"}]}
+    ],
+    "TaskCreated": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook TaskCreated"}]}
+    ],
+    "TaskCompleted": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook TaskCompleted"}]}
+    ],
+    "FileChanged": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook FileChanged"}]}
+    ],
+    "PostToolUseFailure": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUseFailure"}]}
+    ],
 }
 if dst.exists():
     try:
@@ -501,6 +516,7 @@ managed_codex_hooks = {
     "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SessionStart', "statusMessage": "Loading Code Brain session context"}]}],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" UserPromptSubmit', "statusMessage": "Loading Code Brain prompt context"}]}],
     "Stop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" Stop', "statusMessage": "Recording Code Brain stop event"}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SubagentStart', "statusMessage": "Loading Code Brain subagent context"}]}],
     "SubagentStop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SubagentStop', "statusMessage": "Recording Code Brain subagent stop"}]}],
     "PreCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreCompact', "statusMessage": "Saving Code Brain compact snapshot"}]}],
     "PostCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostCompact', "statusMessage": "Recording Code Brain compact completion"}]}],
@@ -589,6 +605,8 @@ managed = {
                                      "statusMessage": "Loading Code Brain prompt context"}]}],
     "Stop": [{"hooks": [{"type": "command", "command": cmd("Stop"),
                          "statusMessage": "Recording Code Brain stop event"}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": cmd("SubagentStart"),
+                                  "statusMessage": "Loading Code Brain subagent context"}]}],
     "SubagentStop": [{"hooks": [{"type": "command", "command": cmd("SubagentStop"),
                                  "statusMessage": "Recording Code Brain subagent stop"}]}],
     "PreCompact": [{"hooks": [{"type": "command", "command": cmd("PreCompact"),

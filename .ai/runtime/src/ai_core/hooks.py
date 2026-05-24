@@ -21,9 +21,9 @@ import os as _os
 
 HOT_PATH_TARGET_MS = 200
 SESSION_START_TARGET_MS = 1500
-INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit"}
-AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop"}
-CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart"}
+INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit", "SubagentStart"}
+AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop", "FileChanged"}
+CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "SubagentStart"}
 SKILL_RECOMMENDATION_HOOKS = {"SessionStart"}
 try:
     MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "4096"))))
@@ -1541,6 +1541,59 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
                 "load_reason": load_reason[:32],
             },
         )
+        return
+
+    if hook_name == "SubagentStart":
+        agent_id = str(payload.get("agent_id") or payload.get("subagent_id") or "")
+        agent_type = str(payload.get("agent_type") or payload.get("subagent_type") or "")
+        append_audit(
+            root,
+            action="subagent.started",
+            category="memory",
+            payload={"agent_id": agent_id[:64], "agent_type": agent_type[:64]},
+        )
+        return
+
+    if hook_name == "TaskCreated":
+        title = str(payload.get("title") or payload.get("subject") or "").strip()
+        if title:
+            try:
+                from .memory import append_todo
+                append_todo(root, title=title[:200], source="task_hook")
+            except Exception:
+                pass
+        return
+
+    if hook_name == "TaskCompleted":
+        match = str(payload.get("title") or payload.get("subject") or payload.get("task_id") or "").strip()
+        if match:
+            try:
+                from .memory import close_todo
+                close_todo(root, match=match[:200], status="done", reason="task_hook")
+            except Exception:
+                pass
+        return
+
+    if hook_name == "FileChanged":
+        file_path = str(payload.get("file_path") or payload.get("path") or "")
+        append_audit(
+            root,
+            action="file.changed",
+            category="memory",
+            payload={"file_path": file_path[:200]},
+        )
+        return
+
+    if hook_name == "PostToolUseFailure":
+        tool_name = str(payload.get("tool_name") or payload.get("tool") or "")
+        error = str(payload.get("error") or payload.get("error_message") or "")[:200]
+        append_audit(
+            root,
+            action="tool.failed",
+            category="hook",
+            payload={"tool_name": tool_name[:64], "error": error},
+        )
+        return
 
 
 def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None = None) -> str:

@@ -1249,6 +1249,7 @@ def accept(root: Path, candidate_id: str) -> dict[str, Any]:
     targets = [
         root / ".claude" / "commands" / f"{entry.slug}.md",
         root / ".codex" / "prompts" / f"{entry.slug}.md",
+        root / ".agents" / "skills" / entry.slug / "SKILL.md",
     ]
     for tgt in targets:
         if tgt.exists():

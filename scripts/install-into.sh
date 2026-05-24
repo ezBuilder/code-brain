@@ -57,6 +57,7 @@ managed_files() {
       .githooks \
       .claude/commands \
       .codex/prompts \
+      AGENTS.md \
       scripts/env-check.sh \
       scripts/preflight.sh
   ) | grep -vx ".ai/secret_scan_allowlist.txt" || true
@@ -78,7 +79,7 @@ seed_user_owned_files() {
 }
 
 merged_config_files() {
-  printf '%s\n' ".mcp.json" ".codex/config.toml"
+  printf '%s\n' ".mcp.json" ".codex/config.toml" ".agents/mcp_config.json" ".agents/hooks.json"
 }
 
 manifest_path() {
@@ -168,11 +169,65 @@ payload = {
     "installed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "project": root.name,
     "files": sorted(set(files)),
-    "merged_config_files": [".mcp.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json"],
+    "merged_config_files": [".mcp.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json", ".agents/mcp_config.json", ".agents/hooks.json"],
     "source_git_sha": source,
 }
 print(json.dumps(payload, indent=2, sort_keys=True))
 ' "$TARGET_ROOT" "$SOURCE_ROOT" >"$(manifest_path)" < <(managed_files)
+}
+
+restore_managed_owner_if_root() {
+  if [[ "$(id -u)" != "0" ]]; then
+    return 0
+  fi
+  if [[ ! -e "$TARGET_ROOT/.ai" ]]; then
+    return 0
+  fi
+  local owner_spec
+  owner_spec="$(stat -c '%u:%g' "$TARGET_ROOT/.ai" 2>/dev/null || stat -f '%u:%g' "$TARGET_ROOT/.ai" 2>/dev/null || true)"
+  if [[ -z "$owner_spec" ]]; then
+    return 0
+  fi
+  local path
+  for path in \
+    "$TARGET_ROOT/.ai/bin" \
+    "$TARGET_ROOT/.ai/cache" \
+    "$TARGET_ROOT/.ai/memory" \
+    "$TARGET_ROOT/.ai/runtime" \
+    "$TARGET_ROOT/.ai/generated" \
+    "$TARGET_ROOT/.ai/skills" \
+    "$TARGET_ROOT/.githooks" \
+    "$TARGET_ROOT/.claude/commands" \
+    "$TARGET_ROOT/.codex/prompts"
+  do
+    if [[ -e "$path" ]]; then
+      chown -R "$owner_spec" "$path"
+    fi
+  done
+  while IFS= read -r rel; do
+    if [[ "$rel" == .ai/memory/* ]]; then
+      continue
+    fi
+    if [[ -e "$TARGET_ROOT/$rel" ]]; then
+      chown "$owner_spec" "$TARGET_ROOT/$rel"
+    fi
+  done < <(managed_files)
+  for path in \
+    "$TARGET_ROOT/.mcp.json" \
+    "$TARGET_ROOT/.codex/config.toml" \
+    "$TARGET_ROOT/.codex/hooks.json" \
+    "$TARGET_ROOT/.claude/settings.json" \
+    "$TARGET_ROOT/.agents" \
+    "$TARGET_ROOT/.agents/mcp_config.json" \
+    "$TARGET_ROOT/.agents/hooks.json" \
+    "$TARGET_ROOT/.agents/skills" \
+    "$TARGET_ROOT/AGENTS.md" \
+    "$TARGET_ROOT/bootstrap-code-brain.sh"
+  do
+    if [[ -e "$path" ]]; then
+      chown -R "$owner_spec" "$path" 2>/dev/null || chown "$owner_spec" "$path"
+    fi
+  done
 }
 
 configure_project() {
@@ -489,6 +544,92 @@ dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
 PY
 }
 
+merge_antigravity_mcp_json() {
+  local dst="$TARGET_ROOT/.agents/mcp_config.json"
+  python - "$dst" "$SOURCE_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+dst = Path(sys.argv[1])
+source_root = Path(sys.argv[2])
+sys.path.insert(0, str(source_root / ".ai" / "runtime" / "src"))
+from ai_core.mcp_config import merge_antigravity_mcp_json
+
+merge_antigravity_mcp_json(dst)
+PY
+}
+
+merge_antigravity_hooks_json() {
+  local dst="$TARGET_ROOT/.agents/hooks.json"
+  python - "$dst" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+dst = Path(sys.argv[1])
+# Antigravity hooks accept the same matcher+command shape as Claude/Codex. The
+# command string runs in a POSIX shell on macOS/Linux; Windows hosts should
+# install the .ps1 variant separately (TODO when Antigravity adds Windows).
+def cmd(event: str) -> str:
+    return (
+        'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
+        f'"$ROOT/.ai/bin/ai-hook" {event}'
+    )
+
+managed = {
+    "PreToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command",
+                    "hooks": [{"type": "command", "command": cmd("PreToolUse"),
+                               "statusMessage": "Checking Code Brain command routing"}]}],
+    "PostToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep",
+                     "hooks": [{"type": "command", "command": cmd("PostToolUse"),
+                                "statusMessage": "Recording Code Brain tool result"}]}],
+    "SessionStart": [{"hooks": [{"type": "command", "command": cmd("SessionStart"),
+                                 "statusMessage": "Loading Code Brain session context"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("UserPromptSubmit"),
+                                     "statusMessage": "Loading Code Brain prompt context"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": cmd("Stop"),
+                         "statusMessage": "Recording Code Brain stop event"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": cmd("SubagentStop"),
+                                 "statusMessage": "Recording Code Brain subagent stop"}]}],
+    "PreCompact": [{"hooks": [{"type": "command", "command": cmd("PreCompact"),
+                               "statusMessage": "Saving Code Brain compact snapshot"}]}],
+    "PostCompact": [{"hooks": [{"type": "command", "command": cmd("PostCompact"),
+                                "statusMessage": "Recording Code Brain compact completion"}]}],
+}
+if dst.exists():
+    try:
+        payload = json.loads(dst.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        raise SystemExit(f"install-into failed: existing {dst} is not valid JSON")
+    if not isinstance(payload, dict):
+        raise SystemExit(f"install-into failed: existing {dst} is not a JSON object")
+else:
+    payload = {"_note": "Antigravity hooks. Schema follows Claude Code matcher+command convention."}
+hooks = payload.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    raise SystemExit(f"install-into failed: existing {dst}.hooks must be a JSON object")
+
+def _has_code_brain_command(entry):
+    if isinstance(entry, dict):
+        for handler in entry.get("hooks", []) or []:
+            if isinstance(handler, dict):
+                c = handler.get("command")
+                if isinstance(c, str) and ".ai/bin/ai-hook" in c:
+                    return True
+    return False
+
+for name, managed_entries in managed.items():
+    existing = hooks.get(name)
+    if isinstance(existing, list):
+        kept = [e for e in existing if not _has_code_brain_command(e)]
+    else:
+        kept = []
+    hooks[name] = kept + managed_entries
+dst.parent.mkdir(parents=True, exist_ok=True)
+dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
 install_or_upgrade() {
   while IFS= read -r rel; do
     copy_file "$rel"
@@ -498,6 +639,8 @@ install_or_upgrade() {
   merge_codex_config
   merge_claude_settings
   merge_codex_hooks_json
+  merge_antigravity_mcp_json
+  merge_antigravity_hooks_json
   configure_project
   write_bootstrap
   chmod +x "$TARGET_ROOT/.ai/bin/ai" "$TARGET_ROOT/.ai/bin/ai-hook" "$TARGET_ROOT/.ai/bin/ai-mcp"
@@ -509,6 +652,7 @@ install_or_upgrade() {
   ./bootstrap-code-brain.sh >/dev/null
   .ai/bin/ai audit rebuild-index --json >/dev/null
   .ai/bin/ai session start --agent operator --rebuild always --json >/dev/null
+  restore_managed_owner_if_root
 }
 
 uninstall() {
@@ -614,6 +758,47 @@ if claude_settings.exists():
             claude_settings.write_text(json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         else:
             claude_settings.unlink()
+agent_mcp = root / ".agents" / "mcp_config.json"
+if agent_mcp.exists():
+    try:
+        data = json.loads(agent_mcp.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        servers = data.get("mcpServers")
+        if isinstance(servers, dict) and "code-brain" in servers:
+            servers.pop("code-brain", None)
+            if servers:
+                agent_mcp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            else:
+                agent_mcp.unlink()
+agent_hooks = root / ".agents" / "hooks.json"
+if agent_hooks.exists():
+    try:
+        cfg = json.loads(agent_hooks.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        cfg = None
+    if isinstance(cfg, dict):
+        hb = cfg.get("hooks")
+        if isinstance(hb, dict):
+            for name in list(hb.keys()):
+                entries = hb.get(name)
+                if isinstance(entries, list):
+                    kept = [e for e in entries if not any(
+                        isinstance(h, dict) and isinstance(h.get("command"), str) and ".ai/bin/ai-hook" in h["command"]
+                        for h in (e.get("hooks") or []) if isinstance(e, dict)
+                    )]
+                    if kept:
+                        hb[name] = kept
+                    else:
+                        hb.pop(name, None)
+            if not hb:
+                cfg.pop("hooks")
+        keys_left = [k for k in cfg.keys() if k != "_note"]
+        if keys_left:
+            agent_hooks.write_text(json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        else:
+            agent_hooks.unlink()
 codex_hooks = root / ".codex" / "hooks.json"
 if codex_hooks.exists():
     try:
@@ -644,7 +829,7 @@ for rel in (".ai", ".githooks"):
     path = root / rel
     if path.exists():
         shutil.rmtree(path)
-for rel in (".claude/commands", ".codex/prompts"):
+for rel in (".claude/commands", ".codex/prompts", ".agents/skills", ".agents"):
     path = root / rel
     if path.exists() and path.is_dir() and not any(path.iterdir()):
         path.rmdir()

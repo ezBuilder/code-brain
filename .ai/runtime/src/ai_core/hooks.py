@@ -1068,6 +1068,48 @@ def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
     )
 
 
+def _session_scope_summary(root: Path) -> str:
+    """Nudge to ``/clear`` when many audit events accumulate since the most
+    recent ``SessionStart`` marker in the current audit file.
+
+    Returns "" when disabled, when no SessionStart marker is found in the
+    tail window, or when the count is below threshold. Intended for
+    UserPromptSubmit injection only — at SessionStart the count is zero
+    so the line carries no signal.
+    """
+    if _env_disabled("AI_SESSION_SCOPE_SUMMARY"):
+        return ""
+    try:
+        threshold = max(10, int(_os.environ.get("AI_SESSION_SCOPE_THRESHOLD", "30")))
+    except (ValueError, TypeError):
+        threshold = 30
+    files = all_audit_files(root)
+    if not files:
+        return ""
+    try:
+        entries = _read_jsonl_tail(files[-1], 500)
+    except Exception:
+        return ""
+    if not entries:
+        return ""
+    count = 0
+    found_start = False
+    for entry in reversed(entries):
+        payload = entry.get("payload") or {}
+        kind = str(payload.get("kind") or "")
+        action = str(entry.get("action") or "")
+        if action == "event.append" and kind == "SessionStart":
+            found_start = True
+            break
+        count += 1
+    if not found_start or count < threshold:
+        return ""
+    return (
+        f"cb-scope: {count} audit events since SessionStart — "
+        "if the topic has shifted, `/clear` before continuing."
+    )
+
+
 def _compact_meta_line(root: Path) -> str:
     """Compact-mode unified one-liner combining federated + satisfaction data.
 
@@ -1669,6 +1711,9 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
                 sections.append(_harness_directive(root, explicit=True))
         except Exception:
             pass
+        scope_line = _session_scope_summary(root)
+        if scope_line:
+            sections.append(scope_line)
     elif hook_name == "SessionStart":
         try:
             from .session_resume import read_latest_snapshot

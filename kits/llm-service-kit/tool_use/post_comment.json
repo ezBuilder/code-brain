@@ -1,0 +1,29 @@
+{
+  "name": "post_comment",
+  "description": "Post a generated reply comment to a third-party post. Always pass dryRun=true the first time; switch to false only after the caller has reviewed the comment text and riskLevel.",
+  "strict": true,
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["postId", "comment", "riskLevel", "dryRun"],
+    "properties": {
+      "postId": {
+        "type": "string",
+        "description": "Internal id of the source post being replied to."
+      },
+      "comment": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 600
+      },
+      "riskLevel": {
+        "type": "string",
+        "enum": ["low", "medium", "high"]
+      },
+      "dryRun": {
+        "type": "boolean",
+        "description": "When true, the server records the intended post but does not publish. Use true for evals and first-pass review."
+      }
+    }
+  }
+}

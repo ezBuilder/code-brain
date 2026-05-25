@@ -190,6 +190,28 @@ restore_managed_owner_if_root() {
   if [[ -z "$owner_spec" ]]; then
     return 0
   fi
+  # Sanity check: if .ai/ owner is a UID that does not exist on this host
+  # (typically a macOS UID 501 transplanted to a linux host via rsync/cp -a),
+  # propagating that UID to every chown call leaves every file unreadable.
+  # Honor AI_INSTALL_OWNER if set; otherwise fall back to the SUDO_USER (when
+  # run via sudo), then the invoker's own UID. Skip recursive chown only when
+  # we genuinely cannot determine a safe owner.
+  local _uid="${owner_spec%%:*}"
+  if ! getent passwd "$_uid" >/dev/null 2>&1; then
+    local _fallback=""
+    if [[ -n "${AI_INSTALL_OWNER:-}" ]]; then
+      _fallback="$AI_INSTALL_OWNER"
+    elif [[ -n "${SUDO_USER:-}" ]] && getent passwd "$SUDO_USER" >/dev/null 2>&1; then
+      _fallback="$SUDO_USER:$SUDO_USER"
+    fi
+    if [[ -n "$_fallback" ]]; then
+      echo "install-into: .ai/ owner UID $_uid not on this host; falling back to $_fallback (override with AI_INSTALL_OWNER)" >&2
+      owner_spec="$_fallback"
+    else
+      echo "install-into: skipping owner restore — .ai/ owner UID $_uid unknown and no AI_INSTALL_OWNER/SUDO_USER fallback" >&2
+      return 0
+    fi
+  fi
   local path
   # Chown the entire .ai/ tree so any subdirectory created since the previous
   # upgrade (precall_rules, skills, agents_catalog, ...) ends up readable by

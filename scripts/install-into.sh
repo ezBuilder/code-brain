@@ -747,9 +747,35 @@ install_or_upgrade() {
   write_install_manifest
 
   cd "$TARGET_ROOT"
-  ./bootstrap-code-brain.sh >/dev/null
-  .ai/bin/ai audit rebuild-index --json >/dev/null
-  .ai/bin/ai session start --agent operator --rebuild always --json >/dev/null
+  # When install-into runs as root (typical on shared servers like the Phalanx
+  # llm host where cc is the operator), running bootstrap/uv-sync/session as
+  # root would create root-owned files inside .venv and .ai/cache that the
+  # operator user cannot use. Resolve the intended target user and drop privs
+  # for the runtime-touching steps so every artifact lands with the correct
+  # ownership the first time. Falls through to direct execution when not root
+  # or when no safe fallback user can be determined.
+  local _run_as=""
+  if [[ "$(id -u)" == "0" ]]; then
+    local _ai_uid
+    _ai_uid="$(stat -c '%u' "$TARGET_ROOT/.ai" 2>/dev/null || stat -f '%u' "$TARGET_ROOT/.ai" 2>/dev/null || echo "")"
+    local _run_user=""
+    if [[ -n "$_ai_uid" ]] && getent passwd "$_ai_uid" >/dev/null 2>&1; then
+      _run_user="$(getent passwd "$_ai_uid" | cut -d: -f1)"
+    elif [[ -n "${AI_INSTALL_OWNER:-}" ]]; then
+      _run_user="${AI_INSTALL_OWNER%%:*}"
+    elif [[ -n "${SUDO_USER:-}" ]] && getent passwd "$SUDO_USER" >/dev/null 2>&1; then
+      _run_user="$SUDO_USER"
+    fi
+    if [[ -n "$_run_user" ]] && id -u "$_run_user" >/dev/null 2>&1; then
+      echo "install-into: root detected; running bootstrap/session as $_run_user (override with AI_INSTALL_OWNER)" >&2
+      _run_as="sudo -u $_run_user -H"
+    else
+      echo "install-into: root detected but no safe target user found; running bootstrap as root (venv may need manual chown later)" >&2
+    fi
+  fi
+  $_run_as ./bootstrap-code-brain.sh >/dev/null
+  $_run_as .ai/bin/ai audit rebuild-index --json >/dev/null
+  $_run_as .ai/bin/ai session start --agent operator --rebuild always --json >/dev/null
   restore_managed_owner_if_root
 }
 

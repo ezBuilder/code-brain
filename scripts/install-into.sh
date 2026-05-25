@@ -196,8 +196,21 @@ restore_managed_owner_if_root() {
   # the target user. Restricting to a hand-maintained allowlist regressed
   # before — when a new subdir was added in a later release, the original
   # target owner lost read access on root-run upgrades.
+  #
+  # IMPORTANT: exclude .ai/runtime/.venv — venvs are owner-sensitive (pyvenv.cfg,
+  # site-packages, bin/python shebang resolution all assume a stable owner).
+  # A blanket chown -R caused hook failures across already-installed targets
+  # (observed user-visible symptom: "hook venv 오류" requiring sudo rm -rf
+  # .ai/runtime/.venv as recovery). The venv is created/owned by the user who
+  # first ran `uv sync` and must stay that way.
   if [[ -e "$TARGET_ROOT/.ai" ]]; then
-    chown -R "$owner_spec" "$TARGET_ROOT/.ai"
+    if [[ -d "$TARGET_ROOT/.ai/runtime/.venv" ]]; then
+      find "$TARGET_ROOT/.ai" \
+        -path "$TARGET_ROOT/.ai/runtime/.venv" -prune \
+        -o -exec chown "$owner_spec" {} +
+    else
+      chown -R "$owner_spec" "$TARGET_ROOT/.ai"
+    fi
   fi
   for path in \
     "$TARGET_ROOT/.githooks" \

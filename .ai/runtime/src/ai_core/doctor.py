@@ -631,6 +631,13 @@ def check_diagnostics(root: Path) -> Check:
         from .obs import diagnostics
 
         payload = diagnostics(root, dry_run=True, include_doctor=False)
+    except PermissionError as exc:
+        # diagnostics walks metrics paths which may include files outside the
+        # Code Brain managed tree (e.g. ~/.claude/projects/*.jsonl owned by a
+        # different user when Code Brain is invoked under sudo on a shared
+        # host). That is an environment fact, not a Code Brain failure —
+        # skip with detail instead of failing strict.
+        return Check("diagnostics_dry_run", True, f"skipped: permission denied ({exc})")
     except Exception as exc:
         return Check("diagnostics_dry_run", False, str(exc))
     return Check("diagnostics_dry_run", bool(payload.get("ok")), "ok" if payload.get("ok") else "failed")

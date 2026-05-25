@@ -230,8 +230,14 @@ printf '{"agent":"codex"}' | uv run --project .ai/runtime ai hook SessionStart -
 ```bash
 make doctor                  # 일반 doctor
 ai doctor --strict --json    # 23+ checks
+make lockfile-check          # scripts/lockfile-check.sh: uv lock --check --project .ai/runtime
 make release-gate            # full release gate (package + tamper-check + reproducibility)
 ```
+
+### 장기/대규모 운영
+- **`ai exec prune --older-than-seconds 86400`** — `.ai/cache/sandbox/*` 누적 정리. Stop/SessionEnd 후 sleep-time 백그라운드 job으로 자동 실행됨. 대규모 워크로드에서 수동 호출 가능.
+- **`ai audit repair-chain --json`** — `git stash`/머지로 `audit/*.jsonl`의 `prev_sha` 체인이 깨졌을 때 결정적 복구. content 손실 없음.
+- **`ai audit rebuild-index --json`** — `audit-index.jsonl`을 연도 audit 로그에서 재구성 (restore/upgrade 후).
 
 ---
 

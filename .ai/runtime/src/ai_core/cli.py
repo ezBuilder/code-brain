@@ -235,6 +235,9 @@ def build_parser() -> argparse.ArgumentParser:
     audit_append.add_argument("--json", action="store_true", dest="command_json")
     audit_rebuild = audit_sub.add_parser("rebuild-index")
     audit_rebuild.add_argument("--json", action="store_true", dest="command_json")
+    audit_repair = audit_sub.add_parser("repair-chain", help="re-compute prev_sha for mis-chained audit records (after stash/merge artifact)")
+    audit_repair.add_argument("--year", type=int, default=None, help="repair a specific year file only")
+    audit_repair.add_argument("--json", action="store_true", dest="command_json")
     exec_parser = sub.add_parser("exec", help="run a shell command in Code Brain sandbox (truncated summary, fetchable by id)")
     exec_sub = exec_parser.add_subparsers(dest="exec_command", required=True)
     exec_run = exec_sub.add_parser("run")
@@ -756,6 +759,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "audit" and args.audit_command == "rebuild-index":
             reject_ci_write("audit")
             payload = rebuild_audit_index(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "audit" and args.audit_command == "repair-chain":
+            reject_ci_write("audit")
+            from .audit_repair import repair_audit_chain
+            payload = repair_audit_chain(root, year=args.year)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "index" and args.index_command == "rebuild":

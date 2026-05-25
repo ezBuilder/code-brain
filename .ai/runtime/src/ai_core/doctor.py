@@ -384,7 +384,14 @@ def check_audit_chain(root: Path) -> Check:
             previous_was_chained = is_chained
 
     if bad:
-        return Check("audit_chain", False, "invalid: " + ", ".join(bad[:10]))
+        # Add actionable remediation hint — chain damage usually comes from stash
+        # union merges or partial restore, both of which `ai audit repair-chain`
+        # can fix deterministically without dropping content.
+        return Check(
+            "audit_chain",
+            False,
+            "invalid: " + ", ".join(bad[:10]) + " — run `ai audit repair-chain` to fix",
+        )
     detail = f"ok chained_lines={chained}" if chained else "ok no chained lines yet"
     return Check("audit_chain", True, detail)
 

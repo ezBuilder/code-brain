@@ -160,3 +160,18 @@ def test_evaluate_non_dict_tool_input_allows() -> None:
     result = evaluate("Bash", None)
     assert result["action"] == "allow"
     assert result["reason"] == "no_command"
+
+
+def test_evaluate_antigravity_run_command_blocks() -> None:
+    # run_command with CommandLine parameter should be correctly evaluated as a shell tool
+    result = evaluate("run_command", {"CommandLine": "rg pattern"})
+    assert result["action"] == "block"
+    assert result["binary"] == "rg"
+    assert result["suggestion"].startswith(".ai/bin/ai exec run -- ")
+
+
+def test_evaluate_antigravity_run_command_allows_safe() -> None:
+    result = evaluate("run_command", {"CommandLine": "echo hello"})
+    assert result["action"] == "allow"
+    assert result["reason"] == "unmatched"
+

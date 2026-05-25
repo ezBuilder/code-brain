@@ -374,3 +374,45 @@ def test_recommend_memory_deps_include_all_audit_session_and_codex_global(tmp_pa
     assert ".ai/memory/session-current.md" in rels
     assert ".ai/memory/todos.jsonl" in rels
     assert any(path.endswith(".codex/memories/raw_memories.md") for path in outside)
+
+
+def test_pretooluse_antigravity_run_command_blocks() -> None:
+    result = run_hook(
+        "PreToolUse",
+        {
+            "agent": "antigravity",
+            "tool_name": "run_command",
+            "tool_input": {"CommandLine": "rg pattern"},
+        },
+    )
+    payload = _parse_ok(result)
+    assert payload.get("decision") == "block"
+    assert payload.get("precall", {}).get("binary") == "rg"
+    hso = payload.get("hookSpecificOutput")
+    assert isinstance(hso, dict)
+    assert hso.get("permissionDecision") == "deny"
+    assert "rg pattern" in hso.get("permissionDecisionReason", "")
+
+
+def test_pretooluse_antigravity_run_command_rewrites() -> None:
+    result = run_hook(
+        "PreToolUse",
+        {
+            "agent": "antigravity",
+            "tool_name": "run_command",
+            "tool_input": {"CommandLine": "rg pattern"},
+        },
+        env_extra={"AI_PRECALL_REWRITE": "true"},
+    )
+    payload = _parse_ok(result)
+    assert payload.get("decision") != "block"
+    assert payload.get("rewritten") is True
+    hso = payload.get("hookSpecificOutput")
+    assert isinstance(hso, dict)
+    assert hso.get("permissionDecision") == "allow"
+    updated = hso.get("updatedInput")
+    assert isinstance(updated, dict)
+    assert updated.get("CommandLine") == ".ai/bin/ai exec run -- rg pattern"
+    assert updated.get("command") == ".ai/bin/ai exec run -- rg pattern"
+
+

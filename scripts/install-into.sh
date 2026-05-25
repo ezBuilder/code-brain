@@ -773,6 +773,27 @@ install_or_upgrade() {
       echo "install-into: root detected but no safe target user found; running bootstrap as root (venv may need manual chown later)" >&2
     fi
   fi
+  # Venv self-heal: when the existing .venv/bin/python symlink points at a
+  # missing or unreadable interpreter (typical after a host's uv cache moved,
+  # the original installer's $HOME was wiped, or the venv was created by a
+  # different user whose Python directory the target user cannot read),
+  # bootstrap will reuse the broken venv and every hook ends in
+  # "command not found". Detect that up front and tear down the venv so the
+  # next uv sync inside bootstrap rebuilds with an interpreter the target
+  # user can actually read. Only the broken-symlink case triggers removal.
+  local _venv_py="$TARGET_ROOT/.ai/runtime/.venv/bin/python"
+  if [[ -L "$_venv_py" ]]; then
+    local _venv_ok=1
+    if [[ -n "$_run_as" ]]; then
+      $_run_as test -x "$_venv_py" || _venv_ok=0
+    else
+      [[ -x "$_venv_py" ]] || _venv_ok=0
+    fi
+    if [[ "$_venv_ok" == "0" ]]; then
+      echo "install-into: venv interpreter unreachable (broken symlink target); recreating .venv" >&2
+      rm -rf "$TARGET_ROOT/.ai/runtime/.venv"
+    fi
+  fi
   $_run_as ./bootstrap-code-brain.sh >/dev/null
   $_run_as .ai/bin/ai audit rebuild-index --json >/dev/null
   $_run_as .ai/bin/ai session start --agent operator --rebuild always --json >/dev/null

@@ -103,3 +103,60 @@ def test_eval_cli_record_and_summary_json(tmp_path: Path) -> None:
     assert summary["total"] == 1
     assert summary["failed"] == 1
     assert summary["latest_failures"][0]["id"] == "cli-1"
+
+
+def test_record_case_failure_appends_to_lessons(tmp_path: Path) -> None:
+    from ai_core.eval_loop import record_case
+    from ai_core.lessons import lessons_path
+
+    repo = _init_repo(tmp_path)
+    (repo / ".ai" / "memory").mkdir(parents=True, exist_ok=True)
+
+    # Record a failure outcome
+    result = record_case(
+        repo,
+        case_id="fail-1",
+        kind="swe",
+        command="pytest some_test.py",
+        outcome="fail",
+        duration_ms=500,
+        created_at="2026-05-20T10:00:00Z",
+    )
+    assert result["ok"] is True
+
+    # Verify lessons.jsonl was appended
+    lessons_file = lessons_path(repo)
+    assert lessons_file.exists(), "lessons.jsonl should be created"
+    lines = lessons_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+
+    lesson = json.loads(lines[0])
+    assert lesson["source"] == "eval_fail"
+    assert lesson["kind"] == "swe"
+    assert lesson["command"] == "pytest some_test.py"
+    assert lesson["outcome"] == "fail"
+    assert "duration_ms=500" in lesson["details"]
+    assert lesson["ts"].endswith("Z")
+
+
+def test_record_case_success_does_not_append_to_lessons(tmp_path: Path) -> None:
+    from ai_core.eval_loop import record_case
+    from ai_core.lessons import lessons_path
+
+    repo = _init_repo(tmp_path)
+    (repo / ".ai" / "memory").mkdir(parents=True, exist_ok=True)
+
+    # Record a successful outcome
+    result = record_case(
+        repo,
+        case_id="pass-1",
+        kind="swe",
+        command="pytest some_test.py",
+        outcome="pass",
+        duration_ms=100,
+    )
+    assert result["ok"] is True
+
+    # Verify lessons.jsonl was not created
+    lessons_file = lessons_path(repo)
+    assert not lessons_file.exists(), "lessons.jsonl should not be created for pass"

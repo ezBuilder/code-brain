@@ -46,8 +46,46 @@ def run_checks(root: Path) -> list[Check]:
         check_diagnostics(root),
         check_skills_catalog(root),
         check_precall_rules(root),
+        check_antigravity_artifacts(root),
     ]
     return checks
+
+
+def check_antigravity_artifacts(root: Path) -> Check:
+    """Verify the workspace's Antigravity wiring is internally consistent.
+
+    Not a hard requirement — Antigravity install is optional — but when the
+    workspace HAS opted in (``.agents/`` exists), the two managed artifacts
+    must both be well-formed and point at this project's Code Brain.
+    """
+    agents_dir = root / ".agents"
+    if not agents_dir.exists():
+        return Check("antigravity_artifacts", True, "not installed")
+    mcp = agents_dir / "mcp_config.json"
+    hooks = agents_dir / "hooks.json"
+    issues: list[str] = []
+    if mcp.exists():
+        try:
+            import json as _json
+            payload = _json.loads(mcp.read_text(encoding="utf-8"))
+            servers = payload.get("mcpServers", {}) if isinstance(payload, dict) else {}
+            if "code-brain" not in servers:
+                issues.append("mcp_config.json missing code-brain server")
+        except Exception as exc:
+            issues.append(f"mcp_config.json unreadable: {exc}")
+    if hooks.exists():
+        try:
+            import json as _json
+            payload = _json.loads(hooks.read_text(encoding="utf-8"))
+            hook_block = payload.get("hooks", {}) if isinstance(payload, dict) else {}
+            for required in ("PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit"):
+                if required not in hook_block:
+                    issues.append(f"hooks.json missing event {required}")
+        except Exception as exc:
+            issues.append(f"hooks.json unreadable: {exc}")
+    if issues:
+        return Check("antigravity_artifacts", False, "; ".join(issues[:5]))
+    return Check("antigravity_artifacts", True, "ok")
 
 
 def check_precall_rules(root: Path) -> Check:
@@ -191,8 +229,17 @@ def check_index_freshness(root: Path) -> Check:
             rows = conn.execute("select path, sha256 from chunks order by path").fetchall()
     except sqlite3.Error as exc:
         return Check("index_freshness", False, f"index unreadable: {exc}")
+    seen: set[str] = set()
     for row in rows:
         rel_path = str(row["path"])
+        # Function-level chunks store "<file>:<qualname>"; file-level chunks
+        # cover freshness for the whole file. Skip the per-function rows so
+        # they don't appear as missing file paths.
+        if ":" in rel_path:
+            continue
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
         path = root / rel_path
         try:
             content = path.read_text(encoding="utf-8")
@@ -337,7 +384,14 @@ def check_audit_chain(root: Path) -> Check:
             previous_was_chained = is_chained
 
     if bad:
-        return Check("audit_chain", False, "invalid: " + ", ".join(bad[:10]))
+        # Add actionable remediation hint — chain damage usually comes from stash
+        # union merges or partial restore, both of which `ai audit repair-chain`
+        # can fix deterministically without dropping content.
+        return Check(
+            "audit_chain",
+            False,
+            "invalid: " + ", ".join(bad[:10]) + " — run `ai audit repair-chain` to fix",
+        )
     detail = f"ok chained_lines={chained}" if chained else "ok no chained lines yet"
     return Check("audit_chain", True, detail)
 
@@ -584,6 +638,13 @@ def check_diagnostics(root: Path) -> Check:
         from .obs import diagnostics
 
         payload = diagnostics(root, dry_run=True, include_doctor=False)
+    except PermissionError as exc:
+        # diagnostics walks metrics paths which may include files outside the
+        # Code Brain managed tree (e.g. ~/.claude/projects/*.jsonl owned by a
+        # different user when Code Brain is invoked under sudo on a shared
+        # host). That is an environment fact, not a Code Brain failure —
+        # skip with detail instead of failing strict.
+        return Check("diagnostics_dry_run", True, f"skipped: permission denied ({exc})")
     except Exception as exc:
         return Check("diagnostics_dry_run", False, str(exc))
     return Check("diagnostics_dry_run", bool(payload.get("ok")), "ok" if payload.get("ok") else "failed")
@@ -645,7 +706,11 @@ def secret_hits(root: Path) -> Iterable[str]:
             continue
         try:
             text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, OSError):
+            # PermissionError happens in mixed-ownership repos (e.g. Phalanx
+            # has root-owned .pipeline_output/*.json that cc can't read). The
+            # secret scan can't inspect what it can't read; skip rather than
+            # aborting doctor with a fatal error.
             continue
         for pattern in SECRET_PATTERNS:
             if pattern.search(text):

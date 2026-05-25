@@ -399,6 +399,75 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     # remote_memory_* tools removed (T37) — .ai/ git sync replaces Cloudflare round-trip.
+    # ---- Innovation modules (PoC; safe — no hot-path mutation) ----
+    {
+        "name": "lsp_available",
+        "description": "Detect LSP backend readiness (multilspy + language servers on PATH).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "lsp_find_references",
+        "description": "LSP find_references — precise cross-file reference graph for a symbol.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "line": {"type": "integer"},
+                "column": {"type": "integer"},
+            },
+            "required": ["file_path", "line", "column"],
+        },
+    },
+    {
+        "name": "lsp_goto_definition",
+        "description": "LSP goto_definition for a symbol at file:line:column.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "line": {"type": "integer"},
+                "column": {"type": "integer"},
+            },
+            "required": ["file_path", "line", "column"],
+        },
+    },
+    {
+        "name": "lsp_workspace_symbols",
+        "description": "LSP workspace_symbols — fuzzy symbol search across the workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "speculative_mine_patterns",
+        "description": "Mine 2-gram tool-call patterns from audit/2026.jsonl for speculative execution.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "min_support": {"type": "integer", "default": 3},
+                "min_confidence": {"type": "number", "default": 0.5},
+                "limit": {"type": "integer", "default": 100},
+            },
+        },
+    },
+    {
+        "name": "speculative_hit_rate",
+        "description": "Speculative-execution hit/miss summary from .ai/cache/speculative.jsonl.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "trajectory_summarize",
+        "description": "TRAJEVAL-style trajectory diagnosis (efficiency + failure mode) across recent sessions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "default": 10}},
+        },
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -631,6 +700,47 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             raise ValueError("agents_uninstall requires slug string")
         return ag_uninstall_fn(root, slug, force=bool(args.get("force", False)))
     # remote_memory_* dispatchers removed (T37)
+    # ---- Innovation modules (PoC dispatch) ----
+    if name == "lsp_available":
+        from .lsp import lsp_available
+        return lsp_available(root)
+    if name == "lsp_find_references":
+        from .lsp import find_references
+        return find_references(
+            root,
+            str(args.get("file_path", "")),
+            int(args.get("line", 0) or 0),
+            int(args.get("column", 0) or 0),
+        )
+    if name == "lsp_goto_definition":
+        from .lsp import goto_definition
+        return goto_definition(
+            root,
+            str(args.get("file_path", "")),
+            int(args.get("line", 0) or 0),
+            int(args.get("column", 0) or 0),
+        )
+    if name == "lsp_workspace_symbols":
+        from .lsp import workspace_symbols
+        return workspace_symbols(
+            root,
+            str(args.get("query", "")),
+            limit=int(args.get("limit", 20) or 20),
+        )
+    if name == "speculative_mine_patterns":
+        from .speculative import mine_patterns
+        return mine_patterns(
+            root,
+            min_support=int(args.get("min_support", 3) or 3),
+            min_confidence=float(args.get("min_confidence", 0.5) or 0.5),
+            limit=int(args.get("limit", 100) or 100),
+        )
+    if name == "speculative_hit_rate":
+        from .speculative import hit_rate
+        return hit_rate(root)
+    if name == "trajectory_summarize":
+        from .trajectory import summarize
+        return summarize(root, limit=int(args.get("limit", 10) or 10))
     raise KeyError(name)
 
 

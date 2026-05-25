@@ -116,9 +116,18 @@ def _compute_cross_project_summary(self_root: Path, *, home: Path | None = None)
     n = sig.get("scanned_projects", 0)
     if n == 0:
         return {"ok": True, "scanned_projects": 0, "note": "no_other_installs"}
+    self_resolved = self_root.resolve()
+    others = [p for p in discover_installations(home=home) if p.resolve() != self_resolved]
+    antigravity_coverage = sum(
+        1 for p in others if (p / ".agents" / "mcp_config.json").exists()
+    )
     return {
         "ok": True,
         "scanned_projects": n,
+        "antigravity_coverage": {
+            "wired": antigravity_coverage,
+            "total": len(others),
+        },
         "common_tags": [
             {"tag": k, "projects": v}
             for k, v in sig.get("decision_tags", {}).items()

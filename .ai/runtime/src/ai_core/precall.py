@@ -18,6 +18,7 @@ SHELL_TOOL_NAMES = {
     "exec_command",
     "functions.exec_command",
     "terminal",
+    "run_command",
 }
 
 HATCH_TOKENS = (
@@ -378,10 +379,10 @@ def evaluate(
     if not _is_shell_tool(tool_name):
         return {"action": "allow", "reason": "non_bash_tool"}
 
-    if not isinstance(tool_input, dict) or "command" not in tool_input:
+    if not isinstance(tool_input, dict) or ("command" not in tool_input and "CommandLine" not in tool_input and "commandLine" not in tool_input):
         return {"action": "allow", "reason": "no_command"}
 
-    command = tool_input.get("command", "")
+    command = tool_input.get("command") or tool_input.get("CommandLine") or tool_input.get("commandLine") or ""
     if not command:
         return {"action": "allow", "reason": "empty_command"}
 

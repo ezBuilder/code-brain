@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -81,3 +82,107 @@ def lesson_summary(root: Path) -> dict[str, Any]:
         "by_source": dict(sorted(by_source.items())),
         "by_tag": dict(sorted(by_tag.items())),
     }
+
+
+def append_lesson(
+    root: Path,
+    *,
+    kind: str,
+    command: str,
+    outcome: str,
+    details: str = "",
+) -> dict[str, Any]:
+    """
+    Append a lesson from an eval_loop failure.
+
+    Schema: {"ts": iso8601, "source": "eval_fail", "kind": ..., "command": ..., "outcome": ..., "details": ...}
+
+    Args:
+        root: Project root
+        kind: Evaluation kind (e.g., "swe", "cli")
+        command: Command that failed
+        outcome: Non-pass outcome string
+        details: Optional additional context (e.g., "duration_ms=123")
+
+    Returns:
+        {"ok": True, "record": ...} on success
+        {"ok": False, "reason": "..."} on silent fail
+    """
+    try:
+        record = {
+            "ts": now_iso(),
+            "source": "eval_fail",
+            "kind": _clean_text(kind, max_len=128),
+            "command": _clean_text(command, max_len=512),
+            "outcome": _clean_text(outcome, max_len=128),
+            "details": _clean_text(details, max_len=256) if details else "",
+        }
+        if not record["kind"] or not record["command"] or not record["outcome"]:
+            return {"ok": False, "reason": "missing_required_field"}
+        append_jsonl(lessons_path(root), record)
+        append_audit(root, action="lessons.append", category="memory", payload={"source": "eval_fail", "kind": record["kind"]})
+
+        # Auto-trigger consolidate_from_lessons when append count reaches N=5 modulo
+        _maybe_trigger_consolidate(root)
+
+        return {"ok": True, "record": record}
+    except (OSError, ValueError, json.JSONDecodeError, Exception):
+        return {"ok": False, "reason": "append_failed"}
+
+
+def _maybe_trigger_consolidate(root: Path, interval: int = 5) -> None:
+    """Fire consolidate_from_lessons every N appends (modulo check on line count)."""
+    try:
+        lp = lessons_path(root)
+        if not lp.exists():
+            return
+        # Count lines as cheap proxy for append count
+        count = sum(1 for _ in lp.read_text(encoding="utf-8", errors="ignore").splitlines())
+        if count > 0 and count % interval == 0:
+            # Consolidate asynchronously (fire-and-forget)
+            _spawn_consolidate_background(root)
+    except Exception:
+        pass
+
+
+def _spawn_consolidate_background(root: Path) -> None:
+    """Fire-and-forget background consolidate_from_lessons."""
+    import os
+    import subprocess
+    import sys
+
+    try:
+        from .portable import detached_popen_kwargs
+        from .process_janitor import cleanup_children, register_child
+
+        cleanup_children(root)
+
+        lock_path = root / ".ai" / "cache" / "consolidate.lock"
+        import time
+        try:
+            if lock_path.exists() and time.time() - lock_path.stat().st_mtime < 60:
+                return
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            return
+        except OSError:
+            pass
+
+        cmd = [
+            sys.executable, "-c",
+            "from ai_core.procedural_memory import consolidate_from_lessons; "
+            "from pathlib import Path; "
+            f"r=Path({str(root)!r}); lock=Path({str(lock_path)!r}); "
+            "\ntry:\n    consolidate_from_lessons(r, dry_run=False)\nfinally:\n    lock.unlink(missing_ok=True)",
+        ]
+        env = {**os.environ, "PYTHONPATH": str(root / ".ai" / "runtime" / "src")}
+        with open(os.devnull, "wb") as devnull:
+            proc = subprocess.Popen(
+                cmd, stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
+                env=env, **detached_popen_kwargs(),
+            )
+        register_child(root, pid=proc.pid, kind="consolidate_lessons", command=cmd)
+    except Exception:
+        pass

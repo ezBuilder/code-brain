@@ -12,7 +12,7 @@ from typing import Any
 from .config import load_config
 from .redact import redact_value
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 import os as _os
 try:
     SNIPPET_MAX_BYTES = max(80, min(2048, int(_os.environ.get("AI_SNIPPET_MAX_BYTES", "240"))))
@@ -161,7 +161,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
           chunk_id integer primary key,
           kind text not null default 'file',
           bytes integer not null,
-          line_count integer not null
+          line_count integer not null,
+          qualname text,
+          start_line integer,
+          end_line integer
         );
         create table if not exists summaries (
           path text primary key,
@@ -192,19 +195,23 @@ def create_schema(conn: sqlite3.Connection) -> None:
           kind text not null,
           lineno integer not null,
           end_lineno integer not null,
-          parent text
+          parent text,
+          lang text not null default 'python'
         );
         create index if not exists code_symbols_path_idx on code_symbols(path);
         create index if not exists code_symbols_qualname_idx on code_symbols(qualname);
+        create index if not exists code_symbols_lang_idx on code_symbols(lang);
         create table if not exists code_calls (
           id integer primary key,
           path text not null,
           caller text not null,
           callee text not null,
-          lineno integer not null
+          lineno integer not null,
+          lang text not null default 'python'
         );
         create index if not exists code_calls_callee_idx on code_calls(callee);
         create index if not exists code_calls_caller_idx on code_calls(caller);
+        create index if not exists code_calls_lang_idx on code_calls(lang);
         """
     )
     conn.execute(f"pragma user_version={SCHEMA_VERSION}")
@@ -304,6 +311,13 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
                 conn.execute("delete from provenance where path = ?", (rel,))
                 conn.execute("delete from code_symbols where path = ?", (rel,))
                 conn.execute("delete from code_calls where path = ?", (rel,))
+                # Also delete function chunks for this file (they have path like "file.ext:qualname")
+                # Applies to any supported language that has function-level chunks
+                chunk_ids = conn.execute(
+                    "select id from chunks where path like ?", (f"{rel}:%",)
+                ).fetchall()
+                for (cid,) in chunk_ids:
+                    _delete_chunk_rows_keep_fts(conn, cid)
             summary = summarize(redacted)
             cursor = conn.execute(
                 "insert into chunks(path, sha256, summary) values (?, ?, ?)",
@@ -328,6 +342,8 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
             )
             _insert_chunk_embedding(conn, chunk_id, redacted, root)
             _insert_codegraph_for_path(conn, rel, redacted, path)
+            # For supported languages, also insert function/class level chunks (hybrid chunking)
+            _insert_function_chunks(conn, rel, content, chunk_id)
             if existing_pair is not None:
                 changed += 1
             else:
@@ -341,6 +357,12 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
                 conn.execute("delete from provenance where path = ?", (rel,))
                 conn.execute("delete from code_symbols where path = ?", (rel,))
                 conn.execute("delete from code_calls where path = ?", (rel,))
+                # Also delete function chunks for this file
+                chunk_ids = conn.execute(
+                    "select id from chunks where path like ?", (f"{rel}:%",)
+                ).fetchall()
+                for (func_cid,) in chunk_ids:
+                    _delete_chunk_rows_keep_fts(conn, func_cid)
                 deleted += 1
         conn.commit()
     return {
@@ -397,6 +419,8 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
             )
             _insert_chunk_embedding(conn, chunk_id, redacted, root)
             _insert_codegraph_for_path(conn, rel, redacted, path)
+            # For supported languages, also insert function/class level chunks (hybrid chunking)
+            _insert_function_chunks(conn, rel, content, chunk_id)
             indexed += 1
         conn.commit()
         conn.execute("vacuum")
@@ -408,34 +432,187 @@ def _codegraph_enabled() -> bool:
     return str(raw).strip().lower() not in {"0", "off", "false", "no"}
 
 
-def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text: str, abs_path: Path) -> None:
-    """Insert function/class symbols + call edges for Python source files.
+def _insert_function_chunks(
+    conn: sqlite3.Connection, path: str, source_text: str, file_chunk_id: int
+) -> None:
+    """Insert function/class level chunks for a source file (hybrid chunking).
 
-    Default ON (AI_SEARCH_CODEGRAPH=1). Skips non-Python and any file the AST
-    parser rejects (best-effort indexer behavior).
+    Supports Python, JS/TS, Go, Rust via language-specific extraction.
+
+    For each function/class extracted from the source:
+      1. Create a new chunk row with the symbol text
+      2. Insert into chunks_fts for full-text search
+      3. Update chunk_meta with symbol metadata (qualname, start/end lines, kind)
+
+    This preserves file-level chunks while adding function-level chunks.
+    Best-effort: silently skips if parsing fails or ast-grep is unavailable.
+    """
+    # Determine language from file extension
+    lang = None
+    if path.endswith(".py"):
+        lang = "py"
+    elif path.endswith((".js", ".jsx")):
+        lang = "js"
+    elif path.endswith((".ts", ".tsx")):
+        lang = "ts"
+    elif path.endswith(".go"):
+        lang = "go"
+    elif path.endswith(".rs"):
+        lang = "rs"
+    else:
+        return
+
+    func_chunks = _function_chunks_for_lang(path, source_text, lang)
+    if not func_chunks:
+        return
+
+    for func in func_chunks:
+        qualname = func["qualname"]
+        chunk_text = func["text"]
+        start_line = func["start_line"]
+        end_line = func["end_line"]
+        kind = func["kind"]
+
+        # Create a unique summary for the function chunk
+        summary = f"{kind} {qualname} ({start_line}-{end_line})"
+
+        # Compute sha256 of chunk text (for dedup purposes, though we allow multiples per file)
+        chunk_digest = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+
+        try:
+            # Insert chunk row with a fake "path" to make it searchable
+            # Use a canonical path like "path.py:qualname" for clarity
+            chunk_path = f"{path}:{qualname}"
+            cursor = conn.execute(
+                "insert into chunks(path, sha256, summary) values (?, ?, ?)",
+                (chunk_path, chunk_digest, summary),
+            )
+            chunk_id = int(cursor.lastrowid)
+
+            # Insert into FTS index
+            conn.execute(
+                "insert into chunks_fts(rowid, path, content) values (?, ?, ?)",
+                (chunk_id, chunk_path, chunk_text),
+            )
+
+            # Insert into chunk_meta with function metadata
+            conn.execute(
+                "insert into chunk_meta(chunk_id, kind, bytes, line_count, qualname, start_line, end_line) "
+                "values (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    chunk_id,
+                    kind,
+                    len(chunk_text.encode("utf-8")),
+                    chunk_text.count("\n") + 1,
+                    qualname,
+                    start_line,
+                    end_line,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # Duplicate or constraint violation; skip this chunk
+            pass
+
+
+def _insert_function_chunks_for_python(
+    conn: sqlite3.Connection, path: str, source_text: str, file_chunk_id: int
+) -> None:
+    """Deprecated: use _insert_function_chunks() instead.
+
+    Kept for backward compatibility; simply delegates to the new function.
+    """
+    _insert_function_chunks(conn, path, source_text, file_chunk_id)
+
+
+def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text: str, abs_path: Path) -> None:
+    """Insert function/class symbols + call edges for Python and multi-language source files.
+
+    Default ON (AI_SEARCH_CODEGRAPH=1). Supports Python, JS, TS, Go, Rust via ast-grep.
+    Skips unsupported files and any file the AST parser rejects (best-effort indexer behavior).
     """
     if not _codegraph_enabled():
         return
-    if not rel.endswith(".py"):
+
+    # Detect language from file extension
+    lang = None
+    extract_symbols_func = None
+    extract_calls_func = None
+
+    if rel.endswith(".py"):
+        lang = "python"
+        try:
+            from .codegraph import extract_symbols, extract_calls
+            extract_symbols_func = extract_symbols
+            extract_calls_func = extract_calls
+        except Exception:
+            return
+    elif rel.endswith((".js", ".jsx")):
+        lang = "javascript"
+        try:
+            from .astgrep_integration import extract_symbols_js, extract_calls_js
+            extract_symbols_func = lambda src, **kw: extract_symbols_js(str(abs_path))
+            extract_calls_func = lambda src, **kw: extract_calls_js(str(abs_path))
+        except Exception:
+            return
+    elif rel.endswith((".ts", ".tsx")):
+        lang = "typescript"
+        try:
+            from .astgrep_integration import extract_symbols_ts, extract_calls_ts
+            extract_symbols_func = lambda src, **kw: extract_symbols_ts(str(abs_path))
+            extract_calls_func = lambda src, **kw: extract_calls_ts(str(abs_path))
+        except Exception:
+            return
+    elif rel.endswith(".go"):
+        lang = "go"
+        try:
+            from .astgrep_integration import extract_symbols_go, extract_calls_go
+            extract_symbols_func = lambda src, **kw: extract_symbols_go(str(abs_path))
+            extract_calls_func = lambda src, **kw: extract_calls_go(str(abs_path))
+        except Exception:
+            return
+    elif rel.endswith(".rs"):
+        lang = "rust"
+        try:
+            from .astgrep_integration import extract_symbols_rs, extract_calls_rs
+            extract_symbols_func = lambda src, **kw: extract_symbols_rs(str(abs_path))
+            extract_calls_func = lambda src, **kw: extract_calls_rs(str(abs_path))
+        except Exception:
+            return
+    else:
+        # Unsupported language
         return
+
     try:
-        from .codegraph import extract_symbols, extract_calls
-    except Exception:
-        return
-    try:
-        syms = extract_symbols(redacted_text, path=rel)
-        for s in syms:
-            conn.execute(
-                "insert into code_symbols(path, qualname, kind, lineno, end_lineno, parent) "
-                "values (?, ?, ?, ?, ?, ?)",
-                (s.path, s.qualname, s.kind, s.lineno, s.end_lineno, s.parent),
-            )
-        calls = extract_calls(redacted_text, path=rel)
-        for c in calls:
-            conn.execute(
-                "insert into code_calls(path, caller, callee, lineno) values (?, ?, ?, ?)",
-                (c.path, c.caller, c.callee, c.lineno),
-            )
+        if lang == "python":
+            # Python AST extraction works with source text
+            syms = extract_symbols_func(redacted_text, path=rel)
+            for s in syms:
+                conn.execute(
+                    "insert into code_symbols(path, qualname, kind, lineno, end_lineno, parent, lang) "
+                    "values (?, ?, ?, ?, ?, ?, ?)",
+                    (s.path, s.qualname, s.kind, s.lineno, s.end_lineno, s.parent, lang),
+                )
+            calls = extract_calls_func(redacted_text, path=rel)
+            for c in calls:
+                conn.execute(
+                    "insert into code_calls(path, caller, callee, lineno, lang) values (?, ?, ?, ?, ?)",
+                    (c.path, c.caller, c.callee, c.lineno, lang),
+                )
+        else:
+            # Multi-language extraction (ast-grep) returns dicts
+            syms = extract_symbols_func(redacted_text)
+            for s in syms:
+                conn.execute(
+                    "insert into code_symbols(path, qualname, kind, lineno, end_lineno, lang) "
+                    "values (?, ?, ?, ?, ?, ?)",
+                    (rel, s.get("qualname"), s.get("kind"), s.get("lineno"), s.get("end_lineno"), lang),
+                )
+            calls = extract_calls_func(redacted_text)
+            for c in calls:
+                conn.execute(
+                    "insert into code_calls(path, caller, callee, lineno, lang) values (?, ?, ?, ?, ?)",
+                    (rel, "<module>", c.get("callee"), c.get("lineno"), lang),
+                )
     except Exception:
         # Indexer must continue even if one file misbehaves.
         return
@@ -465,7 +642,12 @@ def _insert_chunk_embedding(conn: sqlite3.Connection, chunk_id: int, text: str, 
 
 
 def _bm25_weights() -> tuple[float, float]:
-    """Read FTS5 BM25 column weights from env, with safe defaults."""
+    """Read FTS5 BM25 column weights from env, with safe defaults.
+
+    Environment variables:
+    - AI_SEARCH_BM25_PATH_WEIGHT: weight for path column (default 2.0)
+    - AI_SEARCH_BM25_CONTENT_WEIGHT: weight for content column (default 1.0)
+    """
     def _read(name: str, default: float) -> float:
         raw = os.environ.get(name)
         if raw is None or str(raw).strip() == "":
@@ -482,6 +664,170 @@ def _bm25_weights() -> tuple[float, float]:
         _read("AI_SEARCH_BM25_PATH_WEIGHT", 2.0),
         _read("AI_SEARCH_BM25_CONTENT_WEIGHT", 1.0),
     )
+
+
+def _function_chunks_for_python(path: str, source_text: str) -> list[dict[str, Any]]:
+    """Extract function/class level text chunks from Python source.
+
+    Returns list of dicts with keys:
+      - symbol_name: short name (e.g., "my_func")
+      - qualname: full qualified name (e.g., "module.MyClass.method")
+      - start_line: 1-indexed start line
+      - end_line: 1-indexed end line (inclusive)
+      - text: source text of the chunk
+      - kind: 'function', 'async_function', 'method', 'async_method', or 'class'
+
+    Returns [] if Python parsing fails (best-effort indexer behavior).
+    """
+    try:
+        from .codegraph import extract_symbols
+    except Exception:
+        return []
+
+    try:
+        symbols = extract_symbols(source_text, path=path)
+    except Exception:
+        return []
+
+    if not symbols:
+        return []
+
+    lines = source_text.split("\n")
+    chunks = []
+
+    for sym in symbols:
+        start_line = sym.lineno
+        end_line = sym.end_lineno
+        if start_line < 1 or end_line < start_line or end_line > len(lines):
+            continue
+
+        # Extract lines (0-indexed slicing for 1-indexed line numbers)
+        chunk_lines = lines[start_line - 1 : end_line]
+        chunk_text = "\n".join(chunk_lines)
+
+        chunks.append({
+            "symbol_name": sym.qualname.split(".")[-1],  # short name
+            "qualname": sym.qualname,
+            "start_line": start_line,
+            "end_line": end_line,
+            "text": chunk_text,
+            "kind": sym.kind,
+        })
+
+    return chunks
+
+
+def _function_chunks_for_lang(path: str, source_text: str, lang: str) -> list[dict[str, Any]]:
+    """Extract function/class level text chunks from source in a given language.
+
+    Supports: "py", "js"/"jsx", "ts"/"tsx", "go", "rs".
+
+    Returns list of dicts with keys:
+      - symbol_name: short name
+      - qualname: full qualified name
+      - start_line: 1-indexed start line
+      - end_line: 1-indexed end line (inclusive)
+      - text: source text of the chunk
+      - kind: 'function', 'class', or language-specific variant
+
+    Returns [] if parsing fails or ast-grep is unavailable (best-effort indexer behavior).
+    """
+    if lang == "py":
+        return _function_chunks_for_python(path, source_text)
+
+    # Multi-language extraction via ast-grep integration
+    if lang not in {"js", "jsx", "ts", "tsx", "go", "rs"}:
+        return []
+
+    try:
+        from . import astgrep_integration as ast_mod
+    except Exception:
+        return []
+
+    # Select the appropriate extract_symbols function
+    extract_func = None
+    if lang in {"js", "jsx"}:
+        extract_func = ast_mod.extract_symbols_js
+    elif lang in {"ts", "tsx"}:
+        extract_func = ast_mod.extract_symbols_ts
+    elif lang == "go":
+        extract_func = ast_mod.extract_symbols_go
+    elif lang == "rs":
+        extract_func = ast_mod.extract_symbols_rs
+
+    if extract_func is None:
+        return []
+
+    try:
+        symbols = extract_func(path)
+    except Exception:
+        return []
+
+    if not symbols:
+        return []
+
+    lines = source_text.split("\n")
+    chunks = []
+
+    for sym in symbols:
+        start_line = sym.get("lineno")
+        end_line = sym.get("end_lineno")
+        qualname = sym.get("qualname", "")
+        kind = sym.get("kind", "function")
+
+        if not qualname or not isinstance(start_line, int) or not isinstance(end_line, int):
+            continue
+        if start_line < 1 or end_line < start_line or end_line > len(lines):
+            continue
+
+        # Extract lines (0-indexed slicing for 1-indexed line numbers)
+        chunk_lines = lines[start_line - 1 : end_line]
+        chunk_text = "\n".join(chunk_lines)
+
+        chunks.append({
+            "symbol_name": qualname.split(".")[-1] if "." in qualname else qualname,
+            "qualname": qualname,
+            "start_line": start_line,
+            "end_line": end_line,
+            "text": chunk_text,
+            "kind": kind,
+        })
+
+    return chunks
+
+
+def _compute_rrf_k(indexed_chunk_count: int) -> int:
+    """Compute RRF k dynamically based on corpus size.
+
+    For corpus size N (indexed chunks), compute:
+      k = clamp(round(60 * log2(max(N, 16)) / log2(1024)), 30, 120)
+
+    This scales k with corpus growth: small corpus (16 chunks) → k≈30,
+    1024 chunks → k≈60, larger corpus scales toward k≤120.
+
+    Environment variable AI_SEARCH_RRF_K (if set) overrides dynamic k.
+    """
+    import math
+
+    # Check for env override first
+    raw = os.environ.get("AI_SEARCH_RRF_K")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+
+    # Dynamic k: scale with log of corpus size
+    N = max(indexed_chunk_count, 16)
+    # Reference: at N=1024 (baseline), k=60
+    # scaling factor: log2(N) / log2(1024) to normalize growth
+    base_k = 60.0
+    log_scale = math.log2(N) / math.log2(1024)
+    computed_k = base_k * log_scale
+    k = max(30, min(120, round(computed_k)))
+    return k
 
 
 def _looks_like_code_symbol(q: str) -> bool:
@@ -528,6 +874,7 @@ def _index_state_from_conn(conn: sqlite3.Connection) -> dict[str, int]:
     sym = conn.execute("select count(*) as count from code_symbols").fetchone()
     calls = conn.execute("select count(*) as count from code_calls").fetchone()
     return {
+        "indexed_chunks": int(row["count"]),  # used for dynamic RRF_K computation
         "indexed_files": int(row["count"]),
         "symbol_count": int(sym["count"]),
         "call_edge_count": int(calls["count"]),
@@ -709,20 +1056,29 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
                     dense_scores.append((r["id"], _cos(qvec, vec)))
             dense_scores.sort(key=lambda x: -x[1])
             dense_rank = {cid: idx for idx, (cid, _s) in enumerate(dense_scores)}
-            # RRF k=60 standard
-            RRF_K = 60
+            # RRF k: dynamic or env override (AI_SEARCH_RRF_K)
+            rrf_k = _compute_rrf_k(index_state.get("indexed_chunks", 16))
             combined = []
             for r in fts_results:
                 cid = r["id"]
                 bm_r = bm25_rank.get(cid, candidate_limit)
                 dn_r = dense_rank.get(cid, candidate_limit)
-                fused = 1.0 / (RRF_K + bm_r + 1) + 1.0 / (RRF_K + dn_r + 1)
+                fused = 1.0 / (rrf_k + bm_r + 1) + 1.0 / (rrf_k + dn_r + 1)
                 row_copy = dict(r)
                 row_copy["_rrf"] = fused
                 combined.append(row_copy)
             combined.sort(key=lambda x: -x["_rrf"])
             fts_results = combined
             dense_used = True
+    # Apply cross-encoder reranker if active (post-RRF, pre-limit).
+    try:
+        from . import reranker as _rr
+        if _rr.is_active_for(root):
+            reranked = _rr.rerank(text, fts_results, root, top_k=limit)
+            if reranked is not None:
+                fts_results = reranked
+    except Exception:
+        pass
     # Strip internal fields before returning.
     for r in fts_results:
         r.pop("id", None)

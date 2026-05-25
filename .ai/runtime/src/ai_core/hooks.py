@@ -21,10 +21,45 @@ import os as _os
 
 HOT_PATH_TARGET_MS = 200
 SESSION_START_TARGET_MS = 1500
-INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit"}
-AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop"}
-CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart"}
+INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit", "SubagentStart"}
+AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop", "FileChanged"}
+CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "SubagentStart"}
 SKILL_RECOMMENDATION_HOOKS = {"SessionStart"}
+
+KNOWN_AGENTS = {"claude", "codex", "antigravity"}
+
+
+def normalize_agent(payload: dict[str, Any]) -> str:
+    """Map a hook payload's agent identifier to one of the canonical names.
+
+    Returns one of ``claude``, ``codex``, ``antigravity``, or ``unknown``. We
+    prefer an explicit ``agent`` (or ``agent_name``) field; otherwise we fall
+    back to environment variables each host sets (``CLAUDE_PROJECT_DIR`` for
+    Claude Code, ``CODEX_HOME`` for OpenAI Codex CLI, ``ANTIGRAVITY_CLI`` /
+    ``AGY_HOME`` for Google Antigravity). The result is used both for
+    inject-context headers and for obs/audit breakdown.
+    """
+    raw = payload.get("agent") or payload.get("agent_name") or ""
+    norm = str(raw).strip().lower()
+    aliases = {
+        "claude": "claude", "claude-code": "claude", "claudecode": "claude",
+        "codex": "codex", "codex-cli": "codex",
+        "antigravity": "antigravity", "agy": "antigravity", "antigravity-cli": "antigravity",
+    }
+    if norm in aliases:
+        return aliases[norm]
+    if norm and norm != "unknown":
+        return norm
+    env = _os.environ
+    if env.get("CLAUDE_PROJECT_DIR"):
+        return "claude"
+    if env.get("CODEX_HOME") or env.get("CODEX_TURN_ID"):
+        return "codex"
+    if env.get("ANTIGRAVITY_CLI") or env.get("AGY_HOME"):
+        return "antigravity"
+    return "unknown"
+
+
 try:
     MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "4096"))))
 except (ValueError, TypeError):
@@ -132,6 +167,140 @@ def _spawn_background_rebuild(root: Path) -> None:
         register_child(root, pid=proc.pid, kind="index_rebuild", command=cmd)
     except Exception:
         pass
+
+
+def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
+    """Spawn background idle-time jobs (memory page-out, audit fold, index refresh).
+
+    Fire-and-forget detached subprocess. Uses lock file (.ai/cache/sleep-time.lock)
+    to prevent duplicate spawns within 600 seconds. Opt-out via AI_SLEEP_TIME=0/off.
+
+    Returns:
+      {"ok": bool, "spawned": [...], "skipped": bool, "reason": str | None}
+
+    Errors are silently swallowed — hook response never fails.
+    """
+    import os
+    import subprocess
+
+    # Opt-out check
+    if _env_disabled("AI_SLEEP_TIME", default="1"):
+        return {"ok": True, "spawned": [], "skipped": True, "reason": "AI_SLEEP_TIME disabled"}
+
+    # Lock-based dedup (600s cooldown)
+    lock_path = root / ".ai" / "cache" / "sleep-time.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.exists():
+            age = time.time() - lock_path.stat().st_mtime
+            if age < 600:
+                return {"ok": True, "spawned": [], "skipped": True, "reason": "lock_recent"}
+    except OSError:
+        pass
+
+    # Update lock
+    try:
+        lock_path.write_text("running", encoding="utf-8")
+    except OSError:
+        pass
+
+    # Resolve ai binary
+    from .portable import IS_WINDOWS, detached_popen_kwargs
+
+    ai_bin_unix = root / ".ai" / "bin" / "ai"
+    ai_bin_ps = root / ".ai" / "bin" / "ai.ps1"
+
+    spawned: list[str] = []
+
+    # Job 1: memory page-out (includes audit fold per T1)
+    try:
+        from .process_janitor import cleanup_children, register_child
+
+        cleanup_children(root)
+        if IS_WINDOWS and ai_bin_ps.exists():
+            cmd = ["powershell", "-NoProfile", "-File", str(ai_bin_ps), "memory", "page-out", "--json"]
+        elif ai_bin_unix.exists():
+            cmd = [str(ai_bin_unix), "memory", "page-out", "--json"]
+        else:
+            return {"ok": False, "spawned": spawned, "skipped": False, "reason": "ai_bin_not_found"}
+
+        with open(os.devnull, "wb") as devnull:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=devnull,
+                stderr=devnull,
+                stdin=subprocess.DEVNULL,
+                cwd=str(root),
+                **detached_popen_kwargs(),
+            )
+        register_child(root, pid=proc.pid, kind="sleep_time_page_out", command=cmd)
+        spawned.append(f"page_out(pid={proc.pid})")
+    except Exception:
+        pass
+
+    # Job 2: index rebuild (optional, only if not just done in Stop handler)
+    try:
+        from .process_janitor import register_child
+
+        if IS_WINDOWS and ai_bin_ps.exists():
+            cmd = [
+                "powershell", "-NoProfile", "-File", str(ai_bin_ps),
+                "index", "rebuild", "--single-flight", "--incremental", "--json"
+            ]
+        elif ai_bin_unix.exists():
+            cmd = [
+                str(ai_bin_unix),
+                "index", "rebuild", "--single-flight", "--incremental", "--json"
+            ]
+        else:
+            pass  # skip if no binary
+
+        if ai_bin_unix.exists() or (IS_WINDOWS and ai_bin_ps.exists()):
+            with open(os.devnull, "wb") as devnull:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=devnull,
+                    stderr=devnull,
+                    stdin=subprocess.DEVNULL,
+                    cwd=str(root),
+                    **detached_popen_kwargs(),
+                )
+            register_child(root, pid=proc.pid, kind="sleep_time_index_rebuild", command=cmd)
+            spawned.append(f"index_rebuild(pid={proc.pid})")
+    except Exception:
+        pass
+
+    # Job 3: sandbox prune — clean stale sandbox executions older than 24h.
+    # Without this background trigger, .ai/cache/sandbox accumulates indefinitely
+    # (every sandbox_execute writes a .txt + .meta.json pair). Large/long-lived
+    # projects had observed 360+ files / 16 MB before this hook was wired.
+    try:
+        from .process_janitor import register_child
+
+        if IS_WINDOWS and ai_bin_ps.exists():
+            cmd = ["powershell", "-NoProfile", "-File", str(ai_bin_ps),
+                   "exec", "prune", "--older-than-seconds", "86400", "--json"]
+        elif ai_bin_unix.exists():
+            cmd = [str(ai_bin_unix), "exec", "prune", "--older-than-seconds", "86400", "--json"]
+        else:
+            cmd = None
+
+        if cmd is not None:
+            with open(os.devnull, "wb") as devnull:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=devnull,
+                    stderr=devnull,
+                    stdin=subprocess.DEVNULL,
+                    cwd=str(root),
+                    **detached_popen_kwargs(),
+                )
+            register_child(root, pid=proc.pid, kind="sleep_time_sandbox_prune", command=cmd)
+            spawned.append(f"sandbox_prune(pid={proc.pid})")
+    except Exception:
+        pass
+
+    return {"ok": True, "spawned": spawned, "skipped": False, "reason": None}
 
 
 def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
@@ -929,6 +1098,48 @@ def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
     )
 
 
+def _session_scope_summary(root: Path) -> str:
+    """Nudge to ``/clear`` when many audit events accumulate since the most
+    recent ``SessionStart`` marker in the current audit file.
+
+    Returns "" when disabled, when no SessionStart marker is found in the
+    tail window, or when the count is below threshold. Intended for
+    UserPromptSubmit injection only — at SessionStart the count is zero
+    so the line carries no signal.
+    """
+    if _env_disabled("AI_SESSION_SCOPE_SUMMARY"):
+        return ""
+    try:
+        threshold = max(10, int(_os.environ.get("AI_SESSION_SCOPE_THRESHOLD", "30")))
+    except (ValueError, TypeError):
+        threshold = 30
+    files = all_audit_files(root)
+    if not files:
+        return ""
+    try:
+        entries = _read_jsonl_tail(files[-1], 500)
+    except Exception:
+        return ""
+    if not entries:
+        return ""
+    count = 0
+    found_start = False
+    for entry in reversed(entries):
+        payload = entry.get("payload") or {}
+        kind = str(payload.get("kind") or "")
+        action = str(entry.get("action") or "")
+        if action == "event.append" and kind == "SessionStart":
+            found_start = True
+            break
+        count += 1
+    if not found_start or count < threshold:
+        return ""
+    return (
+        f"cb-scope: {count} audit events since SessionStart — "
+        "if the topic has shifted, `/clear` before continuing."
+    )
+
+
 def _compact_meta_line(root: Path) -> str:
     """Compact-mode unified one-liner combining federated + satisfaction data.
 
@@ -1063,7 +1274,16 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                 try:
                     from .precall_recommend import record_user_override
 
-                    record_user_override(root, rid, str(tool_input.get("command") or ""))
+                    record_user_override(
+                        root,
+                        rid,
+                        str(
+                            tool_input.get("command")
+                            or tool_input.get("CommandLine")
+                            or tool_input.get("commandLine")
+                            or ""
+                        ),
+                    )
                 except Exception:
                     pass
         except Exception:
@@ -1151,6 +1371,12 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             _handle_lifecycle_event(root, effective_hook, payload)
         except Exception:
             pass
+        # T6: spawn sleep-time idle jobs after SessionEnd/Stop (memory page-out, audit fold, index refresh)
+        if effective_hook in {"Stop", "SessionEnd"}:
+            try:
+                _spawn_sleep_time_jobs(root)
+            except Exception:
+                pass
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     target_ms = _target_ms_for(effective_hook)
     if persisted and elapsed_ms > target_ms:
@@ -1193,7 +1419,11 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     "permissionDecisionReason": (
                         f"Code Brain auto-rewrite: {precall_decision.get('reason')} → routed to sandbox."
                     ),
-                    "updatedInput": {"command": suggestion},
+                    "updatedInput": {
+                        "command": suggestion,
+                        "CommandLine": suggestion,
+                        "commandLine": suggestion,
+                    },
                     "additionalContext": additional_context,
                 }
                 response["rewritten"] = True
@@ -1296,7 +1526,7 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
 
     if hook_name in LIFECYCLE_SNAPSHOT_HOOKS:
         session_id = str(payload.get("session_id") or payload.get("sid") or "")
-        agent = str(payload.get("agent") or "unknown")
+        agent = normalize_agent(payload)
         if session_id:
             try:
                 from .session_resume import write_snapshot
@@ -1350,7 +1580,12 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
         raw_input = payload.get("tool_input")
         description = ""
         if isinstance(raw_input, dict):
-            description = str(raw_input.get("description") or "")[:200]
+            description = str(
+                raw_input.get("description")
+                or raw_input.get("Reason")
+                or raw_input.get("reason")
+                or ""
+            )[:200]
         append_audit(
             root,
             action="permission.requested",
@@ -1431,10 +1666,63 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
                 "load_reason": load_reason[:32],
             },
         )
+        return
+
+    if hook_name == "SubagentStart":
+        agent_id = str(payload.get("agent_id") or payload.get("subagent_id") or "")
+        agent_type = str(payload.get("agent_type") or payload.get("subagent_type") or "")
+        append_audit(
+            root,
+            action="subagent.started",
+            category="memory",
+            payload={"agent_id": agent_id[:64], "agent_type": agent_type[:64]},
+        )
+        return
+
+    if hook_name == "TaskCreated":
+        title = str(payload.get("title") or payload.get("subject") or "").strip()
+        if title:
+            try:
+                from .memory import append_todo
+                append_todo(root, title=title[:200], source="task_hook")
+            except Exception:
+                pass
+        return
+
+    if hook_name == "TaskCompleted":
+        match = str(payload.get("title") or payload.get("subject") or payload.get("task_id") or "").strip()
+        if match:
+            try:
+                from .memory import close_todo
+                close_todo(root, match=match[:200], status="done", reason="task_hook")
+            except Exception:
+                pass
+        return
+
+    if hook_name == "FileChanged":
+        file_path = str(payload.get("file_path") or payload.get("path") or "")
+        append_audit(
+            root,
+            action="file.changed",
+            category="memory",
+            payload={"file_path": file_path[:200]},
+        )
+        return
+
+    if hook_name == "PostToolUseFailure":
+        tool_name = str(payload.get("tool_name") or payload.get("tool") or "")
+        error = str(payload.get("error") or payload.get("error_message") or "")[:200]
+        append_audit(
+            root,
+            action="tool.failed",
+            category="hook",
+            payload={"tool_name": tool_name[:64], "error": error},
+        )
+        return
 
 
 def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None = None) -> str:
-    agent = payload.get("agent", "unknown")
+    agent = normalize_agent(payload)
     writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
     header = f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={writes}."
     if hook_name not in INJECTION_HOOKS or root is None:
@@ -1471,6 +1759,9 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
                 sections.append(_harness_directive(root, explicit=True))
         except Exception:
             pass
+        scope_line = _session_scope_summary(root)
+        if scope_line:
+            sections.append(scope_line)
     elif hook_name == "SessionStart":
         try:
             from .session_resume import read_latest_snapshot

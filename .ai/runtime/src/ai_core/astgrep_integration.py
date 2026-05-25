@@ -146,4 +146,633 @@ def scan_path(
     return findings
 
 
-__all__ = ["astgrep_available", "scan_path"]
+def extract_symbols_js(file_path: str) -> list[dict]:
+    """Extract function/class symbols from JS/TS file using ast-grep.
+
+    Returns list of dicts with keys: qualname, kind, lineno, end_lineno.
+    Returns [] if ast-grep is unavailable or parse fails.
+    """
+    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
+        return []
+    binary = _binary()
+    if not binary:
+        return []
+
+    p = Path(file_path)
+    if not p.exists():
+        return []
+
+    # ast-grep pattern for function declarations and arrow functions
+    rule_yaml = """\
+id: js-functions
+language: JavaScript
+rule:
+  pattern: |
+    function $FUNC_NAME($_) {
+      $$$BODY
+    }
+severity: info
+message: function
+---
+id: js-arrow-functions
+language: JavaScript
+rule:
+  pattern: const $VAR = $_
+severity: info
+message: arrow-function
+---
+id: js-class
+language: JavaScript
+rule:
+  pattern: |
+    class $CLASS_NAME {
+      $$$BODY
+    }
+severity: info
+message: class
+"""
+
+    findings: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
+        rule_file = Path(tmp) / "rules.yml"
+        try:
+            rule_file.write_text(rule_yaml, encoding="utf-8")
+        except OSError:
+            return []
+
+        cmd = [
+            binary,
+            "scan",
+            "--rule",
+            str(rule_file),
+            "--json=stream",
+            str(p),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                timeout=10.0,
+                capture_output=True,
+                text=True,
+                check=False,
+                shell=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return []
+
+        # Parse best-effort: extract lineno from matched nodes
+        stdout = proc.stdout or ""
+        stripped = stdout.strip()
+        if not stripped:
+            return []
+
+        # Handle both NDJSON and JSON array formats
+        if stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+                if isinstance(data, list):
+                    findings = [d for d in data if isinstance(d, dict)]
+            except json.JSONDecodeError:
+                return []
+        else:
+            for line in stripped.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        findings.append(obj)
+                except json.JSONDecodeError:
+                    continue
+
+    # Transform ast-grep findings into symbol records
+    symbols: list[dict] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        matches = finding.get("matches", [])
+        if not isinstance(matches, list):
+            continue
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            # Attempt to extract function/class name from matched text
+            start = match.get("start", {})
+            end = match.get("end", {})
+            lineno = start.get("line", 0) if isinstance(start, dict) else 0
+            end_lineno = end.get("line", lineno) if isinstance(end, dict) else lineno
+            # Increment because ast-grep uses 0-indexed lines, we want 1-indexed
+            lineno = max(1, lineno + 1)
+            end_lineno = max(lineno, end_lineno + 1)
+
+            # Best-effort: extract identifier from matched region
+            text = match.get("text", "")
+            kind = finding.get("message", "function").lower()
+
+            # Heuristic: try to extract function name
+            import re as _re
+            name_match = _re.search(r'(?:function|const|class)\s+(\w+)', text)
+            if name_match:
+                qualname = name_match.group(1)
+            else:
+                qualname = f"<anonymous at {lineno}>"
+
+            symbols.append({
+                "qualname": qualname,
+                "kind": kind,
+                "lineno": lineno,
+                "end_lineno": end_lineno,
+            })
+
+    return symbols
+
+
+def extract_calls_js(file_path: str) -> list[dict]:
+    """Extract function call sites from JS/TS file using ast-grep.
+
+    Returns list of dicts with keys: callee, lineno.
+    Returns [] if ast-grep is unavailable or parse fails.
+    """
+    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
+        return []
+    binary = _binary()
+    if not binary:
+        return []
+
+    p = Path(file_path)
+    if not p.exists():
+        return []
+
+    # Pattern to match function calls
+    rule_yaml = """\
+id: js-calls
+language: JavaScript
+rule:
+  pattern: $FUNC($_)
+severity: info
+message: call
+"""
+
+    findings: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
+        rule_file = Path(tmp) / "rules.yml"
+        try:
+            rule_file.write_text(rule_yaml, encoding="utf-8")
+        except OSError:
+            return []
+
+        cmd = [
+            binary,
+            "scan",
+            "--rule",
+            str(rule_file),
+            "--json=stream",
+            str(p),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                timeout=10.0,
+                capture_output=True,
+                text=True,
+                check=False,
+                shell=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return []
+
+        stdout = proc.stdout or ""
+        stripped = stdout.strip()
+        if not stripped:
+            return []
+
+        if stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+                if isinstance(data, list):
+                    findings = [d for d in data if isinstance(d, dict)]
+            except json.JSONDecodeError:
+                return []
+        else:
+            for line in stripped.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        findings.append(obj)
+                except json.JSONDecodeError:
+                    continue
+
+    calls: list[dict] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        matches = finding.get("matches", [])
+        if not isinstance(matches, list):
+            continue
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            start = match.get("start", {})
+            lineno = start.get("line", 0) if isinstance(start, dict) else 0
+            lineno = max(1, lineno + 1)
+
+            # Extract callee name from matched text
+            text = match.get("text", "")
+            # Heuristic: function call pattern "name(...)" → extract "name"
+            import re as _re
+            callee_match = _re.search(r'(\w+(?:\.\w+)*)\s*\(', text)
+            if callee_match:
+                callee = callee_match.group(1)
+            else:
+                callee = text.split('(')[0].strip()
+
+            if callee:
+                calls.append({
+                    "callee": callee,
+                    "lineno": lineno,
+                })
+
+    return calls
+
+
+def extract_symbols_ts(file_path: str) -> list[dict]:
+    """Extract symbols from TypeScript file. Delegates to JS extraction."""
+    return extract_symbols_js(file_path)
+
+
+def extract_calls_ts(file_path: str) -> list[dict]:
+    """Extract calls from TypeScript file. Delegates to JS extraction."""
+    return extract_calls_js(file_path)
+
+
+def extract_symbols_go(file_path: str) -> list[dict]:
+    """Extract function/method symbols from Go file using ast-grep.
+
+    Returns [] if ast-grep unavailable.
+    """
+    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
+        return []
+    binary = _binary()
+    if not binary:
+        return []
+
+    p = Path(file_path)
+    if not p.exists():
+        return []
+
+    rule_yaml = """\
+id: go-functions
+language: Go
+rule:
+  pattern: |
+    func $FUNC_NAME($_) {
+      $$$BODY
+    }
+severity: info
+message: function
+"""
+
+    findings: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
+        rule_file = Path(tmp) / "rules.yml"
+        try:
+            rule_file.write_text(rule_yaml, encoding="utf-8")
+        except OSError:
+            return []
+
+        cmd = [binary, "scan", "--rule", str(rule_file), "--json=stream", str(p)]
+        try:
+            proc = subprocess.run(
+                cmd, timeout=10.0, capture_output=True, text=True, check=False, shell=False
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return []
+
+        stdout = proc.stdout or ""
+        stripped = stdout.strip()
+        if not stripped:
+            return []
+
+        if stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+                findings = [d for d in data if isinstance(d, dict)]
+            except json.JSONDecodeError:
+                return []
+        else:
+            for line in stripped.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            findings.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+
+    symbols: list[dict] = []
+    for finding in findings:
+        matches = finding.get("matches", [])
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            start = match.get("start", {})
+            end = match.get("end", {})
+            lineno = start.get("line", 0) if isinstance(start, dict) else 0
+            end_lineno = end.get("line", lineno) if isinstance(end, dict) else lineno
+            lineno = max(1, lineno + 1)
+            end_lineno = max(lineno, end_lineno + 1)
+
+            text = match.get("text", "")
+            import re as _re
+            name_match = _re.search(r'func\s+\(?\s*\w+\s*\)?\s*(\w+)', text)
+            if name_match:
+                qualname = name_match.group(1)
+            else:
+                qualname = f"<anonymous at {lineno}>"
+
+            symbols.append({
+                "qualname": qualname,
+                "kind": "function",
+                "lineno": lineno,
+                "end_lineno": end_lineno,
+            })
+
+    return symbols
+
+
+def extract_calls_go(file_path: str) -> list[dict]:
+    """Extract call sites from Go file using ast-grep."""
+    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
+        return []
+    binary = _binary()
+    if not binary:
+        return []
+
+    p = Path(file_path)
+    if not p.exists():
+        return []
+
+    rule_yaml = """\
+id: go-calls
+language: Go
+rule:
+  pattern: $FUNC($_)
+severity: info
+message: call
+"""
+
+    findings: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
+        rule_file = Path(tmp) / "rules.yml"
+        try:
+            rule_file.write_text(rule_yaml, encoding="utf-8")
+        except OSError:
+            return []
+
+        cmd = [binary, "scan", "--rule", str(rule_file), "--json=stream", str(p)]
+        try:
+            proc = subprocess.run(
+                cmd, timeout=10.0, capture_output=True, text=True, check=False, shell=False
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return []
+
+        stdout = proc.stdout or ""
+        stripped = stdout.strip()
+        if not stripped:
+            return []
+
+        if stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+                findings = [d for d in data if isinstance(d, dict)]
+            except json.JSONDecodeError:
+                return []
+        else:
+            for line in stripped.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            findings.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+
+    calls: list[dict] = []
+    for finding in findings:
+        matches = finding.get("matches", [])
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            start = match.get("start", {})
+            lineno = start.get("line", 0) if isinstance(start, dict) else 0
+            lineno = max(1, lineno + 1)
+
+            text = match.get("text", "")
+            import re as _re
+            callee_match = _re.search(r'(\w+(?:\.\w+)*)\s*\(', text)
+            if callee_match:
+                callee = callee_match.group(1)
+            else:
+                callee = text.split('(')[0].strip()
+
+            if callee:
+                calls.append({"callee": callee, "lineno": lineno})
+
+    return calls
+
+
+def extract_symbols_rs(file_path: str) -> list[dict]:
+    """Extract function/method symbols from Rust file using ast-grep."""
+    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
+        return []
+    binary = _binary()
+    if not binary:
+        return []
+
+    p = Path(file_path)
+    if not p.exists():
+        return []
+
+    rule_yaml = """\
+id: rust-functions
+language: Rust
+rule:
+  pattern: |
+    fn $FUNC_NAME($_) {
+      $$$BODY
+    }
+severity: info
+message: function
+"""
+
+    findings: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
+        rule_file = Path(tmp) / "rules.yml"
+        try:
+            rule_file.write_text(rule_yaml, encoding="utf-8")
+        except OSError:
+            return []
+
+        cmd = [binary, "scan", "--rule", str(rule_file), "--json=stream", str(p)]
+        try:
+            proc = subprocess.run(
+                cmd, timeout=10.0, capture_output=True, text=True, check=False, shell=False
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return []
+
+        stdout = proc.stdout or ""
+        stripped = stdout.strip()
+        if not stripped:
+            return []
+
+        if stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+                findings = [d for d in data if isinstance(d, dict)]
+            except json.JSONDecodeError:
+                return []
+        else:
+            for line in stripped.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            findings.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+
+    symbols: list[dict] = []
+    for finding in findings:
+        matches = finding.get("matches", [])
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            start = match.get("start", {})
+            end = match.get("end", {})
+            lineno = start.get("line", 0) if isinstance(start, dict) else 0
+            end_lineno = end.get("line", lineno) if isinstance(end, dict) else lineno
+            lineno = max(1, lineno + 1)
+            end_lineno = max(lineno, end_lineno + 1)
+
+            text = match.get("text", "")
+            import re as _re
+            name_match = _re.search(r'fn\s+(\w+)', text)
+            if name_match:
+                qualname = name_match.group(1)
+            else:
+                qualname = f"<anonymous at {lineno}>"
+
+            symbols.append({
+                "qualname": qualname,
+                "kind": "function",
+                "lineno": lineno,
+                "end_lineno": end_lineno,
+            })
+
+    return symbols
+
+
+def extract_calls_rs(file_path: str) -> list[dict]:
+    """Extract call sites from Rust file using ast-grep."""
+    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
+        return []
+    binary = _binary()
+    if not binary:
+        return []
+
+    p = Path(file_path)
+    if not p.exists():
+        return []
+
+    rule_yaml = """\
+id: rust-calls
+language: Rust
+rule:
+  pattern: $FUNC($_)
+severity: info
+message: call
+"""
+
+    findings: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
+        rule_file = Path(tmp) / "rules.yml"
+        try:
+            rule_file.write_text(rule_yaml, encoding="utf-8")
+        except OSError:
+            return []
+
+        cmd = [binary, "scan", "--rule", str(rule_file), "--json=stream", str(p)]
+        try:
+            proc = subprocess.run(
+                cmd, timeout=10.0, capture_output=True, text=True, check=False, shell=False
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return []
+
+        stdout = proc.stdout or ""
+        stripped = stdout.strip()
+        if not stripped:
+            return []
+
+        if stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+                findings = [d for d in data if isinstance(d, dict)]
+            except json.JSONDecodeError:
+                return []
+        else:
+            for line in stripped.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            findings.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+
+    calls: list[dict] = []
+    for finding in findings:
+        matches = finding.get("matches", [])
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            start = match.get("start", {})
+            lineno = start.get("line", 0) if isinstance(start, dict) else 0
+            lineno = max(1, lineno + 1)
+
+            text = match.get("text", "")
+            import re as _re
+            callee_match = _re.search(r'(\w+(?::\w+)*)\s*\(', text)
+            if callee_match:
+                callee = callee_match.group(1)
+            else:
+                callee = text.split('(')[0].strip()
+
+            if callee:
+                calls.append({"callee": callee, "lineno": lineno})
+
+    return calls
+
+
+__all__ = [
+    "astgrep_available",
+    "scan_path",
+    "extract_symbols_js",
+    "extract_calls_js",
+    "extract_symbols_ts",
+    "extract_calls_ts",
+    "extract_symbols_go",
+    "extract_calls_go",
+    "extract_symbols_rs",
+    "extract_calls_rs",
+]

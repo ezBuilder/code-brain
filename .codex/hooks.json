@@ -3,59 +3,92 @@
   "hooks": {
     "PermissionRequest": [
       {
-        "matcher": "Bash",
         "hooks": [
           {
-            "type": "command",
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PermissionRequest",
-            "statusMessage": "Checking Code Brain approval policy"
+            "statusMessage": "Checking Code Brain approval policy",
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PostCompact",
+            "statusMessage": "Recording Code Brain compact completion",
+            "type": "command"
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep",
         "hooks": [
           {
-            "type": "command",
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PostToolUse",
-            "statusMessage": "Recording Code Brain tool result"
+            "statusMessage": "Recording Code Brain tool result",
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep"
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PreCompact",
+            "statusMessage": "Saving Code Brain compact snapshot",
+            "type": "command"
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
         "hooks": [
           {
-            "type": "command",
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PreToolUse",
-            "statusMessage": "Checking Code Brain command routing"
+            "statusMessage": "Checking Code Brain command routing",
+            "type": "command"
           }
-        ]
+        ],
+        "matcher": "Bash"
       }
     ],
     "SessionStart": [
       {
-        "matcher": "startup|resume|clear",
         "hooks": [
           {
-            "type": "command",
-          "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; AI_SKILL_RECOMMENDATIONS=0 AI_AGENT_RECOMMENDATIONS=0 AI_PRECALL_RECOMMENDATIONS=0 \"$ROOT/.ai/bin/ai-hook\" SessionStart",
-            "statusMessage": "Loading Code Brain session context"
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; AI_SKILL_RECOMMENDATIONS=0 AI_AGENT_RECOMMENDATIONS=0 AI_PRECALL_RECOMMENDATIONS=0 \"$ROOT/.ai/bin/ai-hook\" SessionStart",
+            "statusMessage": "Loading Code Brain session context",
+            "type": "command"
           }
-        ]
+        ],
+        "matcher": "startup|resume|clear"
       }
     ],
     "Stop": [
       {
         "hooks": [
           {
-            "type": "command",
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" Stop",
-            "statusMessage": "Recording Code Brain stop event"
+            "statusMessage": "Recording Code Brain stop event",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" SubagentStart",
+            "statusMessage": "Loading Code Brain subagent context",
+            "type": "command"
           }
         ]
       }
@@ -64,31 +97,9 @@
       {
         "hooks": [
           {
-            "type": "command",
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" SubagentStop",
-            "statusMessage": "Recording Code Brain subagent stop"
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PreCompact",
-            "statusMessage": "Saving Code Brain compact snapshot"
-          }
-        ]
-      }
-    ],
-    "PostCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PostCompact",
-            "statusMessage": "Recording Code Brain compact completion"
+            "statusMessage": "Recording Code Brain subagent stop",
+            "type": "command"
           }
         ]
       }
@@ -97,9 +108,9 @@
       {
         "hooks": [
           {
-            "type": "command",
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" UserPromptSubmit",
-            "statusMessage": "Loading Code Brain prompt context"
+            "statusMessage": "Loading Code Brain prompt context",
+            "type": "command"
           }
         ]
       }

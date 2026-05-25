@@ -81,28 +81,31 @@ def classify(root: Path) -> dict[str, Any]:
     for af in audit_files:
         try:
             audit_bytes += af.stat().st_size
-            content = af.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            audit_total += 1
-            ts = _parse_ts(str(rec.get("ts") or ""))
-            if ts is None:
-                audit_cold += 1
-                continue
-            if ts >= hot_cutoff:
-                audit_hot += 1
-            elif ts >= warm_cutoff:
-                audit_warm += 1
-            else:
-                audit_cold += 1
+        try:
+            with af.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    audit_total += 1
+                    ts = _parse_ts(str(rec.get("ts") or ""))
+                    if ts is None:
+                        audit_cold += 1
+                        continue
+                    if ts >= hot_cutoff:
+                        audit_hot += 1
+                    elif ts >= warm_cutoff:
+                        audit_warm += 1
+                    else:
+                        audit_cold += 1
+        except OSError:
+            continue
 
     todos_open = 0
     todos_closed = 0
@@ -111,18 +114,19 @@ def classify(root: Path) -> dict[str, Any]:
         try:
             # latest status per id
             latest: dict[str, str] = {}
-            for line in tpath.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                tid = str(rec.get("id") or "")
-                if not tid:
-                    continue
-                latest[tid] = str(rec.get("status") or "open").lower()
+            with tpath.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    tid = str(rec.get("id") or "")
+                    if not tid:
+                        continue
+                    latest[tid] = str(rec.get("status") or "open").lower()
             for status in latest.values():
                 if status in {"done", "closed", "completed", "cancelled", "canceled"}:
                     todos_closed += 1
@@ -135,7 +139,8 @@ def classify(root: Path) -> dict[str, Any]:
     dpath = decisions_path(root)
     if dpath.exists():
         try:
-            decisions_count = sum(1 for line in dpath.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip())
+            with dpath.open(encoding="utf-8", errors="replace") as fh:
+                decisions_count = sum(1 for line in fh if line.strip())
         except OSError:
             pass
 
@@ -225,12 +230,15 @@ def archive_old_sessions(root: Path, *, age_days: float = 30.0, dry_run: bool = 
 
 def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
     """High-level page-out: rotate session-current if pressured + archive
-    sessions older than AI_MEMORY_ARCHIVE_DAYS (default 30)."""
+    sessions older than AI_MEMORY_ARCHIVE_DAYS (default 30) + fold audit
+    entries older than AI_AUDIT_FOLD_DAYS (default 30)."""
     from .memory import (
         _SESSION_NOTE_MAX_BYTES, _SESSION_NOTE_KEEP_BYTES, session_current_path,
     )
+    from .audit_fold import fold_old_entries
 
     age_days = _env_float("AI_MEMORY_ARCHIVE_DAYS", 30.0)
+    audit_fold_days = int(_env_float("AI_AUDIT_FOLD_DAYS", 30.0))
     result: dict[str, Any] = {"ok": True, "dry_run": dry_run}
 
     spath = session_current_path(root)
@@ -256,6 +264,25 @@ def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
 
     arch = archive_old_sessions(root, age_days=age_days, dry_run=dry_run)
     result["archived"] = arch
+
+    # Fold old audit entries (separated, never blocks page_out)
+    if audit_fold_days <= 0:
+        result["audit_fold"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "disabled (AI_AUDIT_FOLD_DAYS <= 0)",
+        }
+    else:
+        try:
+            fold_result = fold_old_entries(root, days=audit_fold_days, dry_run=dry_run)
+            result["audit_fold"] = fold_result
+        except Exception as e:
+            # Non-fatal: log but keep page_out ok=True
+            result["audit_fold"] = {
+                "ok": False,
+                "error": str(e),
+            }
+
     return result
 
 

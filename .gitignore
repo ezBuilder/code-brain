@@ -8,4 +8,6 @@ dist/
 .DS_Store
 .claude/*
 !.claude/commands/
+.agents/*
+!.agents/skills/
 .ai/memory/events/

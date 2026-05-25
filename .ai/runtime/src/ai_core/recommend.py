@@ -67,6 +67,7 @@ class Signals:
     global_claude_titles: list[str] = field(default_factory=list)
     global_codex_threads: list[dict[str, Any]] = field(default_factory=list)
     bash_head_counts: Counter[str] = field(default_factory=Counter)
+    procedural_hints: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -163,6 +164,8 @@ def gather_signals(
         f"{e.get('category', '?')}.{str(e.get('action') or '').split('.', 1)[-1]}"
         for e in audit
     ]
+
+    sig.procedural_hints = _gather_procedural_hints(root)
 
     if include_global:
         h = home or Path.home()
@@ -268,6 +271,42 @@ def _spawn_bash_head_cache_rebuild(root: Path) -> None:
         pass
 
 
+def _gather_procedural_hints(root: Path) -> list[dict[str, Any]]:
+    """Gather procedural memory hints for recommend signals.
+
+    Returns list of {"trigger", "procedure", "tags"} dicts (limit=50).
+    If procedural.jsonl does not exist, returns empty list (backward compat).
+    """
+    try:
+        from .procedural_memory import procedural_path
+    except ImportError:
+        return []
+
+    proc_path = procedural_path(root)
+    if not proc_path.exists():
+        return []
+
+    try:
+        records = read_jsonl_all(proc_path)
+    except Exception:
+        return []
+
+    hints: list[dict[str, Any]] = []
+    for rec in records[-50:]:  # Latest 50
+        if not isinstance(rec, dict):
+            continue
+        trigger = str(rec.get("trigger") or "").strip()
+        procedure = str(rec.get("procedure") or "").strip()
+        tags = rec.get("tags") or []
+        if trigger and procedure:
+            hints.append({
+                "trigger": trigger,
+                "procedure": procedure[:160],  # Truncate for signal brevity
+                "tags": list(tags)[:5],  # Keep only first 5 tags
+            })
+    return hints
+
+
 def _gather_bash_heads(root: Path) -> Counter[str]:
     """Stale-while-revalidate cache: use cache if present, schedule rebuild if stale or missing."""
     import time
@@ -355,6 +394,7 @@ def cluster_candidates(
     candidates.extend(_candidates_from_codex_groups(signals, min_signal=min_signal))
     candidates.extend(_candidates_from_codex_keywords(signals, min_signal=min_signal))
     candidates.extend(_candidates_from_bash_heads(signals, min_signal=min_signal))
+    candidates.extend(_candidates_from_procedural_hints(signals, min_signal=min_signal))
 
     deduped: dict[str, Candidate] = {}
     for c in candidates:
@@ -586,6 +626,45 @@ def _candidates_from_codex_keywords(signals: Signals, *, min_signal: int) -> lis
     return out
 
 
+def _candidates_from_procedural_hints(signals: Signals, *, min_signal: int) -> list[Candidate]:
+    """Mine procedural memory triggers for automation candidates.
+
+    Procedural hints encode learned patterns (lesson, skill, precall rules, fix patterns).
+    Triggers like "pytest_failure", "import_error" suggest automation/handling procedures.
+    Group by trigger, threshold by min_signal (typically 3).
+    """
+    if not signals.procedural_hints:
+        return []
+
+    trigger_counts: Counter[str] = Counter()
+    trigger_to_hints: dict[str, list[dict[str, Any]]] = {}
+
+    for hint in signals.procedural_hints:
+        trigger = str(hint.get("trigger", "")).strip()
+        if not trigger:
+            continue
+        trigger_counts[trigger] += 1
+        trigger_to_hints.setdefault(trigger, []).append(hint)
+
+    out: list[Candidate] = []
+    for trigger, count in trigger_counts.most_common(8):
+        if count < min_signal:
+            continue
+        slug = _slugify(f"procedural {trigger}")
+        hints_sample = trigger_to_hints.get(trigger, [])[:3]
+        evidence = {
+            "signals": [f"procedural:{count}"],
+            "sources": _evidence_snippets([f"[{h.get('trigger')}] {h.get('procedure', '')}" for h in hints_sample]),
+            "rationale": f"procedural trigger '{trigger}' learned {count}×",
+        }
+        body = _draft_body_for_procedural_trigger(trigger, evidence["sources"])
+        desc = f"'{trigger}' 절차 자동화 — 누적 패턴 {count}회."
+        cid = _candidate_id(slug, body)
+        out.append(Candidate(id=cid, slug=slug, description=desc, body=body, evidence=evidence))
+
+    return out
+
+
 def _candidates_from_bash_heads(signals: Signals, *, min_signal: int) -> list[Candidate]:
     bash_threshold = max(min_signal * 4, 10)
     out: list[Candidate] = []
@@ -603,6 +682,18 @@ def _candidates_from_bash_heads(signals: Signals, *, min_signal: int) -> list[Ca
         cid = _candidate_id(slug, body)
         out.append(Candidate(id=cid, slug=slug, description=desc, body=body, evidence=evidence))
     return out
+
+
+def _draft_body_for_procedural_trigger(trigger: str, sources: list[str]) -> str:
+    bullets = "\n".join(f"- {s}" for s in sources) if sources else "- (no examples)"
+    body = (
+        f"`.ai/bin/ai` 명령으로 '{trigger}' 관련 절차를 조회. "
+        "결과를 한 줄씩 나열. 각 줄: `- [{{ts:0:19}}] {{trigger}}: {{procedure_summary}}`.\n\n"
+        "결과 0건이면 `'{trigger}' 관련 절차 없음.` 한 줄 출력 후 stop.\n\n"
+        f"참고 — 이 명령은 다음 누적 절차로 추천됨:\n{bullets}\n\n"
+        + _BODY_RULES_FOOTER
+    )
+    return body[:MAX_BODY_BYTES]
 
 
 def _draft_body_for_bash_head(head: str, count: int) -> str:
@@ -1158,6 +1249,7 @@ def accept(root: Path, candidate_id: str) -> dict[str, Any]:
     targets = [
         root / ".claude" / "commands" / f"{entry.slug}.md",
         root / ".codex" / "prompts" / f"{entry.slug}.md",
+        root / ".agents" / "skills" / entry.slug / "SKILL.md",
     ]
     for tgt in targets:
         if tgt.exists():

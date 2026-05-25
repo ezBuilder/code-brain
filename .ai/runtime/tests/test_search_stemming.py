@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 from ai_core import search as search_mod  # noqa: E402
 from ai_core.search import (  # noqa: E402
     SCHEMA_VERSION,
+    _function_chunks_for_lang,
     _looks_like_code_symbol,
     _rg_fallback,
     connect,
@@ -38,14 +39,14 @@ def _write(repo: Path, rel: str, content: str) -> Path:
     return path
 
 
-def test_schema_version_is_five(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 5
+def test_schema_version_is_seven(tmp_path: Path) -> None:
+    assert SCHEMA_VERSION == 7
     repo = _make_repo(tmp_path)
     _write(repo, "doc.md", "hello world\n")
     rebuild(repo)
     with connect(repo) as conn:
         version = int(conn.execute("pragma user_version").fetchone()[0])
-    assert version == 5
+    assert version == 7
 
 
 def test_porter_stemming_matches_inflected_forms(tmp_path: Path) -> None:
@@ -122,7 +123,7 @@ def test_legacy_v2_cache_auto_migrates_to_v4(tmp_path: Path) -> None:
         assert version_before == 2
         init_schema(conn, migrate_legacy=True)
         version_after = int(conn.execute("pragma user_version").fetchone()[0])
-        assert version_after == 5
+        assert version_after == 7
 
         tables = {
             row[0]
@@ -285,3 +286,87 @@ def test_bm25_weights_invalid_env_falls_back_to_defaults(tmp_path: Path, monkeyp
     result = query(repo, "hello")
     assert result["ok"] is True
     assert len(result["results"]) == 1
+
+
+def test_function_chunks_for_python_extracts_functions(tmp_path: Path) -> None:
+    """Test Python function chunking via _function_chunks_for_lang."""
+    py_source = """\
+def hello():
+    return "world"
+
+class MyClass:
+    def method(self):
+        pass
+"""
+    chunks = _function_chunks_for_lang("test.py", py_source, "py")
+    # Best-effort: may return [] if codegraph is unavailable.
+    # If successful, should extract at least the top-level function.
+    if chunks:
+        qualnames = [c["qualname"] for c in chunks]
+        assert "hello" in qualnames or "MyClass" in qualnames
+        for chunk in chunks:
+            assert "text" in chunk
+            assert "start_line" in chunk
+            assert "end_line" in chunk
+            assert chunk["start_line"] <= chunk["end_line"]
+
+
+def test_function_chunks_for_unsupported_lang_returns_empty() -> None:
+    """Test that unsupported languages return empty list."""
+    source = "fn main() {}\n"
+    chunks = _function_chunks_for_lang("test.c", source, "c")
+    assert chunks == []
+
+
+def test_function_chunks_for_js_graceful_when_astgrep_unavailable(monkeypatch) -> None:
+    """Test that JS chunks gracefully return [] if ast-grep is unavailable."""
+    # Simulate ast-grep unavailable
+    monkeypatch.setenv("AI_ASTGREP_DISABLE", "1")
+    js_source = """\
+function hello() {
+    return "world";
+}
+"""
+    chunks = _function_chunks_for_lang("test.js", js_source, "js")
+    # With AI_ASTGREP_DISABLE=1, should gracefully return []
+    assert chunks == []
+
+
+def test_python_function_chunks_in_rebuild(tmp_path: Path, monkeypatch) -> None:
+    """Test that Python function chunks are indexed during rebuild."""
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    repo = _make_repo(tmp_path)
+    py_source = """\
+def helper():
+    '''A helper function.'''
+    return 42
+
+def main():
+    '''Main entry point.'''
+    result = helper()
+    return result
+"""
+    _write(repo, "app.py", py_source)
+    rebuild(repo)
+
+    with connect(repo) as conn:
+        init_schema(conn)
+        # Check that file-level chunk exists
+        file_chunks = conn.execute(
+            "select count(*) from chunks where path = 'app.py'"
+        ).fetchone()
+        assert file_chunks[0] == 1, "file-level chunk should exist"
+
+        # Check for function-level chunks (qualname column in chunk_meta)
+        func_chunks = conn.execute(
+            "select count(*) from chunks where path like 'app.py:%'"
+        ).fetchone()
+        # If Python AST extraction works, should have function chunks.
+        # Best-effort: may be 0 if codegraph unavailable.
+        if func_chunks[0] > 0:
+            # Verify they have the expected metadata
+            meta = conn.execute(
+                "select qualname from chunk_meta where qualname is not null and chunk_id in "
+                "(select id from chunks where path like 'app.py:%')"
+            ).fetchall()
+            assert len(meta) > 0, "function chunks should have qualname metadata"

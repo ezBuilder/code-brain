@@ -140,6 +140,15 @@ def build_parser() -> argparse.ArgumentParser:
     obs_slo.add_argument("--json", action="store_true", dest="command_json")
     obs_health = obs_sub.add_parser("health-summary")
     obs_health.add_argument("--json", action="store_true", dest="command_json")
+    obs_traj = obs_sub.add_parser("trajectory", help="TRAJEVAL-style trajectory diagnosis")
+    obs_traj.add_argument("--session-id", default=None)
+    obs_traj.add_argument("--limit", type=int, default=10)
+    obs_traj.add_argument("--json", action="store_true", dest="command_json")
+    obs_spec = obs_sub.add_parser("speculative", help="PASTE-style pattern mining + hit rate")
+    obs_spec.add_argument("--min-support", type=int, default=3)
+    obs_spec.add_argument("--min-confidence", type=float, default=0.5)
+    obs_spec.add_argument("--hit-rate", action="store_true", help="Show hit rate only")
+    obs_spec.add_argument("--json", action="store_true", dest="command_json")
     diagnostics_parser = sub.add_parser("diagnostics")
     diagnostics_sub = diagnostics_parser.add_subparsers(dest="diagnostics_command", required=True)
     diagnostics_bundle = diagnostics_sub.add_parser("bundle")
@@ -226,6 +235,9 @@ def build_parser() -> argparse.ArgumentParser:
     audit_append.add_argument("--json", action="store_true", dest="command_json")
     audit_rebuild = audit_sub.add_parser("rebuild-index")
     audit_rebuild.add_argument("--json", action="store_true", dest="command_json")
+    audit_repair = audit_sub.add_parser("repair-chain", help="re-compute prev_sha for mis-chained audit records (after stash/merge artifact)")
+    audit_repair.add_argument("--year", type=int, default=None, help="repair a specific year file only")
+    audit_repair.add_argument("--json", action="store_true", dest="command_json")
     exec_parser = sub.add_parser("exec", help="run a shell command in Code Brain sandbox (truncated summary, fetchable by id)")
     exec_sub = exec_parser.add_subparsers(dest="exec_command", required=True)
     exec_run = exec_sub.add_parser("run")
@@ -614,6 +626,26 @@ def main(argv: list[str] | None = None) -> int:
             payload = health_summary(root)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "obs" and args.obs_command == "trajectory":
+            from .trajectory import summarize, extract_trajectories
+            if args.session_id:
+                payload = extract_trajectories(root, session_id=args.session_id, limit=args.limit)
+            else:
+                payload = summarize(root, limit=args.limit)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "obs" and args.obs_command == "speculative":
+            from .speculative import mine_patterns, hit_rate
+            if args.hit_rate:
+                payload = hit_rate(root)
+            else:
+                payload = mine_patterns(
+                    root,
+                    min_support=args.min_support,
+                    min_confidence=args.min_confidence,
+                )
+            emit(payload, as_json=as_json)
+            return OK
         if args.command == "diagnostics" and args.diagnostics_command == "bundle":
             reject_ci_write("diagnostics_write", dry_run=args.dry_run)
             payload = diagnostics(root, dry_run=args.dry_run)
@@ -727,6 +759,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "audit" and args.audit_command == "rebuild-index":
             reject_ci_write("audit")
             payload = rebuild_audit_index(root)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "audit" and args.audit_command == "repair-chain":
+            reject_ci_write("audit")
+            from .audit_repair import repair_audit_chain
+            payload = repair_audit_chain(root, year=args.year)
             emit(payload, as_json=as_json)
             return OK
         if args.command == "index" and args.index_command == "rebuild":

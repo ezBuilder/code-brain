@@ -196,69 +196,74 @@ def event_observability(root: Path) -> dict[str, Any]:
     mcp_breakdown: dict[str, dict[str, int]] = {}
     mcp_tool_breakdown: dict[str, dict[str, int]] = {}
     for path in sorted(events_root.glob("*.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            payload = record.get("payload") if isinstance(record, dict) else None
-            if not isinstance(payload, dict):
-                continue
-            kind = str(record.get("kind") or payload.get("hook") or payload.get("kind") or "")
-            totals["events"] += 1
-            ctx_bytes = _int(payload.get("additional_context_bytes"))
-            orig_bytes = _int(payload.get("original_context_bytes")) or ctx_bytes
-            delta_skipped = bool(payload.get("delta_skipped"))
-            req_bytes = _int(payload.get("request_bytes"))
-            resp_bytes = _int(payload.get("response_bytes"))
-            totals["additional_context_bytes"] += ctx_bytes
-            totals["original_context_bytes"] += orig_bytes
-            if delta_skipped:
-                totals["delta_skipped_count"] += 1
-                totals["delta_saved_bytes"] += max(0, orig_bytes - ctx_bytes)
-            totals["mcp_request_bytes"] += req_bytes
-            totals["mcp_response_bytes"] += resp_bytes
-            if kind == "mcp.request":
-                totals["mcp_requests"] += 1
-                method = str(payload.get("method") or "unknown")
-                bucket = mcp_breakdown.setdefault(
-                    method, {"count": 0, "request_bytes": 0, "response_bytes": 0}
-                )
-                bucket["count"] += 1
-                bucket["request_bytes"] += req_bytes
-                bucket["response_bytes"] += resp_bytes
-                tool_name = payload.get("tool_name")
-                if method == "tools/call" and isinstance(tool_name, str) and tool_name:
-                    tool_bucket = mcp_tool_breakdown.setdefault(
-                        tool_name, {"count": 0, "request_bytes": 0, "response_bytes": 0}
+        try:
+            fh = path.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = record.get("payload") if isinstance(record, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                kind = str(record.get("kind") or payload.get("hook") or payload.get("kind") or "")
+                totals["events"] += 1
+                ctx_bytes = _int(payload.get("additional_context_bytes"))
+                orig_bytes = _int(payload.get("original_context_bytes")) or ctx_bytes
+                delta_skipped = bool(payload.get("delta_skipped"))
+                req_bytes = _int(payload.get("request_bytes"))
+                resp_bytes = _int(payload.get("response_bytes"))
+                totals["additional_context_bytes"] += ctx_bytes
+                totals["original_context_bytes"] += orig_bytes
+                if delta_skipped:
+                    totals["delta_skipped_count"] += 1
+                    totals["delta_saved_bytes"] += max(0, orig_bytes - ctx_bytes)
+                totals["mcp_request_bytes"] += req_bytes
+                totals["mcp_response_bytes"] += resp_bytes
+                if kind == "mcp.request":
+                    totals["mcp_requests"] += 1
+                    method = str(payload.get("method") or "unknown")
+                    bucket = mcp_breakdown.setdefault(
+                        method, {"count": 0, "request_bytes": 0, "response_bytes": 0}
                     )
-                    tool_bucket["count"] += 1
-                    tool_bucket["request_bytes"] += req_bytes
-                    tool_bucket["response_bytes"] += resp_bytes
-            elif kind == "sandbox.execute":
-                totals["sandbox_executions"] += 1
-            elif kind in HOOK_NAMES:
-                totals["hook_events"] += 1
-                bucket = hook_breakdown.setdefault(
-                    kind, {"count": 0, "bytes_total": 0, "blocked": 0, "allowed": 0}
-                )
-                bucket["count"] += 1
-                bucket["bytes_total"] += ctx_bytes
-                if kind == "PreToolUse":
-                    precall = payload.get("precall") if isinstance(payload.get("precall"), dict) else None
-                    action = (precall or {}).get("action")
-                    decision = payload.get("decision") or (payload.get("response") or {}).get("decision")
-                    if action == "block" or decision == "block":
-                        bucket["blocked"] += 1
-                        totals["pretooluse_blocks"] += 1
-                    elif action == "allow":
-                        bucket["allowed"] += 1
-                        totals["pretooluse_allows"] += 1
-                    elif action == "observe":
-                        bucket.setdefault("observed", 0)
-                        bucket["observed"] += 1
+                    bucket["count"] += 1
+                    bucket["request_bytes"] += req_bytes
+                    bucket["response_bytes"] += resp_bytes
+                    tool_name = payload.get("tool_name")
+                    if method == "tools/call" and isinstance(tool_name, str) and tool_name:
+                        tool_bucket = mcp_tool_breakdown.setdefault(
+                            tool_name, {"count": 0, "request_bytes": 0, "response_bytes": 0}
+                        )
+                        tool_bucket["count"] += 1
+                        tool_bucket["request_bytes"] += req_bytes
+                        tool_bucket["response_bytes"] += resp_bytes
+                elif kind == "sandbox.execute":
+                    totals["sandbox_executions"] += 1
+                elif kind in HOOK_NAMES:
+                    totals["hook_events"] += 1
+                    bucket = hook_breakdown.setdefault(
+                        kind, {"count": 0, "bytes_total": 0, "blocked": 0, "allowed": 0}
+                    )
+                    bucket["count"] += 1
+                    bucket["bytes_total"] += ctx_bytes
+                    if kind == "PreToolUse":
+                        precall = payload.get("precall") if isinstance(payload.get("precall"), dict) else None
+                        action = (precall or {}).get("action")
+                        decision = payload.get("decision") or (payload.get("response") or {}).get("decision")
+                        if action == "block" or decision == "block":
+                            bucket["blocked"] += 1
+                            totals["pretooluse_blocks"] += 1
+                        elif action == "allow":
+                            bucket["allowed"] += 1
+                            totals["pretooluse_allows"] += 1
+                        elif action == "observe":
+                            bucket.setdefault("observed", 0)
+                            bucket["observed"] += 1
     totals["hook_breakdown"] = {k: hook_breakdown[k] for k in sorted(hook_breakdown)}
     totals["mcp_breakdown"] = {k: mcp_breakdown[k] for k in sorted(mcp_breakdown)}
     totals["mcp_tool_breakdown"] = {k: mcp_tool_breakdown[k] for k in sorted(mcp_tool_breakdown)}
@@ -417,73 +422,74 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
     pending_count_by_id: dict[str, int] = {}
     for audit_file in audit_files:
         try:
-            content = audit_file.read_text(encoding="utf-8", errors="replace")
+            fh = audit_file.open(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = _json.loads(line)
-            except _json.JSONDecodeError:
-                continue
-            act = str(rec.get("action") or "")
-            if not act.startswith(("skill.", "agent.", "precall.")):
-                continue
-            source = act.split(".", 1)[0]  # T25: "skill" | "agent" | "precall"
-            tail = act.split(".", 1)[1]
-            pid = (rec.get("payload") or {}).get("id") if isinstance(rec.get("payload"), dict) else None
-            ts_raw = str(rec.get("ts") or "")
-            parsed_ts: datetime | None = None
-            if ts_raw:
+        with fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
                 try:
-                    parsed_ts = (
-                        datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
-                        if ts_raw.endswith("Z") else datetime.fromisoformat(ts_raw)
-                    )
-                except ValueError:
-                    parsed_ts = None
-            if tail == "recommend_pending":
-                counts["surfaced"] += 1
-                if isinstance(pid, str):
-                    pending_count_by_id[pid] = pending_count_by_id.get(pid, 0) + 1
-                if parsed_ts is not None and isinstance(pid, str):
-                    surfaced_records.append((parsed_ts, pid))
-                    id_events.setdefault(pid, []).append((parsed_ts, "recommend_pending"))
-                    # T25 latency: remember earliest unpaired pending ts for this id.
-                    if pid not in pending_ts_by_id:
-                        pending_ts_by_id[pid] = parsed_ts
-            elif tail.startswith("accept"):
-                counts["accepted"] += 1
-                # T25 source bucket
-                bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
-                bucket["accepted"] += 1
-                if isinstance(pid, str):
-                    acted_ids.add(pid)
-                    # T25 latency: pair with earliest pending for this id, if any.
-                    if parsed_ts is not None and pid in pending_ts_by_id:
-                        delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
-                        if delta >= 0:
-                            latency_seconds.append(delta)
-                if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
-                    last_act_dt = parsed_ts
-            elif tail == "reject":
-                counts["rejected"] += 1
-                # T25 source bucket
-                bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
-                bucket["rejected"] += 1
-                if isinstance(pid, str):
-                    acted_ids.add(pid)
-                    if parsed_ts is not None:
-                        id_events.setdefault(pid, []).append((parsed_ts, "reject"))
-                    # T25 latency: a reject also closes the pending pairing.
-                    if parsed_ts is not None and pid in pending_ts_by_id:
-                        delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
-                        if delta >= 0:
-                            latency_seconds.append(delta)
-                if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
-                    last_act_dt = parsed_ts
+                    rec = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                act = str(rec.get("action") or "")
+                if not act.startswith(("skill.", "agent.", "precall.")):
+                    continue
+                source = act.split(".", 1)[0]  # T25: "skill" | "agent" | "precall"
+                tail = act.split(".", 1)[1]
+                pid = (rec.get("payload") or {}).get("id") if isinstance(rec.get("payload"), dict) else None
+                ts_raw = str(rec.get("ts") or "")
+                parsed_ts: datetime | None = None
+                if ts_raw:
+                    try:
+                        parsed_ts = (
+                            datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
+                            if ts_raw.endswith("Z") else datetime.fromisoformat(ts_raw)
+                        )
+                    except ValueError:
+                        parsed_ts = None
+                if tail == "recommend_pending":
+                    counts["surfaced"] += 1
+                    if isinstance(pid, str):
+                        pending_count_by_id[pid] = pending_count_by_id.get(pid, 0) + 1
+                    if parsed_ts is not None and isinstance(pid, str):
+                        surfaced_records.append((parsed_ts, pid))
+                        id_events.setdefault(pid, []).append((parsed_ts, "recommend_pending"))
+                        # T25 latency: remember earliest unpaired pending ts for this id.
+                        if pid not in pending_ts_by_id:
+                            pending_ts_by_id[pid] = parsed_ts
+                elif tail.startswith("accept"):
+                    counts["accepted"] += 1
+                    # T25 source bucket
+                    bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
+                    bucket["accepted"] += 1
+                    if isinstance(pid, str):
+                        acted_ids.add(pid)
+                        # T25 latency: pair with earliest pending for this id, if any.
+                        if parsed_ts is not None and pid in pending_ts_by_id:
+                            delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
+                            if delta >= 0:
+                                latency_seconds.append(delta)
+                    if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
+                        last_act_dt = parsed_ts
+                elif tail == "reject":
+                    counts["rejected"] += 1
+                    # T25 source bucket
+                    bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
+                    bucket["rejected"] += 1
+                    if isinstance(pid, str):
+                        acted_ids.add(pid)
+                        if parsed_ts is not None:
+                            id_events.setdefault(pid, []).append((parsed_ts, "reject"))
+                        # T25 latency: a reject also closes the pending pairing.
+                        if parsed_ts is not None and pid in pending_ts_by_id:
+                            delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
+                            if delta >= 0:
+                                latency_seconds.append(delta)
+                    if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
+                        last_act_dt = parsed_ts
     # resurface_after_reject: for each reject (with parsed ts), check if any
     # subsequent recommend_pending for the same id occurs within 7 days.
     total_rejected_with_ts = 0
@@ -676,3 +682,150 @@ def prune_diagnostics(root: Path, *, keep_days: int = 30) -> dict[str, Any]:
             shutil.rmtree(path)
             removed += 1
     return {"ok": True, "removed": removed}
+
+
+def mem_eval_summary(root: Path, *, window_days: int = 7) -> dict[str, Any]:
+    """Memory and recommendation quality metrics over a time window.
+
+    Returns time-series aggregates (daily buckets) for:
+    - accept/reject recommend actions
+    - hot-tier audit volume
+    - search index freshness
+    - lesson volume (if lessons.jsonl exists)
+
+    All OSError/JSONDecodeError are silently caught. Missing files return
+    zero counts. Malformed JSON lines are skipped.
+
+    Returns:
+        {
+            "ok": True,
+            "window_days": int,
+            "accept_rate_by_day": {"2026-05-20": {"accept": N, "reject": M}, ...},
+            "hot_audit_by_day": {"2026-05-20": N, ...},
+            "search_index_age_seconds": int | None,
+            "lessons_added_recent": int
+        }
+    """
+    from datetime import timedelta
+    import sqlite3
+
+    now_dt = datetime.now(timezone.utc)
+    window_start = now_dt - timedelta(days=window_days)
+
+    # 1. Aggregate accept/reject rates by day from audit files
+    accept_rate_by_day: dict[str, dict[str, int]] = {}
+    hot_audit_by_day: dict[str, int] = {}
+    audit_files = all_audit_files(root)
+
+    for audit_file in audit_files:
+        try:
+            fh = audit_file.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts_raw = str(rec.get("ts") or "")
+                parsed_ts: datetime | None = None
+                if ts_raw:
+                    try:
+                        parsed_ts = (
+                            datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
+                            if ts_raw.endswith("Z")
+                            else datetime.fromisoformat(ts_raw)
+                        )
+                    except ValueError:
+                        parsed_ts = None
+                if parsed_ts is None or parsed_ts < window_start:
+                    continue
+                date_key = parsed_ts.strftime("%Y-%m-%d")
+
+                # Accept/reject tracking
+                action = str(rec.get("action") or "")
+                if action.startswith(("skill.", "agent.", "precall.")):
+                    tail = action.split(".", 1)[1]
+                    if "accept" in tail:
+                        bucket = accept_rate_by_day.setdefault(date_key, {"accept": 0, "reject": 0})
+                        bucket["accept"] += 1
+                    elif tail == "reject":
+                        bucket = accept_rate_by_day.setdefault(date_key, {"accept": 0, "reject": 0})
+                        bucket["reject"] += 1
+
+                # Hot-tier pressure: count recommend_pending + accept actions (surfaced candidates)
+                if action in ("skill.recommend_pending", "agent.recommend_pending", "precall.recommend_pending"):
+                    hot_audit_by_day[date_key] = hot_audit_by_day.get(date_key, 0) + 1
+
+    # 2. Search index age: max(chunks.updated_at) from code.sqlite
+    search_index_age_seconds: int | None = None
+    db_path = root / ".ai" / "cache" / "code.sqlite"
+    if db_path.exists():
+        try:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "select max(updated_at) as last_update from chunks"
+                ).fetchone()
+                if row and row["last_update"]:
+                    try:
+                        last_ts = datetime.fromisoformat(
+                            row["last_update"][:-1].replace("+00:00", "")
+                        ).replace(tzinfo=timezone.utc)
+                        search_index_age_seconds = int((now_dt - last_ts).total_seconds())
+                    except (ValueError, AttributeError):
+                        pass
+        except Exception:
+            pass
+
+    # 3. Lesson volume: count lines added in window_days
+    lessons_added_recent = 0
+    lessons_path_obj = root / ".ai" / "memory" / "lessons.jsonl"
+    if lessons_path_obj.exists():
+        try:
+            fh = lessons_path_obj.open(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        else:
+            with fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts_raw = str(rec.get("created_at") or "")
+                    parsed_ts: datetime | None = None
+                    if ts_raw:
+                        try:
+                            parsed_ts = (
+                                datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
+                                if ts_raw.endswith("Z")
+                                else datetime.fromisoformat(ts_raw)
+                            )
+                        except ValueError:
+                            parsed_ts = None
+                    if parsed_ts is not None and parsed_ts >= window_start:
+                        lessons_added_recent += 1
+
+    # Normalize daily buckets: ensure all days in window are present
+    for i in range(window_days):
+        day_dt = now_dt - timedelta(days=i)
+        date_key = day_dt.strftime("%Y-%m-%d")
+        if date_key not in accept_rate_by_day:
+            accept_rate_by_day[date_key] = {"accept": 0, "reject": 0}
+        if date_key not in hot_audit_by_day:
+            hot_audit_by_day[date_key] = 0
+
+    return {
+        "ok": True,
+        "window_days": window_days,
+        "accept_rate_by_day": {k: accept_rate_by_day[k] for k in sorted(accept_rate_by_day.keys())},
+        "hot_audit_by_day": {k: hot_audit_by_day[k] for k in sorted(hot_audit_by_day.keys())},
+        "search_index_age_seconds": search_index_age_seconds,
+        "lessons_added_recent": lessons_added_recent,
+    }

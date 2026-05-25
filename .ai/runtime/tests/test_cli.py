@@ -631,7 +631,7 @@ def test_code_index_schema_v2_does_not_store_full_content(tmp_path: Path) -> Non
     with sqlite3.connect(db) as conn:
         user_version = conn.execute("pragma user_version").fetchone()[0]
         columns = [row[1] for row in conn.execute("pragma table_info(chunks)").fetchall()]
-    assert user_version == 5
+    assert user_version == 7
     assert "content" not in columns
     query_result = run_ai("code", "query", "worker", "--json", cwd=repo)
     payload = json.loads(query_result.stdout)
@@ -685,7 +685,7 @@ def test_code_index_migrates_legacy_content_schema(tmp_path: Path) -> None:
     with sqlite3.connect(db) as conn:
         columns = [row[1] for row in conn.execute("pragma table_info(chunks)").fetchall()]
         user_version = conn.execute("pragma user_version").fetchone()[0]
-    assert user_version == 5
+    assert user_version == 7
     assert "content" not in columns
     assert "summary" in columns
 
@@ -1061,7 +1061,7 @@ def test_obs_search_reports_cache_and_measured_context_bytes(tmp_path: Path) -> 
     query = payload["query"]
     assert payload["ok"] is True
     assert payload["exists"] is True
-    assert payload["schema_version"] == 5
+    assert payload["schema_version"] == 7
     assert payload["retriever"] == "bm25"
     assert payload["sqlite_bytes"] > 0
     assert payload["indexed_files"] > 0

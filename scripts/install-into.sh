@@ -65,8 +65,11 @@ managed_files() {
 
 # User-owned files seeded on first install but never managed afterwards.
 # Manifest does NOT track these — uninstall will leave them alone.
+# AGENTS.md is seeded as a thin forwarder when missing; if the target already
+# has a user-authored AGENTS.md (common in long-lived repos), we never touch
+# it — that file is part of the project's contract, not Code Brain's.
 seed_user_owned_files() {
-  local seeds=(".ai/secret_scan_allowlist.txt")
+  local seeds=(".ai/secret_scan_allowlist.txt" "AGENTS.md")
   for rel in "${seeds[@]}"; do
     local src="$SOURCE_ROOT/$rel"
     local dst="$TARGET_ROOT/$rel"
@@ -78,7 +81,7 @@ seed_user_owned_files() {
 }
 
 merged_config_files() {
-  printf '%s\n' ".mcp.json" ".codex/config.toml"
+  printf '%s\n' ".mcp.json" ".codex/config.toml" ".agents/mcp_config.json" ".agents/hooks.json"
 }
 
 manifest_path() {
@@ -168,11 +171,118 @@ payload = {
     "installed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "project": root.name,
     "files": sorted(set(files)),
-    "merged_config_files": [".mcp.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json"],
+    "merged_config_files": [".mcp.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json", ".agents/mcp_config.json", ".agents/hooks.json"],
     "source_git_sha": source,
 }
 print(json.dumps(payload, indent=2, sort_keys=True))
 ' "$TARGET_ROOT" "$SOURCE_ROOT" >"$(manifest_path)" < <(managed_files)
+}
+
+restore_managed_owner_if_root() {
+  if [[ "$(id -u)" != "0" ]]; then
+    return 0
+  fi
+  if [[ ! -e "$TARGET_ROOT/.ai" ]]; then
+    return 0
+  fi
+  local owner_spec
+  owner_spec="$(stat -c '%u:%g' "$TARGET_ROOT/.ai" 2>/dev/null || stat -f '%u:%g' "$TARGET_ROOT/.ai" 2>/dev/null || true)"
+  if [[ -z "$owner_spec" ]]; then
+    return 0
+  fi
+  # Sanity check: if .ai/ owner is a UID that does not exist on this host
+  # (typically a macOS UID 501 transplanted to a linux host via rsync/cp -a),
+  # propagating that UID to every chown call leaves every file unreadable.
+  # Honor AI_INSTALL_OWNER if set; otherwise fall back to the SUDO_USER (when
+  # run via sudo), then the invoker's own UID. Skip recursive chown only when
+  # we genuinely cannot determine a safe owner.
+  local _uid="${owner_spec%%:*}"
+  if ! getent passwd "$_uid" >/dev/null 2>&1; then
+    local _fallback=""
+    if [[ -n "${AI_INSTALL_OWNER:-}" ]]; then
+      _fallback="$AI_INSTALL_OWNER"
+    elif [[ -n "${SUDO_USER:-}" ]] && getent passwd "$SUDO_USER" >/dev/null 2>&1; then
+      _fallback="$SUDO_USER:$SUDO_USER"
+    fi
+    if [[ -n "$_fallback" ]]; then
+      echo "install-into: .ai/ owner UID $_uid not on this host; falling back to $_fallback (override with AI_INSTALL_OWNER)" >&2
+      owner_spec="$_fallback"
+    else
+      echo "install-into: skipping owner restore — .ai/ owner UID $_uid unknown and no AI_INSTALL_OWNER/SUDO_USER fallback" >&2
+      return 0
+    fi
+  fi
+  local path
+  # Chown the entire .ai/ tree so any subdirectory created since the previous
+  # upgrade (precall_rules, skills, agents_catalog, ...) ends up readable by
+  # the target user. Restricting to a hand-maintained allowlist regressed
+  # before — when a new subdir was added in a later release, the original
+  # target owner lost read access on root-run upgrades.
+  #
+  # IMPORTANT: exclude .ai/runtime/.venv — venvs are owner-sensitive (pyvenv.cfg,
+  # site-packages, bin/python shebang resolution all assume a stable owner).
+  # A blanket chown -R caused hook failures across already-installed targets
+  # (observed user-visible symptom: "hook venv 오류" requiring sudo rm -rf
+  # .ai/runtime/.venv as recovery). The venv is created/owned by the user who
+  # first ran `uv sync` and must stay that way.
+  if [[ -e "$TARGET_ROOT/.ai" ]]; then
+    if [[ -d "$TARGET_ROOT/.ai/runtime/.venv" ]]; then
+      find "$TARGET_ROOT/.ai" \
+        -path "$TARGET_ROOT/.ai/runtime/.venv" -prune \
+        -o -exec chown "$owner_spec" {} +
+      # Selectively repair editable-install artifacts left as root by a previous
+      # root-run `uv sync`. Three artifacts block `import ai_core` when owned by
+      # root with mode 600: the editable .pth, the dist-info dir, and bin/ai.
+      # Touching only these keeps the venv binaries themselves owner-stable.
+      local _uid="${owner_spec%%:*}"
+      find "$TARGET_ROOT/.ai/runtime/.venv/lib" -name "*.pth" \
+        -not -uid "$_uid" -exec chown "$owner_spec" {} + 2>/dev/null || true
+      find "$TARGET_ROOT/.ai/runtime/.venv/lib" -type d -name "*.dist-info" \
+        -not -uid "$_uid" -exec chown -R "$owner_spec" {} + 2>/dev/null || true
+      if [[ -f "$TARGET_ROOT/.ai/runtime/.venv/bin/ai" ]]; then
+        local _bin_uid
+        _bin_uid="$(stat -c '%u' "$TARGET_ROOT/.ai/runtime/.venv/bin/ai" 2>/dev/null || stat -f '%u' "$TARGET_ROOT/.ai/runtime/.venv/bin/ai" 2>/dev/null || echo "$_uid")"
+        if [[ "$_bin_uid" != "$_uid" ]]; then
+          chown "$owner_spec" "$TARGET_ROOT/.ai/runtime/.venv/bin/ai" 2>/dev/null || true
+        fi
+      fi
+    else
+      chown -R "$owner_spec" "$TARGET_ROOT/.ai"
+    fi
+  fi
+  for path in \
+    "$TARGET_ROOT/.githooks" \
+    "$TARGET_ROOT/.claude/commands" \
+    "$TARGET_ROOT/.codex/prompts"
+  do
+    if [[ -e "$path" ]]; then
+      chown -R "$owner_spec" "$path"
+    fi
+  done
+  while IFS= read -r rel; do
+    if [[ "$rel" == .ai/memory/* ]]; then
+      continue
+    fi
+    if [[ -e "$TARGET_ROOT/$rel" ]]; then
+      chown "$owner_spec" "$TARGET_ROOT/$rel"
+    fi
+  done < <(managed_files)
+  for path in \
+    "$TARGET_ROOT/.mcp.json" \
+    "$TARGET_ROOT/.codex/config.toml" \
+    "$TARGET_ROOT/.codex/hooks.json" \
+    "$TARGET_ROOT/.claude/settings.json" \
+    "$TARGET_ROOT/.agents" \
+    "$TARGET_ROOT/.agents/mcp_config.json" \
+    "$TARGET_ROOT/.agents/hooks.json" \
+    "$TARGET_ROOT/.agents/skills" \
+    "$TARGET_ROOT/AGENTS.md" \
+    "$TARGET_ROOT/bootstrap-code-brain.sh"
+  do
+    if [[ -e "$path" ]]; then
+      chown -R "$owner_spec" "$path" 2>/dev/null || chown "$owner_spec" "$path"
+    fi
+  done
 }
 
 configure_project() {
@@ -385,6 +495,21 @@ managed = {
     "InstructionsLoaded": [
         {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook InstructionsLoaded"}]}
     ],
+    "SubagentStart": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SubagentStart"}]}
+    ],
+    "TaskCreated": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook TaskCreated"}]}
+    ],
+    "TaskCompleted": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook TaskCompleted"}]}
+    ],
+    "FileChanged": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook FileChanged"}]}
+    ],
+    "PostToolUseFailure": [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUseFailure"}]}
+    ],
 }
 if dst.exists():
     try:
@@ -440,16 +565,37 @@ import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
+
+def cmd(event):
+    return 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" ' + event
+
+def cmd_win(event):
+    return (
+        'powershell -NoProfile -Command "$ROOT = (git rev-parse --show-toplevel 2>$null); '
+        'if (-not $ROOT) { $ROOT = (Get-Location).Path }; '
+        '& \\"$ROOT/.ai/bin/ai-hook.ps1\\" ' + event + '"'
+    )
+
+def H(event, matcher=None, msg=None):
+    handler = {"type": "command", "command": cmd(event), "commandWindows": cmd_win(event)}
+    if msg:
+        handler["statusMessage"] = msg
+    entry = {"hooks": [handler]}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    return [entry]
+
 managed_codex_hooks = {
-    "PreToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreToolUse', "statusMessage": "Checking Code Brain command routing"}]}],
-    "PostToolUse": [{"matcher": "Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostToolUse', "statusMessage": "Recording Code Brain tool result"}]}],
-    "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SessionStart', "statusMessage": "Loading Code Brain session context"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" UserPromptSubmit', "statusMessage": "Loading Code Brain prompt context"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" Stop', "statusMessage": "Recording Code Brain stop event"}]}],
-    "SubagentStop": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" SubagentStop', "statusMessage": "Recording Code Brain subagent stop"}]}],
-    "PreCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PreCompact', "statusMessage": "Saving Code Brain compact snapshot"}]}],
-    "PostCompact": [{"hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PostCompact', "statusMessage": "Recording Code Brain compact completion"}]}],
-    "PermissionRequest": [{"matcher": "Bash|Shell|exec_command|functions.exec_command", "hooks": [{"type": "command", "command": 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" PermissionRequest', "statusMessage": "Checking Code Brain approval policy"}]}],
+    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|run_command", msg="Checking Code Brain command routing"),
+    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|run_command|replace_file_content|multi_replace_file_content|write_to_file|view_file|grep_search|list_dir", msg="Recording Code Brain tool result"),
+    "SessionStart": H("SessionStart", matcher="startup|resume|clear", msg="Loading Code Brain session context"),
+    "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
+    "Stop": H("Stop", msg="Recording Code Brain stop event"),
+    "SubagentStart": H("SubagentStart", msg="Loading Code Brain subagent context"),
+    "SubagentStop": H("SubagentStop", msg="Recording Code Brain subagent stop"),
+    "PreCompact": H("PreCompact", msg="Saving Code Brain compact snapshot"),
+    "PostCompact": H("PostCompact", msg="Recording Code Brain compact completion"),
+    "PermissionRequest": H("PermissionRequest", matcher="Bash|Shell|exec_command|functions.exec_command|run_command|ask_permission", msg="Checking Code Brain approval policy"),
 }
 if dst.exists():
     try:
@@ -489,6 +635,99 @@ dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
 PY
 }
 
+merge_antigravity_mcp_json() {
+  local dst="$TARGET_ROOT/.agents/mcp_config.json"
+  python - "$dst" "$SOURCE_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+dst = Path(sys.argv[1])
+source_root = Path(sys.argv[2])
+sys.path.insert(0, str(source_root / ".ai" / "runtime" / "src"))
+from ai_core.mcp_config import merge_antigravity_mcp_json
+
+merge_antigravity_mcp_json(dst)
+PY
+}
+
+merge_antigravity_hooks_json() {
+  local dst="$TARGET_ROOT/.agents/hooks.json"
+  python - "$dst" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+dst = Path(sys.argv[1])
+# Antigravity hooks accept the same matcher+command shape as Claude/Codex. The
+# command string runs in a POSIX shell on macOS/Linux; Windows hosts should
+# install the .ps1 variant separately (TODO when Antigravity adds Windows).
+def cmd(event: str) -> str:
+    return (
+        'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
+        f'"$ROOT/.ai/bin/ai-hook" {event}'
+    )
+
+def cmd_win(event: str) -> str:
+    return (
+        "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); "
+        "if (-not $ROOT) { $ROOT = (Get-Location).Path }; "
+        f"& \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" {event}\""
+    )
+
+def H(event, matcher=None, msg=None):
+    handler = {"type": "command", "command": cmd(event), "commandWindows": cmd_win(event)}
+    if msg:
+        handler["statusMessage"] = msg
+    entry = {"hooks": [handler]}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    return [entry]
+
+managed = {
+    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|run_command", msg="Checking Code Brain command routing"),
+    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|run_command|replace_file_content|multi_replace_file_content|write_to_file|view_file|grep_search|list_dir", msg="Recording Code Brain tool result"),
+    "SessionStart": H("SessionStart", msg="Loading Code Brain session context"),
+    "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
+    "Stop": H("Stop", msg="Recording Code Brain stop event"),
+    "SubagentStart": H("SubagentStart", msg="Loading Code Brain subagent context"),
+    "SubagentStop": H("SubagentStop", msg="Recording Code Brain subagent stop"),
+    "PreCompact": H("PreCompact", msg="Saving Code Brain compact snapshot"),
+    "PostCompact": H("PostCompact", msg="Recording Code Brain compact completion"),
+}
+if dst.exists():
+    try:
+        payload = json.loads(dst.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        raise SystemExit(f"install-into failed: existing {dst} is not valid JSON")
+    if not isinstance(payload, dict):
+        raise SystemExit(f"install-into failed: existing {dst} is not a JSON object")
+else:
+    payload = {"_note": "Antigravity hooks. Schema follows Claude Code matcher+command convention."}
+hooks = payload.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    raise SystemExit(f"install-into failed: existing {dst}.hooks must be a JSON object")
+
+def _has_code_brain_command(entry):
+    if isinstance(entry, dict):
+        for handler in entry.get("hooks", []) or []:
+            if isinstance(handler, dict):
+                c = handler.get("command")
+                if isinstance(c, str) and ".ai/bin/ai-hook" in c:
+                    return True
+    return False
+
+for name, managed_entries in managed.items():
+    existing = hooks.get(name)
+    if isinstance(existing, list):
+        kept = [e for e in existing if not _has_code_brain_command(e)]
+    else:
+        kept = []
+    hooks[name] = kept + managed_entries
+dst.parent.mkdir(parents=True, exist_ok=True)
+dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
 install_or_upgrade() {
   while IFS= read -r rel; do
     copy_file "$rel"
@@ -498,6 +737,8 @@ install_or_upgrade() {
   merge_codex_config
   merge_claude_settings
   merge_codex_hooks_json
+  merge_antigravity_mcp_json
+  merge_antigravity_hooks_json
   configure_project
   write_bootstrap
   chmod +x "$TARGET_ROOT/.ai/bin/ai" "$TARGET_ROOT/.ai/bin/ai-hook" "$TARGET_ROOT/.ai/bin/ai-mcp"
@@ -506,9 +747,36 @@ install_or_upgrade() {
   write_install_manifest
 
   cd "$TARGET_ROOT"
-  ./bootstrap-code-brain.sh >/dev/null
-  .ai/bin/ai audit rebuild-index --json >/dev/null
-  .ai/bin/ai session start --agent operator --rebuild always --json >/dev/null
+  # When install-into runs as root (typical on shared servers like the Phalanx
+  # llm host where cc is the operator), running bootstrap/uv-sync/session as
+  # root would create root-owned files inside .venv and .ai/cache that the
+  # operator user cannot use. Resolve the intended target user and drop privs
+  # for the runtime-touching steps so every artifact lands with the correct
+  # ownership the first time. Falls through to direct execution when not root
+  # or when no safe fallback user can be determined.
+  local _run_as=""
+  if [[ "$(id -u)" == "0" ]]; then
+    local _ai_uid
+    _ai_uid="$(stat -c '%u' "$TARGET_ROOT/.ai" 2>/dev/null || stat -f '%u' "$TARGET_ROOT/.ai" 2>/dev/null || echo "")"
+    local _run_user=""
+    if [[ -n "$_ai_uid" ]] && getent passwd "$_ai_uid" >/dev/null 2>&1; then
+      _run_user="$(getent passwd "$_ai_uid" | cut -d: -f1)"
+    elif [[ -n "${AI_INSTALL_OWNER:-}" ]]; then
+      _run_user="${AI_INSTALL_OWNER%%:*}"
+    elif [[ -n "${SUDO_USER:-}" ]] && getent passwd "$SUDO_USER" >/dev/null 2>&1; then
+      _run_user="$SUDO_USER"
+    fi
+    if [[ -n "$_run_user" ]] && id -u "$_run_user" >/dev/null 2>&1; then
+      echo "install-into: root detected; running bootstrap/session as $_run_user (override with AI_INSTALL_OWNER)" >&2
+      _run_as="sudo -u $_run_user -H"
+    else
+      echo "install-into: root detected but no safe target user found; running bootstrap as root (venv may need manual chown later)" >&2
+    fi
+  fi
+  $_run_as ./bootstrap-code-brain.sh >/dev/null
+  $_run_as .ai/bin/ai audit rebuild-index --json >/dev/null
+  $_run_as .ai/bin/ai session start --agent operator --rebuild always --json >/dev/null
+  restore_managed_owner_if_root
 }
 
 uninstall() {
@@ -614,6 +882,47 @@ if claude_settings.exists():
             claude_settings.write_text(json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         else:
             claude_settings.unlink()
+agent_mcp = root / ".agents" / "mcp_config.json"
+if agent_mcp.exists():
+    try:
+        data = json.loads(agent_mcp.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        servers = data.get("mcpServers")
+        if isinstance(servers, dict) and "code-brain" in servers:
+            servers.pop("code-brain", None)
+            if servers:
+                agent_mcp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            else:
+                agent_mcp.unlink()
+agent_hooks = root / ".agents" / "hooks.json"
+if agent_hooks.exists():
+    try:
+        cfg = json.loads(agent_hooks.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        cfg = None
+    if isinstance(cfg, dict):
+        hb = cfg.get("hooks")
+        if isinstance(hb, dict):
+            for name in list(hb.keys()):
+                entries = hb.get(name)
+                if isinstance(entries, list):
+                    kept = [e for e in entries if not any(
+                        isinstance(h, dict) and isinstance(h.get("command"), str) and ".ai/bin/ai-hook" in h["command"]
+                        for h in (e.get("hooks") or []) if isinstance(e, dict)
+                    )]
+                    if kept:
+                        hb[name] = kept
+                    else:
+                        hb.pop(name, None)
+            if not hb:
+                cfg.pop("hooks")
+        keys_left = [k for k in cfg.keys() if k != "_note"]
+        if keys_left:
+            agent_hooks.write_text(json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        else:
+            agent_hooks.unlink()
 codex_hooks = root / ".codex" / "hooks.json"
 if codex_hooks.exists():
     try:
@@ -644,7 +953,7 @@ for rel in (".ai", ".githooks"):
     path = root / rel
     if path.exists():
         shutil.rmtree(path)
-for rel in (".claude/commands", ".codex/prompts"):
+for rel in (".claude/commands", ".codex/prompts", ".agents/skills", ".agents"):
     path = root / rel
     if path.exists() and path.is_dir() and not any(path.iterdir()):
         path.rmdir()

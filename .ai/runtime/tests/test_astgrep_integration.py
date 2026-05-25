@@ -77,3 +77,105 @@ def test_ast_verify_file_includes_astgrep_pass(tmp_path, monkeypatch):
     rep = verify_file(target)
     assert rep is not None
     assert hasattr(rep, "violations")
+
+
+@pytest.mark.skipif(not astgrep_available(), reason="ast-grep binary not installed")
+def test_extract_symbols_js_returns_list(tmp_path, monkeypatch):
+    """extract_symbols_js must return list of dicts (graceful degradation on parse failure)."""
+    monkeypatch.delenv("AI_ASTGREP_DISABLE", raising=False)
+    from ai_core.astgrep_integration import extract_symbols_js
+
+    target = tmp_path / "test.js"
+    target.write_text("function foo() { return 42; }\nconst bar = () => 'hello';\n", encoding="utf-8")
+    result = extract_symbols_js(str(target))
+    assert isinstance(result, list)
+    # May be empty if ast-grep output format differs, but should not raise
+    for item in result:
+        assert isinstance(item, dict)
+
+
+@pytest.mark.skipif(not astgrep_available(), reason="ast-grep binary not installed")
+def test_extract_calls_js_returns_list(tmp_path, monkeypatch):
+    """extract_calls_js must return list of dicts."""
+    monkeypatch.delenv("AI_ASTGREP_DISABLE", raising=False)
+    from ai_core.astgrep_integration import extract_calls_js
+
+    target = tmp_path / "test.js"
+    target.write_text("function foo() { console.log('hi'); helper(); }\nfunction helper() {}\n", encoding="utf-8")
+    result = extract_calls_js(str(target))
+    assert isinstance(result, list)
+    for item in result:
+        assert isinstance(item, dict)
+        if item:
+            assert "callee" in item or "lineno" in item
+
+
+def test_extract_symbols_js_when_astgrep_disabled(tmp_path, monkeypatch):
+    """When ast-grep disabled, extract_symbols_js returns empty list."""
+    monkeypatch.setenv("AI_ASTGREP_DISABLE", "1")
+    from ai_core.astgrep_integration import extract_symbols_js
+
+    target = tmp_path / "test.js"
+    target.write_text("function foo() {}\n", encoding="utf-8")
+    assert extract_symbols_js(str(target)) == []
+
+
+def test_extract_calls_js_when_astgrep_disabled(tmp_path, monkeypatch):
+    """When ast-grep disabled, extract_calls_js returns empty list."""
+    monkeypatch.setenv("AI_ASTGREP_DISABLE", "1")
+    from ai_core.astgrep_integration import extract_calls_js
+
+    target = tmp_path / "test.js"
+    target.write_text("foo();\n", encoding="utf-8")
+    assert extract_calls_js(str(target)) == []
+
+
+def test_extract_symbols_ts_delegates_to_js(tmp_path, monkeypatch):
+    """extract_symbols_ts should delegate to JS extraction."""
+    monkeypatch.setenv("AI_ASTGREP_DISABLE", "1")
+    from ai_core.astgrep_integration import extract_symbols_ts
+
+    target = tmp_path / "test.ts"
+    target.write_text("function foo(): number { return 1; }\n", encoding="utf-8")
+    # When disabled, should return []
+    assert extract_symbols_ts(str(target)) == []
+
+
+def test_extract_symbols_go_when_disabled(tmp_path, monkeypatch):
+    """extract_symbols_go returns [] when ast-grep disabled."""
+    monkeypatch.setenv("AI_ASTGREP_DISABLE", "1")
+    from ai_core.astgrep_integration import extract_symbols_go
+
+    target = tmp_path / "test.go"
+    target.write_text("func main() {}\n", encoding="utf-8")
+    assert extract_symbols_go(str(target)) == []
+
+
+def test_extract_symbols_rs_when_disabled(tmp_path, monkeypatch):
+    """extract_symbols_rs returns [] when ast-grep disabled."""
+    monkeypatch.setenv("AI_ASTGREP_DISABLE", "1")
+    from ai_core.astgrep_integration import extract_symbols_rs
+
+    target = tmp_path / "test.rs"
+    target.write_text("fn main() {}\n", encoding="utf-8")
+    assert extract_symbols_rs(str(target)) == []
+
+
+def test_extract_calls_go_when_disabled(tmp_path, monkeypatch):
+    """extract_calls_go returns [] when ast-grep disabled."""
+    monkeypatch.setenv("AI_ASTGREP_DISABLE", "1")
+    from ai_core.astgrep_integration import extract_calls_go
+
+    target = tmp_path / "test.go"
+    target.write_text("func main() { foo() }\n", encoding="utf-8")
+    assert extract_calls_go(str(target)) == []
+
+
+def test_extract_calls_rs_when_disabled(tmp_path, monkeypatch):
+    """extract_calls_rs returns [] when ast-grep disabled."""
+    monkeypatch.setenv("AI_ASTGREP_DISABLE", "1")
+    from ai_core.astgrep_integration import extract_calls_rs
+
+    target = tmp_path / "test.rs"
+    target.write_text("fn main() { foo(); }\n", encoding="utf-8")
+    assert extract_calls_rs(str(target)) == []

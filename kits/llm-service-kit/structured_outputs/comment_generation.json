@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GeneratedComment",
+  "description": "Output shape for a Claude-generated reply comment on a third-party post. Use with the Anthropic SDK structured-output / response_format flag so the model is forced to return parseable JSON.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["comment", "riskLevel", "reason", "shouldPost"],
+  "properties": {
+    "comment": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 600,
+      "description": "The reply text to be posted. No surrounding quotes, no boilerplate, no AI self-reference."
+    },
+    "riskLevel": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Posting-risk heuristic. high = could plausibly violate platform TOS or be flagged spammy."
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "description": "One-sentence justification for the riskLevel and shouldPost decision. Stored for audit, not shown to the end reader."
+    },
+    "shouldPost": {
+      "type": "boolean",
+      "description": "Final gate. False when riskLevel == high, when the source post is itself spam, or when no value-add reply is possible."
+    },
+    "tone": {
+      "type": "string",
+      "enum": ["informational", "supportive", "question", "promotional"],
+      "description": "Optional. The intent of the reply. Used downstream for variant balancing."
+    }
+  }
+}

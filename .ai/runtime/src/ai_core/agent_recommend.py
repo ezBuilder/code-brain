@@ -100,37 +100,62 @@ def _danger_match(text: str) -> bool:
 
 
 def _gather_subagent_intents(root: Path) -> Counter[str]:
-    """Counter of subagent_type values invoked from this project's Claude transcripts."""
+    """Counter of subagent_type values invoked from this project's Claude transcripts
+    and procedural memory insights."""
     home = Path("~/.claude").expanduser()
     proj = home / "projects" / hyphen_encode_path(str(root))
-    if not proj.is_dir():
-        return Counter()
     counts: Counter[str] = Counter()
-    for sess in sorted(proj.glob("*.jsonl"))[:30]:
-        try:
-            text = sess.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or '"Agent"' not in line:
-                continue
+
+    # Gather from Claude transcripts
+    if proj.is_dir():
+        for sess in sorted(proj.glob("*.jsonl"))[:30]:
             try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
+                text = sess.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
                 continue
-            content = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if not isinstance(item, dict):
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or '"Agent"' not in line:
                     continue
-                if item.get("type") == "tool_use" and item.get("name") == "Agent":
-                    inp = item.get("input") or {}
-                    if isinstance(inp, dict):
-                        sub = inp.get("subagent_type")
-                        if isinstance(sub, str) and sub.strip():
-                            counts[sub.strip()] += 1
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "tool_use" and item.get("name") == "Agent":
+                        inp = item.get("input") or {}
+                        if isinstance(inp, dict):
+                            sub = inp.get("subagent_type")
+                            if isinstance(sub, str) and sub.strip():
+                                counts[sub.strip()] += 1
+
+    # Gather procedural hints for subagent roles (lessons with role-like triggers)
+    try:
+        from .procedural_memory import procedural_path
+        proc_path = procedural_path(root)
+        if proc_path.exists():
+            from .memory import read_jsonl_all
+            records = read_jsonl_all(proc_path)
+            for rec in records:
+                kind = str(rec.get("kind", "")).lower()
+                trigger = str(rec.get("trigger", "")).lower()
+                # Map procedural lesson triggers to sub-agent roles
+                # e.g., "implement" → "implement-helper", "audit" → "audit-investigator"
+                if kind == "lesson" and trigger:
+                    if any(x in trigger for x in ("implement", "refactor", "fix", "build")):
+                        counts["implement-specialist"] += 1
+                    elif any(x in trigger for x in ("audit", "review", "test", "verify")):
+                        counts["test-reviewer"] += 1
+                    elif any(x in trigger for x in ("design", "plan", "architect")):
+                        counts["architect-planner"] += 1
+    except Exception:
+        pass
+
     return counts
 
 

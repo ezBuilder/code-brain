@@ -230,6 +230,22 @@ restore_managed_owner_if_root() {
       find "$TARGET_ROOT/.ai" \
         -path "$TARGET_ROOT/.ai/runtime/.venv" -prune \
         -o -exec chown "$owner_spec" {} +
+      # Selectively repair editable-install artifacts left as root by a previous
+      # root-run `uv sync`. Three artifacts block `import ai_core` when owned by
+      # root with mode 600: the editable .pth, the dist-info dir, and bin/ai.
+      # Touching only these keeps the venv binaries themselves owner-stable.
+      local _uid="${owner_spec%%:*}"
+      find "$TARGET_ROOT/.ai/runtime/.venv/lib" -name "*.pth" \
+        -not -uid "$_uid" -exec chown "$owner_spec" {} + 2>/dev/null || true
+      find "$TARGET_ROOT/.ai/runtime/.venv/lib" -type d -name "*.dist-info" \
+        -not -uid "$_uid" -exec chown -R "$owner_spec" {} + 2>/dev/null || true
+      if [[ -f "$TARGET_ROOT/.ai/runtime/.venv/bin/ai" ]]; then
+        local _bin_uid
+        _bin_uid="$(stat -c '%u' "$TARGET_ROOT/.ai/runtime/.venv/bin/ai" 2>/dev/null || stat -f '%u' "$TARGET_ROOT/.ai/runtime/.venv/bin/ai" 2>/dev/null || echo "$_uid")"
+        if [[ "$_bin_uid" != "$_uid" ]]; then
+          chown "$owner_spec" "$TARGET_ROOT/.ai/runtime/.venv/bin/ai" 2>/dev/null || true
+        fi
+      fi
     else
       chown -R "$owner_spec" "$TARGET_ROOT/.ai"
     fi

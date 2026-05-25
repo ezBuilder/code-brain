@@ -1244,7 +1244,16 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                 try:
                     from .precall_recommend import record_user_override
 
-                    record_user_override(root, rid, str(tool_input.get("command") or ""))
+                    record_user_override(
+                        root,
+                        rid,
+                        str(
+                            tool_input.get("command")
+                            or tool_input.get("CommandLine")
+                            or tool_input.get("commandLine")
+                            or ""
+                        ),
+                    )
                 except Exception:
                     pass
         except Exception:
@@ -1380,7 +1389,11 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     "permissionDecisionReason": (
                         f"Code Brain auto-rewrite: {precall_decision.get('reason')} → routed to sandbox."
                     ),
-                    "updatedInput": {"command": suggestion},
+                    "updatedInput": {
+                        "command": suggestion,
+                        "CommandLine": suggestion,
+                        "commandLine": suggestion,
+                    },
                     "additionalContext": additional_context,
                 }
                 response["rewritten"] = True
@@ -1537,7 +1550,12 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
         raw_input = payload.get("tool_input")
         description = ""
         if isinstance(raw_input, dict):
-            description = str(raw_input.get("description") or "")[:200]
+            description = str(
+                raw_input.get("description")
+                or raw_input.get("Reason")
+                or raw_input.get("reason")
+                or ""
+            )[:200]
         append_audit(
             root,
             action="permission.requested",

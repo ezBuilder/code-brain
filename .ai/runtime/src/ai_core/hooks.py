@@ -270,6 +270,36 @@ def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
     except Exception:
         pass
 
+    # Job 3: sandbox prune — clean stale sandbox executions older than 24h.
+    # Without this background trigger, .ai/cache/sandbox accumulates indefinitely
+    # (every sandbox_execute writes a .txt + .meta.json pair). Large/long-lived
+    # projects had observed 360+ files / 16 MB before this hook was wired.
+    try:
+        from .process_janitor import register_child
+
+        if IS_WINDOWS and ai_bin_ps.exists():
+            cmd = ["powershell", "-NoProfile", "-File", str(ai_bin_ps),
+                   "exec", "prune", "--older-than-seconds", "86400", "--json"]
+        elif ai_bin_unix.exists():
+            cmd = [str(ai_bin_unix), "exec", "prune", "--older-than-seconds", "86400", "--json"]
+        else:
+            cmd = None
+
+        if cmd is not None:
+            with open(os.devnull, "wb") as devnull:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=devnull,
+                    stderr=devnull,
+                    stdin=subprocess.DEVNULL,
+                    cwd=str(root),
+                    **detached_popen_kwargs(),
+                )
+            register_child(root, pid=proc.pid, kind="sleep_time_sandbox_prune", command=cmd)
+            spawned.append(f"sandbox_prune(pid={proc.pid})")
+    except Exception:
+        pass
+
     return {"ok": True, "spawned": spawned, "skipped": False, "reason": None}
 
 

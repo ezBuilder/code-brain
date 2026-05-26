@@ -213,6 +213,9 @@ def build_parser() -> argparse.ArgumentParser:
     memory_pageout = memory_sub.add_parser("page-out", help="rotate session + archive old sessions (T30 step B)")
     memory_pageout.add_argument("--dry-run", action="store_true")
     memory_pageout.add_argument("--json", action="store_true", dest="command_json")
+    memory_retention = memory_sub.add_parser("retention", help="retention scoring (decay+reinforcement) of durable memory")
+    memory_retention.add_argument("--evict-limit", type=int, default=50)
+    memory_retention.add_argument("--json", action="store_true", dest="command_json")
     lessons = sub.add_parser("lessons")
     lessons_sub = lessons.add_subparsers(dest="lessons_command", required=True)
     lessons_add = lessons_sub.add_parser("add")
@@ -227,6 +230,14 @@ def build_parser() -> argparse.ArgumentParser:
     lessons_list.add_argument("--json", action="store_true", dest="command_json")
     lessons_summary = lessons_sub.add_parser("summary")
     lessons_summary.add_argument("--json", action="store_true", dest="command_json")
+    lessons_score = lessons_sub.add_parser("score", help="confidence/decay scoring of lessons")
+    lessons_score.add_argument("--include-stale", action="store_true")
+    lessons_score.add_argument("--json", action="store_true", dest="command_json")
+    lessons_recall = lessons_sub.add_parser("recall", help="rank lessons for a query (confidence*relevance*recency)")
+    lessons_recall.add_argument("--query", required=True)
+    lessons_recall.add_argument("--limit", type=int, default=10)
+    lessons_recall.add_argument("--include-stale", action="store_true")
+    lessons_recall.add_argument("--json", action="store_true", dest="command_json")
     audit = sub.add_parser("audit")
     audit_sub = audit.add_subparsers(dest="audit_command", required=True)
     audit_append = audit_sub.add_parser("append")
@@ -735,6 +746,10 @@ def main(argv: list[str] | None = None) -> int:
             from . import memory_tier as _mt
             emit(_mt.page_out(root, dry_run=bool(args.dry_run)), as_json=as_json)
             return OK
+        if args.command == "memory" and args.memory_command == "retention":
+            from . import memory_tier as _mt
+            emit(_mt.retention_report(root, evict_limit=int(args.evict_limit)), as_json=as_json)
+            return OK
         if args.command == "lessons":
             from .lessons import add_lesson, lesson_summary, list_lessons
 
@@ -749,6 +764,16 @@ def main(argv: list[str] | None = None) -> int:
                 return OK
             if args.lessons_command == "summary":
                 payload = lesson_summary(root)
+                emit(payload, as_json=as_json)
+                return OK
+            if args.lessons_command == "score":
+                from .lessons import score_lessons
+                payload = score_lessons(root, include_stale=bool(args.include_stale))
+                emit(payload, as_json=as_json)
+                return OK
+            if args.lessons_command == "recall":
+                from .lessons import recall_lessons
+                payload = recall_lessons(root, query=args.query, limit=int(args.limit), include_stale=bool(args.include_stale))
                 emit(payload, as_json=as_json)
                 return OK
         if args.command == "audit" and args.audit_command == "append":

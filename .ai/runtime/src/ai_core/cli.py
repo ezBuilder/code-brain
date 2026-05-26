@@ -406,9 +406,24 @@ def build_parser() -> argparse.ArgumentParser:
     code_verify.add_argument("source", nargs="?", help="file path; omit to read from stdin")
     code_verify.add_argument("--stdin", action="store_true")
     code_verify.add_argument("--json", action="store_true", dest="command_json")
+    code_hashline = code_sub.add_parser("read-hashline", help="read file with line+hash anchors")
+    code_hashline.add_argument("path")
+    code_hashline.add_argument("--start", type=int)
+    code_hashline.add_argument("--end", type=int)
+    code_hashline.add_argument("--json", action="store_true", dest="command_json")
+    code_verify_hashline = code_sub.add_parser("verify-hashline", help="verify line+hash anchors from JSON stdin")
+    code_verify_hashline.add_argument("path")
+    code_verify_hashline.add_argument("--json", action="store_true", dest="command_json")
     code_map = code_sub.add_parser("map", help="live top-level codebase map with local commands")
     code_map.add_argument("--limit", type=int, default=40)
     code_map.add_argument("--json", action="store_true", dest="command_json")
+    guard = sub.add_parser("guard")
+    guard_sub = guard.add_subparsers(dest="guard_command", required=True)
+    guard_scan = guard_sub.add_parser("scan")
+    guard_scan.add_argument("--text")
+    guard_scan.add_argument("--scope", choices=["tool", "prompt", "output"], default="tool")
+    guard_scan.add_argument("--stdin", action="store_true")
+    guard_scan.add_argument("--json", action="store_true", dest="command_json")
     context = sub.add_parser("context")
     context_sub = context.add_subparsers(dest="context_command", required=True)
     context_pack_parser = context_sub.add_parser("pack")
@@ -1013,11 +1028,31 @@ def main(argv: list[str] | None = None) -> int:
                 report = _av.verify_file(args.source).to_dict()
             emit(report, as_json=as_json)
             return OK if report["ok"] else GENERIC_ERROR
+        if args.command == "code" and args.code_command == "read-hashline":
+            from .hashline import read_hashline
+            payload = read_hashline(root, args.path, start=args.start, end=args.end)
+            emit(payload, as_json=as_json)
+            return OK
+        if args.command == "code" and args.code_command == "verify-hashline":
+            from .hashline import verify_anchors
+            raw = sys.stdin.read()
+            anchors = json.loads(raw) if raw.strip() else []
+            if not isinstance(anchors, list):
+                raise ValueError("verify-hashline expects JSON array on stdin")
+            payload = verify_anchors(root, args.path, anchors)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "code" and args.code_command == "map":
             from .codebase_map import build_codebase_map
 
             emit(build_codebase_map(root, max_entries=args.limit), as_json=as_json)
             return OK
+        if args.command == "guard" and args.guard_command == "scan":
+            from .stream_guard import scan_text
+            text = sys.stdin.read() if args.stdin else (args.text or "")
+            payload = scan_text(text, scope=args.scope)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "context" and args.context_command == "pack":
             payload = context_pack(root, args.query, limit=args.limit)
             emit(payload, as_json=as_json)

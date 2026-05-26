@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 PYTHON="$ROOT/.ai/runtime/.venv/bin/python"
 if [[ -x "$PYTHON" ]]; then
   exec "$PYTHON" -m ai_core.cli "$@"

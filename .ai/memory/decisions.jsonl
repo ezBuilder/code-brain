@@ -1,2 +1,4 @@
 
 {"decided_at":"2026-05-20T03:27:47.828930Z","decision":"추천 skill/agent/precall 후보는 이 세션에서 별도 승인 질문 없이 자율 수락/활성화한다","id":"dec-7cbc2f40","source":"user","tags":["autonomy","recommendations"]}
+{"decided_at":"2026-05-21T12:31:13.911456Z","decision":"Use code_read_hashline as the default exact code-reading path after code_query for edit-relevant slices.","id":"dec-659dc3fe","source":"operator","tags":["code-reading","hashline"]}
+{"decided_at":"2026-05-24T09:20:52.154052Z","decision":"Google Antigravity 지원을 위한 run_command 및 CommandLine 바인딩 완료","id":"dec-202dd7f1","source":"agent","tags":[]}

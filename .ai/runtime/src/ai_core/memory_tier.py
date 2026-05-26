@@ -22,10 +22,30 @@ This module is read-only. Page-in/page-out lands in steps B/C.
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+# Retention salience baselines per memory type (adapted from agentmemory's
+# retention model). Higher = more durable. Pure-local, no network.
+RETENTION_TYPE_WEIGHTS: dict[str, float] = {
+    "decision": 0.9,
+    "architecture": 0.9,
+    "preference": 0.85,
+    "pattern": 0.8,
+    "skill": 0.8,
+    "bug": 0.7,
+    "lesson": 0.7,
+    "precall": 0.65,
+    "workflow": 0.6,
+    "procedure": 0.6,
+    "fact": 0.5,
+    "todo": 0.5,
+    "event": 0.4,
+}
+_RETENTION_DEFAULT_WEIGHT = 0.5
 
 
 def _env_float(name: str, default: float) -> float:
@@ -310,4 +330,158 @@ def hot_pressure(root: Path) -> dict[str, Any]:
         "audit_pressure_ratio": round(audit_pressure, 4),
         "hot_audit_events": hot_events,
         "page_out_recommended": session_ratio >= 0.8 or audit_pressure >= 1.0,
+    }
+
+
+# --- Retention scoring (decay + reinforcement) -------------------------------
+# A score-based view of memory durability, complementing the TTL-bucket
+# classify(). Fully deterministic and local: exponential time decay, optional
+# access-reinforcement, and per-type salience. No network, hot-path safe.
+
+
+def _decay_lambda() -> float:
+    return max(0.0, _env_float("AI_MEMORY_DECAY_LAMBDA", 0.01))
+
+
+def _reinforce_sigma() -> float:
+    return max(0.0, _env_float("AI_MEMORY_REINFORCE_SIGMA", 0.3))
+
+
+def retention_score(
+    *,
+    mem_type: str,
+    age_days: float,
+    access_count: int = 0,
+    recent_access_days: list[float] | None = None,
+    confidence: float | None = None,
+) -> float:
+    """Durability score in [0, 1] for a single memory item.
+
+      salience      = type_weight + min(0.2, access_count*0.02)
+                      (raised to `confidence` when one is supplied)
+      temporal      = exp(-lambda * age_days)        lambda=AI_MEMORY_DECAY_LAMBDA
+      reinforcement = sigma * sum(1/days_since_access)  sigma=AI_MEMORY_REINFORCE_SIGMA
+      score         = min(1, salience*temporal + reinforcement)
+    """
+    base = RETENTION_TYPE_WEIGHTS.get(str(mem_type or "").lower(), _RETENTION_DEFAULT_WEIGHT)
+    salience = base + min(0.2, max(0, int(access_count)) * 0.02)
+    if confidence is not None:
+        try:
+            salience = max(salience, float(confidence))
+        except (TypeError, ValueError):
+            pass
+    salience = min(1.0, salience)
+
+    temporal = math.exp(-_decay_lambda() * max(0.0, float(age_days)))
+
+    boost = 0.0
+    if recent_access_days:
+        sigma = _reinforce_sigma()
+        boost = sigma * sum(1.0 / max(1.0, float(d)) for d in recent_access_days)
+
+    return max(0.0, min(1.0, salience * temporal + boost))
+
+
+def score_tier(score: float) -> str:
+    """Map a retention score to hot/warm/cold/evictable (env-overridable cuts)."""
+    hot = _env_float("AI_MEMORY_TIER_HOT", 0.7)
+    warm = _env_float("AI_MEMORY_TIER_WARM", 0.4)
+    cold = _env_float("AI_MEMORY_TIER_COLD", 0.15)
+    if score >= hot:
+        return "hot"
+    if score >= warm:
+        return "warm"
+    if score >= cold:
+        return "cold"
+    return "evictable"
+
+
+def _ts_of(rec: dict[str, Any]) -> datetime | None:
+    for key in ("ts", "created_at", "decided_at", "updated_at", "last_seen"):
+        dt = _parse_ts(str(rec.get(key) or ""))
+        if dt is not None:
+            return dt
+    return None
+
+
+def retention_report(root: Path, *, evict_limit: int = 50) -> dict[str, Any]:
+    """Score durable memory items (decisions, lessons, procedures) by retention.
+
+    Read-only: returns a tier histogram plus the lowest-scoring items as
+    eviction *candidates* (recommendation only — never deletes). Lessons fold
+    in their confidence/reinforcement signal from `lessons.score_lessons`.
+    """
+    from .memory import decisions_path, read_jsonl_all
+    from .lessons import lessons_path, score_lessons
+    from .procedural_memory import procedural_path
+
+    now = datetime.now(timezone.utc)
+
+    def _age_days(rec: dict[str, Any]) -> float:
+        dt = _ts_of(rec)
+        if dt is None:
+            return 365.0  # unknown age → treat as stale
+        return max(0.0, (now - dt).total_seconds() / 86400.0)
+
+    scored: list[dict[str, Any]] = []
+
+    for rec in read_jsonl_all(decisions_path(root)):
+        s = retention_score(mem_type="decision", age_days=_age_days(rec))
+        scored.append({
+            "kind": "decision",
+            "score": round(s, 4),
+            "tier": score_tier(s),
+            "age_days": round(_age_days(rec), 2),
+            "ref": str(rec.get("id") or rec.get("decision", ""))[:80],
+        })
+
+    # Lessons: use confidence + reinforcement count as salience/access signal.
+    lesson_scores = score_lessons(root, now=now, include_stale=True).get("items", [])
+    for item in lesson_scores:
+        conf = item.get("confidence")
+        reinf = int(item.get("reinforcements", 1) or 1)
+        s = retention_score(
+            mem_type="lesson",
+            age_days=_age_days(item),
+            access_count=reinf,
+            confidence=conf,
+        )
+        scored.append({
+            "kind": "lesson",
+            "score": round(s, 4),
+            "tier": score_tier(s),
+            "age_days": round(_age_days(item), 2),
+            "confidence": conf,
+            "reinforcements": reinf,
+            "ref": str(item.get("id") or item.get("failure", ""))[:80],
+        })
+
+    for rec in read_jsonl_all(procedural_path(root)):
+        mtype = str(rec.get("kind") or "procedure").lower()
+        s = retention_score(mem_type=mtype, age_days=_age_days(rec))
+        scored.append({
+            "kind": "procedure",
+            "score": round(s, 4),
+            "tier": score_tier(s),
+            "age_days": round(_age_days(rec), 2),
+            "ref": str(rec.get("id") or rec.get("trigger", ""))[:80],
+        })
+
+    hist = {"hot": 0, "warm": 0, "cold": 0, "evictable": 0}
+    for item in scored:
+        hist[item["tier"]] += 1
+
+    evict_cap = max(0, int(evict_limit))
+    candidates = sorted(
+        (i for i in scored if i["tier"] == "evictable"),
+        key=lambda i: i["score"],
+    )[:evict_cap]
+
+    return {
+        "ok": True,
+        "scored": len(scored),
+        "tiers": hist,
+        "decay_lambda": _decay_lambda(),
+        "reinforce_sigma": _reinforce_sigma(),
+        "evict_candidates": candidates,
     }

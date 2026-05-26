@@ -1549,7 +1549,16 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                 )
     if stream_guard_decision:
         response["stream_guard"] = stream_guard_decision
-        if stream_guard_decision.get("action") == "block" and response.get("decision") != "block":
+        # Blocking is only meaningful BEFORE a tool runs (PreToolUse) or for a
+        # prompt/stop. On PostToolUse the tool already executed, so promoting a
+        # match to decision=block is both pointless and emits a wire shape Codex
+        # rejects as "invalid post-tool-use JSON output". There the match still
+        # drives redaction (updatedToolOutput) and is recorded in the audit.
+        if (
+            stream_guard_decision.get("action") == "block"
+            and effective_hook != "PostToolUse"
+            and response.get("decision") != "block"
+        ):
             response["decision"] = "block"
             reason = str(stream_guard_decision.get("reason") or "Code Brain stream guard blocked this operation")
             existing = response.get("hookSpecificOutput")
@@ -1572,7 +1581,13 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             raw_tool_output = payload.get("tool_output")
         if raw_tool_output is not None:
             cleaned = redact_value(raw_tool_output)
-            if cleaned != raw_tool_output:
+            # `updatedToolOutput` MUST be a string per the Claude Code / Codex hook
+            # spec. A dict/list value (e.g. exec_command's {"stdout":...} response
+            # after redaction) makes the client reject the whole hook as "invalid
+            # post-tool-use JSON output". Only surface the cleaned value when it is
+            # a string; structured outputs are still scrubbed in the persisted audit
+            # copy via the redact_value(response) below.
+            if isinstance(cleaned, str) and cleaned != raw_tool_output:
                 existing = response.get("hookSpecificOutput")
                 if not isinstance(existing, dict):
                     existing = {"hookEventName": effective_hook}
@@ -2005,6 +2020,11 @@ def _memory_staleness_context(root: Path, hook_name: str) -> str:
         root / ".ai" / "memory" / "decisions.jsonl",
         root / ".git" / "HEAD",
         root / ".git" / "index",
+        # .git/HEAD only changes on branch switch; a new commit on the *same*
+        # branch must still bust the cache. The HEAD reflog is appended on every
+        # HEAD movement (commit/checkout/reset), so its mtime is the reliable
+        # signal — and it is a cheap stat, no extra git subprocess on the hot path.
+        root / ".git" / "logs" / "HEAD",
     ]
     return _cached_hook_summary(
         root, cache_name="memory_staleness", deps=deps, compute=compute

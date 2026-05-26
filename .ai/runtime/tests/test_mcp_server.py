@@ -22,6 +22,8 @@ def test_tools_list_response_shape(tmp_path: Path) -> None:
     # Sanity: a few well-known tools should appear.
     assert "obs_usage" in names
     assert "memory_query" in names
+    assert "code_read_hashline" in names
+    assert "stream_guard_scan" in names
 
 
 def test_tools_list_response_cached(tmp_path: Path, monkeypatch) -> None:

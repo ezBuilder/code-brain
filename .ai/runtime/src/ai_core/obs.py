@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .doctor import as_payload, run_checks
+from .doctor import as_payload
 from .memory import all_audit_files
 from .redact import redact_value
 
@@ -74,20 +74,24 @@ def metrics(root: Path) -> dict[str, Any]:
 
 
 def search_report(root: Path, *, query_text: str | None = None, limit: int = 5) -> dict[str, Any]:
-    from .doctor import as_payload, run_checks
-    from .search import observability as search_observability
+    from .search import connect, db_path, init_schema, observability as search_observability
 
-    doctor = as_payload(run_checks(root))
-    freshness = next((check for check in doctor["checks"] if check["name"] == "index_freshness"), None)
     payload = search_observability(root, query_text=query_text, limit=limit)
     payload["doctor"] = {
-        "ok": doctor["ok"],
-        "index_freshness": freshness,
+        "ok": True,
+        "index_freshness": _search_index_health(root, connect=connect, db_path=db_path, init_schema=init_schema),
     }
+    payload["doctor"]["ok"] = bool(payload["doctor"]["index_freshness"].get("ok"))
     query = payload.get("query")
     if isinstance(query, dict):
         stale = query.get("stale_results") or []
         if stale:
+            payload["doctor"]["ok"] = False
+            payload["doctor"]["index_freshness"] = {
+                "name": "index_freshness",
+                "ok": False,
+                "detail": "stale search results: " + ", ".join(stale[:10]),
+            }
             query["remediation"] = {
                 "command": "ai index rebuild --json",
                 "alternative": "ai obs search --refresh-stale --query <text>",
@@ -95,6 +99,27 @@ def search_report(root: Path, *, query_text: str | None = None, limit: int = 5) 
                 "exit_code": 13,
             }
     return payload
+
+
+def _search_index_health(root: Path, *, connect: Any, db_path: Any, init_schema: Any) -> dict[str, Any]:
+    """Cheap health for obs search.
+
+    Full doctor freshness re-hashes every indexed file. That is appropriate for
+    `doctor` and `health-summary`, but it makes each search O(repo). Search only
+    needs the index to be readable; returned result staleness is checked per hit
+    by snippet generation.
+    """
+    db = db_path(root)
+    if not db.exists():
+        return {"name": "index_freshness", "ok": True, "detail": "not indexed"}
+    try:
+        with connect(root) as conn:
+            init_schema(conn)
+            row = conn.execute("select count(*) as count from chunks").fetchone()
+            count = int(row["count"] if row is not None else 0)
+    except Exception as exc:
+        return {"name": "index_freshness", "ok": False, "detail": f"index unreadable: {exc}"}
+    return {"name": "index_freshness", "ok": True, "detail": f"ok indexed={count} (search-fast)"}
 
 
 def usage_report(root: Path, *, include_sessions: bool = False) -> dict[str, Any]:
@@ -296,6 +321,7 @@ def _int(value: Any) -> int:
 
 
 def health_summary(root: Path) -> dict[str, Any]:
+    from .doctor import run_checks
     from .worker.lock import lock_status
     from .worker.scheduler import QUEUE_PENDING_AGE_STALE_SECONDS, QUEUE_PROCESSING_AGE_STALE_SECONDS, status as queue_status
 
@@ -642,6 +668,7 @@ def slo_bench(root: Path, iterations: int = 10) -> dict[str, Any]:
 
 
 def diagnostics(root: Path, *, dry_run: bool = False, include_doctor: bool = True) -> dict[str, Any]:
+    from .doctor import run_checks
     checks = as_payload(run_checks(root)) if include_doctor else {"ok": True, "checks": []}
     bundle = {
         "created_at": now_iso(),

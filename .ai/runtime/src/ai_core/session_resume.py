@@ -110,7 +110,22 @@ def _session_tail(root: Path) -> str:
 
 
 def _audit_tail_actions(root: Path) -> list[str]:
-    entries = _read_jsonl(root / ".ai" / "memory" / "audit.jsonl")
+    # Real installs store audit under .ai/memory/audit/<year>.jsonl; the flat
+    # audit.jsonl never exists there, so the previous read always returned [] and
+    # every resume snapshot shipped empty recent-actions. Read the per-year files
+    # (newest two) and fall back to the legacy flat file when absent.
+    entries: list[dict[str, Any]] = []
+    try:
+        from .memory import all_audit_files
+
+        files = all_audit_files(root)
+    except Exception:
+        files = []
+    if not files:
+        legacy = root / ".ai" / "memory" / "audit.jsonl"
+        files = [legacy] if legacy.is_file() else []
+    for path in files[-2:]:
+        entries.extend(_read_jsonl(path))
     seen: set[str] = set()
     actions: list[str] = []
     # Walk from newest to oldest so most recent unique actions are preferred.

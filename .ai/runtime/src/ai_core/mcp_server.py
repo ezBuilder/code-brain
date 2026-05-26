@@ -110,7 +110,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "memory_tier",
-        "description": "MemGPT-style hot/warm/cold memory classification + page-out signal. Read-only.",
+        "description": "MemGPT-style hot/warm/cold memory classification + page-out signal + retention scoring (decay/reinforcement) of decisions/lessons/procedures. Read-only.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -527,10 +527,10 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         from .ast_verify import verify_source
         return verify_source(str(args.get("source", ""))).to_dict()
     if name == "memory_tier":
-        from .memory_tier import classify, hot_pressure
+        from .memory_tier import classify, hot_pressure, retention_report
         cls = classify(root)
         pres = hot_pressure(root)
-        return {**cls, "pressure": pres}
+        return {**cls, "pressure": pres, "retention": retention_report(root)}
     if name == "ai_status":
         return health(root)
     if name == "ai_request_rebuild":

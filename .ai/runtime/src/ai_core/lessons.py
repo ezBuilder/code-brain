@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +84,162 @@ def lesson_summary(root: Path) -> dict[str, Any]:
         "by_source": dict(sorted(by_source.items())),
         "by_tag": dict(sorted(by_tag.items())),
     }
+
+
+# --- Confidence + decay scoring (read-time, append-only safe) ----------------
+# Lessons are append-only, so repeated observations of the "same" lesson are
+# reinforcement signals rather than mutations. Confidence is rebuilt at read
+# time: each occurrence strengthens it; elapsed weeks since the last sighting
+# decay it. Pure-local, no network. Adapted from agentmemory's lesson model.
+
+
+def _parse_ts(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            return datetime.fromisoformat(value[:-1]).replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(value)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def lesson_fingerprint(record: dict[str, Any]) -> str:
+    """Stable identity for reinforcement/dedup across append-only occurrences."""
+    failure = str(record.get("failure") or "").strip().lower()
+    cause = str(record.get("cause") or "").strip().lower()
+    fix = str(record.get("fix") or "").strip().lower()
+    if failure or cause or fix:
+        key = f"{str(record.get('source') or '').lower()}|{failure}|{cause}|{fix}"
+    else:  # eval_fail shape
+        key = "|".join(
+            str(record.get(k) or "").strip().lower()
+            for k in ("source", "kind", "command", "outcome")
+        )
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _env_float(name: str, default: float) -> float:
+    import os
+
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return default if val != val else val
+
+
+def score_lessons(
+    root: Path,
+    *,
+    now: datetime | None = None,
+    decay_rate: float | None = None,
+    include_stale: bool = True,
+) -> dict[str, Any]:
+    """Group lessons by fingerprint and assign a decayed confidence.
+
+      confidence starts 0.5, reinforced once per repeat: c <- c + 0.1*(1-c)
+      decayed by elapsed weeks since last sighting: c <- c - decay_rate*weeks
+      floored at 0.05; `stale` when c <= 0.1 and seen only once.
+    """
+    rate = _env_float("AI_LESSON_DECAY_RATE", 0.05) if decay_rate is None else float(decay_rate)
+    moment = now or datetime.now(timezone.utc)
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for rec in read_jsonl_all(lessons_path(root)):
+        fp = lesson_fingerprint(rec)
+        if fp not in groups:
+            groups[fp] = []
+            order.append(fp)
+        groups[fp].append(rec)
+
+    items: list[dict[str, Any]] = []
+    for fp in order:
+        group = groups[fp]
+        reinforcements = len(group)
+        confidence = 0.5
+        for _ in range(reinforcements - 1):
+            confidence = min(1.0, confidence + 0.1 * (1.0 - confidence))
+
+        last_dt: datetime | None = None
+        for rec in group:
+            dt = _parse_ts(str(rec.get("created_at") or rec.get("ts") or ""))
+            if dt is not None and (last_dt is None or dt > last_dt):
+                last_dt = dt
+        weeks = 0.0
+        if last_dt is not None:
+            weeks = max(0.0, (moment - last_dt).total_seconds() / (7 * 86400.0))
+        confidence = max(0.05, confidence - rate * weeks)
+
+        stale = confidence <= 0.1 and reinforcements <= 1
+        if stale and not include_stale:
+            continue
+
+        latest = dict(group[-1])
+        latest.update({
+            "fingerprint": fp,
+            "confidence": round(confidence, 4),
+            "reinforcements": reinforcements,
+            "stale": stale,
+            "last_seen": last_dt.isoformat() if last_dt else None,
+        })
+        items.append(latest)
+
+    items.sort(key=lambda r: r["confidence"], reverse=True)
+    return {"ok": True, "count": len(items), "items": items}
+
+
+def recall_lessons(
+    root: Path,
+    *,
+    query: str,
+    limit: int = 10,
+    include_stale: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Rank lessons for a query: confidence * relevance * recency.
+
+    relevance = matched query tokens / total tokens (over failure+cause+fix+
+    tags+command). recency = 1/(1 + days_since_last_seen*0.01). Pure-local.
+    """
+    tokens = [t for t in str(query or "").strip().lower().split() if t]
+    if not tokens:
+        return {"ok": True, "count": 0, "items": []}
+
+    moment = now or datetime.now(timezone.utc)
+    scored = score_lessons(root, now=moment, include_stale=include_stale).get("items", [])
+
+    results: list[dict[str, Any]] = []
+    for item in scored:
+        haystack = " ".join(
+            str(item.get(k) or "")
+            for k in ("failure", "cause", "fix", "kind", "command", "outcome")
+        ).lower()
+        haystack += " " + " ".join(str(t).lower() for t in (item.get("tags") or []))
+        hits = sum(1 for t in tokens if t in haystack)
+        if hits == 0:
+            continue
+        relevance = hits / len(tokens)
+
+        days = 0.0
+        last_dt = _parse_ts(str(item.get("last_seen") or ""))
+        if last_dt is not None:
+            days = max(0.0, (moment - last_dt).total_seconds() / 86400.0)
+        recency = 1.0 / (1.0 + days * 0.01)
+
+        score = float(item.get("confidence", 0.5)) * relevance * recency
+        out = dict(item)
+        out["recall_score"] = round(score, 6)
+        out["relevance"] = round(relevance, 4)
+        results.append(out)
+
+    results.sort(key=lambda r: r["recall_score"], reverse=True)
+    return {"ok": True, "count": len(results[: max(0, int(limit))]), "items": results[: max(0, int(limit))]}
 
 
 def append_lesson(

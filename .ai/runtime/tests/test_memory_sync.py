@@ -88,6 +88,24 @@ def test_sync_commits_only_memory_not_code_and_pushes(tmp_path: Path) -> None:
     assert "code.py" in _gok(mac, "status", "--porcelain")
 
 
+def test_sync_commits_memory_even_with_gitignored_agents_md(tmp_path: Path) -> None:
+    # Regression: AGENTS.md is a git-ignored, per-machine regenerated memory mirror. It must
+    # NOT be in the sync pathspec — else `git add -- .ai/memory AGENTS.md` aborts on the
+    # ignored path and .ai/memory never gets staged, so the sync silently commits nothing.
+    remote, mac = _origin_with_mac(tmp_path)
+    (mac / ".gitignore").write_text("/AGENTS.md\n", encoding="utf-8")
+    _gok(mac, "add", "--", ".gitignore")
+    _gok(mac, "commit", "-q", "-m", "ignore AGENTS.md")
+    _gok(mac, "push", "-q")
+    (mac / "AGENTS.md").write_text("regenerated memory block\n", encoding="utf-8")  # ignored, on disk
+    (mac / ".ai" / "memory" / "decisions.jsonl").write_text('{"id":"d1"}\n{"id":"d2"}\n', encoding="utf-8")
+    res = sync_once(mac, agent="claude")
+    assert res["committed"] and res["pushed"], res
+    files = _gok(mac, "show", "--name-only", "--pretty=format:", "HEAD").split()
+    assert any("decisions.jsonl" in f for f in files), files
+    assert "AGENTS.md" not in files  # never committed (git-ignored, per-machine artifact)
+
+
 def test_sync_rebases_when_behind_and_clean(tmp_path: Path) -> None:
     remote, mac = _origin_with_mac(tmp_path)
     vps = _clone(tmp_path, remote, "vps")

@@ -5,8 +5,10 @@ fast-forward push, behind+clean rebase, behind+dirty skip, and conflict abort.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -151,6 +153,57 @@ def test_sync_aborts_on_conflict_and_leaves_clean_tree(tmp_path: Path) -> None:
     assert res["conflict"] and not res["pushed"], res
     # rebase was aborted → no rebase in progress, tree usable
     assert not (mac / ".git" / "rebase-merge").exists() and not (mac / ".git" / "rebase-apply").exists()
+
+
+def test_sync_holds_push_when_user_has_unpushed_code_commit(tmp_path: Path) -> None:
+    # Guard: the daemon must NOT push the user's unpushed CODE/infra commits for them —
+    # that silently publishes in-flight work and sets up the amend/rebase divergence trap.
+    remote, mac = _origin_with_mac(tmp_path)
+    (mac / "code.py").write_text("print('feature')\n", encoding="utf-8")
+    _gok(mac, "add", "--", "code.py")
+    _gok(mac, "commit", "-q", "-m", "wip: user feature (unpushed)")
+    # a memory change rides along
+    (mac / ".ai" / "memory" / "decisions.jsonl").write_text('{"id":"d1"}\n{"id":"d2"}\n', encoding="utf-8")
+    res = sync_once(mac, agent="claude")
+    # memory got committed locally, but the push was held back
+    assert res["committed"] and not res["pushed"] and res["skipped_push"], res
+    _gok(mac, "fetch", "-q")
+    # origin still has the ORIGINAL code.py — the user's "feature" edit was NOT published
+    assert _gok(mac, "show", "origin/develop:code.py").strip() == "print(1)"
+    # the user's commit is still local-only → safe for them to amend/rebase
+    assert "wip: user feature" in _gok(mac, "log", "--oneline", "origin/develop..HEAD")
+
+
+def test_sync_pushes_when_only_memory_commits_are_ahead(tmp_path: Path) -> None:
+    # The guard must NOT block the normal case: only memory commits ahead → push proceeds.
+    remote, mac = _origin_with_mac(tmp_path)
+    (mac / ".ai" / "memory" / "decisions.jsonl").write_text('{"id":"d1"}\n{"id":"d2"}\n', encoding="utf-8")
+    res = sync_once(mac, agent="claude")
+    assert res["committed"] and res["pushed"] and not res["skipped_push"], res
+
+
+def test_sync_skips_when_lock_is_held(tmp_path: Path) -> None:
+    # A live concurrent cycle holds the lock → this call no-ops (no double commit/push).
+    remote, mac = _origin_with_mac(tmp_path)
+    (mac / ".ai" / "memory" / "decisions.jsonl").write_text('{"id":"d1"}\n{"id":"d2"}\n', encoding="utf-8")
+    lock = mac / ".ai" / "cache" / "memory-sync.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("99999 held", encoding="utf-8")  # fresh mtime → live lock
+    res = sync_once(mac, agent="claude")
+    assert res["skipped_lock"] and not res["committed"] and not res["pushed"], res
+
+
+def test_sync_steals_a_stale_lock(tmp_path: Path) -> None:
+    # A lock older than the TTL is a crashed cycle → steal it and proceed.
+    remote, mac = _origin_with_mac(tmp_path)
+    (mac / ".ai" / "memory" / "decisions.jsonl").write_text('{"id":"d1"}\n{"id":"d2"}\n', encoding="utf-8")
+    lock = mac / ".ai" / "cache" / "memory-sync.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("123 crashed", encoding="utf-8")
+    old = time.time() - 9999
+    os.utime(lock, (old, old))
+    res = sync_once(mac, agent="claude")
+    assert res["committed"] and not res["skipped_lock"], res
 
 
 def test_sync_enabled_reads_config(tmp_path: Path) -> None:

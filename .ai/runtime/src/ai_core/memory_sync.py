@@ -10,6 +10,11 @@ It is deliberately conservative and NEVER touches the user's code:
     upstream — but ONLY when the rest of the working tree is clean. If other (code)
     changes are in flight, the rebase is skipped (the cb-behind banner already nags to
     pull). On any rebase conflict it aborts cleanly and reports — never a half-merged tree.
+  * Pushes ONLY when every commit ahead of upstream is memory-only. If the user has
+    unpushed code/infra commits, the push is held (``skipped_push``) so the sync never
+    publishes their in-flight work or invites an amend/rebase divergence.
+  * Holds a per-machine lock per cycle so the SessionEnd daemon and a manual ``ai memory
+    sync`` can't race (double commit/push); a stale lock is stolen after a TTL.
   * Writes a per-machine heartbeat so other machines can show "VPS synced 3m ago".
 
 Hard rule: this does NETWORK I/O (fetch/push) and MUST NOT run on the hooks/MCP hot
@@ -19,6 +24,7 @@ when ``memory_sync.enabled`` is set, spawned detached at SessionEnd.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -34,6 +40,11 @@ _GIT_TIMEOUT = 30
 # which left .ai/memory unstaged so the sync silently committed nothing.
 MEMORY_PATHS = (".ai/memory",)
 _HEARTBEAT_DIR = (".ai", "memory", "sync")
+# Per-machine, git-ignored lock so the detached SessionEnd daemon and a manual
+# `ai memory sync` never run a cycle concurrently (double commit/push races). A lock
+# older than _LOCK_TTL is treated as stale and stolen (crash-safe).
+_LOCK_PATH = (".ai", "cache", "memory-sync.lock")
+_LOCK_TTL = 120
 
 
 def _utc() -> str:
@@ -79,6 +90,11 @@ def _write_heartbeat(root: Path, mid: str, agent: str) -> None:
         pass
 
 
+def _is_memory_path(path: str) -> bool:
+    """A repo-relative path the sync is allowed to own (stage/commit/push)."""
+    return path == ".ai/memory" or path.startswith(".ai/memory/")
+
+
 def _other_paths_dirty(root: Path) -> bool:
     """True if the working tree has TRACKED-file changes OUTSIDE the memory paths (user
     code in flight) — rebase is then unsafe and skipped. Untracked files (``??``) are
@@ -95,7 +111,7 @@ def _other_paths_dirty(root: Path) -> bool:
         path = line[3:].strip().strip('"')
         if " -> " in line:  # rename: "R  old -> new"
             path = line.split(" -> ", 1)[1].strip().strip('"')
-        if path.startswith(".ai/memory/") or path == "AGENTS.md":
+        if _is_memory_path(path) or path == "AGENTS.md":
             continue
         return True
     return False
@@ -116,14 +132,88 @@ def _maybe_repair_audit_chain(root: Path) -> None:
         pass
 
 
+def _ahead_has_non_memory_commit(root: Path, upstream: str) -> bool:
+    """True if any commit in ``upstream..HEAD`` touches a path OUTSIDE ``.ai/memory`` — i.e.
+    the user has unpushed code/infra commits. The sync must NOT push those for them: doing so
+    silently publishes in-flight work and invites amend/rebase divergence. Unknown git state
+    → True (conservative: hold the push)."""
+    ok, out, _ = _git(root, "rev-list", f"{upstream}..HEAD")
+    if not ok:
+        return True
+    for sha in (s for s in out.split() if s):
+        fok, fout, _ = _git(root, "show", "--name-only", "--pretty=format:", sha)
+        if not fok:
+            return True
+        for f in fout.splitlines():
+            f = f.strip().strip('"')
+            if f and not _is_memory_path(f):
+                return True
+    return False
+
+
+def _acquire_sync_lock(root: Path) -> bool:
+    """Best-effort, portable, non-blocking lock: True if acquired. A lock older than
+    _LOCK_TTL is stolen so a crashed cycle never wedges sync forever. Lock-infra failures
+    fail OPEN (return True) — the lock is a courtesy, never a reason to disable sync."""
+    p = Path(root).joinpath(*_LOCK_PATH)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return True
+    try:
+        if p.exists() and (time.time() - p.stat().st_mtime) > _LOCK_TTL:
+            p.unlink()
+    except OSError:
+        pass
+    try:
+        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return True
+    try:
+        os.write(fd, f"{os.getpid()} {_utc()}".encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+def _release_sync_lock(root: Path) -> None:
+    try:
+        Path(root).joinpath(*_LOCK_PATH).unlink()
+    except OSError:
+        pass
+
+
 def sync_once(root: Path, *, agent: str = "agent", push: bool = True) -> dict[str, Any]:
-    """One sync cycle. Safe to call repeatedly; no-op when nothing changed and in sync."""
+    """One sync cycle. Safe to call repeatedly; no-op when nothing changed and in sync.
+
+    Holds a per-machine lock for the cycle so the detached SessionEnd daemon and a manual
+    ``ai memory sync`` cannot race (double commit/push). If a live cycle holds the lock this
+    returns immediately with ``skipped_lock=True``."""
+    root = Path(root)
+    if not _acquire_sync_lock(root):
+        return {
+            "ok": True, "machine_id": machine_id(root), "committed": False, "pushed": False,
+            "rebased": False, "behind_before": 0, "ahead_before": 0, "skipped_rebase": False,
+            "conflict": False, "skipped_push": False, "skipped_lock": True, "errors": [],
+        }
+    try:
+        return _sync_once_locked(root, agent=agent, push=push)
+    finally:
+        _release_sync_lock(root)
+
+
+def _sync_once_locked(root: Path, *, agent: str = "agent", push: bool = True) -> dict[str, Any]:
+    """One sync cycle (run while holding the per-machine lock). Safe to call repeatedly;
+    no-op when nothing changed and in sync."""
     root = Path(root)
     mid = machine_id(root)
     res: dict[str, Any] = {
         "ok": True, "machine_id": mid, "committed": False, "pushed": False,
         "rebased": False, "behind_before": 0, "ahead_before": 0,
-        "skipped_rebase": False, "conflict": False, "errors": [],
+        "skipped_rebase": False, "conflict": False, "skipped_push": False,
+        "skipped_lock": False, "errors": [],
     }
     if not _git(root, "rev-parse", "--is-inside-work-tree")[0]:
         res["ok"] = False
@@ -179,7 +269,13 @@ def sync_once(root: Path, *, agent: str = "agent", push: bool = True) -> dict[st
     if push:
         ahead_ok, ahead_out, _ = _git(root, "rev-list", "--count", f"{upstream}..HEAD")
         ahead_now = int(ahead_out.strip()) if ahead_ok and ahead_out.strip().isdigit() else 0
-        if ahead_now > 0:
+        if ahead_now > 0 and _ahead_has_non_memory_commit(root, upstream):
+            # The user has unpushed code/infra commits ahead. Pushing here would silently
+            # publish their in-flight work and set up amend/rebase divergence — leave the
+            # push to them; our memory commit rides along on their next push.
+            res["skipped_push"] = True
+            res["errors"].append("unpushed-non-memory-commits: left push to you")
+        elif ahead_now > 0:
             pok, _, perr = _git(root, "push", "--quiet")
             res["pushed"] = pok
             if not pok:

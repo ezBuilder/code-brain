@@ -29,9 +29,11 @@
 |---|---|---|
 | **Claude Code** | `.claude/settings.json` | PreToolUse · PostToolUse · SessionStart · SessionEnd · UserPromptSubmit · Stop · SubagentStart · SubagentStop · PreCompact · PostCompact · Notification · CwdChanged · ConfigChange · PermissionDenied · InstructionsLoaded · TaskCreated · TaskCompleted · FileChanged · PostToolUseFailure |
 | **Codex CLI (OpenAI)** | `.codex/hooks.json` + `.codex/config.toml` | PreToolUse · PostToolUse · SessionStart · UserPromptSubmit · Stop · SubagentStart · SubagentStop · PreCompact · PostCompact · PermissionRequest |
-| **Google Antigravity** | `.agents/hooks.json` + `.agents/mcp_config.json` + `.agents/skills/` | PreToolUse · PostToolUse · SessionStart · UserPromptSubmit · Stop · SubagentStart · SubagentStop · PreCompact · PostCompact |
+| **Google Antigravity** | `.agents/hooks.json` + `.agents/mcp_config.json` + `.agents/skills/` | PreToolUse · PostToolUse · PreInvocation · PostInvocation · Stop |
 
-hook handler는 모두 `.ai/bin/ai-hook` (Unix) / `.ai/bin/ai-hook.ps1` (Windows, `commandWindows` 필드로 자동 등록).
+> **Antigravity 주의**: Antigravity 1.0.x는 위 **5개 이벤트만** 지원한다(SessionStart/UserPromptSubmit 없음). hooks.json은 `{"<name>": {이벤트: [{matcher, hooks:[{type,command,timeout}]}]}}` 형태의 정규 스키마를 쓴다. 또한 command-hook의 stdout으로는 모델 컨텍스트를 주입할 수 없으므로, Claude/Codex가 SessionStart로 받는 메모리를 Antigravity는 **자동 로드되는 `AGENTS.md`의 관리 블록**(`ai_core/agents_md.py`)으로 동일하게 받는다.
+
+Claude / Codex hook handler는 `.ai/bin/ai-hook` (Unix) / `.ai/bin/ai-hook.ps1` (Windows, `commandWindows` 필드로 자동 등록).
 
 ---
 
@@ -55,10 +57,12 @@ hook handler는 모두 `.ai/bin/ai-hook` (Unix) / `.ai/bin/ai-hook.ps1` (Windows
 ### 메모리 (cross-session)
 
 - **append-only JSONL + SHA-256 prev_sha 해시 체인** — 모든 결정·todo·세션 노트가 변조 감지 가능한 audit chain에 들어감.
-- **`record_decision` / `record_todo` / `close_todo` / `append_session_note`** — MCP tool · CLI 모두 노출.
+- **`record_decision` / `record_todo` / `close_todo` / `append_session_note` / `append_handoff`** — MCP tool · CLI(`ai memory handoff`) 모두 노출.
 - **memory_tier (MemGPT-style)** — hot/warm/cold 분류 + page-out 신호. `cb-mem: hot=N warm=N cold=N`로 SessionStart에 자동 inject.
-- **Session resume** — SessionStart hook이 이전 세션의 최근 결정 5개, 미완 todo 5개, `session-current.md` tail 8줄을 자동 inject.
-- **Audit chain repair** (`ai audit rebuild-index`) — stash/머지로 prev_sha가 깨졌을 때 체인 재계산.
+- **Session resume** — SessionStart hook이 **handoff(goal/next_step/plan/open_questions/blockers)** 를 최상단에 inject하고, 이전 세션의 최근 결정 5개·미완 todo 5개·`session-current.md` tail 8줄을 이어 inject.
+- **Handoff (`ai memory handoff` / `append_handoff`)** — 멈추기 전 "무엇을/다음에 뭘"을 기록. `.ai/memory/handoff.json`(git-tracked)으로 머신·에이전트 간 이동.
+- **Cross-machine 연속성** — `machine_id`(불투명 opaque id, gitignored 캐시, 호스트명 PII 미포함; opt-in `AI_MACHINE_LABEL`) provenance + 다른 머신 thread 재개 힌트. `cb-behind` 배너: 이미-fetch된 upstream ref만 읽어(핫패스 네트워크 0) 원격이 앞서면 경고. opt-in 자동 동기 `ai memory sync`(코드는 안 건드리고 `.ai/memory`만 커밋→pull --rebase[클린 트리]→push; `--loop` 데몬). `memory_sync.enabled` + `AI_REMOTE_FETCH=1`로 활성.
+- **Audit chain repair** (`ai audit repair-chain`) — stash/머지로 prev_sha가 깨졌을 때 체인 재계산. (인덱스 재구성은 `ai audit rebuild-index`.)
 
 ### Hook 시스템
 
@@ -96,7 +100,7 @@ code_query, context_pack, memory_query, code_read_hashline, code_verify,
 code_graph_callers, code_graph_callees, code_graph_symbol, code_graph_hotspots,
 stream_guard_scan, sandbox_execute, sandbox_fetch, sandbox_list,
 memory_tier, obs_search, obs_health_summary, obs_usage, doctor_strict,
-record_decision, record_todo, close_todo, append_session_note,
+record_decision, record_todo, close_todo, append_session_note, append_handoff,
 recommend_skills, recommend_skills_accept, recommend_skills_reject,
 skills_list, skills_uninstall, agents_recommend, agents_accept, agents_reject,
 precall_recommend, precall_accept, precall_activate, precall_disable, precall_list,
@@ -109,7 +113,7 @@ trajectory_summarize
 ### Antigravity (Google) 통합
 
 - **workspace `.agents/mcp_config.json`** — `serverUrl` (Claude의 `url`이 아닌) 키 사용, 우리가 dialect 자동 변환.
-- **글로벌 셋업** — `scripts/setup-antigravity-global.sh`가 `~/.local/bin/code-brain-mcp` wrapper 설치 + `~/.gemini/antigravity/mcp_config.json`에 등록. wrapper는 spawning cwd에서 위로 walk-up하며 `.ai/bin/ai-mcp` 자동 발견 → multi-project 한 줄 설정.
+- **글로벌 셋업 (opt-in)** — `scripts/setup-antigravity-global.sh`가 `~/.local/bin/code-brain-mcp` wrapper 설치 + `~/.gemini/antigravity/mcp_config.json`에 등록. **유일하게 글로벌을 건드리는 부분이라 기본 설치에선 실행되지 않고, `AI_INSTALL_GLOBAL_ANTIGRAVITY=1`로 명시 opt-in해야 동작**(Antigravity 1.0.x가 MCP를 워크스페이스가 아닌 글로벌에서 읽기 때문). wrapper는 spawning cwd에서 위로 walk-up하며 `.ai/bin/ai-mcp` 자동 발견 → multi-project 한 줄 설정.
 - **agy 전용 도구 매처** — `run_command` (실행), `replace_file_content`/`multi_replace_file_content`/`view_file` (편집/탐색) 자동 인식.
 - **CommandLine 리라이트** — Antigravity의 `CommandLine` 파라미터를 우리 `updatedInput` 메커니즘으로 sandbox 명령으로 자동 교체.
 
@@ -147,7 +151,21 @@ trajectory_summarize
 
 ## 설치
 
-### 새 프로젝트에 attach
+### 한 줄 설치 (zero-config, 권장)
+
+`uv`를 자동 설치(없을 때)하고, repo-local로 설치 + 런타임 부트스트랩까지 한 번에. **글로벌/머신 설정은 건드리지 않는다.** git 미연동 프로젝트도 동작(크로스머신 동기만 비활성).
+
+```bash
+# macOS / Linux
+/path/to/code-brain/scripts/install.sh /path/to/your/project      # 인자 생략 시 현재 디렉토리
+
+# Windows (PowerShell)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\path\to\code-brain\scripts\install.ps1 C:\path\to\your\project
+```
+
+설치된 CLI 종류와 무관하게 claude/codex/agy 설정을 모두 작성한다(없는 CLI엔 무해). 크로스머신 동기는 옵트인: `.ai/config.yaml`의 `memory_sync.enabled: true` + (원격-앞섬 감지용) `AI_REMOTE_FETCH=1`.
+
+### 새 프로젝트에 attach (수동/세부 제어)
 
 ```bash
 cd /path/to/your/project
@@ -163,13 +181,13 @@ cd /path/to/your/project
 - 루트 `AGENTS.md` — 사용자 정의 파일이 있으면 절대 덮어쓰지 않음 (seed-only)
 - `.githooks/post-merge` + `post-checkout` (인덱스 자동 refresh)
 
-### 글로벌 Antigravity 셋업 (옵션)
+### 글로벌 Antigravity 셋업 (opt-in — 유일한 글로벌 쓰기)
 
 ```bash
-bash /path/to/code-brain/scripts/setup-antigravity-global.sh
+AI_INSTALL_GLOBAL_ANTIGRAVITY=1 bash /path/to/code-brain/scripts/setup-antigravity-global.sh
 ```
 
-`~/.local/bin/code-brain-mcp` wrapper + `~/.gemini/antigravity/mcp_config.json` 등록. opt-out: `AI_SKIP_GLOBAL_ANTIGRAVITY=1`.
+`~/.local/bin/code-brain-mcp` wrapper + `~/.gemini/antigravity/mcp_config.json` 등록. **기본 설치는 이 스크립트를 호출하지 않는다**(repo-local 전용). `AI_INSTALL_GLOBAL_ANTIGRAVITY=1`을 명시해야만 실행되며, 그 외엔 글로벌/머신 설정을 일절 건드리지 않는다.
 
 ### 업그레이드
 
@@ -179,7 +197,7 @@ bash scripts/install-into.sh upgrade /path/to/your/project
 
 - managed 파일만 갱신. user-owned 파일 (root `AGENTS.md` 등)은 손대지 않음.
 - root 권한으로 실행 시 `.ai/` 전체 트리 owner 자동 복원.
-- Windows: `.codex/hooks.json` + `.agents/hooks.json`에 `commandWindows` 자동 등록 (PowerShell `ai-hook.ps1` 호출).
+- Windows: `.claude/settings.json` + `.codex/hooks.json` hook에 `commandWindows` 자동 등록 (PowerShell `ai-hook.ps1` 호출). MCP 서버는 OS 감지로 `powershell -File .ai/bin/ai-mcp.ps1` 사용. (Antigravity hooks는 자체 5-이벤트 정규 스키마를 쓰며, agy의 Windows hook 패리티는 실제 Windows 환경 검증이 더 필요한 미완 항목.)
 
 ### 제거
 
@@ -245,7 +263,7 @@ make release-gate            # full release gate (package + tamper-check + repro
 
 ```
 .ai/
-├── bin/                          # ai, ai-hook (UNIX), ai-hook.ps1 (Windows), ai-mcp
+├── bin/                          # ai / ai-hook / ai-mcp (UNIX) + ai.ps1 / ai-hook.ps1 / ai-mcp.ps1 (Windows)
 ├── memory/
 │   ├── audit/2026.jsonl          # append-only audit chain (SHA-256 prev_sha)
 │   ├── audit-index.jsonl         # year-indexed audit summary

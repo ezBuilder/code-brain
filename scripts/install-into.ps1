@@ -112,7 +112,7 @@ function Merge-McpJson {
 import json, sys
 from pathlib import Path
 dst = Path(sys.argv[1])
-managed = {"mcpServers": {"code-brain": {"command": ".ai/bin/ai-mcp", "args": []}}}
+managed = {"mcpServers": {"code-brain": {"command": "powershell", "args": ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"]}}}
 existing = {}
 if dst.exists():
     try:
@@ -136,8 +136,8 @@ import sys
 from pathlib import Path
 dst = Path(sys.argv[1])
 block = ('[mcp_servers.code-brain]\n'
-         'command = ".ai/bin/ai-mcp"\n'
-         'args = []\n')
+         'command = "powershell"\n'
+         'args = ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"]\n')
 text = dst.read_text(encoding="utf-8") if dst.exists() else ""
 def strip_section(t, header):
     lines = t.splitlines(); out = []; i = 0

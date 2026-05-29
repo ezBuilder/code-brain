@@ -28,6 +28,21 @@ sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 # ---------- pure dialect conversion ----------
 
 
+def test_code_brain_stdio_entry_is_os_aware() -> None:
+    from ai_core.mcp_config import code_brain_stdio_entry
+
+    unix = code_brain_stdio_entry(windows=False)
+    assert unix["command"] == ".ai/bin/ai-mcp"
+    win = code_brain_stdio_entry(windows=True)
+    # On Windows the bash shim is not executable → launch the .ps1 via powershell.
+    assert win["command"] == "powershell"
+    assert ".ai/bin/ai-mcp.ps1" in win["args"]
+    # default detects the host OS (this test host is unix → bash shim)
+    import os as _os
+    default = code_brain_stdio_entry()
+    assert default["command"] == ("powershell" if _os.name == "nt" else ".ai/bin/ai-mcp")
+
+
 def test_to_antigravity_rewrites_url_to_server_url() -> None:
     from ai_core.mcp_config import to_antigravity
 
@@ -193,14 +208,24 @@ def test_install_into_writes_antigravity_hooks(install_into_target: Path) -> Non
     hooks = install_into_target / ".agents" / "hooks.json"
     assert hooks.exists(), "expected .agents/hooks.json"
     payload = json.loads(hooks.read_text(encoding="utf-8"))
-    assert "PreToolUse" in payload["hooks"]
-    assert "SessionStart" in payload["hooks"]
-    # Every managed entry must point at .ai/bin/ai-hook
-    for event_name, entries in payload["hooks"].items():
-        assert isinstance(entries, list), event_name
+    # Antigravity 1.0.x schema: top-level {name: spec} map; a spec has one field
+    # per native event. No legacy Claude wrapper ("_note"/"hooks") — Antigravity
+    # cannot parse that. No SessionStart/UserPromptSubmit (Antigravity has neither).
+    assert "_note" not in payload and "hooks" not in payload
+    spec = payload["code-brain"]
+    assert set(spec) == {"PreToolUse", "PostToolUse", "PreInvocation", "PostInvocation", "Stop"}
+    assert "SessionStart" not in spec and "UserPromptSubmit" not in spec
+    # PreInvocation/PostInvocation unused (null); the side-effect events carry handlers.
+    assert spec["PreInvocation"] is None and spec["PostInvocation"] is None
+    for event_name in ("PreToolUse", "PostToolUse", "Stop"):
+        entries = spec[event_name]
+        assert isinstance(entries, list) and entries, event_name
         for entry in entries:
-            for handler in entry.get("hooks", []):
+            assert "matcher" in entry, event_name
+            for handler in entry["hooks"]:
+                assert handler["type"] == "command"
                 assert ".ai/bin/ai-hook" in handler["command"], event_name
+                assert event_name in handler["command"], event_name
 
 
 def test_install_into_publishes_root_agents_md(install_into_target: Path) -> None:

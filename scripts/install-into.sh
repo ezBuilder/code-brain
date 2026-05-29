@@ -511,6 +511,22 @@ managed = {
         {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUseFailure"}]}
     ],
 }
+# Windows parity: give every Claude hook a commandWindows that runs the .ps1 shim via
+# powershell (Claude Code sets CLAUDE_PROJECT_DIR on Windows too; fall back to cwd). The
+# Unix `command` stays the default; hosts pick commandWindows on Windows. Derived from
+# each command's event (last token) so the 19-event dict above stays the single source.
+def _claude_cmd_win(unix_cmd):
+    event = unix_cmd.rsplit(" ", 1)[-1]
+    return (
+        'powershell -NoProfile -Command "$ROOT = $env:CLAUDE_PROJECT_DIR; '
+        'if (-not $ROOT) { $ROOT = (Get-Location).Path }; '
+        '& \\"$ROOT/.ai/bin/ai-hook.ps1\\" ' + event + '"'
+    )
+for _entries in managed.values():
+    for _entry in _entries:
+        for _handler in _entry.get("hooks", []):
+            if isinstance(_handler, dict) and "command" in _handler and "commandWindows" not in _handler:
+                _handler["commandWindows"] = _claude_cmd_win(_handler["command"])
 if dst.exists():
     try:
         payload = json.loads(dst.read_text(encoding="utf-8"))
@@ -658,73 +674,62 @@ import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
-# Antigravity hooks accept the same matcher+command shape as Claude/Codex. The
-# command string runs in a POSIX shell on macOS/Linux; Windows hosts should
-# install the .ps1 variant separately (TODO when Antigravity adds Windows).
+# Antigravity 1.0.x hooks.json schema (verified against the agy hooks UI, which
+# writes ~/.gemini/antigravity-cli/hooks.json): the file is a top-level map of
+# {"<hook-name>": JSONHookSpec}. A JSONHookSpec has one field per supported
+# lifecycle EVENT, and Antigravity supports exactly five:
+#   PreToolUse, PostToolUse, PreInvocation, PostInvocation, Stop
+# There is NO SessionStart / UserPromptSubmit — those Claude events are unknown to
+# Antigravity (they parse as a named hook with zero handlers). Each event maps to
+# null or a list of matcher-groups: [{"matcher": <regex>, "hooks": [{"type":
+# "command", "command": <shell>, "timeout": <int>}]}]. The legacy Claude-shaped
+# wrapper ({"_note":..., "hooks": {...}}) is unparseable by Antigravity
+# ("cannot unmarshal string into jsonhook.JSONHookSpec") and is dropped here.
+#
+# Antigravity does not pass CLAUDE_PROJECT_DIR, so resolve the repo root via git.
+# Memory injection for agy is delivered via the managed AGENTS.md block
+# (ai_core.agents_md), NOT these hooks: Antigravity command-hook stdout cannot
+# inject model context. These hooks cover the side effects that do work —
+# command routing (PreToolUse), tool-result recording (PostToolUse), and
+# session-end recording + AGENTS.md memory refresh (Stop).
 def cmd(event: str) -> str:
     return (
         'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
         f'"$ROOT/.ai/bin/ai-hook" {event}'
     )
 
-def cmd_win(event: str) -> str:
-    return (
-        "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); "
-        "if (-not $ROOT) { $ROOT = (Get-Location).Path }; "
-        f"& \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" {event}\""
-    )
+def matchers(event: str, timeout: int):
+    return [{"matcher": "", "hooks": [{"type": "command", "command": cmd(event), "timeout": timeout}]}]
 
-def H(event, matcher=None, msg=None):
-    handler = {"type": "command", "command": cmd(event), "commandWindows": cmd_win(event)}
-    if msg:
-        handler["statusMessage"] = msg
-    entry = {"hooks": [handler]}
-    if matcher is not None:
-        entry["matcher"] = matcher
-    return [entry]
-
-managed = {
-    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|run_command", msg="Checking Code Brain command routing"),
-    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|run_command|replace_file_content|multi_replace_file_content|write_to_file|view_file|grep_search|list_dir", msg="Recording Code Brain tool result"),
-    "SessionStart": H("SessionStart", msg="Loading Code Brain session context"),
-    "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
-    "Stop": H("Stop", msg="Recording Code Brain stop event"),
-    "SubagentStart": H("SubagentStart", msg="Loading Code Brain subagent context"),
-    "SubagentStop": H("SubagentStop", msg="Recording Code Brain subagent stop"),
-    "PreCompact": H("PreCompact", msg="Saving Code Brain compact snapshot"),
-    "PostCompact": H("PostCompact", msg="Recording Code Brain compact completion"),
+code_brain_spec = {
+    "PreToolUse": matchers("PreToolUse", 15),
+    "PostToolUse": matchers("PostToolUse", 15),
+    "PreInvocation": None,
+    "PostInvocation": None,
+    "Stop": matchers("Stop", 20),
 }
+
 if dst.exists():
     try:
         payload = json.loads(dst.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        raise SystemExit(f"install-into failed: existing {dst} is not valid JSON")
+        payload = {}
     if not isinstance(payload, dict):
-        raise SystemExit(f"install-into failed: existing {dst} is not a JSON object")
+        payload = {}
 else:
-    payload = {"_note": "Antigravity hooks. Schema follows Claude Code matcher+command convention."}
-hooks = payload.setdefault("hooks", {})
-if not isinstance(hooks, dict):
-    raise SystemExit(f"install-into failed: existing {dst}.hooks must be a JSON object")
+    payload = {}
 
-def _has_code_brain_command(entry):
-    if isinstance(entry, dict):
-        for handler in entry.get("hooks", []) or []:
-            if isinstance(handler, dict):
-                c = handler.get("command")
-                if isinstance(c, str) and ".ai/bin/ai-hook" in c:
-                    return True
-    return False
+# Preserve user-authored named hooks (dict values); drop our own entry and the
+# legacy "_note"/"hooks" wrapper keys, then re-add the Code Brain entry.
+cleaned = {
+    name: spec
+    for name, spec in payload.items()
+    if name not in ("code-brain", "_note", "hooks") and isinstance(spec, dict)
+}
+cleaned["code-brain"] = code_brain_spec
 
-for name, managed_entries in managed.items():
-    existing = hooks.get(name)
-    if isinstance(existing, list):
-        kept = [e for e in existing if not _has_code_brain_command(e)]
-    else:
-        kept = []
-    hooks[name] = kept + managed_entries
 dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+dst.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
 }
 

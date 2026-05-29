@@ -14,6 +14,8 @@ remote_memory:
   inject_on_session_start: false
   default_scope: project
   cache_path: .ai/cache/remote-memory/summary.json
+memory_sync:
+  enabled: false
 cache:
   sqlite_path: .ai/cache/code.sqlite
 search:

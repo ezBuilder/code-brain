@@ -206,6 +206,25 @@ def build_parser() -> argparse.ArgumentParser:
     memory_session_append = memory_session_sub.add_parser("append")
     memory_session_append.add_argument("--text", required=True)
     memory_session_append.add_argument("--json", action="store_true", dest="command_json")
+    memory_handoff = memory_sub.add_parser(
+        "handoff", help="set the resume handoff (goal/plan/next-step) that travels Mac↔VPS"
+    )
+    memory_handoff.add_argument("--goal")
+    memory_handoff.add_argument("--next-step", dest="next_step")
+    memory_handoff.add_argument("--plan", action="append", default=None, help="repeatable")
+    memory_handoff.add_argument("--open-question", action="append", default=None, dest="open_questions", help="repeatable")
+    memory_handoff.add_argument("--blocker", action="append", default=None, dest="blockers", help="repeatable")
+    memory_handoff.add_argument("--agent", default="operator")
+    memory_handoff.add_argument("--clear", action="store_true", help="wipe the current handoff")
+    memory_handoff.add_argument("--json", action="store_true", dest="command_json")
+    memory_sync = memory_sub.add_parser(
+        "sync",
+        help="opt-in: commit .ai/memory only + pull --rebase (clean tree) + push — bounce work Mac↔VPS. NEVER on the hot path.",
+    )
+    memory_sync.add_argument("--agent", default="operator")
+    memory_sync.add_argument("--no-push", action="store_true", help="commit/pull only; do not push")
+    memory_sync.add_argument("--loop", type=int, default=0, help="daemon mode: sync every N seconds (>=30); run under systemd/launchd")
+    memory_sync.add_argument("--json", action="store_true", dest="command_json")
     memory_tier = memory_sub.add_parser("tier", help="MemGPT-style hot/warm/cold classification (T30)")
     memory_tier.add_argument("--json", action="store_true", dest="command_json")
     memory_pressure = memory_sub.add_parser("pressure", help="hot-tier pressure (page-out signal)")
@@ -747,6 +766,30 @@ def main(argv: list[str] | None = None) -> int:
             reject_ci_write("memory")
             from .memory import append_session_note
             payload = append_session_note(root, text=args.text)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "handoff":
+            reject_ci_write("memory")
+            from .session_resume import write_handoff
+            payload = write_handoff(
+                root,
+                goal=args.goal,
+                next_step=args.next_step,
+                plan=args.plan,
+                open_questions=args.open_questions,
+                blockers=args.blockers,
+                agent=args.agent,
+                clear=args.clear,
+            )
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "sync":
+            reject_ci_write("memory")
+            from .memory_sync import sync_loop, sync_once
+            if args.loop and args.loop > 0:
+                sync_loop(root, agent=args.agent, interval=args.loop)  # blocks until killed
+                return OK
+            payload = sync_once(root, agent=args.agent, push=not args.no_push)
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "memory" and args.memory_command == "tier":

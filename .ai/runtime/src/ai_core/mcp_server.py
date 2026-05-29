@@ -270,6 +270,27 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "append_handoff",
+        "description": (
+            "Set/update the resume HANDOFF (goal/plan/next_step/open_questions/blockers) at a "
+            "stopping point. Git-tracked so it travels across machines (Mac↔VPS); the next session "
+            "— any agent, either machine — leads its SessionStart context with it. Partial update: "
+            "only provided fields change. Write-class. Call this before pausing work."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "What we are ultimately trying to do"},
+                "next_step": {"type": "string", "description": "The very next action to take on resume"},
+                "plan": {"type": "array", "items": {"type": "string"}},
+                "open_questions": {"type": "array", "items": {"type": "string"}},
+                "blockers": {"type": "array", "items": {"type": "string"}},
+                "agent": {"type": "string", "default": "agent"},
+                "clear": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
         "name": "recommend_skills",
         "description": "Propose slash-command skills from cross-session memory. May persist pending catalog entries; does not install.",
         "inputSchema": {
@@ -647,6 +668,22 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         if not isinstance(text, str) or not text.strip():
             raise ValueError("append_session_note requires non-empty text")
         return append_session_note(root, text=text)
+    if name == "append_handoff":
+        from .session_resume import write_handoff
+
+        def _as_list(v: Any) -> list[str] | None:
+            return [str(x) for x in v] if isinstance(v, list) else None
+
+        return write_handoff(
+            root,
+            goal=(args.get("goal") if isinstance(args.get("goal"), str) else None),
+            next_step=(args.get("next_step") if isinstance(args.get("next_step"), str) else None),
+            plan=_as_list(args.get("plan")),
+            open_questions=_as_list(args.get("open_questions")),
+            blockers=_as_list(args.get("blockers")),
+            agent=str(args.get("agent") or "agent"),
+            clear=bool(args.get("clear")),
+        )
     if name == "recommend_skills":
         from .recommend import recommend as rec_run
         return rec_run(

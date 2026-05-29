@@ -165,4 +165,60 @@ def staleness_banner(root: Path) -> str:
     return "".join(parts)
 
 
-__all__ = ["memory_freshness", "staleness_banner", "DIRTY_STALE_THRESHOLD"]
+def _upstream_ref(root: Path) -> str:
+    """The configured upstream for the current branch (e.g. ``origin/develop``), or
+    ``""`` if none is set. Pure local ref read."""
+    ok, out = _git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    return out.strip() if ok else ""
+
+
+def remote_sync_state(root: Path) -> dict[str, Any]:
+    """How local HEAD compares to the ALREADY-FETCHED upstream ref.
+
+    Pure local ref reads (rev-parse / rev-list against an existing ref) — it does
+    NOT run ``git fetch``, so it is safe on the hook hot path and offline. The fetch
+    that refreshes ``origin/<branch>`` runs only in the detached sleep-time idle job.
+    Returns behind/ahead commit counts (behind = remote has commits we lack = another
+    machine moved ahead; ahead = we have unpushed commits).
+    """
+    root = Path(root)
+    upstream = _upstream_ref(root)
+    if not upstream:
+        return {"ok": True, "git": False, "upstream": "", "behind": 0, "ahead": 0}
+    ok, out = _git(root, "rev-list", "--left-right", "--count", f"HEAD...{upstream}")
+    ahead = behind = 0
+    if ok:
+        parts = out.split()
+        if len(parts) == 2:
+            try:
+                ahead, behind = int(parts[0]), int(parts[1])
+            except ValueError:
+                ahead = behind = 0
+    return {"ok": True, "git": True, "upstream": upstream, "behind": behind, "ahead": ahead}
+
+
+def remote_sync_banner(root: Path) -> str:
+    """One-line banner when a REMOTE machine is ahead of local (the silent-divergence
+    case the local-only cb-stale check cannot see). ``""`` when in sync / no upstream."""
+    st = remote_sync_state(root)
+    behind = int(st.get("behind") or 0)
+    ahead = int(st.get("ahead") or 0)
+    if behind <= 0:
+        return ""
+    up = st.get("upstream") or "origin"
+    msg = (
+        f"cb-behind: 원격({up})이 로컬보다 {behind}커밋 앞서 있다 — 다른 머신(예: VPS↔Mac)이 진행한 작업이 "
+        "아직 로컬에 반영되지 않았다. 계속하기 전에 `git pull --rebase`로 당겨 동기화하라."
+    )
+    if ahead > 0:
+        msg += f" (로컬에도 미푸시 {ahead}커밋 있음 → 분기 상태, pull 후 push 필요.)"
+    return msg
+
+
+__all__ = [
+    "memory_freshness",
+    "staleness_banner",
+    "remote_sync_state",
+    "remote_sync_banner",
+    "DIRTY_STALE_THRESHOLD",
+]

@@ -164,3 +164,51 @@ def test_auto_milestone_respects_optout(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AI_AUTO_MILESTONE_ON_STALE", "0")
     assert _auto_milestone_on_stale(tmp_path) is False
     assert "[auto:" not in _session_note_text(tmp_path)
+
+
+# ---- P3: remote-ahead (cb-behind) detection across machines ----
+
+def test_remote_sync_detects_remote_ahead(tmp_path: Path) -> None:
+    """Simulate the VPS pushing a commit the Mac has not pulled: after a fetch the
+    local sees origin ahead, which remote_sync must report as behind=1."""
+    from ai_core.memory_staleness import remote_sync_banner, remote_sync_state
+
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git(remote, "init", "--bare", "-q")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _init_repo(work)
+    _git(work, "remote", "add", "origin", str(remote))
+    _commit(work, "a.txt", "c1")
+    _git(work, "branch", "-M", "develop")
+    _git(work, "push", "-q", "-u", "origin", "develop")
+
+    # second clone = "the VPS" pushes a new commit
+    other = tmp_path / "other"
+    _git(tmp_path, "clone", "-q", str(remote), str(other))
+    _git(other, "config", "user.email", "t@t.test")
+    _git(other, "config", "user.name", "t")
+    _git(other, "checkout", "-q", "develop")  # bare HEAD may not point at develop
+    _commit(other, "b.txt", "c2 from vps")
+    _git(other, "push", "-q", "origin", "develop")
+
+    # the Mac fetches (sleep-time job) but has NOT pulled
+    _git(work, "fetch", "-q", "origin")
+    st = remote_sync_state(work)
+    assert st["behind"] == 1 and st["ahead"] == 0, st
+    banner = remote_sync_banner(work)
+    assert "cb-behind" in banner and "1커밋" in banner
+
+
+def test_remote_sync_silent_without_upstream(tmp_path: Path) -> None:
+    from ai_core.memory_staleness import remote_sync_banner, remote_sync_state
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _init_repo(repo)
+    _commit(repo, "a.txt", "c1")
+    # no upstream configured → no banner, behind=0
+    assert remote_sync_state(repo)["behind"] == 0
+    assert remote_sync_banner(repo) == ""

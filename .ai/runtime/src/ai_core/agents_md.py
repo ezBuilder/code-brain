@@ -1,28 +1,28 @@
-"""Render Code Brain's cross-session memory into a managed ``AGENTS.md`` section.
+"""Render Code Brain's cross-session memory into a managed block in ``AGENTS.md``.
 
 Why this exists
 ---------------
-Claude Code and Codex CLI receive Code Brain's memory via the ``SessionStart``
-hook (``additionalContext``). Google Antigravity (``agy``) cannot use that path:
+Claude Code and Codex CLI receive Code Brain's memory via the ``SessionStart`` hook
+(``additionalContext``). Google Antigravity (``agy``) cannot use that path:
 
-  * Antigravity has **no** ``SessionStart`` / ``UserPromptSubmit`` hook event — its
-    only lifecycle events are ``PreToolUse``/``PostToolUse``/``PreInvocation``/
-    ``PostInvocation``/``Stop``.
-  * Antigravity **command** (shell) hooks run but cannot inject model context via
-    stdout — context injection (``HookInjectedStep``) is wired only for its SDK /
-    declarative hook callers, not ``jsonhook`` command hooks (verified empirically:
-    the hook executes but injected steps never reach the model).
+  * Antigravity has **no** ``SessionStart`` / ``UserPromptSubmit`` hook event — its only
+    lifecycle events are ``PreToolUse``/``PostToolUse``/``PreInvocation``/``PostInvocation``/
+    ``Stop``.
+  * Antigravity **command** (shell) hooks run but cannot inject model context via stdout —
+    injection (``HookInjectedStep``) is wired only for its SDK / declarative callers, not
+    ``jsonhook`` command hooks (verified empirically).
 
-Antigravity *does* auto-load ``AGENTS.md`` at session start (verified: agy quoted
-this block, including the latest decision, when asked "진행상황?"). So we give agy
-the same memory by maintaining a managed block in ``AGENTS.md``, refreshed on
-``Stop``/``SessionEnd`` for every agent. The content is produced by the same
-``build_context("SessionStart", ...)`` used for Claude/Codex, so all three agents
-start from the same snapshot.
+Antigravity *does* auto-load ``AGENTS.md`` at session start and surfaces its content with no
+tool call (verified: agy quoted this block, incl. the latest decision). A forwarder ("read
+.ai/memory/X") is NOT reliable — agy would have to issue a tool call to read it, and that can
+be blocked by Code Brain's own PreToolUse routing (e.g. a grep reroute). So the block must be
+INLINE in the auto-loaded file. To avoid git churn from rewriting a tracked file every turn,
+``AGENTS.md`` is git-IGNORED (install seeds it + adds it to the target .gitignore); durable,
+user-authored instructions live in the tracked ``.ai/AGENTS.md`` instead. The block content is
+produced by the same ``build_context("SessionStart", ...)`` Claude/Codex get.
 
-Safety: never raise into the hook hot path (callers wrap in try/except), write
-only when the rendered block actually changed, and stay opt-out via
-``AI_AGENTS_MD_MEMORY=0``.
+Safety: never raise into the hook hot path (callers wrap in try/except), write only when the
+rendered block changed, opt-out via ``AI_AGENTS_MD_MEMORY=0``.
 """
 from __future__ import annotations
 
@@ -44,11 +44,10 @@ def enabled() -> bool:
 
 
 def render_block(root: Path) -> str:
-    """Build the memory body — same content Claude/Codex get at SessionStart.
+    """Build the memory body — the same content Claude/Codex get at SessionStart.
 
-    Recommendation sections are suppressed (as they are for Claude/Codex's
-    SessionStart command) so the rules file stays focused on durable memory.
-    The transient ``Code Brain fast_path: ...`` header line is dropped.
+    Recommendation sections are suppressed (as for Claude/Codex's SessionStart command).
+    The transient ``Code Brain fast_path:`` header line is dropped.
     """
     saved = {k: os.environ.get(k) for k in _SUPPRESS_ENV}
     for k in _SUPPRESS_ENV:
@@ -84,11 +83,8 @@ def compose(existing: str, block: str) -> str:
 
 
 def refresh(root: Path, *, path: str = "AGENTS.md") -> bool:
-    """Refresh the managed block in ``<root>/AGENTS.md``. Returns True if written.
-
-    No-op (returns False) when disabled, when there is no memory to render, or
-    when the file already matches — so it does not churn AGENTS.md every turn.
-    """
+    """Refresh the managed block in ``<root>/AGENTS.md`` (git-ignored). Returns True if
+    written. No-op (False) when disabled, when there is no memory, or when unchanged."""
     if not enabled():
         return False
     block = render_block(root)

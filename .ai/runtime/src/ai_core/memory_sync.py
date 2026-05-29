@@ -3,8 +3,9 @@
 Lets work bounce between machines (Mac↔VPS) without manual ``git push``/``pull``.
 It is deliberately conservative and NEVER touches the user's code:
 
-  * Commits ONLY the memory paths (``.ai/memory/`` + the managed ``AGENTS.md``) using a
-    pathspec commit, so a staged code change in the user's index is left untouched.
+  * Commits ONLY the memory paths (``.ai/memory/``) using a pathspec commit, so a staged
+    code change in the user's index is left untouched. ``AGENTS.md`` is deliberately NOT
+    synced — it is a git-ignored, per-machine mirror regenerated from ``.ai/memory``.
   * Fetches, then integrates remote memory by rebasing the local memory commit onto the
     upstream — but ONLY when the rest of the working tree is clean. If other (code)
     changes are in flight, the rebase is skipped (the cb-behind banner already nags to
@@ -28,7 +29,10 @@ from .session_resume import machine_id
 
 _GIT_TIMEOUT = 30
 # The ONLY paths this sync is allowed to commit. Code is never staged/committed here.
-MEMORY_PATHS = (".ai/memory", "AGENTS.md")
+# AGENTS.md is intentionally excluded: it is git-ignored (a per-machine memory mirror
+# regenerated from .ai/memory). Listing it made `git add` abort on the ignored path,
+# which left .ai/memory unstaged so the sync silently committed nothing.
+MEMORY_PATHS = (".ai/memory",)
 _HEARTBEAT_DIR = (".ai", "memory", "sync")
 
 

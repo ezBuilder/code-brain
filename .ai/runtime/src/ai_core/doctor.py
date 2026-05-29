@@ -77,10 +77,24 @@ def check_antigravity_artifacts(root: Path) -> Check:
         try:
             import json as _json
             payload = _json.loads(hooks.read_text(encoding="utf-8"))
-            hook_block = payload.get("hooks", {}) if isinstance(payload, dict) else {}
-            for required in ("PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit"):
-                if required not in hook_block:
-                    issues.append(f"hooks.json missing event {required}")
+            # Antigravity 1.0.x schema: top-level {name: spec}; spec carries the
+            # native events. NOT the Claude {"hooks": {...}} wrapper (Antigravity
+            # cannot parse that — it errors "string into jsonhook.JSONHookSpec").
+            # Antigravity has no SessionStart/UserPromptSubmit; injection for agy is
+            # delivered via the managed AGENTS.md block, not these hooks.
+            if not isinstance(payload, dict):
+                issues.append("hooks.json is not a JSON object")
+            elif "hooks" in payload or "_note" in payload:
+                issues.append("hooks.json uses the legacy Claude wrapper; run install-into to regenerate")
+            else:
+                spec = payload.get("code-brain")
+                if not isinstance(spec, dict):
+                    issues.append("hooks.json missing code-brain entry")
+                else:
+                    for required in ("PreToolUse", "PostToolUse", "Stop"):
+                        ev = spec.get(required)
+                        if not isinstance(ev, list) or not ev:
+                            issues.append(f"hooks.json code-brain missing event {required}")
         except Exception as exc:
             issues.append(f"hooks.json unreadable: {exc}")
     if issues:

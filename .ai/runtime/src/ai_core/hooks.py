@@ -202,6 +202,107 @@ def _spawn_background_rebuild(root: Path) -> None:
         pass
 
 
+def _spawn_agents_md_refresh(root: Path) -> None:
+    """Refresh the managed AGENTS.md memory block in a DETACHED process.
+
+    Antigravity fires its ``Stop`` hook but does not wait for / may kill the hook
+    process before a synchronous refresh (which calls build_context, ~1s) finishes
+    — so the block would never update from an agy turn. Running the refresh
+    detached (own session, like _spawn_background_rebuild) lets it complete even
+    if the host kills the parent hook. The refresh itself is write-on-change, so
+    repeated spawns don't churn AGENTS.md. Never raises into the hook hot path.
+    """
+    import os
+    import subprocess
+    import sys
+
+    from .portable import detached_popen_kwargs
+
+    if _env_disabled("AI_AGENTS_MD_MEMORY", default="1"):
+        return
+    # Cooldown: PostToolUse can fire many times per turn. Spawn at most once per
+    # window so we don't launch a build_context process on every tool call.
+    try:
+        cooldown = float(os.environ.get("AI_AGENTS_MD_REFRESH_COOLDOWN", "15"))
+    except (TypeError, ValueError):
+        cooldown = 15.0
+    lock = root / ".ai" / "cache" / "agents_md_refresh.lock"
+    try:
+        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
+            return
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(time.time()), encoding="utf-8")
+    except Exception:
+        pass
+    src = str(root / ".ai" / "runtime" / "src")
+    code = (
+        "import sys;from pathlib import Path;"
+        f"sys.path.insert(0,{src!r});"
+        "from ai_core.agents_md import refresh;refresh(Path(sys.argv[1]))"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    try:
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [sys.executable, "-c", code, str(root)],
+                stdout=devnull,
+                stderr=devnull,
+                stdin=subprocess.DEVNULL,
+                cwd=str(root),
+                env=env,
+                **detached_popen_kwargs(),
+            )
+    except Exception:
+        pass
+
+
+def _spawn_memory_sync(root: Path, agent: str) -> None:
+    """Spawn the opt-in cross-machine memory sync DETACHED (off the hook hot path). The
+    sync does git fetch/push; this only launches it. No-op unless memory_sync.enabled, and
+    a cooldown bounds how often it runs so rapid turn-end Stops don't hammer the remote."""
+    import os
+    import subprocess
+
+    from .portable import detached_popen_kwargs
+
+    try:
+        from .memory_sync import sync_enabled
+
+        if not sync_enabled(root):
+            return
+    except Exception:
+        return
+    try:
+        cooldown = float(os.environ.get("AI_MEMORY_SYNC_COOLDOWN", "120"))
+    except (TypeError, ValueError):
+        cooldown = 120.0
+    lock = root / ".ai" / "cache" / "memory_sync.lock"
+    try:
+        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
+            return
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+    ai_bin = root / ".ai" / "bin" / "ai"
+    if not ai_bin.exists():
+        return
+    try:
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [str(ai_bin), "memory", "sync", "--agent", agent, "--json"],
+                stdout=devnull,
+                stderr=devnull,
+                stdin=subprocess.DEVNULL,
+                cwd=str(root),
+                **detached_popen_kwargs(),
+            )
+    except Exception:
+        pass
+
+
 def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
     """Spawn background idle-time jobs (memory page-out, audit fold, index refresh).
 
@@ -332,6 +433,30 @@ def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
             spawned.append(f"sandbox_prune(pid={proc.pid})")
     except Exception:
         pass
+
+    # Job 4 (P3): refresh origin refs so SessionStart's cb-behind banner can detect a
+    # remote machine being ahead. Network — so OPT-IN only (AI_REMOTE_FETCH=1), keeping
+    # Code Brain's offline-by-default ethos. Detached + off the hook hot path; failures
+    # (offline, no remote, auth) are swallowed. SessionStart never fetches; it only reads
+    # the ref this job updated.
+    if _env_enabled("AI_REMOTE_FETCH"):
+        try:
+            from .process_janitor import register_child
+
+            cmd = ["git", "-C", str(root), "fetch", "--quiet", "--no-tags"]
+            with open(os.devnull, "wb") as devnull:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=devnull,
+                    stderr=devnull,
+                    stdin=subprocess.DEVNULL,
+                    cwd=str(root),
+                    **detached_popen_kwargs(),
+                )
+            register_child(root, pid=proc.pid, kind="sleep_time_git_fetch", command=cmd)
+            spawned.append(f"git_fetch(pid={proc.pid})")
+        except Exception:
+            pass
 
     return {"ok": True, "spawned": spawned, "skipped": False, "reason": None}
 
@@ -1428,6 +1553,14 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         append_event(root, event)
         mode = "local-append"
         persisted = True
+        # Spawn the AGENTS.md memory refresh EARLY and detached. Stop/SessionEnd are
+        # the natural triggers for Claude/Codex, but Antigravity kills its Stop hook
+        # before the work runs (its Stop never reaches append_event) — so we also fire
+        # on PostToolUse, which Antigravity DOES complete. A cooldown in the helper
+        # bounds frequency; the refresh is write-on-change and detached so it finishes
+        # even if the host kills the parent hook.
+        if effective_hook in {"Stop", "SessionEnd", "PostToolUse"}:
+            _spawn_agents_md_refresh(root)
         if effective_hook in AUTO_REBUILD_HOOKS:
             _spawn_background_rebuild(root)
             try:
@@ -1479,6 +1612,10 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                 _spawn_sleep_time_jobs(root)
             except Exception:
                 pass
+            # P4: opt-in cross-machine memory auto-sync. Detached + off the hot path; the
+            # sync itself does git fetch/push but this hook only spawns it. Gated by
+            # memory_sync.enabled and a cooldown so rapid turn-end Stops don't hammer git.
+            _spawn_memory_sync(root, normalize_agent(payload))
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     target_ms = _target_ms_for(effective_hook)
     if persisted and elapsed_ms > target_ms:
@@ -1910,6 +2047,37 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             prior = None
         if prior:
             lines = [f"Prior session resume (session_id={prior.get('session_id')}, written_at={prior.get('written_at')}):"]
+            # P1: lead with the intent-carrying handoff so a resuming session (esp. on
+            # the other machine) sees "what we were doing / what to do next" first.
+            handoff = prior.get("handoff") if isinstance(prior.get("handoff"), dict) else None
+            if handoff:
+                if handoff.get("goal"):
+                    lines.append(f"  goal: {str(handoff['goal'])[:200]}")
+                if handoff.get("next_step"):
+                    lines.append(f"  next step: {str(handoff['next_step'])[:200]}")
+                for step in (handoff.get("plan") or [])[:6]:
+                    lines.append(f"  plan: {str(step)[:160]}")
+                for q in (handoff.get("open_questions") or [])[:4]:
+                    lines.append(f"  open question: {str(q)[:160]}")
+                for b in (handoff.get("blockers") or [])[:4]:
+                    lines.append(f"  blocker: {str(b)[:160]}")
+            # P2: cross-machine pointer — if the prior thread ran on another machine,
+            # its full transcript stays there (all 3 agents are local-only); tell the
+            # resuming agent where it is and how to reopen it.
+            try:
+                from .session_resume import machine_id as _machine_id
+                here = _machine_id(root)
+            except Exception:
+                here = ""
+            prior_machine = str(prior.get("machine_id") or "")
+            if prior_machine and here and prior_machine != here:
+                hint = str(prior.get("resume_hint") or "").strip()
+                hint_txt = f" Reopen its full transcript there with `{hint}`." if hint else ""
+                lines.append(
+                    f"  cross-machine: prior thread ran on '{prior_machine}' via {prior.get('agent') or 'unknown'} "
+                    f"(you are on '{here}'). Its full conversation stays on that machine.{hint_txt} "
+                    f"Use memory_query/context_pack here for detail."
+                )
             for entry in (prior.get("decisions_tail") or [])[-3:]:
                 text = str(entry.get("decision") or entry.get("summary") or entry.get("text") or "")[:160]
                 if text:
@@ -2008,12 +2176,32 @@ def _memory_staleness_context(root: Path, hook_name: str) -> str:
         return ""
 
     def compute() -> str:
+        banners: list[str] = []
         try:
-            from .memory_staleness import staleness_banner
+            from .memory_staleness import remote_sync_banner, staleness_banner
 
-            return staleness_banner(root)
+            local = staleness_banner(root)
+            if local:
+                banners.append(local)
+            # P3: remote-ahead (cb-behind) — another machine pushed work we lack. Reads
+            # the already-fetched upstream ref only (no fetch here); the fetch runs in
+            # the detached sleep-time job. Closes the silent cross-machine divergence gap.
+            behind = remote_sync_banner(root)
+            if behind:
+                banners.append(behind)
         except Exception:
             return ""
+        # P4: peer heartbeat summary — "VPS synced 3m ago" — when memory auto-sync runs
+        # on another machine. Local file reads only; absent for single-machine users.
+        try:
+            from .memory_sync import peer_sync_summary
+
+            peers = peer_sync_summary(root)
+            if peers:
+                banners.append(peers)
+        except Exception:
+            pass
+        return "\n\n".join(banners)
 
     deps = [
         root / ".ai" / "memory" / "session-current.md",
@@ -2025,6 +2213,11 @@ def _memory_staleness_context(root: Path, hook_name: str) -> str:
         # HEAD movement (commit/checkout/reset), so its mtime is the reliable
         # signal — and it is a cheap stat, no extra git subprocess on the hot path.
         root / ".git" / "logs" / "HEAD",
+        # FETCH_HEAD mtime changes whenever the sleep-time job runs `git fetch`, so the
+        # cb-behind banner refreshes after new remote commits are fetched.
+        root / ".git" / "FETCH_HEAD",
+        # peer heartbeats change when another machine's memory sync runs.
+        root / ".ai" / "memory" / "sync",
     ]
     return _cached_hook_summary(
         root, cache_name="memory_staleness", deps=deps, compute=compute

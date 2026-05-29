@@ -39,6 +39,10 @@ from .redact import redact_value
 CATALOG_PATH_PARTS = (".ai", "skills", "catalog.jsonl")
 MAX_CANDIDATES_DEFAULT = 5
 MIN_SIGNAL_DEFAULT = 3
+# A "<tool>-runbook" is only worth suggesting when the tool is used across several
+# distinct subcommands (a real domain), not run the same way over and over. Below
+# this many distinct subcommands, a runbook is a low-value stub (e.g. uv→`uv run`).
+MIN_DOMAIN_DIVERSITY = 3
 MAX_BODY_BYTES = 8192
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 DANGER_PATTERNS = (
@@ -67,6 +71,9 @@ class Signals:
     global_claude_titles: list[str] = field(default_factory=list)
     global_codex_threads: list[dict[str, Any]] = field(default_factory=list)
     bash_head_counts: Counter[str] = field(default_factory=Counter)
+    # head -> number of distinct subcommands seen (usage diversity). Empty when
+    # unknown (old cache / direct test setup) → diversity gating fails open.
+    bash_head_diversity: dict[str, int] = field(default_factory=dict)
     procedural_hints: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -172,14 +179,21 @@ def gather_signals(
         sig.global_claude_titles = _gather_claude_global(h, root)
         sig.global_codex_threads = _gather_codex_global(h, root)
         sig.bash_head_counts = _gather_bash_heads(root)
+        sig.bash_head_diversity = _gather_bash_head_diversity(root)
     return sig
 
 
+# Tools eligible for a "<tool>-runbook" slash-command suggestion. Restricted to
+# SUBCOMMAND-oriented domains (git status|log|…, ai exec|doctor|…) where a runbook
+# entry point is genuinely useful. Single-purpose, argument-oriented utilities
+# (rg/fd/jq/cat/…) are intentionally excluded: their second token is an argument,
+# not a subcommand, so they have no "domain" to document and a runbook adds nothing.
+# Frequency alone is not enough — _candidates_from_bash_heads also gates on usage
+# DIVERSITY (distinct subcommands), so e.g. uv used only as `uv run …` is dropped.
 _BASH_DOMAIN_TOOLS = {
     "git", "gh", "kubectl", "docker", "docker-compose", "npm", "pnpm", "yarn",
     "cargo", "pytest", "uv", "hatch", "poetry", "pip", "make", "terraform",
     "ansible", "aws", "gcloud", "az", "helm", "bun", "deno", "ai", "codex",
-    "fd", "rg", "ripgrep", "jq",
 }
 
 
@@ -190,16 +204,23 @@ def _bash_head_cache_path(root: Path) -> Path:
     return root / ".ai" / "cache" / "bash_heads.json"
 
 
-def _compute_bash_heads(root: Path) -> Counter[str]:
+def _compute_bash_head_stats(root: Path) -> tuple[Counter[str], dict[str, int]]:
+    """Single pass over Bash invocations → (head counts, head→distinct-subcommand count).
+
+    The subcommand is the first non-flag token after the tool head (e.g. ``status``
+    in ``git status -s``). Diversity = number of distinct subcommands, used to drop
+    low-value single-pattern runbooks (uv→only ``run``) while keeping real domains.
+    """
     try:
         from .precall_recommend import gather_bash_invocations
     except Exception:
-        return Counter()
+        return Counter(), {}
     try:
         invs = gather_bash_invocations(root, include_transcripts=True)
     except Exception:
-        return Counter()
+        return Counter(), {}
     counts: Counter[str] = Counter()
+    subs: dict[str, set[str]] = {}
     for cmd in invs:
         cmd = (cmd or "").strip()
         if not cmd or cmd.startswith("|"):
@@ -211,17 +232,33 @@ def _compute_bash_heads(root: Path) -> Counter[str]:
         if i >= len(parts):
             continue
         head = parts[i].split("/")[-1]
-        if head in _BASH_DOMAIN_TOOLS:
-            counts[head] += 1
-    return counts
+        if head not in _BASH_DOMAIN_TOOLS:
+            continue
+        counts[head] += 1
+        j = i + 1
+        while j < len(parts) and parts[j].startswith("-"):
+            j += 1
+        sub = parts[j] if j < len(parts) else "(none)"
+        subs.setdefault(head, set()).add(sub)
+    diversity = {h: len(s) for h, s in subs.items()}
+    return counts, diversity
 
 
-def _write_bash_head_cache(root: Path, counts: Counter[str]) -> None:
+def _compute_bash_heads(root: Path) -> Counter[str]:
+    return _compute_bash_head_stats(root)[0]
+
+
+def _write_bash_head_cache(
+    root: Path, counts: Counter[str], diversity: dict[str, int] | None = None
+) -> None:
     cache_path = _bash_head_cache_path(root)
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        tmp.write_text(json.dumps({"counts": dict(counts)}), encoding="utf-8")
+        payload: dict[str, Any] = {"counts": dict(counts)}
+        if diversity is not None:
+            payload["diversity"] = dict(diversity)
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
         import os as _os_atomic
         _os_atomic.replace(tmp, cache_path)
     except OSError:
@@ -254,11 +291,11 @@ def _spawn_bash_head_cache_rebuild(root: Path) -> None:
 
         cmd = [
             sys.executable, "-c",
-            "from ai_core.recommend import _compute_bash_heads, _write_bash_head_cache; "
+            "from ai_core.recommend import _compute_bash_head_stats, _write_bash_head_cache; "
             "from pathlib import Path; "
             "import os; "
             f"r=Path({str(root)!r}); lock=Path({str(lock_path)!r}); "
-            "\ntry:\n    _write_bash_head_cache(r, _compute_bash_heads(r))\nfinally:\n    lock.unlink(missing_ok=True)",
+            "\ntry:\n    _c, _d = _compute_bash_head_stats(r); _write_bash_head_cache(r, _c, _d)\nfinally:\n    lock.unlink(missing_ok=True)",
         ]
         env = {**os.environ, "PYTHONPATH": str(root / ".ai" / "runtime" / "src")}
         with open(os.devnull, "wb") as devnull:
@@ -326,6 +363,26 @@ def _gather_bash_heads(root: Path) -> Counter[str]:
             pass
     _spawn_bash_head_cache_rebuild(root)
     return Counter()
+
+
+def _gather_bash_head_diversity(root: Path) -> dict[str, int]:
+    """Read head→distinct-subcommand counts from the bash_head cache.
+
+    Returns {} when absent (old cache before diversity was tracked, or no cache) so
+    diversity gating fails open — we only suppress a runbook when we KNOW its tool is
+    low-diversity, never on missing data. The cache is (re)built by _gather_bash_heads.
+    """
+    cache_path = _bash_head_cache_path(root)
+    if not cache_path.exists():
+        return {}
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    div = payload.get("diversity") if isinstance(payload, dict) else None
+    if not isinstance(div, dict):
+        return {}
+    return {str(k): int(v) for k, v in div.items() if isinstance(v, int)}
 
 
 def _gather_claude_global(home: Path, root: Path) -> list[str]:
@@ -671,11 +728,21 @@ def _candidates_from_bash_heads(signals: Signals, *, min_signal: int) -> list[Ca
     for head, count in signals.bash_head_counts.most_common(8):
         if count < bash_threshold:
             continue
+        # Diversity gate: a runbook is only worth it when the tool is used across
+        # several distinct subcommands. Fail open when diversity is unknown (not in
+        # the map) so we never suppress on missing data; suppress only known-low.
+        diversity = signals.bash_head_diversity.get(head)
+        if diversity is not None and diversity < MIN_DOMAIN_DIVERSITY:
+            continue
         slug = _slugify(f"{head}-runbook")
         evidence = {
-            "signals": [f"bash_heads:{count}"],
+            "signals": [f"bash_heads:{count}"]
+            + ([f"subcommands:{diversity}"] if diversity is not None else []),
             "sources": [f"{head}"],
-            "rationale": f"`{head}` invoked {count}× across transcripts",
+            "rationale": (
+                f"`{head}` invoked {count}× across transcripts"
+                + (f" over {diversity} distinct subcommands" if diversity is not None else "")
+            ),
         }
         body = _draft_body_for_bash_head(head, count)
         desc = f"'{head}' 워크플로우 런북 — 트랜스크립트에서 {count}회 반복 호출."

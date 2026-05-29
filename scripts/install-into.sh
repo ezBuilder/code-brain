@@ -69,7 +69,7 @@ managed_files() {
 # has a user-authored AGENTS.md (common in long-lived repos), we never touch
 # it — that file is part of the project's contract, not Code Brain's.
 seed_user_owned_files() {
-  local seeds=(".ai/secret_scan_allowlist.txt" "AGENTS.md")
+  local seeds=(".ai/secret_scan_allowlist.txt")
   for rel in "${seeds[@]}"; do
     local src="$SOURCE_ROOT/$rel"
     local dst="$TARGET_ROOT/$rel"
@@ -78,6 +78,35 @@ seed_user_owned_files() {
       cp "$src" "$dst"
     fi
   done
+  seed_agents_md
+}
+
+# AGENTS.md is a Code Brain-managed, auto-loaded memory mirror: Antigravity auto-loads it
+# and Code Brain refreshes an inline memory block in it every session. To avoid churning a
+# tracked file we (a) seed it from a FIXED literal when missing (never copy the source
+# repo's runtime-mutated AGENTS.md), and (b) git-ignore it in the target. Durable,
+# user-authored instructions go in the tracked .ai/AGENTS.md instead. If the target already
+# has its own tracked AGENTS.md we leave it (and the .gitignore line is a no-op for it).
+seed_agents_md() {
+  local dst="$TARGET_ROOT/AGENTS.md"
+  if [[ ! -e "$dst" ]]; then
+    cat >"$dst" <<'MD'
+# AGENTS.md
+
+Canonical agent instructions live in `.ai/AGENTS.md`.
+
+Below, Code Brain auto-maintains a cross-session memory snapshot (handoff, recent
+decisions, open todos, staleness) so every agent — including Antigravity, which auto-loads
+this file — resumes from the same context. It is regenerated each session (do not edit by
+hand) and is git-ignored to avoid churn.
+MD
+  fi
+  local gi="$TARGET_ROOT/.gitignore"
+  if [[ -f "$gi" ]]; then
+    grep -qxF '/AGENTS.md' "$gi" 2>/dev/null || printf '\n# Code Brain-managed auto-loaded memory mirror (regenerated each session)\n/AGENTS.md\n' >>"$gi"
+  else
+    printf '/AGENTS.md\n' >"$gi"
+  fi
 }
 
 merged_config_files() {

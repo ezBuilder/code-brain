@@ -7,13 +7,17 @@
 #   2. Registers that wrapper as the "code-brain" MCP server in
 #      ~/.gemini/antigravity/mcp_config.json, preserving every other server.
 #
-# Opt-out: set AI_SKIP_GLOBAL_ANTIGRAVITY=1 in the environment. Re-running this
-# script is safe — both steps are idempotent merges.
+# OPT-IN (writes to USER-GLOBAL state): this is the ONLY part of Code Brain that
+# touches global config (~/.local/bin, ~/.gemini/antigravity/), so it is never run by
+# the default install and does nothing unless you explicitly opt in with
+# AI_INSTALL_GLOBAL_ANTIGRAVITY=1. It exists only because Antigravity 1.0.x reads its
+# MCP server list from the global path, not the per-workspace .agents/. Re-running is
+# safe — both steps are idempotent merges.
 set -euo pipefail
 umask 077
 
-if [[ "${AI_SKIP_GLOBAL_ANTIGRAVITY:-0}" == "1" ]]; then
-    echo "setup-antigravity-global: skipped via AI_SKIP_GLOBAL_ANTIGRAVITY=1" >&2
+if [[ "${AI_INSTALL_GLOBAL_ANTIGRAVITY:-0}" != "1" ]]; then
+    echo "setup-antigravity-global: skipped — writes to GLOBAL config. Set AI_INSTALL_GLOBAL_ANTIGRAVITY=1 to opt in." >&2
     exit 0
 fi
 

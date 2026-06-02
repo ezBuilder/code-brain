@@ -70,9 +70,25 @@ if (-not $gitTop -or (Resolve-Path $gitTop).Path -ne $TargetRoot) {
 function Get-ManagedFiles {
     Push-Location $SourceRoot
     try {
-        $tracked = git ls-files --cached --others --exclude-standard `
-            -- .ai .githooks .claude/commands .codex/prompts `
-            scripts/env-check.sh scripts/preflight.sh 2>$null
+        $tracked = @()
+        cmd /c "git rev-parse --show-toplevel >NUL 2>NUL"
+        if ($LASTEXITCODE -eq 0) {
+            $tracked = git ls-files --cached --others --exclude-standard `
+                -- .ai .githooks .claude/commands .codex/prompts `
+                scripts/env-check.sh scripts/preflight.sh 2>$null
+        } else {
+            $roots = @(".ai", ".githooks", ".claude/commands", ".codex/prompts")
+            foreach ($root in $roots) {
+                if (Test-Path $root) {
+                    $tracked += Get-ChildItem -Recurse -File $root | ForEach-Object {
+                        $_.FullName.Substring($SourceRoot.Length).TrimStart("\", "/").Replace("\", "/")
+                    }
+                }
+            }
+            foreach ($path in @("scripts/env-check.sh", "scripts/preflight.sh")) {
+                if (Test-Path $path) { $tracked += $path }
+            }
+        }
         return $tracked | Where-Object { $_ -and -not $_.StartsWith(".ai/runtime/.venv") }
     }
     finally {
@@ -94,12 +110,30 @@ function Copy-ManagedFile {
 
 function Invoke-Python {
     param([string]$Script, [string]$Argument)
-    $py = (Get-Command python -ErrorAction SilentlyContinue) ?? (Get-Command python3 -ErrorAction SilentlyContinue)
+    $py = Get-Command python -ErrorAction SilentlyContinue
     if (-not $py) {
-        Write-Error "install-into failed: python not found in PATH"
-        exit 2
+        $py = Get-Command python3 -ErrorAction SilentlyContinue
     }
-    & $py.Path "-c" $Script $Argument
+    $scriptFile = New-TemporaryFile
+    $scriptPath = [System.IO.Path]::ChangeExtension($scriptFile.FullName, ".py")
+    Move-Item -Force -LiteralPath $scriptFile.FullName -Destination $scriptPath
+    Set-Content -LiteralPath $scriptPath -Value $Script -Encoding UTF8
+    try {
+        if ($py) {
+            & $py.Path $scriptPath $Argument
+        }
+        else {
+            $uv = Get-Command uv -ErrorAction SilentlyContinue
+            if (-not $uv) {
+                Write-Error "install-into failed: python not found in PATH and uv is unavailable"
+                exit 2
+            }
+            & $uv.Path "run" "--project" (Join-Path $SourceRoot ".ai/runtime") "python" $scriptPath $Argument
+        }
+    }
+    finally {
+        Remove-Item -Force -LiteralPath $scriptPath -ErrorAction SilentlyContinue
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Error "install-into failed: python merge script returned $LASTEXITCODE"
         exit $LASTEXITCODE
@@ -108,7 +142,7 @@ function Invoke-Python {
 
 function Merge-McpJson {
     $dst = Join-Path $TargetRoot ".mcp.json"
-    $py = @"
+    $py = @'
 import json, sys
 from pathlib import Path
 dst = Path(sys.argv[1])
@@ -125,13 +159,13 @@ servers = existing.setdefault("mcpServers", {})
 servers["code-brain"] = managed["mcpServers"]["code-brain"]
 dst.parent.mkdir(parents=True, exist_ok=True)
 dst.write_text(json.dumps(existing, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-"@
+'@
     Invoke-Python -Script $py -Argument $dst
 }
 
 function Merge-CodexConfig {
     $dst = Join-Path $TargetRoot ".codex/config.toml"
-    $py = @"
+    $py = @'
 import sys
 from pathlib import Path
 dst = Path(sys.argv[1])
@@ -184,17 +218,17 @@ def ensure_features(t):
 new_text = ensure_features(new_text)
 dst.parent.mkdir(parents=True, exist_ok=True)
 dst.write_text(new_text, encoding="utf-8")
-"@
+'@
     Invoke-Python -Script $py -Argument $dst
 }
 
 function Merge-ClaudeSettings {
     $dst = Join-Path $TargetRoot ".claude/settings.json"
-    $py = @"
+    $py = @'
 import json, sys
 from pathlib import Path
 dst = Path(sys.argv[1])
-hooks_dir = "${"${"}CLAUDE_PROJECT_DIR:-.${"}"}/.ai/bin/ai-hook"
+hooks_dir = "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook"
 events = ["PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop", "SubagentStop",
           "PreCompact", "SessionEnd", "Notification", "PostCompact", "CwdChanged", "ConfigChange",
           "PermissionDenied", "InstructionsLoaded"]
@@ -224,13 +258,13 @@ for name, entries in managed.items():
     hooks[name] = strip(existing) + entries
 dst.parent.mkdir(parents=True, exist_ok=True)
 dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-"@
+'@
     Invoke-Python -Script $py -Argument $dst
 }
 
 function Merge-CodexHooksJson {
     $dst = Join-Path $TargetRoot ".codex/hooks.json"
-    $py = @"
+    $py = @'
 import json, sys
 from pathlib import Path
 dst = Path(sys.argv[1])
@@ -264,7 +298,7 @@ for name, entries in managed.items():
     hooks[name] = kept + entries
 dst.parent.mkdir(parents=True, exist_ok=True)
 dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-"@
+'@
     Invoke-Python -Script $py -Argument $dst
 }
 
@@ -272,7 +306,12 @@ function Write-InstallManifest {
     $dst = Join-Path $TargetRoot ".ai/generated/install-manifest.json"
     $sourceSha = ""
     Push-Location $SourceRoot
-    try { $sourceSha = (git rev-parse HEAD 2>$null).Trim() } catch {}
+    try {
+        cmd /c "git rev-parse --is-inside-work-tree >NUL 2>NUL"
+        if ($LASTEXITCODE -eq 0) {
+            $sourceSha = (git rev-parse HEAD 2>$null).Trim()
+        }
+    } catch {}
     Pop-Location
     $files = Get-ManagedFiles
     $project = Split-Path $TargetRoot -Leaf
@@ -292,7 +331,33 @@ function Write-InstallManifest {
     Set-Content -LiteralPath $dst -Value $json -Encoding UTF8
 }
 
+function Ensure-PersistentScaffold {
+    $dirs = @(
+        ".ai/generated",
+        ".ai/memory/audit",
+        ".ai/memory/queue/.tmp",
+        ".ai/memory/queue/processing",
+        ".ai/memory/queue/dead"
+    )
+    foreach ($dir in $dirs) {
+        $path = Join-Path $TargetRoot $dir
+        if (-not (Test-Path $path)) { New-Item -ItemType Directory -Force -Path $path | Out-Null }
+    }
+    foreach ($file in @(
+        ".ai/memory/audit-index.jsonl",
+        ".ai/memory/queue/.tmp/.gitkeep",
+        ".ai/memory/queue/processing/.gitkeep",
+        ".ai/memory/queue/dead/.gitkeep"
+    )) {
+        $path = Join-Path $TargetRoot $file
+        if (-not (Test-Path $path)) { New-Item -ItemType File -Force -Path $path | Out-Null }
+    }
+}
+
 function Invoke-Bootstrap {
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        return
+    }
     Push-Location $TargetRoot
     try {
         $bootstrap = Join-Path $TargetRoot "bootstrap-code-brain.sh"
@@ -322,6 +387,7 @@ function Install-OrUpgrade {
     Merge-CodexConfig
     Merge-ClaudeSettings
     Merge-CodexHooksJson
+    Ensure-PersistentScaffold
     Write-InstallManifest
     Invoke-Bootstrap
     Write-Host "code-brain $Action`: $TargetRoot"
@@ -348,3 +414,4 @@ switch ($Action) {
     "uninstall" { Uninstall }
     default     { Install-OrUpgrade }
 }
+exit 0

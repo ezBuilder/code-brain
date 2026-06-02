@@ -2,15 +2,18 @@
 
 [한국어](../../README.md) · [English](en.md) · 中文 · [日本語](ja.md) · [Español](es.md) · [Français](fr.md) · [Deutsch](de.md)
 
-把 Code Brain 安装到一个仓库:
+如果 AI 只读这个 README，只需要运行下面一条安装命令。安装完成后，新的 Claude Code、Codex CLI 和 Antigravity 会话会自动加载同一套 `.ai/` 记忆、搜索、hooks 和 MCP 配置。
 ```bash
+# macOS / Linux
 git clone https://github.com/ezBuilder/code-brain.git && cd code-brain
-./scripts/install-into.sh install /path/to/project
-make install-into TARGET=/path/to/repo
-make upgrade-in TARGET=/path/to/repo
-make uninstall-from TARGET=/path/to/repo
-cd /path/to/project && .ai/bin/ai session start --agent codex --query "current task" --json && .ai/bin/ai doctor --strict --json
+bash scripts/install.sh /path/to/project
+
+# Windows PowerShell
+git clone https://github.com/ezBuilder/code-brain.git; cd code-brain
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\path\to\project
 ```
+
+成功标志：最后一行显示 `[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.`
 
 Code Brain 是仓库本地的基础设施，让 Claude Code、Codex CLI 和 Google Antigravity 在同一个工作区共享记忆、代码搜索、策略、hooks 和审计记录。
 

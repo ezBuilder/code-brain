@@ -2,15 +2,18 @@
 
 [한국어 기본](README.md) · [English](docs/readme/en.md) · [中文](docs/readme/zh-CN.md) · [日本語](docs/readme/ja.md) · [Español](docs/readme/es.md) · [Français](docs/readme/fr.md) · [Deutsch](docs/readme/de.md)
 
-에이전트가 새 repo에 바로 붙일 때:
+AI가 이 README만 읽고 새 프로젝트에 붙일 때는 아래 한 줄만 실행하면 된다. 설치가 끝나면 Claude Code, Codex CLI, Antigravity의 새 세션이 같은 `.ai/` 메모리·검색·hook·MCP를 자동으로 로드한다.
 ```bash
+# macOS / Linux
 git clone https://github.com/ezBuilder/code-brain.git && cd code-brain
-./scripts/install-into.sh install /path/to/project
-make install-into TARGET=/path/to/repo
-make upgrade-in TARGET=/path/to/repo
-make uninstall-from TARGET=/path/to/repo
-cd /path/to/project && .ai/bin/ai session start --agent codex --query "current task" --json && .ai/bin/ai doctor --strict --json
+bash scripts/install.sh /path/to/project
+
+# Windows PowerShell
+git clone https://github.com/ezBuilder/code-brain.git; cd code-brain
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\path\to\project
 ```
+
+성공 기준: 마지막 줄이 `[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.` 이면 끝.
 
 **Claude Code · Codex CLI · Google Antigravity** 세 코딩 에이전트가 **한 워크스페이스에서 같은 메모리·검색·정책·감사 인프라**를 공유하도록 만드는 repo-local 인프라.
 

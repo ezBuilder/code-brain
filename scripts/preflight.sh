@@ -99,6 +99,13 @@ def python_check() -> dict[str, object]:
 def mode_check(path: Path, *, max_public_bits: int) -> dict[str, object]:
     if not path.exists():
         return {"path": path.relative_to(root).as_posix(), "exists": False, "ok": True}
+    if os.name == "nt":
+        return {
+            "path": path.relative_to(root).as_posix(),
+            "exists": True,
+            "ok": True,
+            "detail": "skipped on Windows",
+        }
     mode = stat.S_IMODE(path.stat().st_mode)
     public_bits = mode & max_public_bits
     return {
@@ -120,14 +127,20 @@ requires_lfs = "filter=lfs" in gitattributes
 
 checks = {
     "repo_layout": {
-        "ok": (root / ".ai" / "runtime" / "pyproject.toml").exists()
-        and ((root / "bootstrap.sh").exists() or (root / "bootstrap-code-brain.sh").exists()),
+        "ok": (
+            (root / ".ai" / "runtime" / "pyproject.toml").exists()
+            and (
+                (root / "bootstrap.sh").exists()
+                or (root / "bootstrap-code-brain.sh").exists()
+                or (os.name == "nt" and (root / ".ai" / "bin" / "ai.ps1").exists())
+            )
+        ),
         "required": True,
         "detail": "ok",
     },
     "bash": command_version("bash", "--version"),
     "git": command_version("git", "--version"),
-    "make": command_version("make", "--version"),
+    "make": command_version("make", "--version", required=(os.name != "nt")),
     "uv": command_version("uv", "--version"),
     "python": python_check(),
     "sops": command_version("sops", "--version", required=bool(encrypted_secrets)),

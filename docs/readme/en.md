@@ -2,15 +2,18 @@
 
 [한국어](../../README.md) · English · [中文](zh-CN.md) · [日本語](ja.md) · [Español](es.md) · [Français](fr.md) · [Deutsch](de.md)
 
-Attach Code Brain to a repository:
+If an AI only reads this README, run one command to attach Code Brain to a project. After installation, new Claude Code, Codex CLI, and Antigravity sessions automatically load the same `.ai/` memory, search, hooks, and MCP wiring.
 ```bash
+# macOS / Linux
 git clone https://github.com/ezBuilder/code-brain.git && cd code-brain
-./scripts/install-into.sh install /path/to/project
-make install-into TARGET=/path/to/repo
-make upgrade-in TARGET=/path/to/repo
-make uninstall-from TARGET=/path/to/repo
-cd /path/to/project && .ai/bin/ai session start --agent codex --query "current task" --json && .ai/bin/ai doctor --strict --json
+bash scripts/install.sh /path/to/project
+
+# Windows PowerShell
+git clone https://github.com/ezBuilder/code-brain.git; cd code-brain
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\path\to\project
 ```
+
+Success means the final line says: `[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.`
 
 Code Brain is repo-local infrastructure that lets Claude Code, Codex CLI, and Google Antigravity share the same memory, code search, policy, hooks, and audit trail inside one workspace.
 

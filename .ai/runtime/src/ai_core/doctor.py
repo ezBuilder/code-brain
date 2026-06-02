@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass
@@ -534,7 +536,14 @@ def check_mcp_methods_registered(root: Path) -> Check:
     if not isinstance(servers, dict) or "code-brain" not in servers:
         return Check("mcp_methods_registered", False, ".mcp.json missing mcpServers.code-brain entry")
     server = servers["code-brain"]
-    if not isinstance(server, dict) or server.get("command") != ".ai/bin/ai-mcp":
+    if not isinstance(server, dict):
+        return Check("mcp_methods_registered", False, ".mcp.json code-brain server is not an object")
+    command = server.get("command")
+    args = server.get("args", [])
+    if os.name == "nt":
+        if command not in {"powershell", "pwsh"} or ".ai/bin/ai-mcp.ps1" not in " ".join(str(arg) for arg in args):
+            return Check("mcp_methods_registered", False, ".mcp.json code-brain command is not Windows ai-mcp.ps1")
+    elif command != ".ai/bin/ai-mcp":
         return Check("mcp_methods_registered", False, ".mcp.json code-brain.command is not .ai/bin/ai-mcp")
     missing_slash = [path for path in REQUIRED_SLASH_COMMAND_FILES if not (root / path).exists()]
     missing_codex = [path for path in REQUIRED_CODEX_PROMPT_FILES if not (root / path).exists()]
@@ -578,14 +587,36 @@ def check_bootstrap_preflight(root: Path) -> Check:
     script = root / "scripts" / "preflight.sh"
     if not script.exists():
         return Check("bootstrap_preflight", False, "scripts/preflight.sh missing")
-    result = subprocess.run(
-        [str(script), "--check-only", "--json"],
-        cwd=root,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    command = [str(script), "--check-only", "--json"]
+    env = os.environ.copy()
+    if os.name == "nt":
+        bash = shutil.which("bash") or shutil.which("bash.exe")
+        if not bash:
+            for candidate in (
+                Path(os.environ.get("ProgramFiles", "")) / "Git" / "bin" / "bash.exe",
+                Path(os.environ.get("ProgramFiles(x86)", "")) / "Git" / "bin" / "bash.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Git" / "bin" / "bash.exe",
+            ):
+                if candidate.is_file():
+                    bash = str(candidate)
+                    break
+        if not bash:
+            return Check("bootstrap_preflight", False, "bash not found")
+        command = [bash, str(script), "--check-only", "--json"]
+        scripts_dir = root / ".ai" / "runtime" / ".venv" / "Scripts"
+        env["PATH"] = str(scripts_dir) + os.pathsep + env.get("PATH", "")
+    try:
+        result = subprocess.run(
+            command,
+            cwd=root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        return Check("bootstrap_preflight", False, str(exc))
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         return Check("bootstrap_preflight", False, detail[:500])

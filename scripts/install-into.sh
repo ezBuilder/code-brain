@@ -75,13 +75,22 @@ fi
 managed_files() {
   (
     cd "$SOURCE_ROOT"
-    git ls-files --cached --others --exclude-standard -- \
-      .ai \
-      .githooks \
-      .claude/commands \
-      .codex/prompts \
-      scripts/env-check.sh \
-      scripts/preflight.sh
+    if git rev-parse --show-toplevel >/dev/null 2>&1; then
+      git ls-files --cached --others --exclude-standard -- \
+        .ai \
+        .githooks \
+        .claude/commands \
+        .codex/prompts \
+        scripts/env-check.sh \
+        scripts/preflight.sh
+    else
+      for path in .ai .githooks .claude/commands .codex/prompts; do
+        [[ -e "$path" ]] && find "$path" -type f
+      done
+      for path in scripts/env-check.sh scripts/preflight.sh; do
+        [[ -f "$path" ]] && printf '%s\n' "$path"
+      done
+    fi
   ) | grep -vx ".ai/secret_scan_allowlist.txt" || true
   printf '%s\n' "bootstrap-code-brain.sh"
 }
@@ -785,6 +794,19 @@ dst.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2, sort_keys=True)
 PY
 }
 
+ensure_persistent_scaffold() {
+  mkdir -p \
+    "$TARGET_ROOT/.ai/generated" \
+    "$TARGET_ROOT/.ai/memory/audit" \
+    "$TARGET_ROOT/.ai/memory/queue/.tmp" \
+    "$TARGET_ROOT/.ai/memory/queue/processing" \
+    "$TARGET_ROOT/.ai/memory/queue/dead"
+  [[ -e "$TARGET_ROOT/.ai/memory/audit-index.jsonl" ]] || : >"$TARGET_ROOT/.ai/memory/audit-index.jsonl"
+  [[ -e "$TARGET_ROOT/.ai/memory/queue/.tmp/.gitkeep" ]] || : >"$TARGET_ROOT/.ai/memory/queue/.tmp/.gitkeep"
+  [[ -e "$TARGET_ROOT/.ai/memory/queue/processing/.gitkeep" ]] || : >"$TARGET_ROOT/.ai/memory/queue/processing/.gitkeep"
+  [[ -e "$TARGET_ROOT/.ai/memory/queue/dead/.gitkeep" ]] || : >"$TARGET_ROOT/.ai/memory/queue/dead/.gitkeep"
+}
+
 install_or_upgrade() {
   while IFS= read -r rel; do
     copy_file "$rel"
@@ -797,6 +819,7 @@ install_or_upgrade() {
   merge_antigravity_mcp_json
   merge_antigravity_hooks_json
   configure_project
+  ensure_persistent_scaffold
   write_bootstrap
   chmod +x "$TARGET_ROOT/.ai/bin/ai" "$TARGET_ROOT/.ai/bin/ai-hook" "$TARGET_ROOT/.ai/bin/ai-mcp"
   chmod +x "$TARGET_ROOT/.githooks/post-merge" "$TARGET_ROOT/.githooks/post-checkout"

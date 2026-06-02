@@ -9,7 +9,16 @@
 $ErrorActionPreference = "Stop"
 $env:PYTHONIOENCODING = "utf-8"
 $SourceRoot = (Resolve-Path "$PSScriptRoot/..").Path
-$Target = if ($args.Count -ge 1) { (Resolve-Path $args[0]).Path } else { (Get-Location).Path }
+if ($args.Count -ge 1) {
+  $TargetArg = if ([System.IO.Path]::IsPathRooted($args[0])) { $args[0] } else { Join-Path (Get-Location).Path $args[0] }
+  $TargetArg = [System.IO.Path]::GetFullPath($TargetArg)
+  if (-not (Test-Path $TargetArg)) {
+    New-Item -ItemType Directory -Force -Path $TargetArg | Out-Null
+  }
+  $Target = (Resolve-Path $TargetArg).Path
+} else {
+  $Target = (Get-Location).Path
+}
 
 function Invoke-Checked {
   param(
@@ -19,6 +28,26 @@ function Invoke-Checked {
   & $FilePath @Arguments
   if ($LASTEXITCODE -ne 0) {
     throw "[code-brain] command failed ($LASTEXITCODE): $FilePath $($Arguments -join ' ')"
+  }
+}
+
+function Invoke-CheckedRetry {
+  param(
+    [Parameter(Mandatory = $true)] [string] $FilePath,
+    [string[]] $Arguments = @(),
+    [int] $Attempts = 2,
+    [scriptblock] $BeforeRetry = $null
+  )
+  for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -eq 0) { return }
+    $code = $LASTEXITCODE
+    if ($attempt -ge $Attempts) {
+      throw "[code-brain] command failed ($code): $FilePath $($Arguments -join ' ')"
+    }
+    Write-Host "[code-brain] retrying after command failed ($code): $FilePath $($Arguments -join ' ')"
+    if ($BeforeRetry) { & $BeforeRetry }
+    Start-Sleep -Seconds 1
   }
 }
 
@@ -64,7 +93,9 @@ try {
   Invoke-Checked "uv" @("sync", "--project", ".ai/runtime", "--extra", "dense")
   Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "render", "--manifest-only", "--json") | Out-Null
   Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "index", "rebuild", "--json") | Out-Null
-  Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "doctor", "--strict", "--json") | Out-Null
+  Invoke-CheckedRetry "uv" @("run", "--project", ".ai/runtime", "ai", "doctor", "--strict", "--json") -BeforeRetry {
+    Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "index", "rebuild", "--json") | Out-Null
+  } | Out-Null
   Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "session", "start", "--agent", "installer", "--query", "initial Code Brain setup", "--json") | Out-Null
 } finally {
   Pop-Location

@@ -1,5 +1,7 @@
 # Code Brain
 
+[한국어 기본](README.md) · [English](docs/readme/en.md) · [中文](docs/readme/zh-CN.md) · [日本語](docs/readme/ja.md) · [Español](docs/readme/es.md) · [Français](docs/readme/fr.md) · [Deutsch](docs/readme/de.md)
+
 에이전트가 새 repo에 바로 붙일 때:
 ```bash
 git clone https://github.com/ezBuilder/code-brain.git && cd code-brain

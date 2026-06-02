@@ -9,6 +9,7 @@
 $ErrorActionPreference = "Stop"
 $env:PYTHONIOENCODING = "utf-8"
 $SourceRoot = (Resolve-Path "$PSScriptRoot/..").Path
+$UvInstalledByInstaller = $false
 if ($args.Count -ge 1) {
   $TargetArg = if ([System.IO.Path]::IsPathRooted($args[0])) { $args[0] } else { Join-Path (Get-Location).Path $args[0] }
   $TargetArg = [System.IO.Path]::GetFullPath($TargetArg)
@@ -56,6 +57,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
   Write-Host "[code-brain] 'uv' not found - installing from astral.sh ..."
   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
   $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+  $UvInstalledByInstaller = $true
 }
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
   throw "[code-brain] uv install failed. Install it manually: https://docs.astral.sh/uv/ , then re-run."
@@ -102,3 +104,6 @@ try {
 }
 
 Write-Host "[code-brain] installed. New AI sessions in $Target now load Code Brain memory, search, hooks, and MCP automatically."
+if ($UvInstalledByInstaller) {
+  Write-Host "[code-brain] note: uv was installed at $env:USERPROFILE\.local\bin. Open a new PowerShell session if the 'uv' command is not visible in the current shell."
+}

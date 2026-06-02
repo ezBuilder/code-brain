@@ -15,6 +15,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\pat
 
 성공 기준: 마지막 줄이 `[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.` 이면 끝.
 
+Windows에서 `uv`가 처음 설치된 경우 현재 PowerShell 세션에는 PATH가 즉시 반영되지 않을 수 있다. 설치는 이미 완료된 상태이며, 새 PowerShell을 열면 보통 `uv`가 잡힌다.
+
 **Claude Code · Codex CLI · Google Antigravity** 세 코딩 에이전트가 **한 워크스페이스에서 같은 메모리·검색·정책·감사 인프라**를 공유하도록 만드는 repo-local 인프라.
 
 `grep`/`rg`을 버리지 않고 위에 `BM25 + hashline 무결성 + MCP + hooks + cross-session memory`를 얹는 lexical-first 설계. **로컬, 오프라인, 네트워크 없이 hot-path < 200ms.**

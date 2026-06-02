@@ -4,7 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-python - "$ROOT" <<'PY'
+# Prefer python3; some systems (e.g. macOS) ship only `python3`, not `python`.
+PYTHON="${PYTHON:-$(command -v python3 || command -v python || true)}"
+if [[ -z "$PYTHON" ]]; then
+  echo "env-check failed: no python3/python interpreter found on PATH" >&2
+  exit 2
+fi
+
+"$PYTHON" - "$ROOT" <<'PY'
 import json
 import shutil
 import subprocess

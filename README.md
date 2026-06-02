@@ -1,5 +1,15 @@
 # Code Brain
 
+에이전트가 새 repo에 바로 붙일 때:
+```bash
+git clone https://github.com/ezBuilder/code-brain.git && cd code-brain
+./scripts/install-into.sh install /path/to/project
+make install-into TARGET=/path/to/repo
+make upgrade-in TARGET=/path/to/repo
+make uninstall-from TARGET=/path/to/repo
+cd /path/to/project && .ai/bin/ai session start --agent codex --query "current task" --json && .ai/bin/ai doctor --strict --json
+```
+
 **Claude Code · Codex CLI · Google Antigravity** 세 코딩 에이전트가 **한 워크스페이스에서 같은 메모리·검색·정책·감사 인프라**를 공유하도록 만드는 repo-local 인프라.
 
 `grep`/`rg`을 버리지 않고 위에 `BM25 + hashline 무결성 + MCP + hooks + cross-session memory`를 얹는 lexical-first 설계. **로컬, 오프라인, 네트워크 없이 hot-path < 200ms.**

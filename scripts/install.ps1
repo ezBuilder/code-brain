@@ -63,6 +63,7 @@ Push-Location $Target
 try {
   Invoke-Checked "uv" @("sync", "--project", ".ai/runtime", "--extra", "dense")
   Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "render", "--manifest-only", "--json") | Out-Null
+  Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "index", "rebuild", "--json") | Out-Null
   Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "doctor", "--strict", "--json") | Out-Null
   Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "session", "start", "--agent", "installer", "--query", "initial Code Brain setup", "--json") | Out-Null
 } finally {

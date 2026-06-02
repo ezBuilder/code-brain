@@ -22,8 +22,18 @@ from typing import Any
 CODE_BRAIN_SERVER_NAME = "code-brain"
 
 
-def code_brain_stdio_entry() -> dict[str, Any]:
-    """Standard Code Brain MCP server entry for stdio transport."""
+def code_brain_stdio_entry(windows: bool | None = None) -> dict[str, Any]:
+    """Standard Code Brain MCP server entry for stdio transport, OS-aware.
+
+    On Windows the bash shim ``.ai/bin/ai-mcp`` is not executable, so launch the
+    PowerShell shim instead. ``windows`` defaults to detecting the OS the installer is
+    running on (os.name == 'nt'); the installer runs on the target machine, so the
+    written config matches that machine. Pass it explicitly to force a dialect."""
+    import os as _os
+
+    is_win = _os.name == "nt" if windows is None else windows
+    if is_win:
+        return {"command": "powershell", "args": ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"], "env": {}}
     return {"command": ".ai/bin/ai-mcp", "args": [], "env": {}}
 
 

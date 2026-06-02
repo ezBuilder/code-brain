@@ -109,6 +109,31 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "code_read_hashline",
+        "description": "Read a repo file with line+hash anchors for stale-edit detection. Read-only; refuses credential-like paths.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start": {"type": "integer"},
+                "end": {"type": "integer"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "stream_guard_scan",
+        "description": "Scan text with Code Brain stream-guard rules. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "scope": {"type": "string", "enum": ["tool", "prompt", "output"], "default": "tool"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
         "name": "memory_tier",
         "description": "MemGPT-style hot/warm/cold memory classification + page-out signal + retention scoring (decay/reinforcement) of decisions/lessons/procedures. Read-only.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -242,6 +267,27 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "type": "object",
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
+        },
+    },
+    {
+        "name": "append_handoff",
+        "description": (
+            "Set/update the resume HANDOFF (goal/plan/next_step/open_questions/blockers) at a "
+            "stopping point. Git-tracked so it travels across machines (Mac↔VPS); the next session "
+            "— any agent, either machine — leads its SessionStart context with it. Partial update: "
+            "only provided fields change. Write-class. Call this before pausing work."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "What we are ultimately trying to do"},
+                "next_step": {"type": "string", "description": "The very next action to take on resume"},
+                "plan": {"type": "array", "items": {"type": "string"}},
+                "open_questions": {"type": "array", "items": {"type": "string"}},
+                "blockers": {"type": "array", "items": {"type": "string"}},
+                "agent": {"type": "string", "default": "agent"},
+                "clear": {"type": "boolean", "default": False},
+            },
         },
     },
     {
@@ -526,6 +572,20 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "code_verify":
         from .ast_verify import verify_source
         return verify_source(str(args.get("source", ""))).to_dict()
+    if name == "code_read_hashline":
+        from .hashline import read_hashline
+        target = args.get("path")
+        if not isinstance(target, str) or not target:
+            raise ValueError("code_read_hashline requires path string")
+        return read_hashline(
+            root,
+            target,
+            start=(int(args["start"]) if isinstance(args.get("start"), int) else None),
+            end=(int(args["end"]) if isinstance(args.get("end"), int) else None),
+        )
+    if name == "stream_guard_scan":
+        from .stream_guard import scan_text
+        return scan_text(str(args.get("text", "")), scope=str(args.get("scope", "tool") or "tool"))
     if name == "memory_tier":
         from .memory_tier import classify, hot_pressure, retention_report
         cls = classify(root)
@@ -608,6 +668,22 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         if not isinstance(text, str) or not text.strip():
             raise ValueError("append_session_note requires non-empty text")
         return append_session_note(root, text=text)
+    if name == "append_handoff":
+        from .session_resume import write_handoff
+
+        def _as_list(v: Any) -> list[str] | None:
+            return [str(x) for x in v] if isinstance(v, list) else None
+
+        return write_handoff(
+            root,
+            goal=(args.get("goal") if isinstance(args.get("goal"), str) else None),
+            next_step=(args.get("next_step") if isinstance(args.get("next_step"), str) else None),
+            plan=_as_list(args.get("plan")),
+            open_questions=_as_list(args.get("open_questions")),
+            blockers=_as_list(args.get("blockers")),
+            agent=str(args.get("agent") or "agent"),
+            clear=bool(args.get("clear")),
+        )
     if name == "recommend_skills":
         from .recommend import recommend as rec_run
         return rec_run(

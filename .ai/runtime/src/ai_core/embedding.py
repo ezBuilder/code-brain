@@ -196,10 +196,10 @@ def embed_batch(texts: list[str], root: Path) -> list[list[float]] | None:
       3. mean-pool with attention mask
       4. L2-normalize → unit vectors
     """
-    if not is_active_for(root):
-        return None
     if not texts:
         return []
+    if not is_active_for(root):
+        return None
     runtime = _get_runtime(root)
     if runtime is None:
         return None

@@ -3,6 +3,21 @@ set -euo pipefail
 export COPYFILE_DISABLE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+py() {
+  if [[ -x "$ROOT/.ai/runtime/.venv/bin/python" ]]; then
+    "$ROOT/.ai/runtime/.venv/bin/python" "$@"
+  elif command -v uv >/dev/null 2>&1; then
+    uv run --project "$ROOT/.ai/runtime" python "$@"
+  else
+    local _py
+    _py="$(command -v python3 || command -v python || true)"
+    if [[ -z "$_py" ]]; then
+      echo "rollback drill failed: no python3/python interpreter found on PATH" >&2
+      exit 2
+    fi
+    "$_py" "$@"
+  fi
+}
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -33,7 +48,7 @@ manifest=".ai/generated/manifest.json"
 before="$(shasum -a 256 "$manifest" | awk '{print $1}')"
 
 dry_run_json="$(uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json)"
-python - "$dry_run_json" "$WORK" <<'PY'
+py - "$dry_run_json" "$WORK" <<'PY'
 import json
 import pathlib
 import sys
@@ -56,7 +71,7 @@ if [[ "$before" != "$after_dry" ]]; then
 fi
 
 apply_json="$(uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --json)"
-backup_path="$(python - "$apply_json" <<'PY'
+backup_path="$(py - "$apply_json" <<'PY'
 import json
 import sys
 
@@ -72,7 +87,7 @@ if [[ ! -f "$backup_path" ]]; then
   exit 1
 fi
 
-python - "$manifest" <<'PY'
+py - "$manifest" <<'PY'
 from pathlib import Path
 import sys
 

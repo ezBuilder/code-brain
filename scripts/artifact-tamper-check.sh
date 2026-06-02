@@ -3,6 +3,21 @@ set -euo pipefail
 export COPYFILE_DISABLE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+py() {
+  if [[ -x "$ROOT/.ai/runtime/.venv/bin/python" ]]; then
+    "$ROOT/.ai/runtime/.venv/bin/python" "$@"
+  elif command -v uv >/dev/null 2>&1; then
+    uv run --project "$ROOT/.ai/runtime" python "$@"
+  else
+    local _py
+    _py="$(command -v python3 || command -v python || true)"
+    if [[ -z "$_py" ]]; then
+      echo "artifact tamper check failed: no python3/python interpreter found on PATH" >&2
+      exit 2
+    fi
+    "$_py" "$@"
+  fi
+}
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -53,7 +68,7 @@ expect_install_check_failure() {
 
 tamper_checksum() {
   local dir="$1"
-  python - "$dir/dist/$BASE.sha256" <<'PY'
+  py - "$dir/dist/$BASE.sha256" <<'PY'
 import pathlib
 import sys
 path = pathlib.Path(sys.argv[1])
@@ -69,7 +84,7 @@ tamper_missing_checksum() {
 
 tamper_manifest() {
   local dir="$1"
-  python - "$dir/dist/$PREFIX.manifest.json" <<'PY'
+  py - "$dir/dist/$PREFIX.manifest.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -87,7 +102,7 @@ tamper_missing_manifest() {
 
 tamper_sbom() {
   local dir="$1"
-  python - "$dir/dist/$PREFIX.sbom.json" <<'PY'
+  py - "$dir/dist/$PREFIX.sbom.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -105,7 +120,7 @@ tamper_missing_sbom() {
 
 tamper_provenance() {
   local dir="$1"
-  python - "$dir/dist/$PREFIX.provenance.json" <<'PY'
+  py - "$dir/dist/$PREFIX.provenance.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -127,7 +142,7 @@ tamper_missing_provenance() {
 
 tamper_dirty_provenance() {
   local dir="$1"
-  python - "$dir/dist/$PREFIX.provenance.json" <<'PY'
+  py - "$dir/dist/$PREFIX.provenance.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -140,7 +155,7 @@ PY
 
 tamper_metadata_version() {
   local dir="$1"
-  python - "$dir/dist/$PREFIX.sbom.json" <<'PY'
+  py - "$dir/dist/$PREFIX.sbom.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -158,7 +173,7 @@ tamper_missing_release_notes() {
 
 tamper_release_notes() {
   local dir="$1"
-  python - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
+  py - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
 import pathlib
 import sys
 path = pathlib.Path(sys.argv[1])
@@ -169,7 +184,7 @@ PY
 
 tamper_release_notes_git_head() {
   local dir="$1"
-  python - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
+  py - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
 import re
 import pathlib
 import sys
@@ -181,7 +196,7 @@ PY
 
 tamper_release_notes_git_status() {
   local dir="$1"
-  python - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
+  py - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
 import pathlib
 import sys
 path = pathlib.Path(sys.argv[1])
@@ -196,7 +211,7 @@ expect_unsafe_archive_failure() {
   mkdir -p "$dir/dist" "$payload/$PREFIX"
   printf 'ok\n' >"$payload/$PREFIX/README.txt"
   printf 'bad\n' >"$payload/../escape.txt"
-  python - "$dir/dist/$BASE" "$payload" "$PREFIX" <<'PY'
+  py - "$dir/dist/$BASE" "$payload" "$PREFIX" <<'PY'
 import pathlib
 import sys
 import tarfile
@@ -213,7 +228,7 @@ PY
   cp "$(dirname "$ARCHIVE")/$PREFIX.sbom.json" "$dir/dist/$PREFIX.sbom.json"
   cp "$(dirname "$ARCHIVE")/$PREFIX.provenance.json" "$dir/dist/$PREFIX.provenance.json"
   cp "$(dirname "$ARCHIVE")/$PREFIX.release-notes.md" "$dir/dist/$PREFIX.release-notes.md"
-  python - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
+  py - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
 import hashlib
 import pathlib
 import sys
@@ -234,7 +249,7 @@ expect_unsafe_member_type_failure() {
   local payload="$TMP/unsafe-member-payload"
   mkdir -p "$dir/dist" "$payload/$PREFIX"
   printf 'ok\n' >"$payload/$PREFIX/README.txt"
-  python - "$dir/dist/$BASE" "$payload" "$PREFIX" <<'PY'
+  py - "$dir/dist/$BASE" "$payload" "$PREFIX" <<'PY'
 import pathlib
 import sys
 import tarfile
@@ -254,7 +269,7 @@ PY
   cp "$(dirname "$ARCHIVE")/$PREFIX.sbom.json" "$dir/dist/$PREFIX.sbom.json"
   cp "$(dirname "$ARCHIVE")/$PREFIX.provenance.json" "$dir/dist/$PREFIX.provenance.json"
   cp "$(dirname "$ARCHIVE")/$PREFIX.release-notes.md" "$dir/dist/$PREFIX.release-notes.md"
-  python - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
+  py - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
 import hashlib
 import pathlib
 import sys
@@ -276,7 +291,7 @@ expect_root_mismatch_failure() {
   local bad_root="not-$PREFIX"
   mkdir -p "$dir/dist" "$payload/$bad_root"
   printf 'ok\n' >"$payload/$bad_root/README.txt"
-  python - "$dir/dist/$BASE" "$payload" "$bad_root" <<'PY'
+  py - "$dir/dist/$BASE" "$payload" "$bad_root" <<'PY'
 import pathlib
 import sys
 import tarfile
@@ -292,7 +307,7 @@ PY
   cp "$(dirname "$ARCHIVE")/$PREFIX.sbom.json" "$dir/dist/$PREFIX.sbom.json"
   cp "$(dirname "$ARCHIVE")/$PREFIX.provenance.json" "$dir/dist/$PREFIX.provenance.json"
   cp "$(dirname "$ARCHIVE")/$PREFIX.release-notes.md" "$dir/dist/$PREFIX.release-notes.md"
-  python - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
+  py - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
 import hashlib
 import pathlib
 import sys
@@ -314,7 +329,7 @@ expect_macos_metadata_failure() {
   mkdir -p "$dir/dist" "$payload/$PREFIX"
   printf 'ok\n' >"$payload/$PREFIX/README.txt"
   printf 'metadata\n' >"$payload/$PREFIX/.DS_Store"
-  python - "$dir/dist/$BASE" "$payload" "$PREFIX" <<'PY'
+  py - "$dir/dist/$BASE" "$payload" "$PREFIX" <<'PY'
 import pathlib
 import sys
 import tarfile
@@ -331,7 +346,7 @@ PY
   cp "$(dirname "$ARCHIVE")/$PREFIX.sbom.json" "$dir/dist/$PREFIX.sbom.json"
   cp "$(dirname "$ARCHIVE")/$PREFIX.provenance.json" "$dir/dist/$PREFIX.provenance.json"
   cp "$(dirname "$ARCHIVE")/$PREFIX.release-notes.md" "$dir/dist/$PREFIX.release-notes.md"
-  python - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
+  py - "$dir/dist/$BASE" "$dir/dist/$BASE.sha256" <<'PY'
 import hashlib
 import pathlib
 import sys

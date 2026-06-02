@@ -211,3 +211,79 @@ def test_prune_snapshots_deletes_old_kept_recent(tmp_path: Path) -> None:
     assert not (base / "ancient" / "resume.json").exists()
     # session directory itself must remain (we delete the file, not the dir)
     assert (base / "ancient").is_dir()
+
+
+# ---- P1/P2: handoff + cross-machine provenance ----
+
+def test_write_handoff_roundtrip_and_embedded_in_snapshot(tmp_path: Path) -> None:
+    from ai_core.session_resume import read_handoff, write_handoff
+
+    _memory(tmp_path)
+    write_handoff(
+        tmp_path,
+        goal="ship cross-machine continuity",
+        next_step="implement P1",
+        plan=["P1 handoff", "P2 pointers"],
+        agent="claude",
+    )
+    h = read_handoff(tmp_path)
+    assert h["goal"].startswith("ship") and h["next_step"] == "implement P1"
+    assert h["plan"] == ["P1 handoff", "P2 pointers"]
+    assert h["agent"] == "claude" and h["machine_id"]
+
+    write_snapshot(tmp_path, session_id="s-h", agent="claude")
+    snap = _read_snapshot(tmp_path, "s-h")
+    assert snap["handoff"]["goal"].startswith("ship")
+    assert snap["machine_id"] == h["machine_id"]
+    assert snap["resume_hint"] == "claude --resume s-h"
+
+
+def test_handoff_partial_update_and_clear(tmp_path: Path) -> None:
+    from ai_core.session_resume import read_handoff, write_handoff
+
+    write_handoff(tmp_path, goal="G", next_step="N1")
+    write_handoff(tmp_path, next_step="N2")  # only next_step changes
+    h = read_handoff(tmp_path)
+    assert h["goal"] == "G" and h["next_step"] == "N2"
+    write_handoff(tmp_path, clear=True)
+    assert not read_handoff(tmp_path).get("goal")
+
+
+def test_handoff_survives_size_cap(tmp_path: Path, monkeypatch) -> None:
+    import ai_core.session_resume as sr
+
+    # handoff is NOT in the drop order → never dropped by _shrink_to_fit.
+    assert "handoff" not in sr._DROP_ORDER
+
+    mem = _memory(tmp_path)
+    _write_jsonl(mem / "todos.jsonl", [{"id": f"t{i}", "title": "todo " + "z" * 80, "status": "open"} for i in range(20)])
+    (mem / "session-current.md").write_text(
+        "\n".join(f"- [2026-05-29T00:00:00Z] bulky note {i} " + "x" * 80 for i in range(40)),
+        encoding="utf-8",
+    )
+    sr.write_handoff(tmp_path, goal="KEEPME", next_step="KEEP_NEXT")
+    monkeypatch.setattr(sr, "RESUME_MAX_BYTES", 600)  # force shrinking
+    sr.write_snapshot(tmp_path, session_id="s-cap", agent="codex")
+    snap = _read_snapshot(tmp_path, "s-cap")
+    assert snap["handoff"]["goal"] == "KEEPME"  # protected from the cap
+    # a bulky droppable field was sacrificed instead
+    assert "session_tail" not in snap or "todos_open" not in snap
+
+
+def test_handoff_fallback_from_open_todo(tmp_path: Path) -> None:
+    mem = _memory(tmp_path)
+    _write_jsonl(mem / "todos.jsonl", [{"id": "t1", "title": "finish the migration", "status": "open"}])
+    write_snapshot(tmp_path, session_id="s-fb", agent="claude")
+    snap = _read_snapshot(tmp_path, "s-fb")
+    assert snap["handoff"]["next_step"] == "finish the migration"
+    assert snap["handoff"]["derived_from"] == "open_todo"
+
+
+def test_machine_id_stable_and_resume_hints(tmp_path: Path) -> None:
+    from ai_core.session_resume import _resume_hint, machine_id
+
+    first = machine_id(tmp_path)
+    assert first and machine_id(tmp_path) == first  # cached/stable
+    assert _resume_hint("claude", "S1") == "claude --resume S1"
+    assert _resume_hint("antigravity", "C9") == "agy --conversation=C9"
+    assert _resume_hint("codex", "anything") == "codex resume"

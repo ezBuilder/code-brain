@@ -1067,11 +1067,30 @@ def test_obs_search_reports_cache_and_measured_context_bytes(tmp_path: Path) -> 
     assert payload["indexed_files"] > 0
     assert payload["indexed_bytes"] > 0
     assert payload["doctor"]["index_freshness"]["ok"] is True
+    assert "search-fast" in payload["doctor"]["index_freshness"]["detail"]
     assert query["result_count"] > 0
     assert query["matched_indexed_bytes"] >= query["context_bytes"]
     assert 0 <= query["context_to_matched_bytes_ratio"] <= 1
     assert query["additionalContext"]
     assert "estimated_context_tokens" not in query
+
+
+def test_obs_search_does_not_run_full_doctor(tmp_path: Path, monkeypatch) -> None:
+    repo = copy_repo(tmp_path)
+    assert run_ai("index", "rebuild", cwd=repo).returncode == 0
+
+    import ai_core.doctor as doctor_mod
+    from ai_core.obs import search_report
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("obs search must not run full doctor checks")
+
+    monkeypatch.setattr(doctor_mod, "run_checks", _boom)
+    payload = search_report(repo, query_text="worker", limit=5)
+
+    assert payload["ok"] is True
+    assert payload["doctor"]["index_freshness"]["ok"] is True
+    assert "search-fast" in payload["doctor"]["index_freshness"]["detail"]
 
 
 def test_obs_usage_reads_actual_claude_transcript_tokens(tmp_path: Path) -> None:
@@ -2403,7 +2422,10 @@ def test_secret_scan_allowlist_acknowledges_known_paths(tmp_path: Path) -> None:
     assert "docs/fixture-sample.md" in secret_no["detail"]
 
     allowlist = repo / ".ai" / "secret_scan_allowlist.txt"
-    allowlist.write_text("# acknowledged fixture\ndocs/fixture-sample.md\n", encoding="utf-8")
+    allowlist.write_text(
+        allowlist.read_text(encoding="utf-8") + "docs/fixture-sample.md\n",
+        encoding="utf-8",
+    )
     subprocess.run(["git", "add", ".ai/secret_scan_allowlist.txt"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-qm", "acknowledge fixture"], cwd=repo, check=True)
 
@@ -2416,7 +2438,8 @@ def test_secret_scan_allowlist_acknowledges_known_paths(tmp_path: Path) -> None:
     payload_yes = json.loads(result_with_allowlist.stdout)
     secret_yes = next(c for c in payload_yes["checks"] if c["name"] == "secret_scan")
     assert secret_yes["ok"] is True
-    assert "acknowledged=1" in secret_yes["detail"]
+    assert "flagged=0" in secret_yes["detail"]
+    assert "acknowledged=" in secret_yes["detail"]
 
 
 def test_secret_scan_skips_known_noisy_paths(tmp_path: Path) -> None:
@@ -2962,6 +2985,7 @@ def test_session_start_hook_injects_decisions_todos_session_tail(tmp_path: Path)
     ctx = response["additionalContext"]
     assert "Search routing" in ctx
     assert "code_query" in ctx
+    assert "code_read_hashline" in ctx
     assert "Adopt MCP code_query as default search" in ctx
     assert "Cache contentless FTS5 v2" in ctx
     assert "Wire SessionStart auto-inject" in ctx
@@ -2970,6 +2994,60 @@ def test_session_start_hook_injects_decisions_todos_session_tail(tmp_path: Path)
     assert response["additional_context_bytes"] == len(ctx.encode("utf-8"))
     assert response["additional_context_bytes"] <= 12288
     assert response["elapsed_ms"] <= 200
+
+
+def test_session_start_memory_tier_summary_is_cached(tmp_path: Path, monkeypatch) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    calls = {"classify": 0}
+
+    import ai_core.memory_tier as memory_tier_mod
+
+    def fake_classify(_root: Path) -> dict:
+        calls["classify"] += 1
+        return {
+            "tiers": {
+                "hot": {"audit_events": 1},
+                "warm": {"audit_events": 2},
+                "cold": {"audit_events": 3},
+            }
+        }
+
+    monkeypatch.setattr(memory_tier_mod, "classify", fake_classify)
+    monkeypatch.setattr(memory_tier_mod, "hot_pressure", lambda _root: {"session_md_ratio": 0.25})
+
+    from ai_core.hooks import _memory_tier_summary_context
+
+    first = _memory_tier_summary_context(repo)
+    second = _memory_tier_summary_context(repo)
+
+    assert "cb-mem: hot=1 warm=2 cold=3" in first
+    assert "cb-mem: hot=1 warm=2 cold=3" in second
+    assert calls["classify"] == 1
+
+
+def test_session_start_codebase_map_is_cached(tmp_path: Path, monkeypatch) -> None:
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    calls = {"map": 0}
+
+    import ai_core.codebase_map as codebase_map_mod
+
+    def fake_map(_root: Path, *, max_entries: int, include_untracked: bool) -> dict:
+        calls["map"] += 1
+        return {"additionalContext": f"Codebase map cached call {calls['map']}"}
+
+    monkeypatch.setattr(codebase_map_mod, "build_codebase_map", fake_map)
+
+    from ai_core.hooks import _codebase_map_summary_context
+
+    first = _codebase_map_summary_context(repo)
+    second = _codebase_map_summary_context(repo)
+
+    assert "Codebase map cached call 1" in first
+    assert "Codebase map cached call 1" in second
+    assert "Codebase map cached call 2" not in second
+    assert calls["map"] == 1
 
 
 def test_session_start_hook_injects_prior_session_tail(tmp_path: Path) -> None:
@@ -3121,6 +3199,7 @@ def test_user_prompt_submit_hook_includes_routing_when_memory_empty(tmp_path: Pa
     response = json.loads(result.stdout)
     ctx = response["additionalContext"]
     assert "Search routing" in ctx
+    assert "code_read_hashline" in ctx
     assert "Recent decisions" not in ctx
 
 
@@ -3140,6 +3219,7 @@ def test_agents_md_documents_search_routing() -> None:
     text = (ROOT / ".ai" / "AGENTS.md").read_text(encoding="utf-8")
     assert "Search Routing" in text
     assert "code_query" in text
+    assert "code_read_hashline" in text
     assert "grep" in text
 
 

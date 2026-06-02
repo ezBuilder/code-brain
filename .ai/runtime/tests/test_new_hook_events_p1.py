@@ -170,8 +170,13 @@ def test_codex_hooks_registers_subagent_start(install_into_target: Path) -> None
     assert "SubagentStart" in hooks.get("hooks", {})
 
 
-def test_antigravity_hooks_registers_subagent_start(install_into_target: Path) -> None:
-    hooks = json.loads(
+def test_antigravity_hooks_uses_native_events(install_into_target: Path) -> None:
+    # Antigravity has no SubagentStart/SessionStart. Its command hooks live under a
+    # top-level named-hook map whose spec exposes the five native event fields.
+    payload = json.loads(
         (install_into_target / ".agents" / "hooks.json").read_text(encoding="utf-8")
     )
-    assert "SubagentStart" in hooks.get("hooks", {})
+    assert "hooks" not in payload  # not the Claude-style {"hooks": {...}} wrapper
+    spec = payload["code-brain"]
+    assert set(spec) == {"PreToolUse", "PostToolUse", "PreInvocation", "PostInvocation", "Stop"}
+    assert "SubagentStart" not in spec

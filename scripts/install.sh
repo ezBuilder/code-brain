@@ -28,18 +28,26 @@ if ! command -v uv >/dev/null 2>&1; then
   echo "[code-brain] uv install failed. Install it manually: https://docs.astral.sh/uv/ , then re-run." >&2
   exit 1
 fi
+if ! command -v git >/dev/null 2>&1; then
+  echo "[code-brain] git is required. Install git, then re-run." >&2
+  exit 1
+fi
+if ! git -C "$TARGET" rev-parse --show-toplevel >/dev/null 2>&1; then
+  git -C "$TARGET" init >/dev/null
+fi
 
 # 2. Copy + wire repo-local config (repo-local only; never global).
 echo "[code-brain] installing into: $TARGET" >&2
 bash "$SOURCE_ROOT/scripts/install-into.sh" install "$TARGET"
 
-# 3. Bootstrap the runtime (uv sync → venv, manifest, doctor). install-into.sh wrote
-#    bootstrap-code-brain.sh into the target.
+# 3. Bootstrap the runtime, verify strict health, and create the first session snapshot.
 if [[ -f "$TARGET/bootstrap-code-brain.sh" ]]; then
   ( cd "$TARGET" && bash ./bootstrap-code-brain.sh )
 else
   ( cd "$TARGET" && uv sync --project .ai/runtime --extra dense )
 fi
+( cd "$TARGET" && uv run --project .ai/runtime ai doctor --strict --json >/dev/null )
+( cd "$TARGET" && uv run --project .ai/runtime ai session start --agent installer --query "initial Code Brain setup" --json >/dev/null )
 
-echo "[code-brain] done. claude / codex / agy in $TARGET now share Code Brain memory." >&2
+echo "[code-brain] installed. New AI sessions in $TARGET now load Code Brain memory, search, hooks, and MCP automatically." >&2
 echo "[code-brain] (optional) cross-machine sync: set memory_sync.enabled: true in .ai/config.yaml + AI_REMOTE_FETCH=1." >&2

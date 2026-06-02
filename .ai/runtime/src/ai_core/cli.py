@@ -489,13 +489,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def emit(payload: object, *, as_json: bool) -> None:
+    def _write(text: str) -> None:
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write((text + "\n").encode("utf-8", errors="backslashreplace"))
     if as_json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        _write(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     elif isinstance(payload, dict):
         for key, value in payload.items():
-            print(f"{key}: {value}")
+            _write(f"{key}: {value}")
     else:
-        print(payload)
+        _write(str(payload))
 
 
 def main(argv: list[str] | None = None) -> int:

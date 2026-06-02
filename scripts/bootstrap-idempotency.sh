@@ -11,7 +11,6 @@ mkdir -p "$COPY"
 cd "$ROOT"
 tar \
   --exclude './.git' \
-  --exclude './.claude' \
   --exclude './.ai/cache' \
   --exclude './.ai/runtime/.venv' \
   --exclude './.ai/runtime/.pytest_cache' \

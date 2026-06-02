@@ -5,6 +5,28 @@ umask 077
 SOURCE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ACTION="${1:-install}"
 
+# Host Python for this installer's inline scripts. Prefer the source runtime's
+# venv interpreter: merge_antigravity_mcp_json imports ai_core, whose
+# requires-python is >=3.11, so an older system python3 (e.g. macOS ships 3.9)
+# would fail to import it. Fall back to uv's project python, then any
+# python3/python. These scripts used to call bare `python`, which is absent on
+# systems that ship only `python3`.
+py() {
+  if [[ -x "$SOURCE_ROOT/.ai/runtime/.venv/bin/python" ]]; then
+    "$SOURCE_ROOT/.ai/runtime/.venv/bin/python" "$@"
+  elif command -v uv >/dev/null 2>&1; then
+    uv run --project "$SOURCE_ROOT/.ai/runtime" python "$@"
+  else
+    local _py
+    _py="$(command -v python3 || command -v python || true)"
+    if [[ -z "$_py" ]]; then
+      echo "install-into failed: no python3/python interpreter found on PATH" >&2
+      exit 2
+    fi
+    "$_py" "$@"
+  fi
+}
+
 usage() {
   cat >&2 <<'EOF'
 usage:
@@ -40,6 +62,7 @@ TARGET_ROOT="$(cd "$TARGET_ARG" && pwd -P)"
 
 if ! git -C "$TARGET_ROOT" rev-parse --show-toplevel >/dev/null 2>&1; then
   echo "install-into failed: target is not inside a git repository: $TARGET_ROOT" >&2
+  echo "  hint: run 'git init' in the target, then re-run install-into" >&2
   exit 2
 fi
 
@@ -121,7 +144,7 @@ is_managed_existing_file() {
   local rel="$1"
   local manifest
   manifest="$(manifest_path)"
-  if [[ -f "$manifest" ]] && python - "$manifest" "$rel" <<'PY'
+  if [[ -f "$manifest" ]] && py - "$manifest" "$rel" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -180,7 +203,7 @@ EOF
 
 write_install_manifest() {
   mkdir -p "$TARGET_ROOT/.ai/generated"
-  python -c '
+  py -c '
 import json
 import subprocess
 import sys
@@ -315,7 +338,7 @@ restore_managed_owner_if_root() {
 }
 
 configure_project() {
-  python - "$TARGET_ROOT" <<'PY'
+  py - "$TARGET_ROOT" <<'PY'
 import sys
 from pathlib import Path
 
@@ -338,7 +361,7 @@ PY
 
 merge_mcp_json() {
   local dst="$TARGET_ROOT/.mcp.json"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -365,7 +388,7 @@ PY
 
 merge_codex_config() {
   local dst="$TARGET_ROOT/.codex/config.toml"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -473,7 +496,7 @@ PY
 
 merge_claude_settings() {
   local dst="$TARGET_ROOT/.claude/settings.json"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -604,7 +627,7 @@ PY
 
 merge_codex_hooks_json() {
   local dst="$TARGET_ROOT/.codex/hooks.json"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -682,7 +705,7 @@ PY
 
 merge_antigravity_mcp_json() {
   local dst="$TARGET_ROOT/.agents/mcp_config.json"
-  python - "$dst" "$SOURCE_ROOT" <<'PY'
+  py - "$dst" "$SOURCE_ROOT" <<'PY'
 import sys
 from pathlib import Path
 
@@ -697,7 +720,7 @@ PY
 
 merge_antigravity_hooks_json() {
   local dst="$TARGET_ROOT/.agents/hooks.json"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -844,7 +867,7 @@ uninstall() {
   if [[ "$(git -C "$TARGET_ROOT" config --get core.hooksPath || true)" == ".githooks" ]]; then
     git -C "$TARGET_ROOT" config --unset core.hooksPath || true
   fi
-  python - "$TARGET_ROOT" "$manifest" <<'PY'
+  py - "$TARGET_ROOT" "$manifest" <<'PY'
 import json
 import re
 import shutil

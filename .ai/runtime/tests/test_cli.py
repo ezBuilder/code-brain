@@ -2422,7 +2422,10 @@ def test_secret_scan_allowlist_acknowledges_known_paths(tmp_path: Path) -> None:
     assert "docs/fixture-sample.md" in secret_no["detail"]
 
     allowlist = repo / ".ai" / "secret_scan_allowlist.txt"
-    allowlist.write_text("# acknowledged fixture\ndocs/fixture-sample.md\n", encoding="utf-8")
+    allowlist.write_text(
+        allowlist.read_text(encoding="utf-8") + "docs/fixture-sample.md\n",
+        encoding="utf-8",
+    )
     subprocess.run(["git", "add", ".ai/secret_scan_allowlist.txt"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-qm", "acknowledge fixture"], cwd=repo, check=True)
 
@@ -2435,7 +2438,8 @@ def test_secret_scan_allowlist_acknowledges_known_paths(tmp_path: Path) -> None:
     payload_yes = json.loads(result_with_allowlist.stdout)
     secret_yes = next(c for c in payload_yes["checks"] if c["name"] == "secret_scan")
     assert secret_yes["ok"] is True
-    assert "acknowledged=1" in secret_yes["detail"]
+    assert "flagged=0" in secret_yes["detail"]
+    assert "acknowledged=" in secret_yes["detail"]
 
 
 def test_secret_scan_skips_known_noisy_paths(tmp_path: Path) -> None:

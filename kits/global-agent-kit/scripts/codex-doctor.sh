@@ -3,6 +3,23 @@ set -euo pipefail
 
 HOME_DIR="$HOME"
 SELF_TEST=0
+PYTHON_BIN="${PYTHON_BIN:-}"
+
+pick_python() {
+  if [[ -n "$PYTHON_BIN" ]]; then
+    printf '%s\n' "$PYTHON_BIN"
+    return 0
+  fi
+  local candidate
+  for candidate in python3.12 python3.11 python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  echo "fail: Python 3.11+ is required for TOML diagnostics" >&2
+  exit 1
+}
 
 usage() {
   cat <<'USAGE'
@@ -36,7 +53,7 @@ while (($#)); do
 done
 
 run_diagnostics() {
-  python3 - "$HOME_DIR" <<'PY'
+  "$(pick_python)" - "$HOME_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path

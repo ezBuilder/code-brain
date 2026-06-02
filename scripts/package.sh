@@ -3,7 +3,22 @@ set -euo pipefail
 export COPYFILE_DISABLE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="$("$ROOT/.ai/bin/ai" --json version | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+py() {
+  if [[ -x "$ROOT/.ai/runtime/.venv/bin/python" ]]; then
+    "$ROOT/.ai/runtime/.venv/bin/python" "$@"
+  elif command -v uv >/dev/null 2>&1; then
+    uv run --project "$ROOT/.ai/runtime" python "$@"
+  else
+    local _py
+    _py="$(command -v python3 || command -v python || true)"
+    if [[ -z "$_py" ]]; then
+      echo "package failed: no python3/python interpreter found on PATH" >&2
+      exit 2
+    fi
+    "$_py" "$@"
+  fi
+}
+VERSION="$("$ROOT/.ai/bin/ai" --json version | py -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
 OUT_DIR="${DIST_OVERRIDE:-$ROOT/dist}"
 NAME="code-brain-${VERSION}"
 ARCHIVE="$OUT_DIR/${NAME}.tar.gz"
@@ -30,7 +45,7 @@ mkdir -p "$OUT_DIR"
 rm -f "$ARCHIVE" "$ARCHIVE.sha256" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES"
 COMMIT_TIME="$(git -C "$ROOT" log -1 --format=%ct)"
 
-python - "$ROOT" "$ARCHIVE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES" "$VERSION" "$NAME" "$COMMIT_TIME" <<'PY'
+py - "$ROOT" "$ARCHIVE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES" "$VERSION" "$NAME" "$COMMIT_TIME" <<'PY'
 import json
 import hashlib
 import gzip

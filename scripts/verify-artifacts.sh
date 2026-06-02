@@ -2,7 +2,23 @@
 set -euo pipefail
 export COPYFILE_DISABLE=1
 
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCHIVE="${1:-}"
+py() {
+  if [[ -x "$ROOT/.ai/runtime/.venv/bin/python" ]]; then
+    "$ROOT/.ai/runtime/.venv/bin/python" "$@"
+  elif command -v uv >/dev/null 2>&1; then
+    uv run --project "$ROOT/.ai/runtime" python "$@"
+  else
+    local _py
+    _py="$(command -v python3 || command -v python || true)"
+    if [[ -z "$_py" ]]; then
+      echo "verify artifacts failed: no python3/python interpreter found on PATH" >&2
+      exit 2
+    fi
+    "$_py" "$@"
+  fi
+}
 
 if [[ -z "$ARCHIVE" ]]; then
   echo "usage: $0 dist/code-brain-<version>.tar.gz" >&2
@@ -22,7 +38,7 @@ RELEASE_NOTES="${ARCHIVE%.tar.gz}.release-notes.md"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-python - "$ARCHIVE" "$SHA_FILE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES" "$TMP" <<'PY'
+py - "$ARCHIVE" "$SHA_FILE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES" "$TMP" <<'PY'
 import hashlib
 import json
 import pathlib

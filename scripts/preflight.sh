@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Prefer python3; some systems (e.g. macOS) ship only `python3`, not `python`.
+PYTHON="${PYTHON:-$(command -v python3 || command -v python || true)}"
+if [[ -z "$PYTHON" ]]; then
+  echo "preflight failed: no python3/python interpreter found on PATH" >&2
+  exit 2
+fi
+
 CHECK_ONLY=false
 JSON=false
 for arg in "$@"; do
@@ -17,7 +24,7 @@ for arg in "$@"; do
   esac
 done
 
-python - "$ROOT" "$CHECK_ONLY" "$JSON" <<'PY'
+"$PYTHON" - "$ROOT" "$CHECK_ONLY" "$JSON" <<'PY'
 import json
 import os
 import shutil

@@ -3,6 +3,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+py() {
+  if [[ -x "$ROOT/.ai/runtime/.venv/bin/python" ]]; then
+    "$ROOT/.ai/runtime/.venv/bin/python" "$@"
+  elif command -v uv >/dev/null 2>&1; then
+    uv run --project "$ROOT/.ai/runtime" python "$@"
+  else
+    local _py
+    _py="$(command -v python3 || command -v python || true)"
+    if [[ -z "$_py" ]]; then
+      echo "release gate failed: no python3/python interpreter found on PATH" >&2
+      exit 2
+    fi
+    "$_py" "$@"
+  fi
+}
 PACKAGE_OUTPUT="$(mktemp)"
 REPORT_OUTPUT="$(mktemp)"
 trap 'rm -f "$PACKAGE_OUTPUT" "$REPORT_OUTPUT"' EXIT
@@ -32,7 +47,7 @@ uv run --project .ai/runtime ai doctor --strict --json >/dev/null
 uv run --project .ai/runtime ai report status --json >"$REPORT_OUTPUT"
 mkdir -p dist
 uv run --project .ai/runtime ai report release-gate-summary --git-sha "$(git rev-parse HEAD)" --json >dist/release-gate.summary.json
-python - "$REPORT_OUTPUT" <<'PY'
+py - "$REPORT_OUTPUT" <<'PY'
 import json
 import sys
 from pathlib import Path

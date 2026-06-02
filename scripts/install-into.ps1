@@ -7,7 +7,8 @@
 #   scripts\install-into.ps1 upgrade <target>
 #   scripts\install-into.ps1 uninstall <target>
 #
-# Reuses Python merge logic via inline scripts. Requires `python` and `git`.
+# Reuses Python merge logic via inline scripts. Prefers `uv` managed Python so
+# Windows Store python/python3 execution aliases are never treated as valid.
 
 param(
     [Parameter(Position = 0)] [string] $Action = "",
@@ -110,26 +111,27 @@ function Copy-ManagedFile {
 
 function Invoke-Python {
     param([string]$Script, [string]$Argument)
-    $py = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $py) {
-        $py = Get-Command python3 -ErrorAction SilentlyContinue
-    }
     $scriptFile = New-TemporaryFile
     $scriptPath = [System.IO.Path]::ChangeExtension($scriptFile.FullName, ".py")
     Move-Item -Force -LiteralPath $scriptFile.FullName -Destination $scriptPath
     Set-Content -LiteralPath $scriptPath -Value $Script -Encoding UTF8
     try {
-        if ($py) {
-            & $py.Path $scriptPath $Argument
-        }
-        else {
-            $uv = Get-Command uv -ErrorAction SilentlyContinue
-            if (-not $uv) {
-                Write-Error "install-into failed: python not found in PATH and uv is unavailable"
-                exit 2
-            }
+        $uv = Get-Command uv -ErrorAction SilentlyContinue
+        if ($uv) {
             & $uv.Path "run" "--project" (Join-Path $SourceRoot ".ai/runtime") "python" $scriptPath $Argument
+            return
         }
+        foreach ($name in @("python", "python3")) {
+            $py = Get-Command $name -ErrorAction SilentlyContinue
+            if (-not $py) { continue }
+            & $py.Path -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" *> $null
+            if ($LASTEXITCODE -eq 0) {
+                & $py.Path $scriptPath $Argument
+                return
+            }
+        }
+        Write-Error "install-into failed: uv unavailable and no real Python 3.11+ interpreter found"
+        exit 2
     }
     finally {
         Remove-Item -Force -LiteralPath $scriptPath -ErrorAction SilentlyContinue

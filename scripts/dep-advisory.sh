@@ -3,6 +3,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+py() {
+  if [[ -x "$ROOT/.ai/runtime/.venv/bin/python" ]]; then
+    "$ROOT/.ai/runtime/.venv/bin/python" "$@"
+  elif command -v uv >/dev/null 2>&1; then
+    uv run --project "$ROOT/.ai/runtime" python "$@"
+  else
+    local _py
+    _py="$(command -v python3 || command -v python || true)"
+    if [[ -z "$_py" ]]; then
+      echo "dep-advisory failed: no python3/python interpreter found on PATH" >&2
+      exit 2
+    fi
+    "$_py" "$@"
+  fi
+}
 mkdir -p dist
 
 OUT="dist/dep-advisory.json"
@@ -10,7 +25,7 @@ RAW_OUTPUT="$(mktemp)"
 trap 'rm -f "$RAW_OUTPUT"' EXIT
 
 if [[ "${CODE_BRAIN_DEP_ADVISORY_OFFLINE:-}" == "1" ]]; then
-  python3 - "$OUT" <<'PY'
+  py - "$OUT" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -35,7 +50,7 @@ if [[ -n "${CODE_BRAIN_DEP_ADVISORY_RAW:-}" ]]; then
   printf '%s\n' "$CODE_BRAIN_DEP_ADVISORY_RAW" >"$RAW_OUTPUT"
 else
   if ! command -v uv >/dev/null 2>&1; then
-    python3 - "$OUT" <<'PY'
+    py - "$OUT" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -60,7 +75,7 @@ PY
   AUDIT_STATUS="$?"
   set -e
   if [[ "$AUDIT_STATUS" -gt 1 ]]; then
-    python3 - "$OUT" "$AUDIT_STATUS" <<'PY'
+    py - "$OUT" "$AUDIT_STATUS" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -83,7 +98,7 @@ PY
   fi
 fi
 
-python3 - "$OUT" "$RAW_OUTPUT" <<'PY'
+py - "$OUT" "$RAW_OUTPUT" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone

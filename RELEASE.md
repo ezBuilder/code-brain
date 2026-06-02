@@ -8,6 +8,7 @@
 ./scripts/lint.sh
 ./scripts/smoke.sh
 ./scripts/docs-check.sh
+./scripts/dep-advisory.sh
 ./scripts/package.sh
 ./scripts/verify-artifacts.sh dist/code-brain-0.1.0.tar.gz
 ./scripts/install-check.sh
@@ -27,6 +28,7 @@ git status --short
 ## Expected State
 
 - All tests pass.
+- Production hardening follow-ups are tracked in `PRODUCTION_HARDENING_BACKLOG.md`.
 - Environment check passes for bash, git, make, uv, and uv-managed Python; PowerShell is reported as optional.
 - Direct bootstrap starts with the environment check; bash and PowerShell bootstrap render with `--dry-run` under CI/GitHub Actions.
 - `uv.lock` is current for `.ai/runtime` through `scripts/lockfile-check.sh`, which wraps `uv lock --check --project .ai/runtime`.

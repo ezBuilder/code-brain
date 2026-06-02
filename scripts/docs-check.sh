@@ -75,9 +75,9 @@ for needle in \
   "/cb-health" \
   "/cb-search" \
   "/cb-doctor" \
-  "make install-into TARGET=/path/to/repo" \
-  "make upgrade-in TARGET=/path/to/repo" \
-  "make uninstall-from TARGET=/path/to/repo" \
+  "bash scripts/install.sh /path/to/project" \
+  "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install.ps1 C:\\path\\to\\project" \
+  "New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically." \
   "ai audit rebuild-index" \
   "ai session start" \
   "uv lock --check --project .ai/runtime" \

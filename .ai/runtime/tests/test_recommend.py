@@ -391,6 +391,58 @@ def test_signal_strength_sort_prioritizes_stronger_signals(tmp_root: Path):
     )
 
 
+def test_bash_head_runbook_dropped_for_low_diversity(tmp_root: Path):
+    """High-frequency but single-subcommand tool (uv→only `uv run`) must NOT yield a
+    runbook, while a genuinely multi-subcommand domain (git) still does."""
+    from collections import Counter
+    from ai_core.recommend import Signals, cluster_candidates
+
+    sig = Signals()
+    sig.bash_head_counts = Counter({"uv": 200, "git": 200})
+    sig.bash_head_diversity = {"uv": 1, "git": 27}
+    slugs = {c.slug for c in cluster_candidates(sig, limit=10, min_signal=3)}
+    assert "git-runbook" in slugs, "multi-subcommand domain should still be recommended"
+    assert "uv-runbook" not in slugs, "single-subcommand tool must be suppressed"
+
+
+def test_bash_head_diversity_gate_fails_open_when_unknown(tmp_root: Path):
+    """Unknown diversity (empty map, e.g. pre-diversity cache) must NOT suppress —
+    we only drop a runbook when diversity is known and below the threshold."""
+    from collections import Counter
+    from ai_core.recommend import Signals, cluster_candidates
+
+    sig = Signals()
+    sig.bash_head_counts = Counter({"uv": 200})
+    sig.bash_head_diversity = {}
+    slugs = {c.slug for c in cluster_candidates(sig, limit=10, min_signal=3)}
+    assert "uv-runbook" in slugs, "unknown diversity must fail open (no suppression)"
+
+
+def test_argument_only_utilities_excluded_from_runbook_domains():
+    """Single-purpose, argument-oriented utilities are not runbook domains."""
+    from ai_core.recommend import _BASH_DOMAIN_TOOLS
+
+    for tool in ("rg", "ripgrep", "fd", "jq"):
+        assert tool not in _BASH_DOMAIN_TOOLS, f"{tool} should not be a runbook domain"
+    for tool in ("git", "ai", "docker", "kubectl"):
+        assert tool in _BASH_DOMAIN_TOOLS, f"{tool} should remain a runbook domain"
+
+
+def test_compute_bash_head_stats_counts_distinct_subcommands(tmp_root: Path, monkeypatch):
+    """Diversity = distinct first-non-flag token after the tool head."""
+    import ai_core.recommend as recmod
+
+    invs = ["uv run pytest", "uv run ruff", "git status -s", "git log", "git diff", "rg foo"]
+    monkeypatch.setattr(
+        "ai_core.precall_recommend.gather_bash_invocations",
+        lambda root, include_transcripts=True: invs,
+    )
+    counts, div = recmod._compute_bash_head_stats(tmp_root)
+    assert counts["uv"] == 2 and div["uv"] == 1, "both uv calls are `uv run`"
+    assert counts["git"] == 3 and div["git"] == 3, "git status/log/diff = 3 distinct"
+    assert "rg" not in counts, "rg is excluded from the runbook domain allowlist"
+
+
 def test_adaptive_cold_start_preserves_explicit_higher_threshold(tmp_root: Path):
     """Cluster cold-start adaptive must NOT downgrade when caller already raised threshold above DEFAULT.
     Prevents hook-level adaptive bump (3→4 after 20+ ignored) from being overridden by cluster cold-start."""

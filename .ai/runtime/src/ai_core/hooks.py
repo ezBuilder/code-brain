@@ -75,6 +75,39 @@ DECISIONS_TAIL = 5
 TODOS_LIMIT = 5
 SESSION_TAIL_LINES = 8
 PRIOR_SESSION_TAIL_LINES = 8
+
+KNOWN_AGENTS = {"claude", "codex", "antigravity"}
+
+
+def normalize_agent(payload: dict[str, Any]) -> str:
+    """Map a hook payload's agent identifier to one of the canonical names.
+
+    Returns one of ``claude``, ``codex``, ``antigravity``, or ``unknown``. We
+    prefer an explicit ``agent`` (or ``agent_name``) field; otherwise we fall
+    back to environment variables each host sets (``CLAUDE_PROJECT_DIR`` for
+    Claude Code, ``CODEX_HOME`` for OpenAI Codex CLI, ``ANTIGRAVITY_CLI`` /
+    ``GEMINI_HOME`` for Google Antigravity). The result is used both for
+    inject-context headers and for obs/audit breakdown.
+    """
+    raw = payload.get("agent") or payload.get("agent_name") or ""
+    norm = str(raw).strip().lower()
+    aliases = {
+        "claude": "claude", "claude-code": "claude", "claudecode": "claude",
+        "codex": "codex", "codex-cli": "codex",
+        "antigravity": "antigravity", "agy": "antigravity", "antigravity-cli": "antigravity",
+    }
+    if norm in aliases:
+        return aliases[norm]
+    if norm and norm != "unknown":
+        return norm
+    env = _os.environ
+    if env.get("CLAUDE_PROJECT_DIR"):
+        return "claude"
+    if env.get("CODEX_HOME") or env.get("CODEX_TURN_ID"):
+        return "codex"
+    if env.get("ANTIGRAVITY_CLI") or env.get("AGY_HOME"):
+        return "antigravity"
+    return "unknown"
 DELTA_NOTICE_SHORT = "cb-ctx: Δ"
 DELTA_NOTICE_VERBOSE = "Code Brain context unchanged since last injection (delta-skipped)."
 SKILL_RECOMMENDATION_DISABLE_VALUES = {"0", "false", "no", "off"}
@@ -165,6 +198,107 @@ def _spawn_background_rebuild(root: Path) -> None:
                 **detached_popen_kwargs(),
             )
         register_child(root, pid=proc.pid, kind="index_rebuild", command=cmd)
+    except Exception:
+        pass
+
+
+def _spawn_agents_md_refresh(root: Path) -> None:
+    """Refresh the managed AGENTS.md memory block in a DETACHED process.
+
+    Antigravity fires its ``Stop`` hook but does not wait for / may kill the hook
+    process before a synchronous refresh (which calls build_context, ~1s) finishes
+    — so the block would never update from an agy turn. Running the refresh
+    detached (own session, like _spawn_background_rebuild) lets it complete even
+    if the host kills the parent hook. The refresh itself is write-on-change, so
+    repeated spawns don't churn AGENTS.md. Never raises into the hook hot path.
+    """
+    import os
+    import subprocess
+    import sys
+
+    from .portable import detached_popen_kwargs
+
+    if _env_disabled("AI_AGENTS_MD_MEMORY", default="1"):
+        return
+    # Cooldown: PostToolUse can fire many times per turn. Spawn at most once per
+    # window so we don't launch a build_context process on every tool call.
+    try:
+        cooldown = float(os.environ.get("AI_AGENTS_MD_REFRESH_COOLDOWN", "15"))
+    except (TypeError, ValueError):
+        cooldown = 15.0
+    lock = root / ".ai" / "cache" / "agents_md_refresh.lock"
+    try:
+        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
+            return
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(time.time()), encoding="utf-8")
+    except Exception:
+        pass
+    src = str(root / ".ai" / "runtime" / "src")
+    code = (
+        "import sys;from pathlib import Path;"
+        f"sys.path.insert(0,{src!r});"
+        "from ai_core.agents_md import refresh;refresh(Path(sys.argv[1]))"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    try:
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [sys.executable, "-c", code, str(root)],
+                stdout=devnull,
+                stderr=devnull,
+                stdin=subprocess.DEVNULL,
+                cwd=str(root),
+                env=env,
+                **detached_popen_kwargs(),
+            )
+    except Exception:
+        pass
+
+
+def _spawn_memory_sync(root: Path, agent: str) -> None:
+    """Spawn the opt-in cross-machine memory sync DETACHED (off the hook hot path). The
+    sync does git fetch/push; this only launches it. No-op unless memory_sync.enabled, and
+    a cooldown bounds how often it runs so rapid turn-end Stops don't hammer the remote."""
+    import os
+    import subprocess
+
+    from .portable import detached_popen_kwargs
+
+    try:
+        from .memory_sync import sync_enabled
+
+        if not sync_enabled(root):
+            return
+    except Exception:
+        return
+    try:
+        cooldown = float(os.environ.get("AI_MEMORY_SYNC_COOLDOWN", "120"))
+    except (TypeError, ValueError):
+        cooldown = 120.0
+    lock = root / ".ai" / "cache" / "memory_sync.lock"
+    try:
+        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
+            return
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+    ai_bin = root / ".ai" / "bin" / "ai"
+    if not ai_bin.exists():
+        return
+    try:
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [str(ai_bin), "memory", "sync", "--agent", agent, "--json"],
+                stdout=devnull,
+                stderr=devnull,
+                stdin=subprocess.DEVNULL,
+                cwd=str(root),
+                **detached_popen_kwargs(),
+            )
     except Exception:
         pass
 
@@ -299,6 +433,30 @@ def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
             spawned.append(f"sandbox_prune(pid={proc.pid})")
     except Exception:
         pass
+
+    # Job 4 (P3): refresh origin refs so SessionStart's cb-behind banner can detect a
+    # remote machine being ahead. Network — so OPT-IN only (AI_REMOTE_FETCH=1), keeping
+    # Code Brain's offline-by-default ethos. Detached + off the hook hot path; failures
+    # (offline, no remote, auth) are swallowed. SessionStart never fetches; it only reads
+    # the ref this job updated.
+    if _env_enabled("AI_REMOTE_FETCH"):
+        try:
+            from .process_janitor import register_child
+
+            cmd = ["git", "-C", str(root), "fetch", "--quiet", "--no-tags"]
+            with open(os.devnull, "wb") as devnull:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=devnull,
+                    stderr=devnull,
+                    stdin=subprocess.DEVNULL,
+                    cwd=str(root),
+                    **detached_popen_kwargs(),
+                )
+            register_child(root, pid=proc.pid, kind="sleep_time_git_fetch", command=cmd)
+            spawned.append(f"git_fetch(pid={proc.pid})")
+        except Exception:
+            pass
 
     return {"ok": True, "spawned": spawned, "skipped": False, "reason": None}
 
@@ -706,6 +864,47 @@ def _recommendation_section(
 
 
 _RECOMMEND_CACHE_TTL_SECONDS = 300
+_HOOK_SUMMARY_CACHE_TTL_SECONDS = 300
+
+
+def _cached_hook_summary(
+    root: Path,
+    *,
+    cache_name: str,
+    deps: list[Path],
+    compute: "callable",
+    cache_key_extra: tuple = (),
+) -> str:
+    """Cache expensive hook summary strings so SessionStart stays sublinear.
+
+    Hook summaries are hints, not source-of-truth checks. A short TTL plus mtime
+    dependencies keeps them fresh enough while preventing repeated audit-log
+    parsing on every startup.
+    """
+    import time
+
+    cache_path = root / ".ai" / "cache" / f"{cache_name}.json"
+    if cache_path.exists():
+        try:
+            cache_mt = cache_path.stat().st_mtime
+            age = time.time() - cache_mt
+            if age < _HOOK_SUMMARY_CACHE_TTL_SECONDS:
+                if all((not p.exists()) or p.stat().st_mtime <= cache_mt for p in deps):
+                    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict) and tuple(payload.get("extra") or ()) == cache_key_extra:
+                        return str(payload.get("text") or "")
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    text = str(compute() or "")
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"extra": list(cache_key_extra), "text": text}), encoding="utf-8")
+        import os as _os_atomic
+        _os_atomic.replace(tmp, cache_path)
+    except OSError:
+        pass
+    return text
 
 
 def _audit_dependency_paths(root: Path) -> list[Path]:
@@ -1027,6 +1226,16 @@ def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
         return ""
     if _env_disabled("AI_SATISFACTION_SUMMARY"):
         return ""
+    deps = _recommend_memory_deps(root)
+    return _cached_hook_summary(
+        root,
+        cache_name="satisfaction_summary_hot",
+        deps=deps,
+        compute=lambda: _satisfaction_summary_context_uncached(root),
+    )
+
+
+def _satisfaction_summary_context_uncached(root: Path) -> str:
     audit_files = all_audit_files(root)
     if not audit_files:
         return ""
@@ -1241,6 +1450,20 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             pass
 
     precall_decision: dict[str, Any] | None = None
+    stream_guard_decision: dict[str, Any] | None = None
+    try:
+        from .stream_guard import decision_reason, evaluate_hook_payload
+
+        scan = evaluate_hook_payload(str(effective_hook), payload)
+        if scan.get("matches"):
+            stream_guard_decision = {
+                "action": "block" if not scan.get("ok", True) else "observe",
+                "reason": decision_reason(scan),
+                "matches": scan.get("matches", []),
+            }
+    except Exception:
+        stream_guard_decision = None
+
     if effective_hook == "PreToolUse":
         tool_name = str(payload.get("tool_name") or payload.get("tool") or "")
         raw_input = payload.get("tool_input")
@@ -1319,6 +1542,10 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         }
         if precall_decision.get("action") == "block":
             event["decision"] = "block"
+    if stream_guard_decision:
+        event["stream_guard"] = stream_guard_decision
+        if stream_guard_decision.get("action") == "block":
+            event["decision"] = "block"
     if is_ci() or payload.get("dry") is True:
         mode = "ci-fast-path" if is_ci() else "local-dry-fast-path"
         persisted = False
@@ -1326,6 +1553,14 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         append_event(root, event)
         mode = "local-append"
         persisted = True
+        # Spawn the AGENTS.md memory refresh EARLY and detached. Stop/SessionEnd are
+        # the natural triggers for Claude/Codex, but Antigravity kills its Stop hook
+        # before the work runs (its Stop never reaches append_event) — so we also fire
+        # on PostToolUse, which Antigravity DOES complete. A cooldown in the helper
+        # bounds frequency; the refresh is write-on-change and detached so it finishes
+        # even if the host kills the parent hook.
+        if effective_hook in {"Stop", "SessionEnd", "PostToolUse"}:
+            _spawn_agents_md_refresh(root)
         if effective_hook in AUTO_REBUILD_HOOKS:
             _spawn_background_rebuild(root)
             try:
@@ -1377,6 +1612,10 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                 _spawn_sleep_time_jobs(root)
             except Exception:
                 pass
+            # P4: opt-in cross-machine memory auto-sync. Detached + off the hot path; the
+            # sync itself does git fetch/push but this hook only spawns it. Gated by
+            # memory_sync.enabled and a cooldown so rapid turn-end Stops don't hammer git.
+            _spawn_memory_sync(root, normalize_agent(payload))
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     target_ms = _target_ms_for(effective_hook)
     if persisted and elapsed_ms > target_ms:
@@ -1445,6 +1684,28 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     "Code Brain stores full output in .ai/cache/sandbox/<exec_id>.txt and returns a short summary "
                     "(first 30 + last 5 lines, total under 4 KB) to keep your context window small."
                 )
+    if stream_guard_decision:
+        response["stream_guard"] = stream_guard_decision
+        # Blocking is only meaningful BEFORE a tool runs (PreToolUse) or for a
+        # prompt/stop. On PostToolUse the tool already executed, so promoting a
+        # match to decision=block is both pointless and emits a wire shape Codex
+        # rejects as "invalid post-tool-use JSON output". There the match still
+        # drives redaction (updatedToolOutput) and is recorded in the audit.
+        if (
+            stream_guard_decision.get("action") == "block"
+            and effective_hook != "PostToolUse"
+            and response.get("decision") != "block"
+        ):
+            response["decision"] = "block"
+            reason = str(stream_guard_decision.get("reason") or "Code Brain stream guard blocked this operation")
+            existing = response.get("hookSpecificOutput")
+            if not isinstance(existing, dict):
+                existing = {"hookEventName": effective_hook}
+            existing["permissionDecision"] = "deny"
+            existing["permissionDecisionReason"] = reason
+            existing["additionalContext"] = additional_context
+            response["hookSpecificOutput"] = existing
+            response["reason"] = reason
     # T44: PostToolUse `updatedToolOutput` — Claude Code 2026 spec field. When a
     # tool's stdout contains secrets (or long matches), we redact and surface
     # the cleaned version via hookSpecificOutput.updatedToolOutput so the model
@@ -1457,7 +1718,13 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             raw_tool_output = payload.get("tool_output")
         if raw_tool_output is not None:
             cleaned = redact_value(raw_tool_output)
-            if cleaned != raw_tool_output:
+            # `updatedToolOutput` MUST be a string per the Claude Code / Codex hook
+            # spec. A dict/list value (e.g. exec_command's {"stdout":...} response
+            # after redaction) makes the client reject the whole hook as "invalid
+            # post-tool-use JSON output". Only surface the cleaned value when it is
+            # a string; structured outputs are still scrubbed in the persisted audit
+            # copy via the redact_value(response) below.
+            if isinstance(cleaned, str) and cleaned != raw_tool_output:
                 existing = response.get("hookSpecificOutput")
                 if not isinstance(existing, dict):
                     existing = {"hookEventName": effective_hook}
@@ -1548,6 +1815,12 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
                     )
                 else:
                     reason = str(payload.get("reason") or "unknown")
+                    # Restore freshness *before* snapshotting so the resume snapshot
+                    # carries real progress instead of frozen, fresh-looking-stale state.
+                    try:
+                        _auto_milestone_on_stale(root)
+                    except Exception:
+                        pass
                     write_snapshot(
                         root,
                         session_id=session_id,
@@ -1737,16 +2010,19 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             "use grep only as fallback when MCP fails."
         )
     sections.append(routing)
+    sections.append(
+        "Code reading: after `code_query` locates a file, prefer MCP `code_read_hashline` "
+        "for exact file slices so line+hash anchors are available before edits. "
+        "For CLI fallback, use `.ai/bin/ai code read-hashline <path> --start N --end M`; "
+        "verify saved anchors with `.ai/bin/ai code verify-hashline <path>` when stale edits matter."
+    )
+    staleness = _memory_staleness_context(root, hook_name)
+    if staleness:
+        sections.append(staleness)
     if hook_name == "SessionStart":
-        try:
-            from .codebase_map import build_codebase_map
-
-            map_payload = build_codebase_map(root, max_entries=12, include_untracked=False)
-            map_context = str(map_payload.get("additionalContext") or "")
-            if map_context:
-                sections.append(map_context)
-        except Exception:
-            pass
+        map_context = _codebase_map_summary_context(root)
+        if map_context:
+            sections.append(map_context)
         try:
             from .autonomous_harness import context_line as _harness_context_line
             sections.append(_harness_context_line(root))
@@ -1771,6 +2047,37 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             prior = None
         if prior:
             lines = [f"Prior session resume (session_id={prior.get('session_id')}, written_at={prior.get('written_at')}):"]
+            # P1: lead with the intent-carrying handoff so a resuming session (esp. on
+            # the other machine) sees "what we were doing / what to do next" first.
+            handoff = prior.get("handoff") if isinstance(prior.get("handoff"), dict) else None
+            if handoff:
+                if handoff.get("goal"):
+                    lines.append(f"  goal: {str(handoff['goal'])[:200]}")
+                if handoff.get("next_step"):
+                    lines.append(f"  next step: {str(handoff['next_step'])[:200]}")
+                for step in (handoff.get("plan") or [])[:6]:
+                    lines.append(f"  plan: {str(step)[:160]}")
+                for q in (handoff.get("open_questions") or [])[:4]:
+                    lines.append(f"  open question: {str(q)[:160]}")
+                for b in (handoff.get("blockers") or [])[:4]:
+                    lines.append(f"  blocker: {str(b)[:160]}")
+            # P2: cross-machine pointer — if the prior thread ran on another machine,
+            # its full transcript stays there (all 3 agents are local-only); tell the
+            # resuming agent where it is and how to reopen it.
+            try:
+                from .session_resume import machine_id as _machine_id
+                here = _machine_id(root)
+            except Exception:
+                here = ""
+            prior_machine = str(prior.get("machine_id") or "")
+            if prior_machine and here and prior_machine != here:
+                hint = str(prior.get("resume_hint") or "").strip()
+                hint_txt = f" Reopen its full transcript there with `{hint}`." if hint else ""
+                lines.append(
+                    f"  cross-machine: prior thread ran on '{prior_machine}' via {prior.get('agent') or 'unknown'} "
+                    f"(you are on '{here}'). Its full conversation stays on that machine.{hint_txt} "
+                    f"Use memory_query/context_pack here for detail."
+                )
             for entry in (prior.get("decisions_tail") or [])[-3:]:
                 text = str(entry.get("decision") or entry.get("summary") or entry.get("text") or "")[:160]
                 if text:
@@ -1827,19 +2134,9 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         if satisfaction:
             sections.append(satisfaction)
     if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_MEMORY_TIER_SUMMARY"):
-        try:
-            from .memory_tier import classify as _classify, hot_pressure as _pressure
-            cls = _classify(root)
-            pres = _pressure(root)
-            hot = cls["tiers"]["hot"]["audit_events"]
-            warm = cls["tiers"]["warm"]["audit_events"]
-            cold = cls["tiers"]["cold"]["audit_events"]
-            sline = f"cb-mem: hot={hot} warm={warm} cold={cold} | session={int(pres['session_md_ratio']*100)}%"
-            if pres.get("page_out_recommended"):
-                sline += " ⚠page-out"
-            sections.append(sline)
-        except Exception:
-            pass
+        memory_tier = _memory_tier_summary_context(root)
+        if memory_tier:
+            sections.append(memory_tier)
     # T35 codegraph hotspot teaser — surfaces the top-3 most-called callees so
     # downstream agents can `code_graph_callers <name>` without prior knowledge.
     if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_CODEGRAPH_SUMMARY"):
@@ -1862,3 +2159,166 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         truncated = composed.encode("utf-8")[: max_bytes - 3].decode("utf-8", errors="ignore") + "..."
         composed = truncated
     return composed
+
+
+def _memory_staleness_context(root: Path, hook_name: str) -> str:
+    """Banner warning that shared memory has fallen behind git progress.
+
+    The navio incident: agents stopped calling record tools, so session-current.md /
+    decisions.jsonl froze while git advanced and the resume snapshot kept looking
+    fresh. Surfacing the gap at every injection point makes all agents converge on
+    git truth instead of diverging from their own native memory. Cached (mtime +
+    TTL) so the git calls never threaten the hot-path budget. Opt-out: AI_MEMORY_STALENESS=0.
+    """
+    if hook_name not in CONTEXT_INJECTION_HOOKS:
+        return ""
+    if _env_disabled("AI_MEMORY_STALENESS", default="1"):
+        return ""
+
+    def compute() -> str:
+        banners: list[str] = []
+        try:
+            from .memory_staleness import remote_sync_banner, staleness_banner
+
+            local = staleness_banner(root)
+            if local:
+                banners.append(local)
+            # P3: remote-ahead (cb-behind) — another machine pushed work we lack. Reads
+            # the already-fetched upstream ref only (no fetch here); the fetch runs in
+            # the detached sleep-time job. Closes the silent cross-machine divergence gap.
+            behind = remote_sync_banner(root)
+            if behind:
+                banners.append(behind)
+        except Exception:
+            return ""
+        # P4: peer heartbeat summary — "VPS synced 3m ago" — when memory auto-sync runs
+        # on another machine. Local file reads only; absent for single-machine users.
+        try:
+            from .memory_sync import peer_sync_summary
+
+            peers = peer_sync_summary(root)
+            if peers:
+                banners.append(peers)
+        except Exception:
+            pass
+        return "\n\n".join(banners)
+
+    deps = [
+        root / ".ai" / "memory" / "session-current.md",
+        root / ".ai" / "memory" / "decisions.jsonl",
+        root / ".git" / "HEAD",
+        root / ".git" / "index",
+        # .git/HEAD only changes on branch switch; a new commit on the *same*
+        # branch must still bust the cache. The HEAD reflog is appended on every
+        # HEAD movement (commit/checkout/reset), so its mtime is the reliable
+        # signal — and it is a cheap stat, no extra git subprocess on the hot path.
+        root / ".git" / "logs" / "HEAD",
+        # FETCH_HEAD mtime changes whenever the sleep-time job runs `git fetch`, so the
+        # cb-behind banner refreshes after new remote commits are fetched.
+        root / ".git" / "FETCH_HEAD",
+        # peer heartbeats change when another machine's memory sync runs.
+        root / ".ai" / "memory" / "sync",
+    ]
+    return _cached_hook_summary(
+        root, cache_name="memory_staleness", deps=deps, compute=compute
+    )
+
+
+def _auto_milestone_on_stale(root: Path) -> bool:
+    """At SessionEnd, if git advanced past recorded memory and the agent forgot to
+    log it, append a *factual* milestone so the next session (and the resume
+    snapshot composed right after) reflect reality instead of frozen state.
+
+    Deliberately records git facts only — commit subjects + dirty count, never an
+    LLM summary — so an automated note can never embed a hallucinated "agreed wrong
+    answer" into shared memory (the panel's main objection). Deduped by HEAD sha so
+    a stale-but-unchanged tree is captured at most once. Opt-out: AI_AUTO_MILESTONE_ON_STALE=0.
+
+    Returns True when a note was written.
+    """
+    if _env_disabled("AI_AUTO_MILESTONE_ON_STALE", default="1"):
+        return False
+    try:
+        from .memory_staleness import memory_freshness
+
+        info = memory_freshness(root)
+    except Exception:
+        return False
+    if not info.get("stale"):
+        return False
+
+    head = str(info.get("head") or "")
+    marker = f"[auto:{head}]" if head else "[auto]"
+    try:
+        tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", 5)
+    except Exception:
+        tail = ""
+    if marker in tail:
+        return False
+
+    commits = info.get("commits") or []
+    count = int(info.get("commit_count") or 0)
+    dirty = int(info.get("dirty_count") or 0)
+    bits = [f"{marker} 에이전트 미기록 자동 캡처(git 사실 기반)"]
+    if count:
+        subject = str(commits[0].get("subject") or "") if commits else ""
+        more = f" 외 {count - 1}개" if count > 1 else ""
+        bits.append(f"커밋 {count}개{more} 최근:{subject[:70]}")
+    if dirty:
+        bits.append(f"dirty {dirty}파일")
+    text = " · ".join(bits) + ". 어디까지 진행했는지는 git log/status가 정답."
+    try:
+        from .memory import append_session_note
+
+        append_session_note(root, text=text)
+        return True
+    except Exception:
+        return False
+
+
+def _memory_tier_summary_context(root: Path) -> str:
+    deps = [
+        root / ".ai" / "memory" / "audit-index.jsonl",
+        root / ".ai" / "memory" / "todos.jsonl",
+        root / ".ai" / "memory" / "decisions.jsonl",
+        root / ".ai" / "memory" / "session-current.md",
+    ]
+    deps.extend(all_audit_files(root))
+
+    def compute() -> str:
+        try:
+            from .memory_tier import classify as _classify, hot_pressure as _pressure
+            cls = _classify(root)
+            pres = _pressure(root)
+            hot = cls["tiers"]["hot"]["audit_events"]
+            warm = cls["tiers"]["warm"]["audit_events"]
+            cold = cls["tiers"]["cold"]["audit_events"]
+            sline = f"cb-mem: hot={hot} warm={warm} cold={cold} | session={int(pres['session_md_ratio']*100)}%"
+            if pres.get("page_out_recommended"):
+                sline += " ⚠page-out"
+            return sline
+        except Exception:
+            return ""
+
+    return _cached_hook_summary(root, cache_name="memory_tier_hot", deps=deps, compute=compute)
+
+
+def _codebase_map_summary_context(root: Path) -> str:
+    deps = [
+        root / ".git" / "index",
+        root / "AGENTS.md",
+        root / "CLAUDE.md",
+        root / "package.json",
+        root / "pyproject.toml",
+        root / "pubspec.yaml",
+    ]
+
+    def compute() -> str:
+        try:
+            from .codebase_map import build_codebase_map
+            map_payload = build_codebase_map(root, max_entries=12, include_untracked=False)
+            return str(map_payload.get("additionalContext") or "")
+        except Exception:
+            return ""
+
+    return _cached_hook_summary(root, cache_name="codebase_map_hot", deps=deps, compute=compute)

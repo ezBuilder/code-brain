@@ -5,6 +5,28 @@ umask 077
 SOURCE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ACTION="${1:-install}"
 
+# Host Python for this installer's inline scripts. Prefer the source runtime's
+# venv interpreter: merge_antigravity_mcp_json imports ai_core, whose
+# requires-python is >=3.11, so an older system python3 (e.g. macOS ships 3.9)
+# would fail to import it. Fall back to uv's project python, then any
+# python3/python. These scripts used to call bare `python`, which is absent on
+# systems that ship only `python3`.
+py() {
+  if [[ -x "$SOURCE_ROOT/.ai/runtime/.venv/bin/python" ]]; then
+    "$SOURCE_ROOT/.ai/runtime/.venv/bin/python" "$@"
+  elif command -v uv >/dev/null 2>&1; then
+    uv run --project "$SOURCE_ROOT/.ai/runtime" python "$@"
+  else
+    local _py
+    _py="$(command -v python3 || command -v python || true)"
+    if [[ -z "$_py" ]]; then
+      echo "install-into failed: no python3/python interpreter found on PATH" >&2
+      exit 2
+    fi
+    "$_py" "$@"
+  fi
+}
+
 usage() {
   cat >&2 <<'EOF'
 usage:
@@ -40,6 +62,7 @@ TARGET_ROOT="$(cd "$TARGET_ARG" && pwd -P)"
 
 if ! git -C "$TARGET_ROOT" rev-parse --show-toplevel >/dev/null 2>&1; then
   echo "install-into failed: target is not inside a git repository: $TARGET_ROOT" >&2
+  echo "  hint: run 'git init' in the target, then re-run install-into" >&2
   exit 2
 fi
 
@@ -52,13 +75,22 @@ fi
 managed_files() {
   (
     cd "$SOURCE_ROOT"
-    git ls-files --cached --others --exclude-standard -- \
-      .ai \
-      .githooks \
-      .claude/commands \
-      .codex/prompts \
-      scripts/env-check.sh \
-      scripts/preflight.sh
+    if git rev-parse --show-toplevel >/dev/null 2>&1; then
+      git ls-files --cached --others --exclude-standard -- \
+        .ai \
+        .githooks \
+        .claude/commands \
+        .codex/prompts \
+        scripts/env-check.sh \
+        scripts/preflight.sh
+    else
+      for path in .ai .githooks .claude/commands .codex/prompts; do
+        [[ -e "$path" ]] && find "$path" -type f
+      done
+      for path in scripts/env-check.sh scripts/preflight.sh; do
+        [[ -f "$path" ]] && printf '%s\n' "$path"
+      done
+    fi
   ) | grep -vx ".ai/secret_scan_allowlist.txt" || true
   printf '%s\n' "bootstrap-code-brain.sh"
 }
@@ -69,7 +101,7 @@ managed_files() {
 # has a user-authored AGENTS.md (common in long-lived repos), we never touch
 # it — that file is part of the project's contract, not Code Brain's.
 seed_user_owned_files() {
-  local seeds=(".ai/secret_scan_allowlist.txt" "AGENTS.md")
+  local seeds=(".ai/secret_scan_allowlist.txt")
   for rel in "${seeds[@]}"; do
     local src="$SOURCE_ROOT/$rel"
     local dst="$TARGET_ROOT/$rel"
@@ -78,6 +110,35 @@ seed_user_owned_files() {
       cp "$src" "$dst"
     fi
   done
+  seed_agents_md
+}
+
+# AGENTS.md is a Code Brain-managed, auto-loaded memory mirror: Antigravity auto-loads it
+# and Code Brain refreshes an inline memory block in it every session. To avoid churning a
+# tracked file we (a) seed it from a FIXED literal when missing (never copy the source
+# repo's runtime-mutated AGENTS.md), and (b) git-ignore it in the target. Durable,
+# user-authored instructions go in the tracked .ai/AGENTS.md instead. If the target already
+# has its own tracked AGENTS.md we leave it (and the .gitignore line is a no-op for it).
+seed_agents_md() {
+  local dst="$TARGET_ROOT/AGENTS.md"
+  if [[ ! -e "$dst" ]]; then
+    cat >"$dst" <<'MD'
+# AGENTS.md
+
+Canonical agent instructions live in `.ai/AGENTS.md`.
+
+Below, Code Brain auto-maintains a cross-session memory snapshot (handoff, recent
+decisions, open todos, staleness) so every agent — including Antigravity, which auto-loads
+this file — resumes from the same context. It is regenerated each session (do not edit by
+hand) and is git-ignored to avoid churn.
+MD
+  fi
+  local gi="$TARGET_ROOT/.gitignore"
+  if [[ -f "$gi" ]]; then
+    grep -qxF '/AGENTS.md' "$gi" 2>/dev/null || printf '\n# Code Brain-managed auto-loaded memory mirror (regenerated each session)\n/AGENTS.md\n' >>"$gi"
+  else
+    printf '/AGENTS.md\n' >"$gi"
+  fi
 }
 
 merged_config_files() {
@@ -92,7 +153,7 @@ is_managed_existing_file() {
   local rel="$1"
   local manifest
   manifest="$(manifest_path)"
-  if [[ -f "$manifest" ]] && python - "$manifest" "$rel" <<'PY'
+  if [[ -f "$manifest" ]] && py - "$manifest" "$rel" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -151,7 +212,7 @@ EOF
 
 write_install_manifest() {
   mkdir -p "$TARGET_ROOT/.ai/generated"
-  python -c '
+  py -c '
 import json
 import subprocess
 import sys
@@ -286,7 +347,7 @@ restore_managed_owner_if_root() {
 }
 
 configure_project() {
-  python - "$TARGET_ROOT" <<'PY'
+  py - "$TARGET_ROOT" <<'PY'
 import sys
 from pathlib import Path
 
@@ -309,7 +370,7 @@ PY
 
 merge_mcp_json() {
   local dst="$TARGET_ROOT/.mcp.json"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -336,7 +397,7 @@ PY
 
 merge_codex_config() {
   local dst="$TARGET_ROOT/.codex/config.toml"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -444,7 +505,7 @@ PY
 
 merge_claude_settings() {
   local dst="$TARGET_ROOT/.claude/settings.json"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -511,6 +572,22 @@ managed = {
         {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUseFailure"}]}
     ],
 }
+# Windows parity: give every Claude hook a commandWindows that runs the .ps1 shim via
+# powershell (Claude Code sets CLAUDE_PROJECT_DIR on Windows too; fall back to cwd). The
+# Unix `command` stays the default; hosts pick commandWindows on Windows. Derived from
+# each command's event (last token) so the 19-event dict above stays the single source.
+def _claude_cmd_win(unix_cmd):
+    event = unix_cmd.rsplit(" ", 1)[-1]
+    return (
+        'powershell -NoProfile -Command "$ROOT = $env:CLAUDE_PROJECT_DIR; '
+        'if (-not $ROOT) { $ROOT = (Get-Location).Path }; '
+        '& \\"$ROOT/.ai/bin/ai-hook.ps1\\" ' + event + '"'
+    )
+for _entries in managed.values():
+    for _entry in _entries:
+        for _handler in _entry.get("hooks", []):
+            if isinstance(_handler, dict) and "command" in _handler and "commandWindows" not in _handler:
+                _handler["commandWindows"] = _claude_cmd_win(_handler["command"])
 if dst.exists():
     try:
         payload = json.loads(dst.read_text(encoding="utf-8"))
@@ -559,7 +636,7 @@ PY
 
 merge_codex_hooks_json() {
   local dst="$TARGET_ROOT/.codex/hooks.json"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -637,7 +714,7 @@ PY
 
 merge_antigravity_mcp_json() {
   local dst="$TARGET_ROOT/.agents/mcp_config.json"
-  python - "$dst" "$SOURCE_ROOT" <<'PY'
+  py - "$dst" "$SOURCE_ROOT" <<'PY'
 import sys
 from pathlib import Path
 
@@ -652,80 +729,82 @@ PY
 
 merge_antigravity_hooks_json() {
   local dst="$TARGET_ROOT/.agents/hooks.json"
-  python - "$dst" <<'PY'
+  py - "$dst" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
-# Antigravity hooks accept the same matcher+command shape as Claude/Codex. The
-# command string runs in a POSIX shell on macOS/Linux; Windows hosts should
-# install the .ps1 variant separately (TODO when Antigravity adds Windows).
+# Antigravity 1.0.x hooks.json schema (verified against the agy hooks UI, which
+# writes ~/.gemini/antigravity-cli/hooks.json): the file is a top-level map of
+# {"<hook-name>": JSONHookSpec}. A JSONHookSpec has one field per supported
+# lifecycle EVENT, and Antigravity supports exactly five:
+#   PreToolUse, PostToolUse, PreInvocation, PostInvocation, Stop
+# There is NO SessionStart / UserPromptSubmit — those Claude events are unknown to
+# Antigravity (they parse as a named hook with zero handlers). Each event maps to
+# null or a list of matcher-groups: [{"matcher": <regex>, "hooks": [{"type":
+# "command", "command": <shell>, "timeout": <int>}]}]. The legacy Claude-shaped
+# wrapper ({"_note":..., "hooks": {...}}) is unparseable by Antigravity
+# ("cannot unmarshal string into jsonhook.JSONHookSpec") and is dropped here.
+#
+# Antigravity does not pass CLAUDE_PROJECT_DIR, so resolve the repo root via git.
+# Memory injection for agy is delivered via the managed AGENTS.md block
+# (ai_core.agents_md), NOT these hooks: Antigravity command-hook stdout cannot
+# inject model context. These hooks cover the side effects that do work —
+# command routing (PreToolUse), tool-result recording (PostToolUse), and
+# session-end recording + AGENTS.md memory refresh (Stop).
 def cmd(event: str) -> str:
     return (
         'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
         f'"$ROOT/.ai/bin/ai-hook" {event}'
     )
 
-def cmd_win(event: str) -> str:
-    return (
-        "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); "
-        "if (-not $ROOT) { $ROOT = (Get-Location).Path }; "
-        f"& \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" {event}\""
-    )
+def matchers(event: str, timeout: int):
+    return [{"matcher": "", "hooks": [{"type": "command", "command": cmd(event), "timeout": timeout}]}]
 
-def H(event, matcher=None, msg=None):
-    handler = {"type": "command", "command": cmd(event), "commandWindows": cmd_win(event)}
-    if msg:
-        handler["statusMessage"] = msg
-    entry = {"hooks": [handler]}
-    if matcher is not None:
-        entry["matcher"] = matcher
-    return [entry]
-
-managed = {
-    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|run_command", msg="Checking Code Brain command routing"),
-    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|run_command|replace_file_content|multi_replace_file_content|write_to_file|view_file|grep_search|list_dir", msg="Recording Code Brain tool result"),
-    "SessionStart": H("SessionStart", msg="Loading Code Brain session context"),
-    "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
-    "Stop": H("Stop", msg="Recording Code Brain stop event"),
-    "SubagentStart": H("SubagentStart", msg="Loading Code Brain subagent context"),
-    "SubagentStop": H("SubagentStop", msg="Recording Code Brain subagent stop"),
-    "PreCompact": H("PreCompact", msg="Saving Code Brain compact snapshot"),
-    "PostCompact": H("PostCompact", msg="Recording Code Brain compact completion"),
+code_brain_spec = {
+    "PreToolUse": matchers("PreToolUse", 15),
+    "PostToolUse": matchers("PostToolUse", 15),
+    "PreInvocation": None,
+    "PostInvocation": None,
+    "Stop": matchers("Stop", 20),
 }
+
 if dst.exists():
     try:
         payload = json.loads(dst.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        raise SystemExit(f"install-into failed: existing {dst} is not valid JSON")
+        payload = {}
     if not isinstance(payload, dict):
-        raise SystemExit(f"install-into failed: existing {dst} is not a JSON object")
+        payload = {}
 else:
-    payload = {"_note": "Antigravity hooks. Schema follows Claude Code matcher+command convention."}
-hooks = payload.setdefault("hooks", {})
-if not isinstance(hooks, dict):
-    raise SystemExit(f"install-into failed: existing {dst}.hooks must be a JSON object")
+    payload = {}
 
-def _has_code_brain_command(entry):
-    if isinstance(entry, dict):
-        for handler in entry.get("hooks", []) or []:
-            if isinstance(handler, dict):
-                c = handler.get("command")
-                if isinstance(c, str) and ".ai/bin/ai-hook" in c:
-                    return True
-    return False
+# Preserve user-authored named hooks (dict values); drop our own entry and the
+# legacy "_note"/"hooks" wrapper keys, then re-add the Code Brain entry.
+cleaned = {
+    name: spec
+    for name, spec in payload.items()
+    if name not in ("code-brain", "_note", "hooks") and isinstance(spec, dict)
+}
+cleaned["code-brain"] = code_brain_spec
 
-for name, managed_entries in managed.items():
-    existing = hooks.get(name)
-    if isinstance(existing, list):
-        kept = [e for e in existing if not _has_code_brain_command(e)]
-    else:
-        kept = []
-    hooks[name] = kept + managed_entries
 dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+dst.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+}
+
+ensure_persistent_scaffold() {
+  mkdir -p \
+    "$TARGET_ROOT/.ai/generated" \
+    "$TARGET_ROOT/.ai/memory/audit" \
+    "$TARGET_ROOT/.ai/memory/queue/.tmp" \
+    "$TARGET_ROOT/.ai/memory/queue/processing" \
+    "$TARGET_ROOT/.ai/memory/queue/dead"
+  [[ -e "$TARGET_ROOT/.ai/memory/audit-index.jsonl" ]] || : >"$TARGET_ROOT/.ai/memory/audit-index.jsonl"
+  [[ -e "$TARGET_ROOT/.ai/memory/queue/.tmp/.gitkeep" ]] || : >"$TARGET_ROOT/.ai/memory/queue/.tmp/.gitkeep"
+  [[ -e "$TARGET_ROOT/.ai/memory/queue/processing/.gitkeep" ]] || : >"$TARGET_ROOT/.ai/memory/queue/processing/.gitkeep"
+  [[ -e "$TARGET_ROOT/.ai/memory/queue/dead/.gitkeep" ]] || : >"$TARGET_ROOT/.ai/memory/queue/dead/.gitkeep"
 }
 
 install_or_upgrade() {
@@ -740,6 +819,7 @@ install_or_upgrade() {
   merge_antigravity_mcp_json
   merge_antigravity_hooks_json
   configure_project
+  ensure_persistent_scaffold
   write_bootstrap
   chmod +x "$TARGET_ROOT/.ai/bin/ai" "$TARGET_ROOT/.ai/bin/ai-hook" "$TARGET_ROOT/.ai/bin/ai-mcp"
   chmod +x "$TARGET_ROOT/.githooks/post-merge" "$TARGET_ROOT/.githooks/post-checkout"
@@ -810,7 +890,7 @@ uninstall() {
   if [[ "$(git -C "$TARGET_ROOT" config --get core.hooksPath || true)" == ".githooks" ]]; then
     git -C "$TARGET_ROOT" config --unset core.hooksPath || true
   fi
-  python - "$TARGET_ROOT" "$manifest" <<'PY'
+  py - "$TARGET_ROOT" "$manifest" <<'PY'
 import json
 import re
 import shutil

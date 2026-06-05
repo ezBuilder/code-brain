@@ -1,0 +1,6 @@
+# AutoResearch derived artifacts (git=SSOT for raw/ + wiki/ only)
+index/*.db
+index/*.db-*
+.state/
+.locks/
+*.staging

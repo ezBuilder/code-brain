@@ -56,10 +56,23 @@ def _corpus_tokens(ar_root: Path) -> int:
     return total // 4
 
 
+def _threshold(ar_root: Path) -> int:
+    """Corpus-token threshold for dense activation — `.ai/config.yaml`
+    autoresearch.search.corpus_threshold_tokens override, else the default."""
+    try:
+        from ..config import load_config
+        cfg = load_config(_project_root(ar_root))
+        section = (cfg.get("autoresearch") or {}).get("search") or {}
+        v = section.get("corpus_threshold_tokens")
+        return int(v) if v is not None else CORPUS_THRESHOLD_TOKENS
+    except Exception:
+        return CORPUS_THRESHOLD_TOKENS
+
+
 def is_active_for(ar_root: Path) -> bool:
     """Dense fires only when corpus exceeds threshold AND the embedder is available
     (deps + model + AI_SEARCH_DENSE policy). Below threshold → BM25-only (§4.6)."""
-    if _corpus_tokens(ar_root) < CORPUS_THRESHOLD_TOKENS:
+    if _corpus_tokens(ar_root) < _threshold(ar_root):
         return False
     return _emb.is_active_for(_project_root(ar_root))
 

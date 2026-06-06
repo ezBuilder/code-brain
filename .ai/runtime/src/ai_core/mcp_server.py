@@ -549,6 +549,14 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "required": ["source_id", "pages"],
         },
     },
+    {
+        "name": "autoresearch_lint",
+        "description": "AutoResearch wiki health lint (Stage 0): orphan / draft / taint / stale pages. Read-only, no auto-fix.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"stale_before": {"type": "string"}},
+        },
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -610,6 +618,10 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         if not isinstance(pages, list):
             raise ValueError("autoresearch_ingest_commit requires pages array")
         return _ari.commit_pages(_ars.data_root(root), source_id=sid, pages=pages)
+    if name == "autoresearch_lint":
+        from .autoresearch import storage as _ars, lint as _arl
+        sb = args.get("stale_before")
+        return _arl.lint(_ars.data_root(root), stale_before=str(sb) if isinstance(sb, str) and sb else None)
     if name in ("memory_query", "code_query"):
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":

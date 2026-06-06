@@ -557,6 +557,15 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "properties": {"stale_before": {"type": "string"}},
         },
     },
+    {
+        "name": "autoresearch_query",
+        "description": "AutoResearch knowledge query (Stage 0): FTS5 retrieval with per-page trust signals. Draft/taint pages are quarantined out of candidates (laundering defense); the calling agent writes the cited answer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"question": {"type": "string"}, "k": {"type": "integer", "default": 10}},
+            "required": ["question"],
+        },
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -622,6 +631,9 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         from .autoresearch import storage as _ars, lint as _arl
         sb = args.get("stale_before")
         return _arl.lint(_ars.data_root(root), stale_before=str(sb) if isinstance(sb, str) and sb else None)
+    if name == "autoresearch_query":
+        from .autoresearch import storage as _ars, query as _arq
+        return _arq.query(_ars.data_root(root), str(args.get("question", "")), k=int(args.get("k", 10) or 10))
     if name in ("memory_query", "code_query"):
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":

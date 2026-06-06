@@ -23,7 +23,9 @@ def parse_frontmatter(text: str) -> dict:
     for line in text[3:end].splitlines():
         if ":" in line:
             key, _, val = line.partition(":")
-            meta[key.strip()] = val.strip()
+            k = key.strip()
+            if k not in meta:  # first-wins: blocks duplicate-key status laundering (draft→active)
+                meta[k] = val.strip()
     return meta
 
 

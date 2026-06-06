@@ -566,6 +566,18 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "required": ["question"],
         },
     },
+    {
+        "name": "autoresearch_verify",
+        "description": "AutoResearch deterministic citation verification (Stage 3): scores each claim's quote against its cited source texts (faithfulness in [0,1], no LLM). The agent uses the score to accept/hedge/reject; factuality judgment is the agent's job.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "claims": {"type": "array", "items": {"type": "object"}},
+                "long_tail_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["claims"],
+        },
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -639,6 +651,13 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "autoresearch_query":
         from .autoresearch import storage as _ars, query as _arq
         return _arq.query(_ars.data_root(root), str(args.get("question", "")), k=int(args.get("k", 10) or 10))
+    if name == "autoresearch_verify":
+        from .autoresearch import storage as _ars, verify as _arv
+        claims = args.get("claims")
+        if not isinstance(claims, list):
+            raise ValueError("autoresearch_verify requires claims array")
+        lt = args.get("long_tail_ids")
+        return _arv.verify_claims(_ars.data_root(root), claims, long_tail_ids=lt if isinstance(lt, list) else None)
     if name in ("memory_query", "code_query"):
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":

@@ -578,6 +578,30 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "required": ["claims"],
         },
     },
+    {
+        "name": "autoresearch_deepresearch_start",
+        "description": "Stage 3: start a deep-research session. Runtime tracks state only; the agent does plan→fetch (autoresearch_ingest_stage with url)→synthesize→commit. Returns the session.",
+        "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]},
+    },
+    {
+        "name": "autoresearch_deepresearch_update",
+        "description": "Stage 3: update a deep-research session (subquestions / add_source / status). Size-capped.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "subquestions": {"type": "array", "items": {"type": "string"}},
+                "add_source": {"type": "string"},
+                "status": {"type": "string"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "autoresearch_deepresearch_status",
+        "description": "Stage 3: get a deep-research session state by session_id.",
+        "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -658,6 +682,31 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             raise ValueError("autoresearch_verify requires claims array")
         lt = args.get("long_tail_ids")
         return _arv.verify_claims(_ars.data_root(root), claims, long_tail_ids=lt if isinstance(lt, list) else None)
+    if name == "autoresearch_deepresearch_start":
+        from .autoresearch import storage as _ars, deepresearch as _dr
+        q = args.get("question")
+        if not isinstance(q, str) or not q:
+            raise ValueError("autoresearch_deepresearch_start requires question")
+        return _dr.start(_ars.data_root(root), q)
+    if name == "autoresearch_deepresearch_update":
+        from .autoresearch import storage as _ars, deepresearch as _dr
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_deepresearch_update requires session_id")
+        res = _dr.update(
+            _ars.data_root(root), sid,
+            subquestions=args.get("subquestions") if isinstance(args.get("subquestions"), list) else None,
+            add_source=args.get("add_source") if isinstance(args.get("add_source"), str) else None,
+            status=args.get("status") if isinstance(args.get("status"), str) else None,
+        )
+        return res if res is not None else {"error": "session_not_found_or_invalid"}
+    if name == "autoresearch_deepresearch_status":
+        from .autoresearch import storage as _ars, deepresearch as _dr
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_deepresearch_status requires session_id")
+        res = _dr.get(_ars.data_root(root), sid)
+        return res if res is not None else {"error": "session_not_found"}
     if name in ("memory_query", "code_query"):
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":

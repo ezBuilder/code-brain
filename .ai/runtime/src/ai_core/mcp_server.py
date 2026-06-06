@@ -602,6 +602,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": "Stage 3: get a deep-research session state by session_id.",
         "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
     },
+    {
+        "name": "autoresearch_route",
+        "description": "Stage 4: suggest a model tier (local/frontier) for a query via a deterministic complexity heuristic (RouteLLM-style). The agent makes the final model choice. No LLM.",
+        "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -707,6 +712,9 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             raise ValueError("autoresearch_deepresearch_status requires session_id")
         res = _dr.get(_ars.data_root(root), sid)
         return res if res is not None else {"error": "session_not_found"}
+    if name == "autoresearch_route":
+        from .autoresearch import complexity_router as _cr
+        return _cr.classify(str(args.get("query", "")))
     if name in ("memory_query", "code_query"):
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":

@@ -52,6 +52,17 @@ def id_exists(root: Path, source_id: str) -> bool:
     return False
 
 
+def find_by_id(root: Path, source_id: str) -> RawManifest | None:
+    path = storage.manifest_path(root)
+    if not path.is_file():
+        return None
+    needle = f'"id":"{source_id}"'
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if needle in line:
+            return RawManifest.from_json(line)
+    return None
+
+
 def append(root: Path, record: RawManifest) -> bool:
     """Append a manifest record. Idempotent on sha256 — returns False if duplicate.
 

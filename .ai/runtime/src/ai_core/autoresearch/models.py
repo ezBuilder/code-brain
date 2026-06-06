@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field, asdict
 
 TRUST_TIERS = ("primary", "secondary", "untrusted")
-STATUSES = ("active", "stale", "draft")
+STATUSES = ("active", "stale", "draft", "quarantined")
 PAGE_TYPES = ("entity", "concept", "synthesis", "summary")
 
 

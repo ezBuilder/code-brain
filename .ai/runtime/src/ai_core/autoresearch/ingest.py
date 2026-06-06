@@ -15,7 +15,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import storage, fts as fts_mod, locking, verify_det, nonce_verify, trust
+from . import storage, fts as fts_mod, locking, verify_det, nonce_verify, trust, injection_scan
 from . import manifest as manifest_mod
 from .models import RawManifest, WikiPageMetadata
 
@@ -58,6 +58,10 @@ def stage_source(
     # trust_tier is SERVER-DERIVED from source_url, never from caller input (§12.2.6).
     # The `trust_tier` parameter is intentionally ignored (kept for signature stability).
     derived_tier = trust.derive_tier(source_url, trust.load_allowlist(ar_root))
+    # Heuristic injection scan: flagged content is persisted but marked `quarantined`,
+    # which propagates taint to any page derived from it at commit time (§12.2.6).
+    inj = injection_scan.scan_injection(content)
+    status = "quarantined" if inj["flagged"] else "draft"
     with locking.ingest_lock(ar_root):
         existing = manifest_mod.find_by_sha(ar_root, sha)
         if existing is not None:
@@ -66,9 +70,11 @@ def stage_source(
         _raw_path(ar_root, source_id).write_text(content, encoding="utf-8")
         manifest_mod.append(ar_root, RawManifest(
             id=source_id, sha256=sha, source_url=source_url, title=title or source_id,
-            mime="text/plain", trust_tier=derived_tier, ingested_at=_now(), status="draft",
+            mime="text/plain", trust_tier=derived_tier, ingested_at=_now(),
+            status=status, status_reason=",".join(inj["signals"]),
         ))
-    return {"source_id": source_id, "duplicate": False, "nonce": nonce, "wrapped": wrapped}
+    return {"source_id": source_id, "duplicate": False, "nonce": nonce,
+            "wrapped": wrapped, "quarantined": inj["flagged"]}
 
 
 def _frontmatter(meta: WikiPageMetadata) -> str:
@@ -119,10 +125,17 @@ def commit_pages(ar_root: Path, *, source_id: str, pages: list[dict]) -> dict:
             )
             if not r.passed:
                 status = "draft"
+        # taint: a page derived from any quarantined source is tainted (laundering guard §12.2.6)
+        taint = False
+        for s in sources:
+            rec = manifest_mod.find_by_id(ar_root, s)
+            if rec is None or rec.status == "quarantined":
+                taint = True  # unknown source → fail-closed; quarantined → laundering taint
+                break
         meta = WikiPageMetadata(
             id=rel, type=str(p.get("type", "synthesis")),
             title=str(p.get("title", rel)), sources=sources,
-            updated=_now(), status=status,
+            updated=_now(), status=status, taint=taint,
         )
         body = _frontmatter(meta) + "\n\n" + content
         sha = hashlib.sha256(content.encode("utf-8")).hexdigest()

@@ -76,3 +76,71 @@ def test_mcp_tools_registered():
     assert "autoresearch_search" in mcp_server.TOOL_NAMES
     assert "autoresearch_ingest_stage" in mcp_server.TOOL_NAMES
     assert "autoresearch_ingest_commit" in mcp_server.TOOL_NAMES
+
+
+def test_commit_rolls_back_new_files_on_failure(tmp_path, monkeypatch):
+    from ai_core.autoresearch import fts as fts_mod
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    st = ingest.stage_source(ar, content="rollback source text body")
+    calls = {"n": 0}
+    real = fts_mod.upsert_page
+
+    def boom(conn, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated FTS failure mid-commit")
+        return real(conn, *a, **k)
+
+    monkeypatch.setattr(ingest.fts_mod, "upsert_page", boom)
+    with pytest.raises(RuntimeError):
+        ingest.commit_pages(ar, source_id=st["source_id"], pages=[
+            {"rel_path": "concepts/a.md", "content": "alpha body", "sources": [st["source_id"]]},
+            {"rel_path": "concepts/b.md", "content": "beta body", "sources": [st["source_id"]]},
+        ])
+    # both newly-created files rolled back, FTS transaction rolled back
+    assert not (storage.wiki_root(ar) / "concepts" / "a.md").exists()
+    assert not (storage.wiki_root(ar) / "concepts" / "b.md").exists()
+    assert fts_mod.search(ar, "alpha", k=5) == []
+
+
+def test_commit_idempotent_overwrite(tmp_path):
+    # re-committing the same page overwrites cleanly (upsert), no duplicate rows
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    st = ingest.stage_source(ar, content="dense bm25 source")
+    page = {"rel_path": "concepts/x.md", "content": "dense bm25", "sources": [st["source_id"]]}
+    ingest.commit_pages(ar, source_id=st["source_id"], pages=[page])
+    ingest.commit_pages(ar, source_id=st["source_id"], pages=[page])
+    from ai_core.autoresearch import fts as fts_mod
+    hits = fts_mod.search(ar, "dense", k=10)
+    assert [h["page"] for h in hits].count("concepts/x.md") == 1
+
+
+def test_commit_restores_overwritten_on_failure(tmp_path, monkeypatch):
+    from ai_core.autoresearch import fts as fts_mod
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    st = ingest.stage_source(ar, content="overwrite source body text")
+    sid = st["source_id"]
+    ingest.commit_pages(ar, source_id=sid, pages=[
+        {"rel_path": "concepts/p.md", "content": "version one", "sources": [sid]}])
+    v1 = (storage.wiki_root(ar) / "concepts" / "p.md").read_text(encoding="utf-8")
+    calls = {"n": 0}
+    real = fts_mod.upsert_page
+
+    def boom(conn, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("boom after overwrite")
+        return real(conn, *a, **k)
+
+    monkeypatch.setattr(ingest.fts_mod, "upsert_page", boom)
+    with pytest.raises(RuntimeError):
+        ingest.commit_pages(ar, source_id=sid, pages=[
+            {"rel_path": "concepts/p.md", "content": "version two", "sources": [sid]},
+            {"rel_path": "concepts/q.md", "content": "new page", "sources": [sid]},
+        ])
+    # overwritten page restored to v1, newly-created page removed
+    assert (storage.wiki_root(ar) / "concepts" / "p.md").read_text(encoding="utf-8") == v1
+    assert not (storage.wiki_root(ar) / "concepts" / "q.md").exists()

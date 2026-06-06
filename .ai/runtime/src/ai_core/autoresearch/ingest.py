@@ -101,39 +101,73 @@ def commit_pages(ar_root: Path, *, source_id: str, pages: list[dict]) -> dict:
     storage.ensure_tree(ar_root)
     rp = _raw_path(ar_root, source_id)
     source_texts = {source_id: rp.read_text(encoding="utf-8")} if rp.is_file() else {}
+    wiki = storage.wiki_root(ar_root)
+
+    # Phase 1 (no lock, no side effects): verify-det + render every page in memory.
+    prepared = []  # (rel, body, sha, content, status)
+    for p in pages:
+        rel = str(p["rel_path"])
+        content = str(p.get("content", ""))
+        sources = list(p.get("sources") or [source_id])
+        status = "active"
+        for cit in p.get("citations", []) or []:
+            r = verify_det.verify_claim(
+                ar_root,
+                list(cit.get("sources") or sources),
+                str(cit.get("quote", "")),
+                source_texts,
+            )
+            if not r.passed:
+                status = "draft"
+        meta = WikiPageMetadata(
+            id=rel, type=str(p.get("type", "synthesis")),
+            title=str(p.get("title", rel)), sources=sources,
+            updated=_now(), status=status,
+        )
+        body = _frontmatter(meta) + "\n\n" + content
+        sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        prepared.append((rel, body, sha, content, status))
+
+    # Phase 2 (locked): write pages + FTS in one transaction. On any failure, roll back
+    # the FTS transaction AND remove files we newly created this call (best-effort atomicity).
     written: list[str] = []
     drafted: list[str] = []
+    new_files: list[Path] = []
+    overwritten: dict[Path, str] = {}  # original content of pages we overwrite, for rollback
     with locking.ingest_lock(ar_root):
         conn = fts_mod.connect(ar_root)
+        fts_mod.init_fts(ar_root)
         try:
-            fts_mod.init_fts(ar_root)
-            for p in pages:
-                rel = str(p["rel_path"])
-                content = str(p.get("content", ""))
-                sources = list(p.get("sources") or [source_id])
-                status = "active"
-                for cit in p.get("citations", []) or []:
-                    r = verify_det.verify_claim(
-                        ar_root,
-                        list(cit.get("sources") or sources),
-                        str(cit.get("quote", "")),
-                        source_texts,
-                    )
-                    if not r.passed:
-                        status = "draft"
-                meta = WikiPageMetadata(
-                    id=rel, type=str(p.get("type", "synthesis")),
-                    title=str(p.get("title", rel)), sources=sources,
-                    updated=_now(), status=status,
-                )
-                page_path = storage.wiki_root(ar_root) / rel
+            for rel, body, sha, content, status in prepared:
+                page_path = wiki / rel
+                existed = page_path.exists()
                 page_path.parent.mkdir(parents=True, exist_ok=True)
-                page_path.write_text(_frontmatter(meta) + "\n\n" + content, encoding="utf-8")
-                sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if existed and page_path not in overwritten:
+                    try:
+                        overwritten[page_path] = page_path.read_text(encoding="utf-8")
+                    except OSError:
+                        pass  # unreadable original — cannot restore, leave as-is
+                page_path.write_text(body, encoding="utf-8")
+                if not existed:
+                    new_files.append(page_path)
                 fts_mod.upsert_page(conn, rel, rel, sha, content)
                 (written if status == "active" else drafted).append(rel)
             conn.commit()
+            _append_log(ar_root, source_id, written + drafted)
+        except Exception:
+            # roll back FTS, remove newly-created files, restore overwritten originals
+            conn.rollback()
+            for pp in new_files:
+                try:
+                    pp.unlink()
+                except OSError:
+                    pass
+            for pp, original in overwritten.items():
+                try:
+                    pp.write_text(original, encoding="utf-8")
+                except OSError:
+                    pass
+            raise
         finally:
             conn.close()
-        _append_log(ar_root, source_id, written + drafted)
     return {"source_id": source_id, "written": written, "drafted": drafted}

@@ -606,8 +606,8 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     """Run the underlying handler for a tool by name. Raises KeyError if unknown."""
     args = arguments or {}
     if name == "autoresearch_search":
-        from .autoresearch import storage as _ars, fts as _arf
-        return {"results": _arf.search(_ars.data_root(root), str(args.get("q", "")), k=int(args.get("k", 10) or 10))}
+        from .autoresearch import storage as _ars, hybrid as _arh
+        return {"results": _arh.search(_ars.data_root(root), str(args.get("q", "")), k=int(args.get("k", 10) or 10))}
     if name == "autoresearch_ingest_stage":
         from .autoresearch import storage as _ars, ingest as _ari
         content = args.get("content")

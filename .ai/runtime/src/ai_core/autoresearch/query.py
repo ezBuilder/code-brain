@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import storage, fts as fts_mod
+from . import storage, hybrid as hybrid_mod
 from . import lint as lint_mod
 
 
@@ -20,7 +20,7 @@ def query(ar_root: Path, question: str, k: int = 10) -> dict:
     candidates: trusted (status=active, not taint). quarantined: draft or taint pages,
     excluded from candidates. The agent must treat quarantined pages as low-trust.
     """
-    hits = fts_mod.search(ar_root, question, k=k)
+    hits = hybrid_mod.search(ar_root, question, k=k)  # hybrid when dense active, BM25 otherwise
     if hits and isinstance(hits[0], dict) and "error" in hits[0]:
         return {"candidates": [], "quarantined": [], "error": hits[0]["error"]}
     wiki = storage.wiki_root(ar_root)

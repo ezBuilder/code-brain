@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +22,81 @@ _FETCH_DEFAULT_WINDOW = 100
 _FETCH_GREP_CAP = 200
 _COMPACT_MAX_LINES = 20
 _COMPACT_MAX_BYTES = 1024
+
+# --- Opt-in execution isolation (PRD §12.2.1: real sandbox layer for Stage 2 auto-run) ---
+# macOS sandbox profile: deny IP network (egress/ingress) + raw IP sockets + mount changes.
+# Pattern is (allow default) + targeted denies — robust vs a fragile (deny default) that would
+# need every implicit syscall allowed. File *reads* stay allowed so uv/python/git reach system
+# libs/config; AF_UNIX local sockets stay allowed (only AF_INET/AF_INET6 denied).
+#
+# Verified empirically on macOS 26.5 under this exact profile: outbound TCP connect -> EPERM,
+# UDP sendto -> EPERM, and DNS getaddrinfo -> EAI_NONAME (resolver unreachable). So both IP
+# egress AND the DNS-name covert channel are blocked (locked by test_isolate_network_blocks_*).
+#
+# Residual risks NOT covered by this baseline (full closure needs a Linux netns/container
+# runtime — out of scope): no filesystem WRITE-jail (Stage 2 mitigates by running in a git
+# worktree); AF_UNIX local IPC / osascript-XPC side channels; inherited file descriptors;
+# PATH points at real binaries (absolute paths defeat any PATH pinning, so PATH is kept).
+# isolate_network and isolate_env are ORTHOGONAL — Stage 2 must enable BOTH (network-deny
+# stops exfil; env-scrub + --noprofile/--norc stop secret reads and rc-file repopulation).
+_SBPL_NETWORK_ISOLATED = """(version 1)
+(allow default)
+(deny network*)
+(deny system-socket (socket-domain 2))
+(deny system-socket (socket-domain 30))
+(deny file-write-mount)
+(deny file-write-unmount)
+"""
+
+# Minimal env allowlist so bash -lc / python / git / uv run without inheriting secrets.
+_ENV_ALLOWLIST = (
+    "PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "SHELL", "LC_CTYPE", "LC_ALL", "LANG",
+)
+# Caller-supplied extra env names are rejected (fail-closed) if they look secret-bearing.
+_SECRET_PREFIXES = (
+    "AWS_", "ANTHROPIC_", "OPENAI_", "AZURE_", "GCP_", "GOOGLE_", "GH_", "GITHUB_", "GITLAB_",
+    "NPM_", "PIP_", "PYPI_", "POETRY_", "TWINE_", "DOCKER_", "REGISTRY_", "SLACK_", "DISCORD_",
+    "SENTRY_", "DATADOG_", "STRIPE_", "FIREBASE_", "TWILIO_", "SSH_", "GPG_", "KUBE",
+)
+_SECRET_SUBSTRINGS = (
+    "SECRET", "TOKEN", "PASSWORD", "PASSWD", "API_KEY", "APIKEY", "CREDENTIAL",
+    "PRIVATE_KEY", "ACCESS_KEY", "BEARER", "SESSION", "OAUTH",
+    "URL", "URI", "DSN",  # connection strings often carry inline credentials
+)
+
+
+def _has_sandbox_exec() -> bool:
+    """sandbox-exec present? (macOS) — gates fail-closed network isolation."""
+    return shutil.which("sandbox-exec") is not None
+
+
+def _is_secret_var(name: str) -> bool:
+    """Heuristic: does this env var name look secret-bearing? (reject from extra allowlist)."""
+    up = name.upper()
+    if any(up.startswith(p) for p in _SECRET_PREFIXES):
+        return True
+    return any(s in up for s in _SECRET_SUBSTRINGS)
+
+
+def _build_clean_env(extra: list[str] | None = None) -> dict[str, str]:
+    """Clean child env: mandatory allowlist + caller-vetted extras; excludes secrets.
+
+    Raises ValueError if an extra name looks secret-bearing (fail-closed).
+    """
+    env: dict[str, str] = {}
+    for name in _ENV_ALLOWLIST:
+        val = os.environ.get(name)
+        if val is not None:
+            env[name] = val
+    for name in extra or ():
+        if not isinstance(name, str) or not name or name in _ENV_ALLOWLIST:
+            continue
+        if _is_secret_var(name):
+            raise ValueError(f"extra_env_vars rejects secret-bearing name: {name!r}")
+        val = os.environ.get(name)
+        if val is not None:
+            env[name] = val
+    return env
 
 
 def _now_iso() -> str:
@@ -91,13 +168,31 @@ def execute(
     command: list[str] | str,
     cwd: str | None = None,
     timeout: int = 30,
+    isolate_network: bool = False,
+    isolate_env: bool = False,
+    extra_env_vars: list[str] | None = None,
 ) -> dict[str, Any]:
+    """Run a command and return a redacted, size-capped summary.
+
+    Isolation is opt-in (PRD §12.2.1); all isolation params default off so existing callers
+    are unaffected (non-destructive):
+      - isolate_network: wrap with macOS `sandbox-exec` to deny IP network egress/ingress and
+        raw IP sockets. FAIL-CLOSED: if sandbox-exec is missing, returns an error instead of
+        running unisolated.
+      - isolate_env: replace the child environment with a minimal allowlist (no inherited
+        secrets). extra_env_vars adds caller-vetted names; secret-looking names are rejected.
+    Filesystem write-jail is not in this baseline (documented residual risk; Stage 2 also runs
+    inside a git worktree).
+    """
     # Accept either an argv list or a shell string. String form runs under `bash -lc`
     # so that heredocs, quoting and pipes work without re-escaping into a JSON array.
     if isinstance(command, str):
         if not command.strip():
             return redact_value({"ok": False, "reason": "empty_command"})
-        cmd_argv = ["bash", "-lc", command]
+        # Under env isolation skip login/rc files (--noprofile --norc) so a user's
+        # ~/.bash_profile/.bashrc cannot re-export and repopulate scrubbed secrets.
+        bash_flags = ["--noprofile", "--norc", "-c"] if isolate_env else ["-lc"]
+        cmd_argv = ["bash", *bash_flags, command]
     else:
         if not command:
             return redact_value({"ok": False, "reason": "empty_command"})
@@ -106,14 +201,32 @@ def execute(
     exec_id = secrets.token_hex(8)
     work_cwd = cwd if cwd is not None else str(root)
 
+    # Opt-in isolation. Defaults off → identical behavior to before for current callers.
+    run_argv = cmd_argv
+    if isolate_network:
+        if not _has_sandbox_exec():
+            # Fail-closed: caller requested isolation we cannot provide.
+            return redact_value({"ok": False, "reason": "sandbox_exec_unavailable", "exec_id": exec_id})
+        run_argv = ["sandbox-exec", "-p", _SBPL_NETWORK_ISOLATED, *cmd_argv]
+
+    child_env: dict[str, str] | None = None
+    if isolate_env:
+        try:
+            child_env = _build_clean_env(extra_env_vars)
+        except ValueError as exc:
+            return redact_value(
+                {"ok": False, "reason": "invalid_extra_env_vars", "error": str(exc), "exec_id": exec_id}
+            )
+
     try:
         completed = subprocess.run(
-            cmd_argv,
+            run_argv,
             cwd=work_cwd,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            env=child_env,
         )
     except subprocess.TimeoutExpired:
         return redact_value({"ok": False, "reason": "timeout", "exec_id": exec_id})
@@ -159,6 +272,8 @@ def execute(
         "total_lines": total_lines,
         "created_at": created_at,
         "stderr_bytes": stderr_bytes,
+        "isolate_network": isolate_network,
+        "isolate_env": isolate_env,
     }
     meta_path = sandbox_dir / f"{exec_id}.meta.json"
     _write_secure(meta_path, json.dumps(meta, ensure_ascii=False, sort_keys=True))
@@ -192,6 +307,26 @@ def execute(
     )
 
     return redact_value(summary)
+
+
+_READ_OUTPUT_CAP_BYTES = 4_000_000  # bound read_output memory (defensive; metric output is tiny)
+
+
+def read_output(root: Path, exec_id: str) -> str | None:
+    """Full redacted combined output of a prior execute() (by exec_id), or None.
+
+    For callers (e.g. the Stage 2 metric loop) that need the complete output for pattern
+    extraction rather than the size-capped summary execute() returns. exec_id is validated
+    as 16 hex chars (the token_hex(8) format) so it cannot traverse paths; the read is capped
+    at _READ_OUTPUT_CAP_BYTES to bound memory.
+    """
+    if not isinstance(exec_id, str) or len(exec_id) != 16 or any(c not in "0123456789abcdef" for c in exec_id):
+        return None
+    out_path = _sandbox_dir(root) / f"{exec_id}.txt"
+    try:
+        return out_path.read_bytes()[:_READ_OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 def fetch(

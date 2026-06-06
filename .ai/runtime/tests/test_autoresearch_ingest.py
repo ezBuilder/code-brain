@@ -1,0 +1,171 @@
+"""Stage 0 ingest pipeline + MCP dispatch end-to-end (agent-driven, deterministic)."""
+from __future__ import annotations
+
+import pathlib
+
+import pytest
+
+from ai_core.autoresearch import storage, ingest, fts
+
+
+@pytest.fixture()
+def ar(tmp_path: pathlib.Path) -> pathlib.Path:
+    r = tmp_path / "ar"
+    storage.ensure_tree(r)
+    return r
+
+
+def test_stage_idempotent_and_wrapped(ar):
+    st = ingest.stage_source(ar, content="Reciprocal rank fusion combines BM25 and dense.", title="RRF")
+    assert not st["duplicate"]
+    assert st["source_id"].startswith("src_")
+    assert "UNTRUSTED-DATA" in st["wrapped"] and st["nonce"] in st["wrapped"]
+    st2 = ingest.stage_source(ar, content="Reciprocal rank fusion combines BM25 and dense.", title="RRF")
+    assert st2["duplicate"] and st2["source_id"] == st["source_id"]
+
+
+def test_commit_active_page_is_searchable(ar):
+    st = ingest.stage_source(ar, content="Reciprocal rank fusion combines BM25 and dense retrieval.")
+    res = ingest.commit_pages(ar, source_id=st["source_id"], pages=[{
+        "rel_path": "concepts/rrf.md", "type": "concept", "title": "RRF",
+        "content": "RRF combines BM25 and dense retrieval signals.",
+        "sources": [st["source_id"]],
+        "citations": [{"quote": "combines BM25 and dense", "sources": [st["source_id"]]}],
+    }])
+    assert res["written"] == ["concepts/rrf.md"] and res["drafted"] == []
+    hits = fts.search(ar, "dense", k=5)
+    assert hits and hits[0]["page"] == "concepts/rrf.md"
+    # frontmatter persisted with active status
+    page = (storage.wiki_root(ar) / "concepts" / "rrf.md").read_text(encoding="utf-8")
+    assert "status: active" in page and st["source_id"] in page
+
+
+def test_commit_quarantines_unverifiable_citation(ar):
+    st = ingest.stage_source(ar, content="some genuine source text about hybrid search")
+    res = ingest.commit_pages(ar, source_id=st["source_id"], pages=[{
+        "rel_path": "concepts/bad.md", "content": "fabricated claim",
+        "sources": [st["source_id"]],
+        "citations": [{"quote": "THIS PHRASE IS NOT IN THE SOURCE", "sources": [st["source_id"]]}],
+    }])
+    assert res["drafted"] == ["concepts/bad.md"] and res["written"] == []
+    page = (storage.wiki_root(ar) / "concepts" / "bad.md").read_text(encoding="utf-8")
+    assert "status: draft" in page
+
+
+def test_mcp_dispatch_end_to_end(tmp_path):
+    from ai_core import mcp_server
+    proj = tmp_path
+    ar_root = storage.data_root(proj)
+    storage.ensure_tree(ar_root)
+    # stage + commit via dispatch
+    st = mcp_server._dispatch_tool(proj, "autoresearch_ingest_stage",
+                                   {"content": "hybrid search blends bm25 and embeddings"})
+    sid = st["source_id"]
+    mcp_server._dispatch_tool(proj, "autoresearch_ingest_commit", {
+        "source_id": sid,
+        "pages": [{"rel_path": "concepts/hybrid.md",
+                   "content": "hybrid blends bm25 and embeddings",
+                   "sources": [sid]}],
+    })
+    out = mcp_server._dispatch_tool(proj, "autoresearch_search", {"q": "embeddings", "k": 5})
+    assert out["results"] and "hybrid" in out["results"][0]["page"]
+
+
+def test_mcp_tools_registered():
+    from ai_core import mcp_server
+    assert "autoresearch_search" in mcp_server.TOOL_NAMES
+    assert "autoresearch_ingest_stage" in mcp_server.TOOL_NAMES
+    assert "autoresearch_ingest_commit" in mcp_server.TOOL_NAMES
+
+
+def test_commit_rolls_back_new_files_on_failure(tmp_path, monkeypatch):
+    from ai_core.autoresearch import fts as fts_mod
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    st = ingest.stage_source(ar, content="rollback source text body")
+    calls = {"n": 0}
+    real = fts_mod.upsert_page
+
+    def boom(conn, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated FTS failure mid-commit")
+        return real(conn, *a, **k)
+
+    monkeypatch.setattr(ingest.fts_mod, "upsert_page", boom)
+    with pytest.raises(RuntimeError):
+        ingest.commit_pages(ar, source_id=st["source_id"], pages=[
+            {"rel_path": "concepts/a.md", "content": "alpha body", "sources": [st["source_id"]]},
+            {"rel_path": "concepts/b.md", "content": "beta body", "sources": [st["source_id"]]},
+        ])
+    # both newly-created files rolled back, FTS transaction rolled back
+    assert not (storage.wiki_root(ar) / "concepts" / "a.md").exists()
+    assert not (storage.wiki_root(ar) / "concepts" / "b.md").exists()
+    assert fts_mod.search(ar, "alpha", k=5) == []
+
+
+def test_commit_idempotent_overwrite(tmp_path):
+    # re-committing the same page overwrites cleanly (upsert), no duplicate rows
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    st = ingest.stage_source(ar, content="dense bm25 source")
+    page = {"rel_path": "concepts/x.md", "content": "dense bm25", "sources": [st["source_id"]]}
+    ingest.commit_pages(ar, source_id=st["source_id"], pages=[page])
+    ingest.commit_pages(ar, source_id=st["source_id"], pages=[page])
+    from ai_core.autoresearch import fts as fts_mod
+    hits = fts_mod.search(ar, "dense", k=10)
+    assert [h["page"] for h in hits].count("concepts/x.md") == 1
+
+
+def test_commit_triggers_dense_refresh_when_active(tmp_path, monkeypatch):
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    monkeypatch.setattr(ingest.dense_mod, "is_active_for", lambda r: True)
+    captured = []
+    monkeypatch.setattr(ingest.dense_mod, "embed_and_store_pages",
+                        lambda root, pages: captured.extend(pages) or len(pages))
+    st = ingest.stage_source(ar, content="dense bm25 source")
+    ingest.commit_pages(ar, source_id=st["source_id"], pages=[
+        {"rel_path": "concepts/a.md", "content": "alpha", "sources": [st["source_id"]]}])
+    assert ("concepts/a.md", "alpha") in captured  # committed page passed to dense refresh
+
+
+def test_commit_no_dense_when_inactive(tmp_path, monkeypatch):
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    called = []
+    monkeypatch.setattr(ingest.dense_mod, "embed_and_store_pages",
+                        lambda root, pages: called.append(pages))
+    st = ingest.stage_source(ar, content="src")
+    ingest.commit_pages(ar, source_id=st["source_id"], pages=[
+        {"rel_path": "a.md", "content": "x", "sources": [st["source_id"]]}])
+    assert called == []  # dense inactive (no deps / small corpus) → not called
+
+
+def test_commit_restores_overwritten_on_failure(tmp_path, monkeypatch):
+    from ai_core.autoresearch import fts as fts_mod
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    st = ingest.stage_source(ar, content="overwrite source body text")
+    sid = st["source_id"]
+    ingest.commit_pages(ar, source_id=sid, pages=[
+        {"rel_path": "concepts/p.md", "content": "version one", "sources": [sid]}])
+    v1 = (storage.wiki_root(ar) / "concepts" / "p.md").read_text(encoding="utf-8")
+    calls = {"n": 0}
+    real = fts_mod.upsert_page
+
+    def boom(conn, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("boom after overwrite")
+        return real(conn, *a, **k)
+
+    monkeypatch.setattr(ingest.fts_mod, "upsert_page", boom)
+    with pytest.raises(RuntimeError):
+        ingest.commit_pages(ar, source_id=sid, pages=[
+            {"rel_path": "concepts/p.md", "content": "version two", "sources": [sid]},
+            {"rel_path": "concepts/q.md", "content": "new page", "sources": [sid]},
+        ])
+    # overwritten page restored to v1, newly-created page removed
+    assert (storage.wiki_root(ar) / "concepts" / "p.md").read_text(encoding="utf-8") == v1
+    assert not (storage.wiki_root(ar) / "concepts" / "q.md").exists()

@@ -514,6 +514,149 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "properties": {"limit": {"type": "integer", "default": 10}},
         },
     },
+    {
+        "name": "autoresearch_search",
+        "description": "AutoResearch knowledge-wiki FTS5 BM25 search (Stage 0). Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"q": {"type": "string"}, "k": {"type": "integer", "default": 10}},
+            "required": ["q"],
+        },
+    },
+    {
+        "name": "autoresearch_ingest_stage",
+        "description": "AutoResearch ingest phase 1: persist immutable raw + manifest (idempotent on sha256), return nonce-wrapped data for the agent to summarize. Provide `content` (local) OR `url` (Stage 3, SSRF-guarded HTTPS fetch). Web content is untrusted (quarantined if flagged). Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "url": {"type": "string"},
+                "source_url": {"type": "string"},
+                "title": {"type": "string"},
+                "trust_tier": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "autoresearch_ingest_commit",
+        "description": "AutoResearch ingest phase 2: verify-det gate, then write agent-authored wiki pages + FTS + log. Failing citations are quarantined as status:draft. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "pages": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["source_id", "pages"],
+        },
+    },
+    {
+        "name": "autoresearch_lint",
+        "description": "AutoResearch wiki health lint (Stage 0): orphan / draft / taint / stale pages. Read-only, no auto-fix.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"stale_before": {"type": "string"}},
+        },
+    },
+    {
+        "name": "autoresearch_query",
+        "description": "AutoResearch knowledge query (Stage 0): FTS5 retrieval with per-page trust signals. Draft/taint pages are quarantined out of candidates (laundering defense); the calling agent writes the cited answer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"question": {"type": "string"}, "k": {"type": "integer", "default": 10}},
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "autoresearch_verify",
+        "description": "AutoResearch deterministic citation verification (Stage 3): scores each claim's quote against its cited source texts (faithfulness in [0,1], no LLM). The agent uses the score to accept/hedge/reject; factuality judgment is the agent's job.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "claims": {"type": "array", "items": {"type": "object"}},
+                "long_tail_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["claims"],
+        },
+    },
+    {
+        "name": "autoresearch_deepresearch_start",
+        "description": "Stage 3: start a deep-research session. Runtime tracks state only; the agent does plan→fetch (autoresearch_ingest_stage with url)→synthesize→commit. Returns the session.",
+        "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]},
+    },
+    {
+        "name": "autoresearch_deepresearch_update",
+        "description": "Stage 3: update a deep-research session (subquestions / add_source / status). Size-capped.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "subquestions": {"type": "array", "items": {"type": "string"}},
+                "add_source": {"type": "string"},
+                "status": {"type": "string"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "autoresearch_deepresearch_status",
+        "description": "Stage 3: get a deep-research session state by session_id.",
+        "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
+    },
+    {
+        "name": "autoresearch_route",
+        "description": "Stage 4: suggest a model tier (local/frontier) for a query via a deterministic complexity heuristic (RouteLLM-style). The agent makes the final model choice. No LLM.",
+        "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+    },
+    {
+        "name": "autoresearch_survey_plan",
+        "description": "Stage 4: gate breadth-first multi-agent fan-out (orchestrator-worker). Returns single vs multi recommendation, a bounded worker list, and the ~15x cost warning. Deterministic policy, not an executor. No LLM.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "subtopics": {"type": "array", "items": {"type": "string"}},
+                "independent": {"type": "boolean"},
+                "max_workers": {"type": "integer"},
+            },
+            "required": ["subtopics"],
+        },
+    },
+    {
+        "name": "autoresearch_loop_start",
+        "description": "Stage 2 (OFF by default; autoresearch.loop.enable): start a metric ratchet loop. Runtime tracks state + budget; the agent does git (worktree/commit/reset) and edits. metric_cmd must be a user-trusted command.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string"},
+                "metric_cmd": {"type": ["string", "array"], "items": {"type": "string"}},
+                "metric_grep": {"type": "string"},
+                "direction": {"type": "string", "enum": ["minimize", "maximize"]},
+                "edit_surface": {"type": "array", "items": {"type": "string"}},
+                "max_iters": {"type": "integer"},
+                "max_cost_usd": {"type": "number"},
+                "per_run_timeout_s": {"type": "integer"},
+            },
+            "required": ["workspace", "metric_cmd", "metric_grep", "direction"],
+        },
+    },
+    {
+        "name": "autoresearch_loop_record",
+        "description": "Stage 2: run one ratchet evaluation (metric in the hardened sandbox — network+env isolated). Returns decision keep|discard|crash + best + should_continue. The agent git-resets on discard/crash.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"session_id": {"type": "string"}, "cost_spent": {"type": "number"}},
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "autoresearch_loop_status",
+        "description": "Stage 2: get a ratchet loop session state by session_id.",
+        "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
+    },
+    {
+        "name": "autoresearch_loop_stop",
+        "description": "Stage 2: stop a ratchet loop (no auto-merge; a human reviews the best commit).",
+        "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -553,6 +696,113 @@ def _invalidate_tools_list_cache() -> None:
 def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run the underlying handler for a tool by name. Raises KeyError if unknown."""
     args = arguments or {}
+    if name == "autoresearch_search":
+        from .autoresearch import storage as _ars, hybrid as _arh
+        return {"results": _arh.search(_ars.data_root(root), str(args.get("q", "")), k=int(args.get("k", 10) or 10))}
+    if name == "autoresearch_ingest_stage":
+        from .autoresearch import storage as _ars, ingest as _ari
+        content = args.get("content")
+        url = args.get("url")
+        has_content = isinstance(content, str) and content
+        has_url = isinstance(url, str) and url
+        if not has_content and not has_url:
+            raise ValueError("autoresearch_ingest_stage requires non-empty content or url")
+        return _ari.stage_source(
+            _ars.data_root(root),
+            content=content if has_content else None,
+            url=url if has_url else None,
+            source_url=str(args.get("source_url", "")), title=str(args.get("title", "")),
+            trust_tier=str(args.get("trust_tier", "untrusted")),
+        )
+    if name == "autoresearch_ingest_commit":
+        from .autoresearch import storage as _ars, ingest as _ari
+        sid = args.get("source_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_ingest_commit requires source_id")
+        pages = args.get("pages")
+        if not isinstance(pages, list):
+            raise ValueError("autoresearch_ingest_commit requires pages array")
+        return _ari.commit_pages(_ars.data_root(root), source_id=sid, pages=pages)
+    if name == "autoresearch_lint":
+        from .autoresearch import storage as _ars, lint as _arl
+        sb = args.get("stale_before")
+        return _arl.lint(_ars.data_root(root), stale_before=str(sb) if isinstance(sb, str) and sb else None)
+    if name == "autoresearch_query":
+        from .autoresearch import storage as _ars, query as _arq
+        return _arq.query(_ars.data_root(root), str(args.get("question", "")), k=int(args.get("k", 10) or 10))
+    if name == "autoresearch_verify":
+        from .autoresearch import storage as _ars, verify as _arv
+        claims = args.get("claims")
+        if not isinstance(claims, list):
+            raise ValueError("autoresearch_verify requires claims array")
+        lt = args.get("long_tail_ids")
+        return _arv.verify_claims(_ars.data_root(root), claims, long_tail_ids=lt if isinstance(lt, list) else None)
+    if name == "autoresearch_deepresearch_start":
+        from .autoresearch import storage as _ars, deepresearch as _dr
+        q = args.get("question")
+        if not isinstance(q, str) or not q:
+            raise ValueError("autoresearch_deepresearch_start requires question")
+        return _dr.start(_ars.data_root(root), q)
+    if name == "autoresearch_deepresearch_update":
+        from .autoresearch import storage as _ars, deepresearch as _dr
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_deepresearch_update requires session_id")
+        res = _dr.update(
+            _ars.data_root(root), sid,
+            subquestions=args.get("subquestions") if isinstance(args.get("subquestions"), list) else None,
+            add_source=args.get("add_source") if isinstance(args.get("add_source"), str) else None,
+            status=args.get("status") if isinstance(args.get("status"), str) else None,
+        )
+        return res if res is not None else {"error": "session_not_found_or_invalid"}
+    if name == "autoresearch_deepresearch_status":
+        from .autoresearch import storage as _ars, deepresearch as _dr
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_deepresearch_status requires session_id")
+        res = _dr.get(_ars.data_root(root), sid)
+        return res if res is not None else {"error": "session_not_found"}
+    if name == "autoresearch_route":
+        from .autoresearch import complexity_router as _cr
+        return _cr.classify(str(args.get("query", "")))
+    if name == "autoresearch_survey_plan":
+        from .autoresearch import orchestration as _orch
+        return _orch.survey_plan(
+            args.get("subtopics", []),
+            independent=bool(args.get("independent", False)),
+            max_workers=args.get("max_workers", _orch.DEFAULT_MAX_WORKERS),
+        )
+    if name == "autoresearch_loop_start":
+        from .autoresearch import loop as _loop
+        return _loop.start(
+            root,
+            workspace=str(args.get("workspace", "")),
+            metric_cmd=args.get("metric_cmd"),
+            metric_grep=str(args.get("metric_grep", "")),
+            direction=str(args.get("direction", "")),
+            edit_surface=args.get("edit_surface"),
+            max_iters=args.get("max_iters", 50),
+            max_cost_usd=args.get("max_cost_usd", 0.0),
+            per_run_timeout_s=args.get("per_run_timeout_s", 600),
+        )
+    if name == "autoresearch_loop_record":
+        from .autoresearch import loop as _loop
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_loop_record requires session_id")
+        return _loop.record(root, sid, cost_spent=args.get("cost_spent", 0.0))
+    if name == "autoresearch_loop_status":
+        from .autoresearch import loop as _loop
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_loop_status requires session_id")
+        return _loop.status(root, sid)
+    if name == "autoresearch_loop_stop":
+        from .autoresearch import loop as _loop
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_loop_stop requires session_id")
+        return _loop.stop(root, sid)
     if name in ("memory_query", "code_query"):
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":

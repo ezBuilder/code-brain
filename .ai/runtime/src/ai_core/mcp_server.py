@@ -514,6 +514,41 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "properties": {"limit": {"type": "integer", "default": 10}},
         },
     },
+    {
+        "name": "autoresearch_search",
+        "description": "AutoResearch knowledge-wiki FTS5 BM25 search (Stage 0). Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"q": {"type": "string"}, "k": {"type": "integer", "default": 10}},
+            "required": ["q"],
+        },
+    },
+    {
+        "name": "autoresearch_ingest_stage",
+        "description": "AutoResearch ingest phase 1: persist immutable raw + manifest (idempotent on sha256), return nonce-wrapped data for the calling agent to summarize. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "source_url": {"type": "string"},
+                "title": {"type": "string"},
+                "trust_tier": {"type": "string"},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "autoresearch_ingest_commit",
+        "description": "AutoResearch ingest phase 2: verify-det gate, then write agent-authored wiki pages + FTS + log. Failing citations are quarantined as status:draft. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "pages": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["source_id", "pages"],
+        },
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -553,6 +588,28 @@ def _invalidate_tools_list_cache() -> None:
 def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run the underlying handler for a tool by name. Raises KeyError if unknown."""
     args = arguments or {}
+    if name == "autoresearch_search":
+        from .autoresearch import storage as _ars, fts as _arf
+        return {"results": _arf.search(_ars.data_root(root), str(args.get("q", "")), k=int(args.get("k", 10) or 10))}
+    if name == "autoresearch_ingest_stage":
+        from .autoresearch import storage as _ars, ingest as _ari
+        content = args.get("content")
+        if not isinstance(content, str) or not content:
+            raise ValueError("autoresearch_ingest_stage requires non-empty content")
+        return _ari.stage_source(
+            _ars.data_root(root), content=content,
+            source_url=str(args.get("source_url", "")), title=str(args.get("title", "")),
+            trust_tier=str(args.get("trust_tier", "untrusted")),
+        )
+    if name == "autoresearch_ingest_commit":
+        from .autoresearch import storage as _ars, ingest as _ari
+        sid = args.get("source_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_ingest_commit requires source_id")
+        pages = args.get("pages")
+        if not isinstance(pages, list):
+            raise ValueError("autoresearch_ingest_commit requires pages array")
+        return _ari.commit_pages(_ars.data_root(root), source_id=sid, pages=pages)
     if name in ("memory_query", "code_query"):
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":

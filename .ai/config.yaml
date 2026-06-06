@@ -25,6 +25,8 @@ manifest:
 autoresearch:
   schema_version: 1
   enable_web_ingest: false
+  loop:
+    enable: false   # Stage 2 ratchet loop auto-executes code — OFF by default (PRD §5)
   search:
     corpus_threshold_tokens: 50000   # Stage 1 dense activates only above this (PRD 4.6)
   # trust_hosts (optional): server-side domain to tier allowlist; callers cannot self-declare.

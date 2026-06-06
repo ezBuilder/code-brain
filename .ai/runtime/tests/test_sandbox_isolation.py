@@ -36,6 +36,18 @@ def test_no_isolation_by_default(tmp_path):
     assert r["ok"] is True and "ok" in _out(r)
 
 
+def test_read_output_rejects_bad_exec_id(tmp_path):
+    assert sandbox.read_output(tmp_path, "../etc/passwd") is None
+    assert sandbox.read_output(tmp_path, "ZZZZ") is None
+    assert sandbox.read_output(tmp_path, "") is None
+
+
+def test_read_output_roundtrip(tmp_path):
+    r = sandbox.execute(tmp_path, command="echo hello_output")
+    out = sandbox.read_output(tmp_path, r["exec_id"])
+    assert out is not None and "hello_output" in out
+
+
 # --- environment scrubbing ---
 
 def test_isolate_env_drops_unlisted_var(tmp_path, monkeypatch):

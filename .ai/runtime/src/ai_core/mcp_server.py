@@ -620,6 +620,43 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "required": ["subtopics"],
         },
     },
+    {
+        "name": "autoresearch_loop_start",
+        "description": "Stage 2 (OFF by default; autoresearch.loop.enable): start a metric ratchet loop. Runtime tracks state + budget; the agent does git (worktree/commit/reset) and edits. metric_cmd must be a user-trusted command.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string"},
+                "metric_cmd": {"type": ["string", "array"], "items": {"type": "string"}},
+                "metric_grep": {"type": "string"},
+                "direction": {"type": "string", "enum": ["minimize", "maximize"]},
+                "edit_surface": {"type": "array", "items": {"type": "string"}},
+                "max_iters": {"type": "integer"},
+                "max_cost_usd": {"type": "number"},
+                "per_run_timeout_s": {"type": "integer"},
+            },
+            "required": ["workspace", "metric_cmd", "metric_grep", "direction"],
+        },
+    },
+    {
+        "name": "autoresearch_loop_record",
+        "description": "Stage 2: run one ratchet evaluation (metric in the hardened sandbox — network+env isolated). Returns decision keep|discard|crash + best + should_continue. The agent git-resets on discard/crash.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"session_id": {"type": "string"}, "cost_spent": {"type": "number"}},
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "autoresearch_loop_status",
+        "description": "Stage 2: get a ratchet loop session state by session_id.",
+        "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
+    },
+    {
+        "name": "autoresearch_loop_stop",
+        "description": "Stage 2: stop a ratchet loop (no auto-merge; a human reviews the best commit).",
+        "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -735,6 +772,37 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             independent=bool(args.get("independent", False)),
             max_workers=args.get("max_workers", _orch.DEFAULT_MAX_WORKERS),
         )
+    if name == "autoresearch_loop_start":
+        from .autoresearch import loop as _loop
+        return _loop.start(
+            root,
+            workspace=str(args.get("workspace", "")),
+            metric_cmd=args.get("metric_cmd"),
+            metric_grep=str(args.get("metric_grep", "")),
+            direction=str(args.get("direction", "")),
+            edit_surface=args.get("edit_surface"),
+            max_iters=args.get("max_iters", 50),
+            max_cost_usd=args.get("max_cost_usd", 0.0),
+            per_run_timeout_s=args.get("per_run_timeout_s", 600),
+        )
+    if name == "autoresearch_loop_record":
+        from .autoresearch import loop as _loop
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_loop_record requires session_id")
+        return _loop.record(root, sid, cost_spent=args.get("cost_spent", 0.0))
+    if name == "autoresearch_loop_status":
+        from .autoresearch import loop as _loop
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_loop_status requires session_id")
+        return _loop.status(root, sid)
+    if name == "autoresearch_loop_stop":
+        from .autoresearch import loop as _loop
+        sid = args.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("autoresearch_loop_stop requires session_id")
+        return _loop.stop(root, sid)
     if name in ("memory_query", "code_query"):
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":

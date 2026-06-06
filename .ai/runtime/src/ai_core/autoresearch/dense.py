@@ -119,3 +119,24 @@ def rebuild_embeddings(ar_root: Path) -> int:
     finally:
         conn.close()
     return count
+
+
+def embed_and_store_pages(ar_root: Path, pages: list[tuple[str, str]]) -> int:
+    """Embed and store a specific set of (page_id, text) pairs (incremental). No-op when
+    dense inactive. Called by ingest.commit_pages to refresh embeddings for new pages."""
+    if not is_active_for(ar_root) or not pages:
+        return 0
+    init_embeddings(ar_root)
+    vecs = _emb.embed_batch([t for _, t in pages], _project_root(ar_root))
+    if vecs is None:
+        return 0
+    conn = fts_mod.connect(ar_root)
+    count = 0
+    try:
+        for (pid, _), vec in zip(pages, vecs):
+            store_embedding(conn, pid, vec)
+            count += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return count

@@ -58,6 +58,25 @@ def test_embed_text_noop_without_deps(tmp_path):
     assert dense.embed_text("hello world", ar) is None
 
 
+def test_embed_and_store_noop_inactive(tmp_path):
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    assert dense.embed_and_store_pages(ar, [("a.md", "text")]) == 0
+
+
+def test_embed_and_store_active_mock(tmp_path, monkeypatch):
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    monkeypatch.setattr(dense, "is_active_for", lambda r: True)
+    monkeypatch.setattr(dense._emb, "embed_batch", lambda texts, root: [[0.1, 0.2] for _ in texts])
+    n = dense.embed_and_store_pages(ar, [("a.md", "alpha"), ("b.md", "beta")])
+    assert n == 2
+    conn = fts.connect(ar)
+    got = dense.get_embedding(conn, "a.md")
+    conn.close()
+    assert got is not None and abs(got[0] - 0.1) < 1e-6
+
+
 def test_rebuild_embeddings_noop_when_inactive(tmp_path):
     ar = tmp_path / "ar"
     storage.ensure_tree(ar)

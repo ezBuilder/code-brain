@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import storage, fts as fts_mod, locking, verify_det, nonce_verify, trust, injection_scan
+from . import dense as dense_mod
 from . import manifest as manifest_mod
 from .models import RawManifest, WikiPageMetadata
 
@@ -183,4 +184,11 @@ def commit_pages(ar_root: Path, *, source_id: str, pages: list[dict]) -> dict:
             raise
         finally:
             conn.close()
+    # Stage 1: refresh dense embeddings for the pages just written (best-effort, no-op when
+    # dense inactive). Never breaks ingest — embeddings are DERIVED and rebuildable.
+    try:
+        if dense_mod.is_active_for(ar_root):
+            dense_mod.embed_and_store_pages(ar_root, [(rel, content) for rel, _b, _s, content, _st in prepared])
+    except Exception:
+        pass
     return {"source_id": source_id, "written": written, "drafted": drafted}

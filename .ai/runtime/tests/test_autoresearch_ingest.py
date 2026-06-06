@@ -117,6 +117,31 @@ def test_commit_idempotent_overwrite(tmp_path):
     assert [h["page"] for h in hits].count("concepts/x.md") == 1
 
 
+def test_commit_triggers_dense_refresh_when_active(tmp_path, monkeypatch):
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    monkeypatch.setattr(ingest.dense_mod, "is_active_for", lambda r: True)
+    captured = []
+    monkeypatch.setattr(ingest.dense_mod, "embed_and_store_pages",
+                        lambda root, pages: captured.extend(pages) or len(pages))
+    st = ingest.stage_source(ar, content="dense bm25 source")
+    ingest.commit_pages(ar, source_id=st["source_id"], pages=[
+        {"rel_path": "concepts/a.md", "content": "alpha", "sources": [st["source_id"]]}])
+    assert ("concepts/a.md", "alpha") in captured  # committed page passed to dense refresh
+
+
+def test_commit_no_dense_when_inactive(tmp_path, monkeypatch):
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    called = []
+    monkeypatch.setattr(ingest.dense_mod, "embed_and_store_pages",
+                        lambda root, pages: called.append(pages))
+    st = ingest.stage_source(ar, content="src")
+    ingest.commit_pages(ar, source_id=st["source_id"], pages=[
+        {"rel_path": "a.md", "content": "x", "sources": [st["source_id"]]}])
+    assert called == []  # dense inactive (no deps / small corpus) → not called
+
+
 def test_commit_restores_overwritten_on_failure(tmp_path, monkeypatch):
     from ai_core.autoresearch import fts as fts_mod
     ar = tmp_path / "ar"

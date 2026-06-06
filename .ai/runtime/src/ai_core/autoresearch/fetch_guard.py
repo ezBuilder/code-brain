@@ -13,6 +13,7 @@ import socket
 from urllib.parse import urlparse
 
 ALLOWED_SCHEMES = ("https",)
+ALLOWED_PORTS = frozenset({443, 8443})         # standard HTTPS only — block internal port scans
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")  # embeds an IPv4 dest
 _6TO4 = ipaddress.ip_network("2002::/16")      # embeds an IPv4 dest
 
@@ -75,5 +76,7 @@ def validate_url(url: str) -> dict:
     except ValueError:
         pass  # not a literal IP — it's a hostname, resolved below
     port = parsed.port or 443
+    if port not in ALLOWED_PORTS:
+        raise FetchBlocked(f"port_not_allowed:{port}")
     pinned = resolve_pinned(host, port)
     return {"host": host, "port": port, "pinned_ips": pinned}

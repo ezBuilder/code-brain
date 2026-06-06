@@ -22,3 +22,8 @@ search:
   retriever: bm25
 manifest:
   path: .ai/generated/manifest.json
+autoresearch:
+  schema_version: 1
+  enable_web_ingest: false
+  # trust_hosts (optional): server-side domain to tier allowlist; callers cannot self-declare.
+  # Add entries under trust_hosts, e.g.  arxiv.org: primary  (single-label keys are rejected).

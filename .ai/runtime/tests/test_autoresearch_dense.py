@@ -44,6 +44,22 @@ def test_get_embedding_missing(tmp_path):
     conn.close()
 
 
+def test_threshold_from_config(tmp_path):
+    proj = tmp_path
+    (proj / ".ai").mkdir()
+    (proj / ".ai" / "config.yaml").write_text(
+        "autoresearch:\n  search:\n    corpus_threshold_tokens: 100\n", encoding="utf-8")
+    ar = proj / ".ai" / "autoresearch"
+    storage.ensure_tree(ar)
+    assert dense._threshold(ar) == 100
+
+
+def test_threshold_default_without_config(tmp_path):
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    assert dense._threshold(ar) == dense.CORPUS_THRESHOLD_TOKENS
+
+
 def test_is_active_for_small_corpus_off(tmp_path):
     ar = tmp_path / "ar"
     storage.ensure_tree(ar)

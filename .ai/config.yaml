@@ -25,5 +25,7 @@ manifest:
 autoresearch:
   schema_version: 1
   enable_web_ingest: false
+  search:
+    corpus_threshold_tokens: 50000   # Stage 1 dense activates only above this (PRD 4.6)
   # trust_hosts (optional): server-side domain to tier allowlist; callers cannot self-declare.
   # Add entries under trust_hosts, e.g.  arxiv.org: primary  (single-label keys are rejected).

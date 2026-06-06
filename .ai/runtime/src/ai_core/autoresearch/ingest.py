@@ -36,7 +36,8 @@ def _raw_path(ar_root: Path, source_id: str) -> Path:
 def stage_source(
     ar_root: Path,
     *,
-    content: str,
+    content: str | None = None,
+    url: str | None = None,
     source_url: str = "",
     title: str = "",
     trust_tier: str = "untrusted",
@@ -48,6 +49,24 @@ def stage_source(
     all raw is treated as untrusted regardless (Phase 2 injection hardening).
     """
     storage.ensure_tree(ar_root)
+    if content is not None and url is not None:
+        # unambiguous contract: exactly one source (local content XOR remote url)
+        return {"source_id": None, "duplicate": False, "nonce": None,
+                "wrapped": None, "error": "content_and_url_both_given"}
+    # Stage 3: fetch from url (SSRF-guarded) → content. Web content is UNTRUSTED and flows
+    # through the SAME nonce/injection/quarantine path as local content (no special trust).
+    if url is not None:
+        from . import fetch_integration, fetch_guard
+        try:
+            fetched = fetch_integration.validated_fetch(url)
+        except (fetch_guard.FetchBlocked, fetch_integration.FetchError) as exc:
+            return {"source_id": None, "duplicate": False, "nonce": None,
+                    "wrapped": None, "error": f"fetch_blocked:{exc}"}
+        content = fetched["text"]
+        source_url = source_url or url
+    if not content:
+        return {"source_id": None, "duplicate": False, "nonce": None,
+                "wrapped": None, "error": "no_content"}
     # Harden the nonce boundary BEFORE persisting anything: adversarial content that
     # embeds the delimiter markers is rejected up front (no raw/manifest write).
     try:

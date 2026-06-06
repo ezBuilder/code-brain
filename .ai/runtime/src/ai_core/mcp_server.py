@@ -525,16 +525,16 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_ingest_stage",
-        "description": "AutoResearch ingest phase 1: persist immutable raw + manifest (idempotent on sha256), return nonce-wrapped data for the calling agent to summarize. Write-class.",
+        "description": "AutoResearch ingest phase 1: persist immutable raw + manifest (idempotent on sha256), return nonce-wrapped data for the agent to summarize. Provide `content` (local) OR `url` (Stage 3, SSRF-guarded HTTPS fetch). Web content is untrusted (quarantined if flagged). Write-class.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string"},
+                "url": {"type": "string"},
                 "source_url": {"type": "string"},
                 "title": {"type": "string"},
                 "trust_tier": {"type": "string"},
             },
-            "required": ["content"],
         },
     },
     {
@@ -611,10 +611,15 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "autoresearch_ingest_stage":
         from .autoresearch import storage as _ars, ingest as _ari
         content = args.get("content")
-        if not isinstance(content, str) or not content:
-            raise ValueError("autoresearch_ingest_stage requires non-empty content")
+        url = args.get("url")
+        has_content = isinstance(content, str) and content
+        has_url = isinstance(url, str) and url
+        if not has_content and not has_url:
+            raise ValueError("autoresearch_ingest_stage requires non-empty content or url")
         return _ari.stage_source(
-            _ars.data_root(root), content=content,
+            _ars.data_root(root),
+            content=content if has_content else None,
+            url=url if has_url else None,
             source_url=str(args.get("source_url", "")), title=str(args.get("title", "")),
             trust_tier=str(args.get("trust_tier", "untrusted")),
         )

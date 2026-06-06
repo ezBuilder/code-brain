@@ -15,7 +15,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import storage, fts as fts_mod, locking, verify_det, nonce_verify
+from . import storage, fts as fts_mod, locking, verify_det, nonce_verify, trust
 from . import manifest as manifest_mod
 from .models import RawManifest, WikiPageMetadata
 
@@ -55,6 +55,9 @@ def stage_source(
         return {"source_id": None, "duplicate": False, "nonce": None,
                 "wrapped": None, "error": "nonce_collision"}
     sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    # trust_tier is SERVER-DERIVED from source_url, never from caller input (§12.2.6).
+    # The `trust_tier` parameter is intentionally ignored (kept for signature stability).
+    derived_tier = trust.derive_tier(source_url, trust.load_allowlist(ar_root))
     with locking.ingest_lock(ar_root):
         existing = manifest_mod.find_by_sha(ar_root, sha)
         if existing is not None:
@@ -63,7 +66,7 @@ def stage_source(
         _raw_path(ar_root, source_id).write_text(content, encoding="utf-8")
         manifest_mod.append(ar_root, RawManifest(
             id=source_id, sha256=sha, source_url=source_url, title=title or source_id,
-            mime="text/plain", trust_tier=trust_tier, ingested_at=_now(), status="draft",
+            mime="text/plain", trust_tier=derived_tier, ingested_at=_now(), status="draft",
         ))
     return {"source_id": source_id, "duplicate": False, "nonce": nonce, "wrapped": wrapped}
 

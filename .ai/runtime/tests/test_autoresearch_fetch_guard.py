@@ -62,6 +62,20 @@ def test_validate_url_public_pins_ip(monkeypatch):
     assert res["pinned_ips"] == ["93.184.216.34"]
 
 
+def test_validate_url_blocks_nonstandard_port(monkeypatch):
+    monkeypatch.setattr(fetch_guard.socket, "getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 8080))])
+    with pytest.raises(fetch_guard.FetchBlocked):
+        fetch_guard.validate_url("https://example.com:8080/")
+
+
+def test_validate_url_allows_8443(monkeypatch):
+    monkeypatch.setattr(fetch_guard.socket, "getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 8443))])
+    res = fetch_guard.validate_url("https://example.com:8443/")
+    assert res["port"] == 8443
+
+
 def test_validate_url_rebinding_mixed_ips_blocked(monkeypatch):
     # one public + one private resolved IP → block (attacker can't sneak a private one in)
     monkeypatch.setattr(fetch_guard.socket, "getaddrinfo",

@@ -73,8 +73,8 @@ def search(root: Path, query: str, k: int = 10) -> list[dict]:
                 (query, k),
             )
             rows = cur.fetchall()
-        except sqlite3.OperationalError as exc:
-            return [{"error": f"fts_query_failed: {exc}"}]
+        except sqlite3.OperationalError:
+            return [{"error": "fts_query_failed"}]  # generic — no path/internal disclosure
         return [
             {"page": r[1], "page_id": r[0], "snippet": r[2], "score": r[3]}
             for r in rows

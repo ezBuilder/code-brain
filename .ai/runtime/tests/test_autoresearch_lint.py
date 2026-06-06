@@ -13,6 +13,12 @@ def test_parse_frontmatter_none_when_absent():
     assert lint.parse_frontmatter("no frontmatter here") == {}
 
 
+def test_parse_frontmatter_first_wins():
+    # duplicate-key laundering: a forged second `status: active` must NOT win
+    fm = lint.parse_frontmatter("---\nstatus: draft\nstatus: active\n---\n\nbody")
+    assert fm["status"] == "draft"
+
+
 def test_lint_flags_orphans_and_drafts(tmp_path):
     ar = tmp_path / "ar"
     storage.ensure_tree(ar)

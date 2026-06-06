@@ -309,6 +309,26 @@ def execute(
     return redact_value(summary)
 
 
+_READ_OUTPUT_CAP_BYTES = 4_000_000  # bound read_output memory (defensive; metric output is tiny)
+
+
+def read_output(root: Path, exec_id: str) -> str | None:
+    """Full redacted combined output of a prior execute() (by exec_id), or None.
+
+    For callers (e.g. the Stage 2 metric loop) that need the complete output for pattern
+    extraction rather than the size-capped summary execute() returns. exec_id is validated
+    as 16 hex chars (the token_hex(8) format) so it cannot traverse paths; the read is capped
+    at _READ_OUTPUT_CAP_BYTES to bound memory.
+    """
+    if not isinstance(exec_id, str) or len(exec_id) != 16 or any(c not in "0123456789abcdef" for c in exec_id):
+        return None
+    out_path = _sandbox_dir(root) / f"{exec_id}.txt"
+    try:
+        return out_path.read_bytes()[:_READ_OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
 def fetch(
     root: Path,
     *,

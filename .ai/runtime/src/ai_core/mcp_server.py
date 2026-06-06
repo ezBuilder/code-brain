@@ -607,6 +607,19 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": "Stage 4: suggest a model tier (local/frontier) for a query via a deterministic complexity heuristic (RouteLLM-style). The agent makes the final model choice. No LLM.",
         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
     },
+    {
+        "name": "autoresearch_survey_plan",
+        "description": "Stage 4: gate breadth-first multi-agent fan-out (orchestrator-worker). Returns single vs multi recommendation, a bounded worker list, and the ~15x cost warning. Deterministic policy, not an executor. No LLM.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "subtopics": {"type": "array", "items": {"type": "string"}},
+                "independent": {"type": "boolean"},
+                "max_workers": {"type": "integer"},
+            },
+            "required": ["subtopics"],
+        },
+    },
 )
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
@@ -715,6 +728,13 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "autoresearch_route":
         from .autoresearch import complexity_router as _cr
         return _cr.classify(str(args.get("query", "")))
+    if name == "autoresearch_survey_plan":
+        from .autoresearch import orchestration as _orch
+        return _orch.survey_plan(
+            args.get("subtopics", []),
+            independent=bool(args.get("independent", False)),
+            max_workers=args.get("max_workers", _orch.DEFAULT_MAX_WORKERS),
+        )
     if name in ("memory_query", "code_query"):
         return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
     if name == "context_pack":

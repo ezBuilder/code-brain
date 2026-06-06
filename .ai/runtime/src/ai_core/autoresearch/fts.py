@@ -94,6 +94,8 @@ def rebuild_index(root: Path) -> int:
         wiki = storage.wiki_root(root)
         if wiki.is_dir():
             for md in sorted(wiki.rglob("*.md")):
+                if md.name == storage.LOG_NAME:  # exclude the append-only chronicle
+                    continue
                 rel = str(md.relative_to(wiki))
                 content = md.read_text(encoding="utf-8", errors="replace")
                 sha = hashlib.sha256(content.encode("utf-8")).hexdigest()

@@ -2,6 +2,17 @@
 
 This repository uses `.ai/` as the single repo-local source for AI agent context, memory, generated metadata, trust, and runtime tooling.
 
+## Operating Loop
+
+Every task runs this loop; the policies below specialize each step.
+
+1. **Understand** the request; restate the goal in one line.
+2. **Inspect existing code first** — MCP `code_query` / `context_pack` (not broad `grep`), then `code_read_hashline` for the exact slice before editing.
+3. **Check applicable instructions** — the nearest local `AGENTS.md` / `CLAUDE.md` (`ai code map`) and any relevant skill, before changing code.
+4. **Make the smallest coherent change.** No new abstraction, config, option, or file without a clear need.
+5. **Validate narrowest-first** — the closest test or `doctor_strict`, then broaden. Never report success without running it.
+6. **Record** decisions / todos / milestones (`record_decision` / `record_todo` / `append_session_note`) so the next session inherits the state.
+
 ## Branching Policy (hard rule)
 
 - **`develop` is the default working branch.** Every commit, every push, every PR target must be `develop` unless the user explicitly requests otherwise.
@@ -97,6 +108,16 @@ Hook responses follow the Claude Code spec via `hookSpecificOutput.{hookEventNam
 Code Brain mines PreToolUse Bash invocations and proposes precall rules that route or block matching commands. Lifecycle `pending → dry_run → active`. Active rules never override built-in `LONG_OUTPUT_BINARIES` interception. User overrides ≥3 auto-disable an active rule.
 
 Full mechanics (CLI, MCP, regex safety probe): see `.ai/policies/precall-rules.md`.
+
+## No Fabrication, Verify External Facts
+
+- **Do not invent** `ai` subcommands, MCP method names, flags, config keys, env vars, file paths, or APIs. Confirm before use: `ai <cmd> --help`, the MCP tool list, `.ai/config.yaml`, or open the file. If you cannot confirm it exists, say so — never guess a command into existence.
+- **Volatile external facts** — model IDs / pricing, package or SDK versions, store/platform policy, legal or regulatory items — are not answered from memory. Verify from current sources (Stage 3 `autoresearch_deepresearch` / web fetch, or the package registry) and state what you checked.
+
+## Workspace & Generated Files
+
+- **Scratch** (throwaway probes, intermediate dumps) → `.ai/tmp/` (git-ignored). **Durable agent deliverables** (reports, generated docs) → `.ai/outputs/` (tracked). Do not scatter temp files across the source tree.
+- **Do not hand-edit owned/derived files** unless the task specifically requires it: `.ai/generated/manifest.json`, `.ai/cache/code.sqlite`, anything under `.ai/cache/` or `.ai/generated/`, and vendor/build/lock files. They are regenerated — edit the source or the generator instead.
 
 ## Hard Constraints
 

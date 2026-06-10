@@ -1,4 +1,5 @@
 .ai/cache/
+.ai/tmp/
 .ai/runtime/.venv/
 .ai/runtime/.pytest_cache/
 __pycache__/

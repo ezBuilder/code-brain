@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
+from .policy import is_ci
 from .redact import redact_value
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 import os as _os
 try:
     SNIPPET_MAX_BYTES = max(80, min(2048, int(_os.environ.get("AI_SNIPPET_MAX_BYTES", "240"))))
@@ -156,7 +157,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
           summary text not null,
           updated_at text default current_timestamp
         );
-        create virtual table if not exists chunks_fts using fts5(path, content, content='', tokenize="porter unicode61 remove_diacritics 2");
+        create virtual table if not exists chunks_fts using fts5(path, content, content='', contentless_delete=1, tokenize="porter unicode61 remove_diacritics 2");
         create table if not exists chunk_meta (
           chunk_id integer primary key,
           kind text not null default 'file',
@@ -217,7 +218,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"pragma user_version={SCHEMA_VERSION}")
 
 
-def rebuild(root: Path, *, single_flight: bool = False, incremental: bool = False) -> dict[str, Any]:
+def rebuild(
+    root: Path,
+    *,
+    single_flight: bool = False,
+    incremental: bool = False,
+    paths: set[str] | None = None,
+) -> dict[str, Any]:
     if single_flight:
         from .portable import lock_exclusive_nonblocking, unlock
         lock_path = root / ".ai" / "cache" / ".rebuild.lock"
@@ -232,7 +239,7 @@ def rebuild(root: Path, *, single_flight: bool = False, incremental: bool = Fals
                     "db_path": db_path(root).relative_to(root).as_posix(),
                 }
             try:
-                return _rebuild_incremental_inner(root) if incremental else _rebuild_inner(root)
+                return _rebuild_incremental_inner(root, paths=paths) if incremental else _rebuild_inner(root)
             finally:
                 unlock(lock_fd)
         finally:
@@ -240,21 +247,20 @@ def rebuild(root: Path, *, single_flight: bool = False, incremental: bool = Fals
                 lock_fd.close()
             except Exception:
                 pass
-    return _rebuild_incremental_inner(root) if incremental else _rebuild_inner(root)
+    return _rebuild_incremental_inner(root, paths=paths) if incremental else _rebuild_inner(root)
 
 
-def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
+def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> dict[str, Any]:
     """Re-index only files whose redacted-content sha256 has changed.
 
     Drops chunks for deleted files; updates chunks for changed files; leaves
     unchanged files untouched. Codegraph + embedding row are rebuilt for the
     changed set too (drop + insert) so they never diverge from the FTS row.
 
-    Limitation: chunks_fts is a contentless FTS5 virtual table, which does
-    not support row-level DELETE. To work around this, we 'delete-all' the
-    FTS table once and re-populate it from chunks for both unchanged and
-    changed rows. embedding + codegraph data is the expensive part and
-    those *are* truly incremental.
+    Schema v8 enables FTS5 contentless_delete, so changed/deleted files can
+    remove just their own FTS rows. When ``paths`` is provided, only those
+    worktree-relative paths are considered; otherwise the whole text-file set
+    is scanned for drift/deletions.
 
     If the schema is out of date or empty, falls back to full rebuild.
     """
@@ -270,21 +276,29 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
             return _rebuild_inner(root)
         existing = {
             row["path"]: (int(row["id"]), str(row["sha256"]))
-            for row in conn.execute("select id, path, sha256 from chunks").fetchall()
+            for row in conn.execute(
+                """
+                select c.id, c.path, c.sha256
+                from chunks c
+                join chunk_meta m on m.chunk_id = c.id
+                where m.kind = 'file'
+                """
+            ).fetchall()
         }
         if not existing:
             return _rebuild_inner(root)
 
         conn.execute("begin immediate")
-        # Wipe the FTS index once; we'll repopulate it from `chunks` afterwards
-        # (contentless FTS5 disallows row DELETE, so this is the only safe path).
-        conn.execute("insert into chunks_fts(chunks_fts) values('delete-all')")
         seen: set[str] = set()
         changed = 0
         added = 0
         unchanged = 0
-        for path in iter_text_files(root):
-            rel = path.relative_to(root).as_posix()
+        candidate_paths = (
+            _target_text_files(root, paths)
+            if paths is not None
+            else ((path.relative_to(root).as_posix(), path) for path in iter_text_files(root))
+        )
+        for rel, path in candidate_paths:
             seen.add(rel)
             try:
                 content = path.read_text(encoding="utf-8")
@@ -294,18 +308,12 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
             existing_pair = existing.get(rel)
             if existing_pair is not None and existing_pair[1] == digest:
-                # chunks row is up to date; just refill the FTS row so search works
-                conn.execute(
-                    "insert into chunks_fts(rowid, path, content) values (?, ?, ?)",
-                    (existing_pair[0], rel, redacted),
-                )
                 unchanged += 1
                 continue
-            # need to (re)write this file: drop dependent tables (NOT chunks_fts;
-            # we already wiped it). chunks row identity is replaced so embedding +
-            # codegraph re-insert below picks up the new chunk_id.
+            # Need to (re)write this file: drop dependent rows, including the
+            # row-level FTS entries for the file and its function chunks.
             if existing_pair is not None:
-                _delete_chunk_rows_keep_fts(conn, existing_pair[0])
+                _delete_chunk_rows(conn, existing_pair[0])
                 # summaries/provenance/codegraph have path-keyed UNIQUE rows; clear them too
                 conn.execute("delete from summaries where path = ?", (rel,))
                 conn.execute("delete from provenance where path = ?", (rel,))
@@ -317,7 +325,7 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
                     "select id from chunks where path like ?", (f"{rel}:%",)
                 ).fetchall()
                 for (cid,) in chunk_ids:
-                    _delete_chunk_rows_keep_fts(conn, cid)
+                    _delete_chunk_rows(conn, cid)
             summary = summarize(redacted)
             cursor = conn.execute(
                 "insert into chunks(path, sha256, summary) values (?, ?, ?)",
@@ -348,11 +356,21 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
                 changed += 1
             else:
                 added += 1
-        # cleanup deleted files (chunks_fts already wiped + repopulated above)
+        # Cleanup deleted files. In targeted mode, only target paths are allowed
+        # to delete rows; full mode compares against the complete seen set.
         deleted = 0
-        for rel, (cid, _digest) in existing.items():
+        delete_candidates = paths if paths is not None else set(existing)
+        for rel in sorted(delete_candidates):
+            existing_pair = existing.get(rel)
+            if existing_pair is None or rel in seen:
+                continue
+            cid, _digest = existing_pair
+            if paths is not None:
+                target = root / rel
+                if _is_indexable_text_file(root, target):
+                    continue
             if rel not in seen:
-                _delete_chunk_rows_keep_fts(conn, cid)
+                _delete_chunk_rows(conn, cid)
                 conn.execute("delete from summaries where path = ?", (rel,))
                 conn.execute("delete from provenance where path = ?", (rel,))
                 conn.execute("delete from code_symbols where path = ?", (rel,))
@@ -362,7 +380,7 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
                     "select id from chunks where path like ?", (f"{rel}:%",)
                 ).fetchall()
                 for (func_cid,) in chunk_ids:
-                    _delete_chunk_rows_keep_fts(conn, func_cid)
+                    _delete_chunk_rows(conn, func_cid)
                 deleted += 1
         conn.commit()
     return {
@@ -374,13 +392,13 @@ def _rebuild_incremental_inner(root: Path) -> dict[str, Any]:
         "added": added,
         "deleted": deleted,
         "indexed": unchanged + changed + added,
+        "targeted": paths is not None,
     }
 
 
-def _delete_chunk_rows_keep_fts(conn: sqlite3.Connection, chunk_id: int) -> None:
-    """Delete chunk-dependent rows. Used by the incremental rebuild path,
-    where chunks_fts is wiped wholesale at the start of the cycle (FTS5
-    contentless DELETE limitation)."""
+def _delete_chunk_rows(conn: sqlite3.Connection, chunk_id: int) -> None:
+    """Delete a chunk and its dependent rows, including its FTS row."""
+    conn.execute("delete from chunks_fts where rowid = ?", (chunk_id,))
     conn.execute("delete from chunk_meta where chunk_id = ?", (chunk_id,))
     conn.execute("delete from embeddings_vec0 where chunk_id = ?", (chunk_id,))
     conn.execute("delete from chunks where id = ?", (chunk_id,))
@@ -969,6 +987,7 @@ def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[s
 
 
 def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
+    auto_refresh = _auto_refresh_if_stale(root)
     retriever = configured_retriever(root)
     if retriever != "bm25":
         raise RuntimeError(f"search retriever '{retriever}' is not implemented; use retriever: bm25")
@@ -1113,6 +1132,7 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
         "results": fts_results[:limit],
         "rg_fallback": fallback_used,
         "dense_rerank": dense_used,
+        "auto_refresh": auto_refresh,
     }
 
 
@@ -1120,6 +1140,72 @@ def context_pack(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
     payload = query(root, text, limit=limit)
     payload["additionalContext"] = "\n".join(f"- {item['path']}: {item['snippet']}" for item in payload["results"])
     return payload
+
+
+def _auto_refresh_enabled() -> bool:
+    raw = os.environ.get("AI_SEARCH_AUTO_REFRESH", "1")
+    return str(raw).strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
+    if not _auto_refresh_enabled():
+        return {"enabled": False, "rebuilt": False, "reason": "disabled"}
+    if is_ci():
+        return {"enabled": False, "rebuilt": False, "reason": "ci_read_only"}
+    dirty_paths = _git_dirty_paths(root)
+    if dirty_paths:
+        result = rebuild(root, single_flight=True, incremental=True, paths=dirty_paths)
+        return {
+            "enabled": True,
+            "rebuilt": True,
+            "reason": "dirty_paths",
+            "path_count": len(dirty_paths),
+            "result": result,
+        }
+    db = db_path(root)
+    if not db.exists():
+        result = rebuild(root, single_flight=True, incremental=True)
+        return {"enabled": True, "rebuilt": True, "reason": "missing", "result": result}
+    try:
+        source_mtime = max((path.stat().st_mtime for path in iter_text_files(root)), default=0.0)
+        db_mtime = db.stat().st_mtime
+    except OSError as exc:
+        return {"enabled": True, "rebuilt": False, "reason": f"stat_error:{exc}"}
+    if source_mtime >= db_mtime:
+        result = rebuild(root, single_flight=True, incremental=True)
+        return {"enabled": True, "rebuilt": True, "reason": "mtime_fallback", "result": result}
+    return {"enabled": True, "rebuilt": False, "reason": "current"}
+
+
+def _git_dirty_paths(root: Path) -> set[str]:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return set()
+    paths: set[str] = set()
+    parts = [item.decode("utf-8", errors="replace") for item in result.stdout.split(b"\0") if item]
+    idx = 0
+    while idx < len(parts):
+        item = parts[idx]
+        status = item[:2]
+        rel = item[3:] if len(item) > 3 else ""
+        if rel:
+            paths.add(rel)
+        if status.startswith(("R", "C")) or len(status) > 1 and status[1] in {"R", "C"}:
+            idx += 1
+            if idx < len(parts):
+                old_rel = parts[idx]
+                if old_rel:
+                    paths.add(old_rel)
+        idx += 1
+    return paths
 
 
 def observability(root: Path, *, query_text: str | None = None, limit: int = 5) -> dict[str, Any]:
@@ -1169,6 +1255,7 @@ def observability(root: Path, *, query_text: str | None = None, limit: int = 5) 
         payload["query"] = {
             "text": query_text,
             "limit": limit,
+            "auto_refresh": pack.get("auto_refresh"),
             "result_count": len(result_paths),
             "result_paths": result_paths,
             "matched_indexed_bytes": matched_bytes,
@@ -1213,28 +1300,45 @@ def configured_retriever(root: Path) -> str:
 
 def iter_text_files(root: Path):
     for path in candidate_files(root):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root)
-        rel_posix = rel.as_posix()
-        if any(rel_posix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
-            continue
-        if any(part in SKIP_DIRS for part in rel.parts):
-            continue
-        if path.name in SKIP_NAMES:
-            continue
-        if any(path.name.endswith(suffix) for suffix in SKIP_SUFFIXES):
-            continue
-        if path.stat().st_size > MAX_TEXT_BYTES:
-            continue
-        if path.suffix in TEXT_SUFFIXES or path.name in {"AGENTS.md", "CLAUDE.md"}:
+        if _is_indexable_text_file(root, path):
             yield path
+
+
+def _is_indexable_text_file(root: Path, path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    rel_posix = rel.as_posix()
+    if any(rel_posix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
+        return False
+    if any(part in SKIP_DIRS for part in rel.parts):
+        return False
+    if path.name in SKIP_NAMES:
+        return False
+    if any(path.name.endswith(suffix) for suffix in SKIP_SUFFIXES):
+        return False
+    try:
+        if path.stat().st_size > MAX_TEXT_BYTES:
+            return False
+    except OSError:
+        return False
+    return path.suffix in TEXT_SUFFIXES or path.name in {"AGENTS.md", "CLAUDE.md"}
+
+
+def _target_text_files(root: Path, rel_paths: set[str]):
+    for rel in sorted(rel_paths):
+        path = root / rel
+        if _is_indexable_text_file(root, path):
+            yield rel, path
 
 
 def candidate_files(root: Path) -> list[Path]:
     try:
         result = subprocess.run(
-            ["git", "ls-files", "-z"],
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             cwd=root,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

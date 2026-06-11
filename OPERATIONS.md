@@ -61,19 +61,23 @@ cd /path/to/project
 
 ## Search Cache Profile
 
-`.ai/cache/code.sqlite` uses SQLite FTS5 for lexical code search. The cache stores file paths, hashes, summaries, provenance, and a contentless FTS index; it does not store duplicate full source bodies in the `chunks` table. Query snippets are read lazily from the current tracked source file and redacted before output.
-If a source file changes after indexing, query output is marked as stale and `doctor --strict` fails `index_freshness` until `ai index rebuild` runs. Read-only query paths reject legacy cache schemas instead of silently dropping or rewriting them.
+`.ai/cache/code.sqlite` uses SQLite FTS5 for lexical code search. The cache stores file paths, hashes, summaries, provenance, and a contentless FTS index; it does not store duplicate full source bodies in the `chunks` table. Query snippets are read lazily from the current source file and redacted before output.
+If a source file changes after indexing, local query paths auto-refresh before searching: dirty/untracked/deleted paths from `git status` are reindexed directly, and only clean-tree checkout/pull drift falls back to a broader incremental scan. CI remains read-only; set `AI_SEARCH_AUTO_REFRESH=0` to force stale-report-only behavior.
 
 ### Stale Index Handling
 
-`ai obs search --query <text>` exits `13` (`MANIFEST_DRIFT`) when any returned hit references a source whose sha256 has drifted from the indexed value. The JSON payload includes a `query.remediation` block with the exact follow-up command. Two safe paths:
+`ai obs search --query <text>` refreshes stale local indexes automatically before retrieval. The JSON payload includes `query.auto_refresh.reason` (`dirty_paths`, `mtime_fallback`, `missing`, or `current`) so operators can see whether the query touched only changed paths or had to scan more broadly. If auto-refresh is disabled or blocked by CI and any returned hit references a source whose sha256 has drifted from the indexed value, the command exits `13` (`MANIFEST_DRIFT`) with a `query.remediation` block.
 
-- **Manual refresh** (default — preserves read-only query):
+- **Default local path**:
+  ```bash
+  .ai/bin/ai obs search --query "<text>" --json
+  ```
+- **Manual full refresh**:
   ```bash
   .ai/bin/ai index rebuild --json
   .ai/bin/ai obs search --query "<text>" --json
   ```
-- **Auto-refresh** (explicit write opt-in; rejected in CI):
+- **Force full refresh before query** (rejected in CI):
   ```bash
   .ai/bin/ai obs search --refresh-stale --query "<text>" --json
   ```

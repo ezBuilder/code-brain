@@ -74,6 +74,24 @@ def test_damaged_chain_recovers(tmp_path: Path) -> None:
         prev_text = ln
 
 
+def test_first_chained_row_prev_sha_recovers_to_null(tmp_path: Path) -> None:
+    from ai_core.audit_repair import repair_audit_chain
+
+    rows = [_row("a", "0" * 64), _row("b", "wrong")]
+    path = _make_audit(tmp_path, rows)
+
+    result = repair_audit_chain(tmp_path)
+
+    assert result["ok"]
+    assert result["total_repaired"] == 2
+    assert result["files"][0]["first_mismatch"] == 1
+    out_lines = path.read_text(encoding="utf-8").splitlines()
+    first = json.loads(out_lines[0])
+    second = json.loads(out_lines[1])
+    assert first["prev_sha"] is None
+    assert second["prev_sha"] == _sha(out_lines[0])
+
+
 def test_no_content_dropped(tmp_path: Path) -> None:
     from ai_core.audit_repair import repair_audit_chain
 

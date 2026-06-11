@@ -1,5 +1,5 @@
 ---
-description: 코드브레인 BM25 검색 — stale 자동 안내.
+description: 코드브레인 BM25 검색 — stale 자동 refresh.
 argument-hint: "<검색어>"
 ---
 
@@ -20,10 +20,10 @@ exit 0이면:
 
 exit 13이면 첫 줄을 다음으로 대체:
 ```
-코드브레인 검색: {query.result_count}건 (인덱스 stale {query.remediation.stale_count}개 — 갱신: ai index rebuild --json)
+코드브레인 검색: {query.result_count}건 (인덱스 stale {query.remediation.stale_count}개 — 자동 refresh 실패/비활성, 갱신: ai index rebuild --json)
 ```
 이어서 결과 동일하게 나열. snippet이 `[stale index: ...]`로 시작하면 그대로 출력.
 
 규칙:
-- 자동 rebuild/refresh 금지.
+- CLI의 기본 자동 refresh 결과를 그대로 신뢰한다. 별도 수동 rebuild는 실행하지 않는다.
 - 위 형식 외 한 글자도 추가하지 않는다.

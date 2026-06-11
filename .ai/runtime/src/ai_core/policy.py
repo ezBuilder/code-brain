@@ -31,6 +31,7 @@ WRITE_COMMANDS = {
     "session",
     "exec",
     "remote_memory",
+    "loop",
 }
 
 

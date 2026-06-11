@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -39,14 +40,14 @@ def _write(repo: Path, rel: str, content: str) -> Path:
     return path
 
 
-def test_schema_version_is_seven(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 7
+def test_schema_version_is_eight(tmp_path: Path) -> None:
+    assert SCHEMA_VERSION == 8
     repo = _make_repo(tmp_path)
     _write(repo, "doc.md", "hello world\n")
     rebuild(repo)
     with connect(repo) as conn:
         version = int(conn.execute("pragma user_version").fetchone()[0])
-    assert version == 7
+    assert version == 8
 
 
 def test_porter_stemming_matches_inflected_forms(tmp_path: Path) -> None:
@@ -73,7 +74,7 @@ def test_porter_stemming_matches_run_running_runs(tmp_path: Path) -> None:
         assert result["results"][0]["path"] == "doc.md"
 
 
-def test_legacy_v2_cache_auto_migrates_to_v4(tmp_path: Path) -> None:
+def test_legacy_v2_cache_auto_migrates_to_current_schema(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     with connect(repo) as conn:
         conn.executescript(
@@ -123,7 +124,7 @@ def test_legacy_v2_cache_auto_migrates_to_v4(tmp_path: Path) -> None:
         assert version_before == 2
         init_schema(conn, migrate_legacy=True)
         version_after = int(conn.execute("pragma user_version").fetchone()[0])
-        assert version_after == 7
+        assert version_after == 8
 
         tables = {
             row[0]
@@ -178,6 +179,41 @@ def test_bm25_weights_path_higher_than_content(tmp_path: Path, monkeypatch) -> N
     assert boosted_paths.index("foo_alpha.py") <= boosted_paths.index("other.py")
     # And boosting actually changed the ordering relative to baseline.
     assert boosted_paths != baseline_paths or boosted_paths[0] == "foo_alpha.py"
+
+
+def test_rebuild_indexes_untracked_git_source_files(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    repo = _make_repo(tmp_path)
+    subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+    _write(repo, "README.md", "tracked baseline\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    _write(
+        repo,
+        "src/workflow/orchestrator.ts",
+        'export function brandNewOrchestrator() { return "needle-orchestrator"; }\n',
+    )
+
+    rebuild(repo)
+
+    result = query(repo, "brandNewOrchestrator", limit=5)
+    assert result["ok"] is True
+    assert any(item["path"] == "src/workflow/orchestrator.ts" for item in result["results"])
+
+
+def test_query_auto_refreshes_stale_index_before_search(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    monkeypatch.delenv("CI", raising=False)
+    repo = _make_repo(tmp_path)
+    path = _write(repo, "src/workflow/orchestrator.ts", "export const oldNeedle = 1;\n")
+    rebuild(repo)
+
+    path.write_text("export const brandNewOrchestratorNeedle = 1;\n", encoding="utf-8")
+
+    result = query(repo, "brandNewOrchestratorNeedle", limit=5)
+    assert result["ok"] is True
+    assert result["auto_refresh"]["rebuilt"] is True
+    assert any(item["path"] == "src/workflow/orchestrator.ts" for item in result["results"])
+    assert result["results"][0]["snippet"].startswith("export const brandNewOrchestratorNeedle")
 
 
 def test_rg_fallback_triggers_on_zero_fts_hits(tmp_path: Path, monkeypatch) -> None:

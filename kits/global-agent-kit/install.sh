@@ -202,20 +202,36 @@ for key in ("deny", "ask", "allow"):
 if permissions:
     merged["permissions"] = permissions
 
-hooks = dict(current.get("hooks", {}))
-for event, entries in incoming.get("hooks", {}).items():
-    existing = hooks.get(event, [])
-    seen = {
-        json.dumps(entry, sort_keys=True, ensure_ascii=False)
-        for entry in existing
-    }
-    combined = list(existing)
-    for entry in entries:
-        marker = json.dumps(entry, sort_keys=True, ensure_ascii=False)
-        if marker not in seen:
-            seen.add(marker)
-            combined.append(entry)
-    hooks[event] = combined
+def _dedupe_event(entry_list):
+    # Merge entries that share a matcher (dedupe hook commands within) so an updated
+    # kit entry — e.g. a hook command added to an existing matcher group — collapses
+    # in place instead of accumulating duplicate matcher groups across re-installs.
+    by_matcher = {}
+    ordered = []
+    for entry in entry_list:
+        matcher = entry.get("matcher")
+        target = by_matcher.get(matcher)
+        if target is None:
+            copied = dict(entry)
+            copied["hooks"] = list(entry.get("hooks", []))
+            by_matcher[matcher] = copied
+            ordered.append(copied)
+            continue
+        seen_cmds = {h.get("command") for h in target.get("hooks", [])}
+        for h in entry.get("hooks", []):
+            if h.get("command") not in seen_cmds:
+                target["hooks"].append(h)
+                seen_cmds.add(h.get("command"))
+    return ordered
+
+hooks = {}
+events = list(current.get("hooks", {}))
+for event in incoming.get("hooks", {}):
+    if event not in hooks and event not in events:
+        events.append(event)
+for event in events:
+    combined = list(current.get("hooks", {}).get(event, [])) + list(incoming.get("hooks", {}).get(event, []))
+    hooks[event] = _dedupe_event(combined)
 if hooks:
     merged["hooks"] = hooks
 

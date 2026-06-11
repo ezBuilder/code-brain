@@ -75,10 +75,10 @@ function Get-ManagedFiles {
         cmd /c "git rev-parse --show-toplevel >NUL 2>NUL"
         if ($LASTEXITCODE -eq 0) {
             $tracked = git ls-files --cached --others --exclude-standard `
-                -- .ai .githooks .claude/commands .codex/prompts `
+                -- .ai .githooks .claude/commands .codex/prompts .agents/skills `
                 scripts/env-check.sh scripts/preflight.sh 2>$null
         } else {
-            $roots = @(".ai", ".githooks", ".claude/commands", ".codex/prompts")
+            $roots = @(".ai", ".githooks", ".claude/commands", ".codex/prompts", ".agents/skills")
             foreach ($root in $roots) {
                 if (Test-Path $root) {
                     $tracked += Get-ChildItem -Recurse -File $root | ForEach-Object {

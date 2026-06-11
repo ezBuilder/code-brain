@@ -23,6 +23,7 @@ def run_ai(*args: str, env: dict[str, str] | None = None, cwd: Path = ROOT) -> s
     for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI"):
         merged.pop(name, None)
     merged["PYTHONPATH"] = str(ROOT / ".ai" / "runtime" / "src")
+    merged["PYTHONDONTWRITEBYTECODE"] = "1"
     if env:
         merged.update(env)
     return subprocess.run(
@@ -46,6 +47,7 @@ def run_ai_input(
     for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI"):
         merged.pop(name, None)
     merged["PYTHONPATH"] = str(ROOT / ".ai" / "runtime" / "src")
+    merged["PYTHONDONTWRITEBYTECODE"] = "1"
     if env:
         merged.update(env)
     return subprocess.run(
@@ -76,6 +78,11 @@ def copy_repo(tmp_path: Path) -> Path:
         ".ai/memory/queue/.tmp/*.json*",
         ".ai/memory/queue/processing/*.json",
         ".ai/memory/queue/dead/*.json",
+        ".ai/memory/loop/inbox/*.json",
+        ".ai/memory/loop/processing/*.json",
+        ".ai/memory/loop/done/*.json",
+        ".ai/memory/loop/dead/*.json",
+        ".ai/memory/loop/.tmp/*.json*",
         ".ai/memory/audit/*.jsonl",
         ".ai/memory/events/*.jsonl",
         ".ai/memory/inbox/*.json",
@@ -564,7 +571,9 @@ def test_code_index_uses_git_baseline_and_skips_dependencies(tmp_path: Path) -> 
     assert rebuild_result.returncode == 0, rebuild_result.stdout + rebuild_result.stderr
     untracked = run_ai("code", "query", untracked_needle, "--json", cwd=repo)
     dependency = run_ai("code", "query", dependency_needle, "--json", cwd=repo)
-    assert json.loads(untracked.stdout)["results"] == []
+    # Schema v8 indexes untracked, non-ignored git source files (git ls-files --others);
+    # only gitignored deps (node_modules) stay out of the baseline.
+    assert json.loads(untracked.stdout)["results"][0]["path"] == "untracked-note.md"
     assert json.loads(dependency.stdout)["results"] == []
 
 
@@ -631,7 +640,7 @@ def test_code_index_schema_v2_does_not_store_full_content(tmp_path: Path) -> Non
     with sqlite3.connect(db) as conn:
         user_version = conn.execute("pragma user_version").fetchone()[0]
         columns = [row[1] for row in conn.execute("pragma table_info(chunks)").fetchall()]
-    assert user_version == 7
+    assert user_version == 8
     assert "content" not in columns
     query_result = run_ai("code", "query", "worker", "--json", cwd=repo)
     payload = json.loads(query_result.stdout)
@@ -648,7 +657,9 @@ def test_code_query_marks_stale_lazy_snippets(tmp_path: Path) -> None:
 
     rebuild_result = run_ai("index", "rebuild", "--json", cwd=repo)
     indexed.write_text("export const changedAfterIndex = true;\n", encoding="utf-8")
-    query_result = run_ai("code", "query", "staleNeedleForIndex", "--json", cwd=repo)
+    # Disable query auto-refresh so the stale-snippet path (FTS row vs changed source) is
+    # exercised; with auto-refresh on (the default) query would re-index the dirty file first.
+    query_result = run_ai("code", "query", "staleNeedleForIndex", "--json", cwd=repo, env={"AI_SEARCH_AUTO_REFRESH": "0"})
     doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
     query_payload = json.loads(query_result.stdout)
     doctor_payload = json.loads(doctor_result.stdout)
@@ -685,7 +696,7 @@ def test_code_index_migrates_legacy_content_schema(tmp_path: Path) -> None:
     with sqlite3.connect(db) as conn:
         columns = [row[1] for row in conn.execute("pragma table_info(chunks)").fetchall()]
         user_version = conn.execute("pragma user_version").fetchone()[0]
-    assert user_version == 7
+    assert user_version == 8
     assert "content" not in columns
     assert "summary" in columns
 
@@ -1061,7 +1072,7 @@ def test_obs_search_reports_cache_and_measured_context_bytes(tmp_path: Path) -> 
     query = payload["query"]
     assert payload["ok"] is True
     assert payload["exists"] is True
-    assert payload["schema_version"] == 7
+    assert payload["schema_version"] == 8
     assert payload["retriever"] == "bm25"
     assert payload["sqlite_bytes"] > 0
     assert payload["indexed_files"] > 0
@@ -1643,6 +1654,302 @@ def test_queue_fail_and_archive(tmp_path: Path) -> None:
     assert json.loads(archive_result.stdout)["archived"] == 1
 
 
+def test_loop_submit_claim_complete_roundtrip(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    instruction = repo / "loop-task.md"
+    rubric = repo / "loop-rubric.md"
+    result_file = repo / "loop-result.md"
+    instruction.write_text("Build the feature with maker and reviewer separation.\n", encoding="utf-8")
+    rubric.write_text("- tests pass\n- reviewer approves\n", encoding="utf-8")
+    result_file.write_text("verified locally\n", encoding="utf-8")
+
+    submit = run_ai(
+        "loop",
+        "submit",
+        "--file",
+        "loop-task.md",
+        "--goal",
+        "Loop feature",
+        "--rubric-file",
+        "loop-rubric.md",
+        "--checklist",
+        "tests pass",
+        "--source-agent",
+        "claude",
+        "--target-agent",
+        "codex",
+        "--priority",
+        "P1",
+        "--json",
+        cwd=repo,
+    )
+    assert submit.returncode == 0, submit.stdout + submit.stderr
+    submitted = json.loads(submit.stdout)["request"]
+    assert submitted["status"] == "pending"
+    assert submitted["source_agent"] == "claude"
+    assert submitted["target_agent"] == "codex"
+    assert "reviewer approves" in submitted["rubric"]
+    assert submitted["checklist"] == ["tests pass"]
+    assert submitted["path"].startswith(".ai/memory/loop/inbox/")
+
+    status = run_ai("loop", "status", "--json", cwd=repo)
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert json.loads(status.stdout)["pending"] == 1
+
+    claim = run_ai("loop", "claim", "--orchestrator-id", "codex-loop", "--agent", "codex", "--json", cwd=repo)
+    assert claim.returncode == 0, claim.stdout + claim.stderr
+    claimed_payload = json.loads(claim.stdout)
+    claimed = claimed_payload["request"]
+    assert claimed["id"] == submitted["id"]
+    assert claimed["status"] == "processing"
+    assert claimed["lease_id"]
+    assert claimed_payload["contract"]["reviewer_required"] is True
+    handoff_path = repo / ".ai" / "memory" / "handoff.json"
+    assert handoff_path.exists()
+    handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    assert handoff["goal"] == "Loop feature"
+    assert "maker" in claimed_payload["contract"]
+    assert "checker" in claimed_payload["contract"]
+    assert "reviewer approves" in claimed_payload["contract"]["rubric"]
+
+    blocked_complete = run_ai(
+        "loop",
+        "complete",
+        "--request-id",
+        claimed["id"],
+        "--lease-id",
+        claimed["lease_id"],
+        "--summary",
+        "done",
+        "--json",
+        cwd=repo,
+    )
+    assert blocked_complete.returncode == 1
+    assert "reviewer verdict pass required" in json.loads(blocked_complete.stdout)["error"]
+
+    verdict = run_ai(
+        "loop",
+        "verdict",
+        "--request-id",
+        claimed["id"],
+        "--lease-id",
+        claimed["lease_id"],
+        "--reviewer",
+        "checker-1",
+        "--verdict",
+        "pass",
+        "--summary",
+        "rubric passed",
+        "--rubric-result",
+        "tests pass; reviewer approves",
+        "--json",
+        cwd=repo,
+    )
+    assert verdict.returncode == 0, verdict.stdout + verdict.stderr
+    verdict_payload = json.loads(verdict.stdout)["request"]["reviewer_verdict"]
+    assert verdict_payload["verdict"] == "pass"
+    assert verdict_payload["reviewer"] == "checker-1"
+
+    complete = run_ai(
+        "loop",
+        "complete",
+        "--request-id",
+        claimed["id"],
+        "--lease-id",
+        claimed["lease_id"],
+        "--summary",
+        "done",
+        "--result-file",
+        "loop-result.md",
+        "--json",
+        cwd=repo,
+    )
+    assert complete.returncode == 0, complete.stdout + complete.stderr
+    completed = json.loads(complete.stdout)["request"]
+    assert completed["status"] == "done"
+    assert completed["result"] == "verified locally"
+    final_status = json.loads(run_ai("loop", "status", "--json", cwd=repo).stdout)
+    assert final_status["pending"] == 0
+    assert final_status["processing"] == 0
+    assert final_status["done"] == 1
+
+    distill = run_ai(
+        "loop",
+        "distill",
+        "--request-id",
+        claimed["id"],
+        "--text",
+        "Loop tasks must record reviewer pass verdict before complete.",
+        "--tag",
+        "rubric",
+        "--json",
+        cwd=repo,
+    )
+    assert distill.returncode == 0, distill.stdout + distill.stderr
+    decision = json.loads(distill.stdout)["decision"]
+    assert decision["source"] == "loop.distill"
+    # outcome tag ("done") distinguishes a verified-success distill from a failure post-mortem
+    assert decision["tags"] == ["loop", "distill", "done", "rubric"]
+    decisions = (repo / ".ai" / "memory" / "decisions.jsonl").read_text(encoding="utf-8")
+    assert "reviewer pass verdict" in decisions
+
+
+def test_loop_recovers_expired_processing_request(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    submit = run_ai("loop", "submit", "--text", "Fix stale loop", "--goal", "Recover loop", "--json", cwd=repo)
+    assert submit.returncode == 0, submit.stdout + submit.stderr
+    claim = run_ai("loop", "claim", "--orchestrator-id", "worker-a", "--lease-seconds", "60", "--json", cwd=repo)
+    assert claim.returncode == 0, claim.stdout + claim.stderr
+    request = json.loads(claim.stdout)["request"]
+    processing = repo / ".ai" / "memory" / "loop" / "processing" / f"{request['id']}.json"
+    payload = json.loads(processing.read_text(encoding="utf-8"))
+    payload["lease_expires_at"] = "2000-01-01T00:00:00Z"
+    processing.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    status = run_ai("loop", "status", "--json", cwd=repo)
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert json.loads(status.stdout)["expired_processing"] == 1
+
+    recover = run_ai("loop", "recover-expired", "--json", cwd=repo)
+    assert recover.returncode == 0, recover.stdout + recover.stderr
+    assert json.loads(recover.stdout)["recovered"] == 1
+    assert not processing.exists()
+    assert (repo / ".ai" / "memory" / "loop" / "inbox" / f"{request['id']}.json").exists()
+
+
+def test_loop_submit_rejects_path_escape(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside\n", encoding="utf-8")
+    result = run_ai("loop", "submit", "--file", str(outside), "--goal", "bad", "--json", cwd=repo)
+    assert result.returncode == 1
+    assert "inside the repository root" in json.loads(result.stdout)["error"]
+
+    rubric_result = run_ai("loop", "submit", "--text", "task", "--rubric-file", str(outside), "--goal", "bad", "--json", cwd=repo)
+    assert rubric_result.returncode == 1
+    assert "inside the repository root" in json.loads(rubric_result.stdout)["error"]
+
+
+def test_loop_complete_rejects_wrong_lease_id(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    run_ai("loop", "submit", "--text", "task", "--goal", "g", "--json", cwd=repo)
+    claimed = json.loads(run_ai("loop", "claim", "--orchestrator-id", "o", "--json", cwd=repo).stdout)["request"]
+    bad = run_ai("loop", "complete", "--request-id", claimed["id"], "--lease-id", "deadbeef",
+                 "--summary", "x", "--json", cwd=repo)
+    assert bad.returncode == 1
+    assert "lease_id mismatch" in json.loads(bad.stdout)["error"]
+
+
+def test_loop_verdict_rejects_wrong_lease_id(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    run_ai("loop", "submit", "--text", "task", "--goal", "g", "--json", cwd=repo)
+    claimed = json.loads(run_ai("loop", "claim", "--orchestrator-id", "o", "--json", cwd=repo).stdout)["request"]
+    bad = run_ai(
+        "loop",
+        "verdict",
+        "--request-id",
+        claimed["id"],
+        "--lease-id",
+        "deadbeef",
+        "--verdict",
+        "pass",
+        "--summary",
+        "x",
+        "--json",
+        cwd=repo,
+    )
+    assert bad.returncode == 1
+    assert "lease_id mismatch" in json.loads(bad.stdout)["error"]
+
+
+def test_loop_complete_rejects_path_traversal_request_id(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    bad = run_ai("loop", "complete", "--request-id", "../inbox/evil", "--lease-id", "x",
+                 "--summary", "x", "--json", cwd=repo)
+    assert bad.returncode == 1
+    assert "invalid request_id" in json.loads(bad.stdout)["error"]
+
+
+def test_loop_second_claim_returns_none_when_inbox_empty(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    run_ai("loop", "submit", "--text", "task", "--goal", "g", "--json", cwd=repo)
+    first = json.loads(run_ai("loop", "claim", "--orchestrator-id", "a", "--json", cwd=repo).stdout)
+    assert first["request"] is not None
+    second = json.loads(run_ai("loop", "claim", "--orchestrator-id", "b", "--json", cwd=repo).stdout)
+    assert second["request"] is None
+
+
+def test_loop_dead_letters_after_max_attempts(tmp_path: Path) -> None:
+    from ai_core.loop_engineering import MAX_ATTEMPTS
+
+    repo = copy_repo(tmp_path)
+    run_ai("loop", "submit", "--text", "flaky", "--goal", "g", "--json", cwd=repo)
+    claimed = json.loads(run_ai("loop", "claim", "--orchestrator-id", "a", "--json", cwd=repo).stdout)["request"]
+    processing = repo / ".ai" / "memory" / "loop" / "processing" / f"{claimed['id']}.json"
+    payload = json.loads(processing.read_text(encoding="utf-8"))
+    payload["attempts"] = MAX_ATTEMPTS
+    payload["lease_expires_at"] = "2000-01-01T00:00:00Z"
+    processing.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    recover = json.loads(run_ai("loop", "recover-expired", "--json", cwd=repo).stdout)
+    assert recover["recovered"] == 0
+    assert (repo / ".ai" / "memory" / "loop" / "dead" / f"{claimed['id']}.json").exists()
+    assert not processing.exists()
+    final = json.loads(run_ai("loop", "status", "--json", cwd=repo).stdout)
+    assert final["dead"] == 1
+    assert final["pending"] == 0
+
+
+def test_loop_distill_allows_failed_task_postmortem(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    run_ai("loop", "submit", "--text", "task", "--goal", "g", "--json", cwd=repo)
+    claimed = json.loads(run_ai("loop", "claim", "--orchestrator-id", "o", "--json", cwd=repo).stdout)["request"]
+    failed = run_ai("loop", "fail", "--request-id", claimed["id"], "--lease-id", claimed["lease_id"],
+                    "--reason", "blocked by X", "--json", cwd=repo)
+    assert failed.returncode == 0, failed.stdout + failed.stderr
+    # A failed (dead-lettered) task can still be distilled as a post-mortem — no pass verdict required.
+    distilled = run_ai("loop", "distill", "--request-id", claimed["id"], "--text", "lesson: avoid X",
+                       "--tag", "postmortem", "--json", cwd=repo)
+    assert distilled.returncode == 0, distilled.stdout + distilled.stderr
+    tags = json.loads(distilled.stdout)["decision"]["tags"]
+    assert "dead" in tags and "postmortem" in tags
+
+
+def _fail_one_loop_task(repo: Path) -> dict:
+    run_ai("loop", "submit", "--text", "t", "--goal", "g", "--json", cwd=repo)
+    claimed = json.loads(run_ai("loop", "claim", "--orchestrator-id", "o", "--json", cwd=repo).stdout)["request"]
+    run_ai("loop", "fail", "--request-id", claimed["id"], "--lease-id", claimed["lease_id"],
+           "--reason", "x", "--json", cwd=repo)
+    return claimed
+
+
+def test_loop_distill_blocks_topic_conflict_until_forced(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    run_ai("memory", "decision", "add", "--text",
+           "Batch every Postgres write through the queue worker for throughput", cwd=repo)
+    claimed = _fail_one_loop_task(repo)
+    lesson = "Batch every Postgres write through the queue worker for throughput consistency"
+
+    blocked = run_ai("loop", "distill", "--request-id", claimed["id"], "--text", lesson, "--json", cwd=repo)
+    payload = json.loads(blocked.stdout)
+    assert payload["ok"] is False
+    assert payload["reason"] == "potential_contradiction"
+    assert payload["conflicts"] and payload["conflicts"][0]["overlap"] >= 0.45
+
+    forced = run_ai("loop", "distill", "--request-id", claimed["id"], "--text", lesson, "--force", "--json", cwd=repo)
+    assert json.loads(forced.stdout)["ok"] is True
+
+
+def test_loop_distill_allows_unrelated_lesson(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    run_ai("memory", "decision", "add", "--text",
+           "Batch every Postgres write through the queue worker for throughput", cwd=repo)
+    claimed = _fail_one_loop_task(repo)
+    ok = run_ai("loop", "distill", "--request-id", claimed["id"], "--text",
+                "Frontend overlay components belong under extension_chrome source", "--json", cwd=repo)
+    assert json.loads(ok.stdout)["ok"] is True
+
+
 def test_queue_dead_empty_returns_zero_count(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     result = run_ai("queue", "dead", "--json", cwd=repo)
@@ -1775,6 +2082,11 @@ def test_ci_mutation_commands_rejected(tmp_path: Path) -> None:
         ("queue", "lease", "--worker-id", "ci"),
         ("queue", "recover-expired"),
         ("queue", "archive-dead", "--older-than-days", "0"),
+        ("loop", "submit", "--text", "ci"),
+        ("loop", "claim", "--orchestrator-id", "ci"),
+        ("loop", "verdict", "--request-id", "loop-1-abcd", "--lease-id", "x", "--verdict", "pass", "--summary", "ci"),
+        ("loop", "distill", "--request-id", "loop-1-abcd", "--text", "ci"),
+        ("loop", "recover-expired"),
         ("worker", "stop", "--force"),
         ("trust", "revoke", "missing"),
         ("inbox", "approve", "missing"),
@@ -1795,6 +2107,7 @@ def test_ci_read_only_commands_allowed(tmp_path: Path) -> None:
     commands = [
         ("queue", "dead", "--json"),
         ("queue", "status", "--json"),
+        ("loop", "status", "--json"),
         ("trust", "list", "--json"),
         ("secrets", "status", "--json"),
         ("inbox", "list", "--json"),
@@ -2375,7 +2688,9 @@ def test_obs_search_returns_13_when_index_stale(tmp_path: Path) -> None:
 
     target_file.write_text(f"{needle} edited body\n", encoding="utf-8")
 
-    stale_result = run_ai("obs", "search", "--query", needle, "--json", cwd=repo)
+    # Disable auto-refresh so the index stays stale and obs reports it (exit 13); the
+    # auto-refresh-on path is covered by test_obs_search_refresh_stale_rebuilds_and_exits_zero.
+    stale_result = run_ai("obs", "search", "--query", needle, "--json", cwd=repo, env={"AI_SEARCH_AUTO_REFRESH": "0"})
     assert stale_result.returncode == 13, (stale_result.returncode, stale_result.stdout, stale_result.stderr)
     payload = json.loads(stale_result.stdout)
     query_block = payload["query"]

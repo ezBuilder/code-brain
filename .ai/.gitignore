@@ -15,3 +15,8 @@
 !/memory/queue/.tmp/.gitkeep
 !/memory/queue/processing/.gitkeep
 !/memory/queue/dead/.gitkeep
+/memory/loop/inbox/*.json
+/memory/loop/processing/*.json
+/memory/loop/done/*.json
+/memory/loop/dead/*.json
+/memory/loop/.tmp/*

@@ -46,6 +46,10 @@
           {
             "type": "command",
             "command": "./.claude/hooks/block-dangerous.sh"
+          },
+          {
+            "type": "command",
+            "command": "./.claude/hooks/block-secret-commit.sh"
           }
         ]
       },

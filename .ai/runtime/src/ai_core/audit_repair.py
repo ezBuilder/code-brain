@@ -33,16 +33,13 @@ def _find_first_mismatch(lines: list[str]) -> int | None:
     for idx, ln in enumerate(lines):
         if not ln.strip():
             continue
-        if prev_line_text is None:
-            prev_line_text = ln
-            continue
         try:
             rec = json.loads(ln)
         except json.JSONDecodeError:
             prev_line_text = ln
             continue
         if isinstance(rec, dict) and "prev_sha" in rec:
-            expected = _line_sha(prev_line_text)
+            expected = None if prev_line_text is None else _line_sha(prev_line_text)
             if rec.get("prev_sha") != expected:
                 return idx
         prev_line_text = ln
@@ -55,7 +52,7 @@ def _rewrite_chain(lines: list[str], start_idx: int) -> tuple[list[str], int]:
     Returns (new_lines, repaired_count).
     """
     out: list[str] = list(lines[:start_idx])
-    prev = lines[start_idx - 1] if start_idx > 0 else ""
+    prev: str | None = lines[start_idx - 1] if start_idx > 0 else None
     repaired = 0
     for ln in lines[start_idx:]:
         if not ln.strip():
@@ -68,7 +65,7 @@ def _rewrite_chain(lines: list[str], start_idx: int) -> tuple[list[str], int]:
             prev = ln
             continue
         if isinstance(rec, dict) and "prev_sha" in rec:
-            rec["prev_sha"] = _line_sha(prev)
+            rec["prev_sha"] = _line_sha(prev) if prev is not None else None
             new_ln = json.dumps(
                 rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             )

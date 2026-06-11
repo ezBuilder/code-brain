@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from . import __version__
 from .config import load_config
@@ -84,6 +85,60 @@ def build_parser() -> argparse.ArgumentParser:
     queue_dead.add_argument("--json", action="store_true", dest="command_json")
     queue_status_parser = queue_sub.add_parser("status")
     queue_status_parser.add_argument("--json", action="store_true", dest="command_json")
+    loop = sub.add_parser("loop", help="file-based loop-engineering handoff between agents")
+    loop_sub = loop.add_subparsers(dest="loop_command", required=True)
+    loop_submit = loop_sub.add_parser("submit")
+    loop_submit.add_argument("--goal", default="")
+    loop_submit.add_argument("--file")
+    loop_submit.add_argument("--text")
+    loop_submit.add_argument("--rubric")
+    loop_submit.add_argument("--rubric-file")
+    loop_submit.add_argument("--checklist", action="append", default=[])
+    loop_submit.add_argument("--source-agent", default="agent")
+    loop_submit.add_argument("--target-agent", default="agent")
+    loop_submit.add_argument("--role", default="worker")
+    loop_submit.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P1")
+    loop_submit.add_argument("--interval-seconds", type=int, default=300)
+    loop_submit.add_argument("--no-review", action="store_true")
+    loop_submit.add_argument("--json", action="store_true", dest="command_json")
+    loop_claim = loop_sub.add_parser("claim")
+    loop_claim.add_argument("--orchestrator-id", required=True)
+    loop_claim.add_argument("--agent", default="agent")
+    loop_claim.add_argument("--priority", choices=["P0", "P1", "P2", "P3"])
+    loop_claim.add_argument("--lease-seconds", type=int, default=300)
+    loop_claim.add_argument("--json", action="store_true", dest="command_json")
+    loop_complete = loop_sub.add_parser("complete")
+    loop_complete.add_argument("--request-id", required=True)
+    loop_complete.add_argument("--lease-id", required=True)
+    loop_complete.add_argument("--summary", required=True)
+    loop_complete.add_argument("--result")
+    loop_complete.add_argument("--result-file")
+    loop_complete.add_argument("--json", action="store_true", dest="command_json")
+    loop_fail = loop_sub.add_parser("fail")
+    loop_fail.add_argument("--request-id", required=True)
+    loop_fail.add_argument("--lease-id", required=True)
+    loop_fail.add_argument("--reason", required=True)
+    loop_fail.add_argument("--json", action="store_true", dest="command_json")
+    loop_verdict = loop_sub.add_parser("verdict")
+    loop_verdict.add_argument("--request-id", required=True)
+    loop_verdict.add_argument("--lease-id", required=True)
+    loop_verdict.add_argument("--reviewer", default="reviewer")
+    loop_verdict.add_argument("--verdict", choices=["pass", "fail", "blocked"], required=True)
+    loop_verdict.add_argument("--summary", required=True)
+    loop_verdict.add_argument("--rubric-result")
+    loop_verdict.add_argument("--rubric-result-file")
+    loop_verdict.add_argument("--json", action="store_true", dest="command_json")
+    loop_distill = loop_sub.add_parser("distill")
+    loop_distill.add_argument("--request-id", required=True)
+    loop_distill.add_argument("--text")
+    loop_distill.add_argument("--file")
+    loop_distill.add_argument("--tag", action="append", default=[])
+    loop_distill.add_argument("--force", action="store_true", help="override the contradiction gate after review")
+    loop_distill.add_argument("--json", action="store_true", dest="command_json")
+    loop_recover = loop_sub.add_parser("recover-expired")
+    loop_recover.add_argument("--json", action="store_true", dest="command_json")
+    loop_status = loop_sub.add_parser("status")
+    loop_status.add_argument("--json", action="store_true", dest="command_json")
     trust = sub.add_parser("trust")
     trust_sub = trust.add_subparsers(dest="trust_command", required=True)
     trust_init = trust_sub.add_parser("init")
@@ -503,6 +558,24 @@ def emit(payload: object, *, as_json: bool) -> None:
         _write(str(payload))
 
 
+def _read_loop_text(root: Path, *, text: str | None, file_path: str | None, stdin_fallback: bool = False) -> str:
+    if text is not None:
+        return text
+    if file_path:
+        raw_path = Path(file_path)
+        path = raw_path if raw_path.is_absolute() else root / raw_path
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+        if resolved != root_resolved and root_resolved not in resolved.parents:
+            raise ValueError("loop file must be inside the repository root")
+        if not resolved.is_file():
+            raise ValueError(f"loop file not found: {file_path}")
+        return resolved.read_text(encoding="utf-8")
+    if stdin_fallback and not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise ValueError("provide --text or --file")
+
+
 def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
     parser = build_parser()
@@ -601,6 +674,97 @@ def main(argv: list[str] | None = None) -> int:
             payload = queue_status(root)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "loop":
+            from . import loop_engineering as loop_eng
+
+            if args.loop_command == "submit":
+                reject_ci_write("loop")
+                instruction = _read_loop_text(root, text=args.text, file_path=args.file, stdin_fallback=True)
+                rubric = (
+                    _read_loop_text(root, text=args.rubric, file_path=args.rubric_file)
+                    if args.rubric is not None or args.rubric_file
+                    else ""
+                )
+                payload = loop_eng.submit(
+                    root,
+                    instruction=instruction,
+                    goal=args.goal,
+                    source_agent=args.source_agent,
+                    target_agent=args.target_agent,
+                    role=args.role,
+                    priority=args.priority,
+                    interval_seconds=args.interval_seconds,
+                    reviewer_required=not args.no_review,
+                    rubric=rubric,
+                    checklist=args.checklist,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if args.loop_command == "claim":
+                reject_ci_write("loop")
+                payload = loop_eng.claim(
+                    root,
+                    orchestrator_id=args.orchestrator_id,
+                    agent=args.agent,
+                    priority=args.priority,
+                    lease_seconds=args.lease_seconds,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if args.loop_command == "complete":
+                reject_ci_write("loop")
+                result = (
+                    _read_loop_text(root, text=args.result, file_path=args.result_file)
+                    if args.result_file or args.result is not None
+                    else ""
+                )
+                payload = loop_eng.complete(
+                    root,
+                    request_id=args.request_id,
+                    lease_id=args.lease_id,
+                    summary=args.summary,
+                    result=result,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if args.loop_command == "fail":
+                reject_ci_write("loop")
+                payload = loop_eng.fail(root, request_id=args.request_id, lease_id=args.lease_id, reason=args.reason)
+                emit(payload, as_json=as_json)
+                return OK
+            if args.loop_command == "verdict":
+                reject_ci_write("loop")
+                rubric_result = (
+                    _read_loop_text(root, text=args.rubric_result, file_path=args.rubric_result_file)
+                    if args.rubric_result is not None or args.rubric_result_file
+                    else ""
+                )
+                payload = loop_eng.record_verdict(
+                    root,
+                    request_id=args.request_id,
+                    lease_id=args.lease_id,
+                    reviewer=args.reviewer,
+                    verdict=args.verdict,
+                    summary=args.summary,
+                    rubric_result=rubric_result,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if args.loop_command == "distill":
+                reject_ci_write("loop")
+                text = _read_loop_text(root, text=args.text, file_path=args.file)
+                payload = loop_eng.distill(root, request_id=args.request_id, text=text, tags=args.tag, force=args.force)
+                emit(payload, as_json=as_json)
+                return OK
+            if args.loop_command == "recover-expired":
+                reject_ci_write("loop")
+                payload = loop_eng.recover_expired(root)
+                emit(payload, as_json=as_json)
+                return OK
+            if args.loop_command == "status":
+                payload = loop_eng.status(root)
+                emit(payload, as_json=as_json)
+                return OK
         if args.command == "trust" and args.trust_command == "init":
             reject_ci_write("trust")
             payload = init_machine(root, name=args.name)

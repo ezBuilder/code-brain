@@ -1450,6 +1450,7 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             pass
 
     precall_decision: dict[str, Any] | None = None
+    commit_block_reason: str | None = None
     stream_guard_decision: dict[str, Any] | None = None
     try:
         from .stream_guard import decision_reason, evaluate_hook_payload
@@ -1511,6 +1512,19 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     pass
         except Exception:
             precall_decision = None
+
+        try:
+            command = str(
+                tool_input.get("command")
+                or tool_input.get("CommandLine")
+                or tool_input.get("commandLine")
+                or ""
+            )
+            from .commit_guard import commit_secret_reason
+
+            commit_block_reason = commit_secret_reason(root, command)
+        except Exception:
+            commit_block_reason = None
 
     additional_context = build_context(effective_hook, payload, root=root)
     if (
@@ -1684,6 +1698,16 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     "Code Brain stores full output in .ai/cache/sandbox/<exec_id>.txt and returns a short summary "
                     "(first 30 + last 5 lines, total under 4 KB) to keep your context window small."
                 )
+    if effective_hook == "PreToolUse" and commit_block_reason:
+        # Secret-in-commit gate (Claude via per-project ai-hook + Codex). Takes precedence:
+        # blocking a credential entering history matters more than search-routing.
+        response["decision"] = "block"
+        response["hookSpecificOutput"] = {
+            "hookEventName": effective_hook,
+            "permissionDecision": "deny",
+            "permissionDecisionReason": commit_block_reason,
+        }
+        response["reason"] = commit_block_reason
     if stream_guard_decision:
         response["stream_guard"] = stream_guard_decision
         # Blocking is only meaningful BEFORE a tool runs (PreToolUse) or for a

@@ -385,6 +385,40 @@ def read_text_tail(path: Path, lines: int) -> str:
     return "\n".join(tail)
 
 
+EVENTS_MAX_BYTES = 4_000_000  # events.jsonl is hook telemetry mined only for RECENT command
+EVENTS_KEEP = 5000            # patterns — rotate to the most recent N lines, drop the rest.
+
+
+def _maybe_rotate_events(path: Path) -> None:
+    """Best-effort: keep events.jsonl bounded to the most recent EVENTS_KEEP lines.
+
+    events.jsonl is append-only hook telemetry whose only consumer (precall_recommend) mines
+    recent command patterns, so unbounded growth is pure waste (it grew to hundreds of MB).
+    Rotation fires only above EVENTS_MAX_BYTES, rewrites in place under the same exclusive lock
+    appends use, and never raises (telemetry must not break the hook path). Unlike the audit
+    log (hash-chained — never truncated), events carry no integrity requirement.
+    """
+    try:
+        if path.stat().st_size <= EVENTS_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        with path.open("r+", encoding="utf-8") as handle:
+            _lock_exclusive(handle)
+            try:
+                lines = handle.read().splitlines()
+                if len(lines) <= EVENTS_KEEP:
+                    return
+                handle.seek(0)
+                handle.write("\n".join(lines[-EVENTS_KEEP:]) + "\n")
+                handle.truncate()
+            finally:
+                _unlock(handle)
+    except OSError:
+        pass
+
+
 def append_event(root: Path, event: dict[str, Any]) -> dict[str, Any]:
     record = {
         "ts": now_iso(),
@@ -393,6 +427,8 @@ def append_event(root: Path, event: dict[str, Any]) -> dict[str, Any]:
         "agent_session_id": event.get("agent_session_id"),
         "payload": redact_value(event),
     }
-    append_jsonl(root / ".ai" / "memory" / "events" / "events.jsonl", record)
+    path = root / ".ai" / "memory" / "events" / "events.jsonl"
+    append_jsonl(path, record)
+    _maybe_rotate_events(path)
     append_audit(root, action="event.append", category="memory", payload={"kind": record["kind"], "agent": record["agent"]})
     return record

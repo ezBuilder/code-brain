@@ -36,9 +36,9 @@ def _write(repo: Path, rel: str, content: str) -> Path:
     return path
 
 
-def test_schema_version_is_seven() -> None:
-    """T2: schema version bumped to 7 for function chunk metadata."""
-    assert SCHEMA_VERSION == 7
+def test_schema_version_is_eight() -> None:
+    """Schema v8 enables row-level FTS delete for true incremental updates."""
+    assert SCHEMA_VERSION == 8
 
 
 def test_compute_rrf_k_dynamic_scaling() -> None:
@@ -202,6 +202,23 @@ def test_incremental_rebuild_removes_stale_function_chunks(tmp_path: Path) -> No
     # New function should appear
     result = query(repo, "func_b")
     assert len(result["results"]) > 0, "func_b should be indexed"
+
+
+def test_targeted_incremental_does_not_delete_unrelated_function_chunks(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/a.py", "def keep_func():\n    return 1\n")
+    _write(repo, "src/b.py", "def changed_func():\n    return 1\n")
+    rebuild(repo)
+
+    _write(repo, "src/b.py", "def changed_func_v2():\n    return 2\n")
+    result = rebuild(repo, incremental=True, paths={"src/b.py"})
+
+    assert result["targeted"] is True
+    assert result["deleted"] == 0
+    keep = query(repo, "keep_func")
+    assert any("src/a.py" in item["path"] for item in keep["results"])
+    changed = query(repo, "changed_func_v2")
+    assert any("src/b.py" in item["path"] for item in changed["results"])
 
 
 def test_chunk_meta_stores_function_metadata(tmp_path: Path) -> None:

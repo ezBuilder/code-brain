@@ -81,10 +81,11 @@ managed_files() {
         .githooks \
         .claude/commands \
         .codex/prompts \
+        .agents/skills \
         scripts/env-check.sh \
         scripts/preflight.sh
     else
-      for path in .ai .githooks .claude/commands .codex/prompts; do
+      for path in .ai .githooks .claude/commands .codex/prompts .agents/skills; do
         [[ -e "$path" ]] && find "$path" -type f
       done
       for path in scripts/env-check.sh scripts/preflight.sh; do

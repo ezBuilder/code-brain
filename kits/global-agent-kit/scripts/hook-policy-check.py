@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations  # PEP 604 unions (str | None) on Python 3.9
+
 import argparse
 import json
 import re

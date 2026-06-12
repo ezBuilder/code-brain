@@ -32,6 +32,9 @@ Priority: security/permission > user request > project instructions > working me
 9. For broad research/review/verification, consider parallel agents or subtasks; split file ownership for parallel edits.
 10. For large/long tasks, keep the main session as supervisor for goal, decomposition, integration, and verification.
 11. If scope is large or impact is unclear, agree on a plan before editing.
+12. Agree on acceptance criteria (what "done" means) in one line before implementing.
+13. Separate the maker from the checker (who changes vs who verifies).
+14. If the same failure repeats twice, stop and report the cause and the blocker.
 
 ## Project Instructions
 

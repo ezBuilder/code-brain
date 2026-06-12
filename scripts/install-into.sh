@@ -178,6 +178,14 @@ copy_file() {
   if [[ "$rel" == "bootstrap-code-brain.sh" ]]; then
     return 0
   fi
+  if [[ -e "$dst" ]]; then
+    local src_abs dst_abs
+    src_abs="$(cd "$(dirname "$src")" && pwd -P)/$(basename "$src")"
+    dst_abs="$(cd "$(dirname "$dst")" && pwd -P)/$(basename "$dst")"
+    if [[ "$src_abs" == "$dst_abs" ]]; then
+      return 0
+    fi
+  fi
   if [[ "$ACTION" == "upgrade" && "$rel" == .ai/memory/* && -e "$dst" ]]; then
     return 0
   fi

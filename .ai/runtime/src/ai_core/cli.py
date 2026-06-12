@@ -173,6 +173,11 @@ def build_parser() -> argparse.ArgumentParser:
     notify_enqueue = notify_sub.add_parser("enqueue")
     notify_enqueue.add_argument("--channel", required=True)
     notify_enqueue.add_argument("--json", action="store_true", dest="command_json")
+    pgrowth = sub.add_parser("prompt-growth")
+    pgrowth_sub = pgrowth.add_subparsers(dest="prompt_growth_command", required=True)
+    pgrowth_status = pgrowth_sub.add_parser("status")
+    pgrowth_status.add_argument("--json", action="store_true", dest="command_json")
+
     obs = sub.add_parser("obs")
     obs_sub = obs.add_subparsers(dest="obs_command", required=True)
     obs_log = obs_sub.add_parser("log")
@@ -824,6 +829,11 @@ def main(argv: list[str] | None = None) -> int:
                 payload = loop_eng.status(root)
                 emit(payload, as_json=as_json)
                 return OK
+        if args.command == "prompt-growth" and args.prompt_growth_command == "status":
+            from . import prompt_growth as _pg
+
+            emit(_pg.status(root), as_json=as_json)
+            return OK
         if args.command == "trust" and args.trust_command == "init":
             reject_ci_write("trust")
             payload = init_machine(root, name=args.name)

@@ -92,7 +92,7 @@ managed_files() {
         [[ -f "$path" ]] && printf '%s\n' "$path"
       done
     fi
-  ) | grep -vx ".ai/secret_scan_allowlist.txt" || true
+  ) | grep -vxE "\.ai/secret_scan_allowlist\.txt|\.ai/generated/install-manifest\.json" || true
   printf '%s\n' "bootstrap-code-brain.sh"
 }
 

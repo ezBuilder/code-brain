@@ -9,7 +9,19 @@ set -euo pipefail
 
 payload="$(cat)"
 
-python3 - "$payload" <<'PY'
+if [[ -n "${PYTHON:-}" ]]; then
+  python_cmd=("$PYTHON")
+elif command -v python3 >/dev/null 2>&1; then
+  python_cmd=(python3)
+elif command -v python >/dev/null 2>&1; then
+  python_cmd=(python)
+elif command -v py >/dev/null 2>&1; then
+  python_cmd=(py -3)
+else
+  exit 0
+fi
+
+"${python_cmd[@]}" - "$payload" <<'PY'
 import json
 import os
 import re

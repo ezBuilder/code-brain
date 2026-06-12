@@ -349,9 +349,10 @@ def test_uv_lock_check_release_gate_integration_invariants() -> None:
 
 def test_lockfile_check_passes_without_modifying_lock(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
+    bash = usable_bash_or_skip()
     lockfile = repo / ".ai" / "runtime" / "uv.lock"
     before = (lockfile.stat().st_mtime_ns, hashlib.sha256(lockfile.read_bytes()).hexdigest())
-    result = subprocess.run(["bash", "scripts/lockfile-check.sh"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    result = subprocess.run([bash, "scripts/lockfile-check.sh"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     after = (lockfile.stat().st_mtime_ns, hashlib.sha256(lockfile.read_bytes()).hexdigest())
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "lockfile-check ok"
@@ -361,8 +362,9 @@ def test_lockfile_check_passes_without_modifying_lock(tmp_path: Path) -> None:
 
 def test_lockfile_check_handles_missing_lockfile(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
+    bash = usable_bash_or_skip()
     (repo / ".ai" / "runtime" / "uv.lock").unlink()
-    result = subprocess.run(["bash", "scripts/lockfile-check.sh"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    result = subprocess.run([bash, "scripts/lockfile-check.sh"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 1
     assert "missing .ai/runtime/uv.lock" in result.stderr
     assert "remediation" in result.stderr
@@ -2662,11 +2664,12 @@ def test_rollback_overwrites_manifest_drift(tmp_path: Path) -> None:
 
 
 def test_rollback_drill_script_does_not_mutate_worktree() -> None:
+    bash = usable_bash_or_skip()
     manifest = ROOT / ".ai" / "generated" / "manifest.json"
     before = hashlib.sha256(manifest.read_bytes()).hexdigest()
     before_mtime = manifest.stat().st_mtime_ns
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "rollback-drill.sh")],
+        [bash, str(ROOT / "scripts" / "rollback-drill.sh")],
         cwd=ROOT,
         text=True,
         stdout=subprocess.PIPE,
@@ -2703,6 +2706,7 @@ def test_bootstrap_idempotency_integration_invariants() -> None:
 
 def test_package_archive_is_reproducible_and_normalized(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
+    bash = usable_bash_or_skip()
     init_package_repo(repo)
     out_a = tmp_path / "a"
     out_b = tmp_path / "b"
@@ -2710,8 +2714,8 @@ def test_package_archive_is_reproducible_and_normalized(tmp_path: Path) -> None:
     env_a["DIST_OVERRIDE"] = str(out_a)
     env_b = os.environ.copy()
     env_b["DIST_OVERRIDE"] = str(out_b)
-    first = subprocess.run(["bash", "scripts/package.sh"], cwd=repo, env=env_a, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    second = subprocess.run(["bash", "scripts/package.sh"], cwd=repo, env=env_b, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    first = subprocess.run([bash, "scripts/package.sh"], cwd=repo, env=env_a, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    second = subprocess.run([bash, "scripts/package.sh"], cwd=repo, env=env_b, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert first.returncode == 0, first.stdout + first.stderr
     assert second.returncode == 0, second.stdout + second.stderr
     archive_a = Path(first.stdout.splitlines()[0])
@@ -2735,23 +2739,24 @@ def test_package_archive_is_reproducible_and_normalized(tmp_path: Path) -> None:
 
 def test_reproducibility_check_script_detects_drift(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
+    bash = usable_bash_or_skip()
     init_package_repo(repo)
-    package = subprocess.run(["bash", "scripts/package.sh"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    package = subprocess.run([bash, "scripts/package.sh"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert package.returncode == 0, package.stdout + package.stderr
     archive = Path(package.stdout.splitlines()[0])
 
-    ok = subprocess.run(["bash", "scripts/reproducibility-check.sh", str(archive)], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    ok = subprocess.run([bash, "scripts/reproducibility-check.sh", str(archive)], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert ok.returncode == 0, ok.stdout + ok.stderr
     assert "reproducibility check ok" in ok.stdout
 
     archive.write_bytes(archive.read_bytes() + b"drift")
-    drift = subprocess.run(["bash", "scripts/reproducibility-check.sh", str(archive)], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    drift = subprocess.run([bash, "scripts/reproducibility-check.sh", str(archive)], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert drift.returncode == 1
     assert "reproducibility drift" in drift.stderr
     assert "primary=" in drift.stderr
     assert "rebuild=" in drift.stderr
 
-    missing = subprocess.run(["bash", "scripts/reproducibility-check.sh", str(repo / "dist" / "missing.tar.gz")], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    missing = subprocess.run([bash, "scripts/reproducibility-check.sh", str(repo / "dist" / "missing.tar.gz")], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert missing.returncode == 2
     assert "no primary archive" in missing.stderr
 

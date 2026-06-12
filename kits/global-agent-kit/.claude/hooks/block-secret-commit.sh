@@ -115,7 +115,7 @@ if hits:
                 "시크릿을 제거하고 재시도하거나, 오탐이면 해당 경로를 .ai/secret_scan_allowlist.txt에 추가."
             ),
         }
-    }, ensure_ascii=False))
+    }))
 
 sys.exit(0)
 PY

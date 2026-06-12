@@ -54,12 +54,6 @@ Priority: security/permission > user request > project instructions > working me
 - Surface Code Brain skill candidates to the user, but create, update, or promote them globally only after explicit approval.
 - If Code Brain is unavailable or stale, fall back to normal local inspection and say so.
 
-## Prompt Loop (Codex)
-
-- Once per session at the end, run a self-improvement judge with your OWN cheaper model (not the working model). Never auto-apply.
-- Compare the user's commands against your outputs; if a rule is violated repeatedly (e.g. verbose reports over the ≤50-char default), record a generalized prompt patch: `ai prompt-loop propose --target global_codex --rationale "<why>" --patch "<rule>" --violation "<type>"`.
-- Patches stay pending; the human accepts with `ai prompt-loop accept --id <id>`. Surface pending patches in one line at session start. Skip if `ai prompt-loop` is unavailable.
-
 ## Completion Report
 
 - Default to 5 lines or fewer; even complex work should stay under 10 lines.

@@ -1593,6 +1593,18 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                         append_session_note(root, text=f"[{effective_hook}] {first_line}")
                     except Exception:
                         pass
+            # Prompt growth: record this turn and let the deterministic loop grow the
+            # project prompt. Background only (Stop hook), never blocks; fail-soft.
+            if not _env_disabled("AI_PROMPT_GROWTH"):
+                try:
+                    from . import prompt_growth
+
+                    last_msg = payload.get("last_assistant_message")
+                    output_chars = len(last_msg) if isinstance(last_msg, str) else 0
+                    prompt_growth.tick(root, output_chars=output_chars,
+                                       agent=normalize_agent(payload))
+                except Exception:
+                    pass
             # T35 autonomous page-out: when MemGPT pressure breaches threshold,
             # the agent should not wait for a human `ai memory page-out` call.
             if not _env_disabled("AI_AUTO_PAGE_OUT"):
@@ -2018,6 +2030,19 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
         return
 
 
+def _learned_prompt_context(root: Path) -> str:
+    """Inject auto-grown project rules (prompt growth). Empty until the loop has grown one."""
+    if _env_disabled("AI_PROMPT_GROWTH"):
+        return ""
+    try:
+        from . import prompt_growth
+
+        text = prompt_growth.learned_prompt_text(root)
+    except Exception:
+        return ""
+    return text or ""
+
+
 def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None = None) -> str:
     agent = normalize_agent(payload)
     writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
@@ -2176,6 +2201,9 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
         sections.append("Session-current tail:\n" + session_tail)
+    learned = _learned_prompt_context(root)
+    if learned:
+        sections.append(learned)
     # T37 — cloudflare remote_memory removed (.ai/ git sync handles cross-device).
     composed = "\n\n".join(sections)
     max_bytes = _max_injection_bytes_for(hook_name)

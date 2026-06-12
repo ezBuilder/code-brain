@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from ai_core.search import (  # noqa: E402
     _rg_fallback,
     connect,
     context_pack,
+    db_path,
     init_schema,
     query,
     rebuild,
@@ -209,6 +211,8 @@ def test_query_auto_refreshes_stale_index_before_search(tmp_path: Path, monkeypa
     rebuild(repo)
 
     path.write_text("export const brandNewOrchestratorNeedle = 1;\n", encoding="utf-8")
+    file_mtime = path.stat().st_mtime
+    os.utime(db_path(repo), (file_mtime + 0.5, file_mtime + 0.5))
 
     result = query(repo, "brandNewOrchestratorNeedle", limit=5)
     assert result["ok"] is True

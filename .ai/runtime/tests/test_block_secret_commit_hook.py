@@ -15,9 +15,25 @@ import pytest
 _REPO = Path(__file__).resolve().parents[3]  # .ai/runtime/tests -> repo root
 HOOK = _REPO / "kits" / "global-agent-kit" / ".claude" / "hooks" / "block-secret-commit.sh"
 
+def _bash_usable() -> bool:
+    bash = shutil.which("bash")
+    if bash is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [bash, "-lc", "printf ok"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0 and proc.stdout == "ok"
+
+
 pytestmark = pytest.mark.skipif(
-    not HOOK.exists() or shutil.which("git") is None or shutil.which("bash") is None,
-    reason="hook, git, or bash unavailable",
+    not HOOK.exists() or shutil.which("git") is None or not _bash_usable(),
+    reason="hook, git, or usable bash unavailable",
 )
 
 _FAKE_TOKEN = "ghp_" + "b" * 36  # not a literal secret pattern in source (assembled)
@@ -29,7 +45,8 @@ def _git(repo: Path, *args: str) -> None:
 
 def _run_hook(cwd: Path, command: str) -> str:
     payload = json.dumps({"tool_input": {"command": command}, "cwd": str(cwd)})
-    proc = subprocess.run(["bash", str(HOOK)], input=payload, capture_output=True, text=True, timeout=20)
+    bash = shutil.which("bash") or "bash"
+    proc = subprocess.run([bash, str(HOOK)], input=payload, capture_output=True, text=True, timeout=20)
     return proc.stdout
 
 

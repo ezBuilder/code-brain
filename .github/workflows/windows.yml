@@ -18,4 +18,8 @@ jobs:
       - name: Pytest (cross-platform unit tests)
         shell: pwsh
         run: |
+          Remove-Item Env:CI -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_ACTIONS -ErrorAction SilentlyContinue
+          Remove-Item Env:GITLAB_CI -ErrorAction SilentlyContinue
+          Remove-Item Env:AI_CI -ErrorAction SilentlyContinue
           uv run --project .ai/runtime python -m pytest .ai/runtime/tests -x --tb=short -q

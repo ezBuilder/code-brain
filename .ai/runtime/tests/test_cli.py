@@ -13,6 +13,8 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PYTHON = sys.executable
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
@@ -60,6 +62,30 @@ def run_ai_input(
         stderr=subprocess.PIPE,
         check=False,
     )
+
+
+def usable_bash_or_skip() -> str:
+    candidates = [
+        shutil.which("bash"),
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if ":" in candidate and not Path(candidate).exists():
+            continue
+        proc = subprocess.run(
+            [candidate, "-lc", "printf ok"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout == "ok":
+            return candidate
+    pytest.skip("usable bash unavailable")
 
 
 def _copy_repo_ignore(src: str, names: list[str]) -> set[str]:
@@ -204,10 +230,11 @@ def test_release_gate_workflow_invariants() -> None:
 
 def test_dep_advisory_offline_skip_emits_schema(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
+    bash = usable_bash_or_skip()
     env = os.environ.copy()
     env["CODE_BRAIN_DEP_ADVISORY_OFFLINE"] = "1"
     result = subprocess.run(
-        ["bash", "scripts/dep-advisory.sh"],
+        [bash, "scripts/dep-advisory.sh"],
         cwd=repo,
         env=env,
         text=True,
@@ -228,6 +255,7 @@ def test_dep_advisory_offline_skip_emits_schema(tmp_path: Path) -> None:
 
 def test_dep_advisory_findings_do_not_fail_gate(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
+    bash = usable_bash_or_skip()
     raw = {
         "dependencies": [
             {
@@ -246,7 +274,7 @@ def test_dep_advisory_findings_do_not_fail_gate(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["CODE_BRAIN_DEP_ADVISORY_RAW"] = json.dumps(raw)
     result = subprocess.run(
-        ["bash", "scripts/dep-advisory.sh"],
+        [bash, "scripts/dep-advisory.sh"],
         cwd=repo,
         env=env,
         text=True,

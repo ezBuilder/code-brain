@@ -517,12 +517,16 @@ def test_ci_write_rejected_before_render() -> None:
     assert payload["command"] == "render"
 
 
-def test_doctor_strict_passes_after_render() -> None:
-    render_result = run_ai("render")
+def test_doctor_strict_passes_after_render(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    from ai_core.mcp_config import CODE_BRAIN_SERVER_NAME, code_brain_stdio_entry, merge_into_target
+
+    merge_into_target(repo / ".mcp.json", "claude", CODE_BRAIN_SERVER_NAME, code_brain_stdio_entry())
+    render_result = run_ai("render", cwd=repo)
     assert render_result.returncode == 0, render_result.stderr
-    rebuild_result = run_ai("index", "rebuild", "--json")
+    rebuild_result = run_ai("index", "rebuild", "--json", cwd=repo)
     assert rebuild_result.returncode == 0, rebuild_result.stdout + rebuild_result.stderr
-    result = run_ai("doctor", "--strict", "--json")
+    result = run_ai("doctor", "--strict", "--json", cwd=repo)
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["ok"] is True

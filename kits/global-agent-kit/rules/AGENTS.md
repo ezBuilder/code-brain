@@ -7,8 +7,8 @@ Priority: security/permission > user request > project instructions > working me
 ## Response
 
 - Respond in Korean by default.
-- Keep ordinary replies to 1-3 sentences. Plans, errors, verification, and completion reports should include only necessary facts.
-- Do not provide detailed explanations, long rationale, or broad background unless the user asks for detail.
+- Default report is one core line (about 50 chars). Plans, errors, verification, and completion reports all follow this: outcome and conclusion only.
+- Expand only when the user explicitly asks for detail ("상세히", "자세히", "explain"). Otherwise omit commentary, background, and rationale.
 - Do not narrate routine progress. Reply during work only for blockers, required approvals, risky choices, or long-running tasks; otherwise report only when done.
 - If a request is ambiguous, inspect the repo and local configuration first. Ask only when the missing choice cannot be discovered safely.
 

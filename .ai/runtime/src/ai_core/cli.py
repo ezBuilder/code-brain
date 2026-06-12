@@ -236,6 +236,18 @@ def build_parser() -> argparse.ArgumentParser:
     memory_sub = memory.add_subparsers(dest="memory_command", required=True)
     memory_append_event = memory_sub.add_parser("append-event")
     memory_append_event.add_argument("--json", action="store_true", dest="command_json")
+    memory_evidence = memory_sub.add_parser("evidence", help="repo-local evidence ledger for search/context results")
+    memory_evidence_sub = memory_evidence.add_subparsers(dest="memory_evidence_command", required=True)
+    memory_evidence_list = memory_evidence_sub.add_parser("list")
+    memory_evidence_list.add_argument("--status", choices=["candidate", "curated", "verified", "rejected"])
+    memory_evidence_list.add_argument("--limit", type=int, default=20)
+    memory_evidence_list.add_argument("--json", action="store_true", dest="command_json")
+    memory_evidence_status = memory_evidence_sub.add_parser("set-status")
+    memory_evidence_status.add_argument("--id", required=True)
+    memory_evidence_status.add_argument("--status", required=True, choices=["candidate", "curated", "verified", "rejected"])
+    memory_evidence_status.add_argument("--note", default="")
+    memory_evidence_status.add_argument("--source", default="operator")
+    memory_evidence_status.add_argument("--json", action="store_true", dest="command_json")
     memory_decision = memory_sub.add_parser("decision")
     memory_decision_sub = memory_decision.add_subparsers(dest="memory_decision_command", required=True)
     memory_decision_add = memory_decision_sub.add_parser("add")
@@ -503,7 +515,53 @@ def build_parser() -> argparse.ArgumentParser:
     context_pack_parser = context_sub.add_parser("pack")
     context_pack_parser.add_argument("query")
     context_pack_parser.add_argument("--limit", type=int, default=5)
+    context_pack_parser.add_argument("--mode", choices=["high_fidelity", "balanced", "aggressive"], default="balanced")
     context_pack_parser.add_argument("--json", action="store_true", dest="command_json")
+    evidence = sub.add_parser("evidence")
+    evidence_sub = evidence.add_subparsers(dest="evidence_command", required=True)
+    evidence_record = evidence_sub.add_parser("record")
+    evidence_record.add_argument("--query", required=True)
+    evidence_record.add_argument("--path", required=True)
+    evidence_record.add_argument("--status", choices=["candidate", "curated", "verified", "rejected"], default="candidate")
+    evidence_record.add_argument("--snippet", default="")
+    evidence_record.add_argument("--source", default="agent")
+    evidence_record.add_argument("--note", default="")
+    evidence_record.add_argument("--json", action="store_true", dest="command_json")
+    evidence_update = evidence_sub.add_parser("update")
+    evidence_update.add_argument("--id", required=True)
+    evidence_update.add_argument("--status", choices=["candidate", "curated", "verified", "rejected"], required=True)
+    evidence_update.add_argument("--note", default="")
+    evidence_update.add_argument("--source", default="agent")
+    evidence_update.add_argument("--json", action="store_true", dest="command_json")
+    evidence_list = evidence_sub.add_parser("list")
+    evidence_list.add_argument("--status", choices=["candidate", "curated", "verified", "rejected"])
+    evidence_list.add_argument("--query")
+    evidence_list.add_argument("--limit", type=int, default=50)
+    evidence_list.add_argument("--json", action="store_true", dest="command_json")
+    security = sub.add_parser("security")
+    security_sub = security.add_subparsers(dest="security_command", required=True)
+    security_finding = security_sub.add_parser("finding")
+    security_finding_sub = security_finding.add_subparsers(dest="security_finding_command", required=True)
+    security_finding_record = security_finding_sub.add_parser("record")
+    security_finding_record.add_argument("--affected-path", required=True)
+    security_finding_record.add_argument("--type", required=True, dest="finding_type")
+    security_finding_record.add_argument("--detail-summary", required=True)
+    security_finding_record.add_argument("--evidence-hash", default="")
+    security_finding_record.add_argument("--repro-command", required=True)
+    security_finding_record.add_argument("--verification-command", required=True)
+    security_finding_record.add_argument("--status", choices=["open", "verified_fixed", "accepted_risk", "false_positive"], default="open")
+    security_finding_record.add_argument("--source", default="agent")
+    security_finding_record.add_argument("--json", action="store_true", dest="command_json")
+    security_finding_update = security_finding_sub.add_parser("update")
+    security_finding_update.add_argument("--id", required=True)
+    security_finding_update.add_argument("--status", choices=["open", "verified_fixed", "accepted_risk", "false_positive"], required=True)
+    security_finding_update.add_argument("--verification-command", required=True)
+    security_finding_update.add_argument("--source", default="agent")
+    security_finding_update.add_argument("--json", action="store_true", dest="command_json")
+    security_finding_list = security_finding_sub.add_parser("list")
+    security_finding_list.add_argument("--status", choices=["open", "verified_fixed", "accepted_risk", "false_positive"])
+    security_finding_list.add_argument("--limit", type=int, default=50)
+    security_finding_list.add_argument("--json", action="store_true", dest="command_json")
     session = sub.add_parser("session")
     session_sub = session.add_subparsers(dest="session_command", required=True)
     session_start = session_sub.add_parser("start")
@@ -513,6 +571,7 @@ def build_parser() -> argparse.ArgumentParser:
     session_start.add_argument("--strict", action="store_true")
     session_start.add_argument("--query")
     session_start.add_argument("--limit", type=int, default=5)
+    session_start.add_argument("--mode", choices=["high_fidelity", "balanced", "aggressive"], default="balanced")
     session_start.add_argument("--json", action="store_true", dest="command_json")
     mcp = sub.add_parser("mcp")
     mcp.add_argument("--once-json")
@@ -913,6 +972,23 @@ def main(argv: list[str] | None = None) -> int:
             payload = append_event(root, read_payload())
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "memory" and args.memory_command == "evidence":
+            from .evidence import list_evidence, set_evidence_status
+            if args.memory_evidence_command == "list":
+                payload = list_evidence(root, status=args.status, limit=args.limit)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.memory_evidence_command == "set-status":
+                reject_ci_write("memory")
+                payload = set_evidence_status(
+                    root,
+                    evidence_id_value=args.id,
+                    status=args.status,
+                    note=args.note,
+                    source=args.source,
+                )
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "memory" and args.memory_command == "decision" and args.memory_decision_command == "add":
             reject_ci_write("memory")
             from .memory import append_decision
@@ -1213,7 +1289,7 @@ def main(argv: list[str] | None = None) -> int:
                 emit(payload, as_json=as_json)
                 return OK
         if args.command == "code" and args.code_command == "query":
-            payload = query(root, args.query, limit=args.limit)
+            payload = query(root, args.query, limit=args.limit, evidence_source="search")
             emit(payload, as_json=as_json)
             return OK
         if args.command == "code" and args.code_command == "graph":
@@ -1266,9 +1342,65 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "context" and args.context_command == "pack":
-            payload = context_pack(root, args.query, limit=args.limit)
+            payload = context_pack(root, args.query, limit=args.limit, mode=args.mode)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "evidence":
+            from .evidence import list_evidence, record_evidence, set_evidence_status
+            if args.evidence_command == "record":
+                reject_ci_write("evidence")
+                payload = record_evidence(
+                    root,
+                    query=args.query,
+                    path=args.path,
+                    status=args.status,
+                    snippet=args.snippet,
+                    source=args.source,
+                    note=args.note,
+                )
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.evidence_command == "update":
+                reject_ci_write("evidence")
+                payload = set_evidence_status(root, evidence_id_value=args.id, status=args.status, note=args.note, source=args.source)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.evidence_command == "list":
+                payload = list_evidence(root, status=args.status, query=args.query, limit=args.limit)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "security" and args.security_command == "finding":
+            from . import security_findings
+            if args.security_finding_command == "record":
+                reject_ci_write("security_finding")
+                payload = security_findings.record(
+                    root,
+                    affected_path=args.affected_path,
+                    finding_type=args.finding_type,
+                    detail_summary=args.detail_summary,
+                    evidence_hash=args.evidence_hash,
+                    repro_command=args.repro_command,
+                    verification_command=args.verification_command,
+                    status=args.status,
+                    source=args.source,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if args.security_finding_command == "update":
+                reject_ci_write("security_finding")
+                payload = security_findings.update(
+                    root,
+                    finding_id=args.id,
+                    status=args.status,
+                    verification_command=args.verification_command,
+                    source=args.source,
+                )
+                emit(payload, as_json=as_json)
+                return OK
+            if args.security_finding_command == "list":
+                payload = security_findings.list_records(root, status=args.status, limit=args.limit)
+                emit(payload, as_json=as_json)
+                return OK
         if args.command == "session" and args.session_command == "start":
             reject_ci_write("session", dry_run=args.dry_run)
             from .session import start_session
@@ -1281,6 +1413,7 @@ def main(argv: list[str] | None = None) -> int:
                 strict=args.strict,
                 query_text=args.query,
                 limit=args.limit,
+                context_budget_mode=args.mode,
             )
             emit(payload, as_json=as_json)
             return OK if payload["ok"] or not args.strict else CONFIG_INVALID
@@ -1343,7 +1476,11 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(exc, "code") and hasattr(exc, "message"):
             emit({"ok": False, "error": exc.code, "detail": exc.message}, as_json=True)
             return GENERIC_ERROR
-        emit({"ok": False, "error": str(exc)}, as_json=True)
+        payload = {"ok": False, "error": str(exc)}
+        metadata = getattr(exc, "metadata", None)
+        if isinstance(metadata, dict):
+            payload.update(metadata)
+        emit(payload, as_json=True)
         return GENERIC_ERROR
     return PERMISSION_DENIED
 

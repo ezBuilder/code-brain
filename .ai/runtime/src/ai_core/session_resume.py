@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from ai_core.context_budget import PROTECTED_SIGNALS, policy as context_budget_policy
 from ai_core.redact import redact_value
 
 RESUME_RETENTION_DAYS = 14
@@ -34,6 +35,7 @@ _DONE_STATUSES = {"done", "closed", "completed", "cancelled", "canceled"}
 # Field-drop priority when payload exceeds RESUME_MAX_BYTES.
 # Earlier entries are dropped first; later entries are kept longer.
 _DROP_ORDER = ("audit_tail_actions", "session_tail", "todos_open")
+_PROTECTED_FIELDS = ("handoff", *PROTECTED_SIGNALS)
 
 
 def _utc_now_iso() -> str:
@@ -151,6 +153,8 @@ def _shrink_to_fit(payload: dict[str, Any], cap: int) -> dict[str, Any]:
     if _payload_size(payload) <= cap:
         return payload
     for field in _DROP_ORDER:
+        if field in _PROTECTED_FIELDS:
+            continue
         if field in payload:
             # Replace with empty container while still indicating drop.
             payload.pop(field, None)
@@ -319,6 +323,7 @@ def write_snapshot(
     agent: str,
     force: bool = False,
     reason: str | None = None,
+    context_budget_mode: str = "balanced",
 ) -> dict[str, Any]:
     """Compose, redact, size-cap, and atomically write a resume snapshot.
 
@@ -331,11 +336,13 @@ def write_snapshot(
     session_dir = _ensure_session_dir(root, session_id)
     target = session_dir / "resume.json"
     tmp = session_dir / "resume.json.tmp"
+    budget = context_budget_policy(context_budget_mode, base_max_bytes=RESUME_MAX_BYTES)
 
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "session_id": session_id,
         "agent": agent,
+        "context_budget": budget,
         # P2: provenance — which machine + how to reopen the native transcript there.
         "machine_id": machine_id(root),
         "resume_hint": _resume_hint(agent, session_id),
@@ -356,7 +363,7 @@ def write_snapshot(
     payload = redact_value(payload)
 
     # Enforce hard size cap by dropping fields in priority order.
-    payload = _shrink_to_fit(payload, RESUME_MAX_BYTES)
+    payload = _shrink_to_fit(payload, int(budget["max_bytes"]))
 
     data = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
     encoded = data.encode("utf-8")

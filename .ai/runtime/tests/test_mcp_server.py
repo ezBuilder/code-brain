@@ -23,6 +23,12 @@ def test_tools_list_response_shape(tmp_path: Path) -> None:
     assert "obs_usage" in names
     assert "memory_query" in names
     assert "code_read_hashline" in names
+    assert "evidence_record" in names
+    assert "evidence_list" in names
+    assert "evidence_set_status" in names
+    assert "security_finding_record" in names
+    assert "security_finding_list" in names
+    assert "security_finding_update" in names
     assert "stream_guard_scan" in names
 
 

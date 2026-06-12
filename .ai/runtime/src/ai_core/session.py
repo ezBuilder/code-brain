@@ -6,6 +6,7 @@ from typing import Any
 
 from .doctor import as_payload, check_index_freshness, run_checks
 from .hooks import handle_hook
+from .context_budget import policy as context_budget_policy
 from .search import context_pack, db_path, iter_text_files, rebuild
 
 
@@ -69,6 +70,7 @@ def start_session(
     strict: bool = False,
     query_text: str | None = None,
     limit: int = 5,
+    context_budget_mode: str = "balanced",
 ) -> dict[str, Any]:
     db_existed_before = db_path(root).exists()
     before = index_status(root)
@@ -92,12 +94,13 @@ def start_session(
     payload: dict[str, Any] = {
         "ok": bool(doctor_payload.get("ok")) if strict else bool(hook_payload.get("ok")),
         "agent": agent,
+        "context_budget": context_budget_policy(context_budget_mode),
         "index": index_payload,
         "hook": hook_payload,
         "doctor": doctor_payload,
     }
     if query_text:
-        payload["context"] = context_pack(root, query_text, limit=limit)
+        payload["context"] = context_pack(root, query_text, limit=limit, mode=context_budget_mode)
     if not dry_run:
         try:
             from .session_resume import write_snapshot
@@ -105,7 +108,7 @@ def start_session(
             if not session_id:
                 from secrets import token_hex
                 session_id = f"{agent}-{token_hex(6)}"
-            snapshot = write_snapshot(root, session_id=session_id, agent=agent)
+            snapshot = write_snapshot(root, session_id=session_id, agent=agent, context_budget_mode=context_budget_mode)
             payload["resume"] = {"ok": True, "path": snapshot.get("path"), "session_id": session_id}
         except Exception as exc:
             payload["resume"] = {"ok": False, "reason": str(exc)[:200]}

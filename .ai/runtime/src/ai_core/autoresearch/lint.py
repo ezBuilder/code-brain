@@ -36,7 +36,7 @@ def _iter_pages(ar_root: Path):
     for md in sorted(wiki.rglob("*.md")):
         if md.name == storage.LOG_NAME:  # wiki/log.md is the append-only chronicle, not a page
             continue
-        rel = str(md.relative_to(wiki))
+        rel = md.relative_to(wiki).as_posix()
         yield rel, parse_frontmatter(md.read_text(encoding="utf-8", errors="replace"))
 
 

@@ -56,6 +56,7 @@ SKIP_DIRS = {
     "generated",
 }
 MAX_TEXT_BYTES = 100_000
+MTIME_STALE_GRACE_SECONDS = 2.0
 SKIP_NAMES = {
     "package-lock.json",
     "pnpm-lock.yaml",
@@ -1189,7 +1190,59 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
     if source_mtime >= db_mtime:
         result = rebuild(root, single_flight=True, incremental=True)
         return {"enabled": True, "rebuilt": True, "reason": "mtime_fallback", "result": result}
+    if 0 <= db_mtime - source_mtime <= MTIME_STALE_GRACE_SECONDS:
+        changed_paths = _changed_index_paths_by_hash(root)
+        if changed_paths:
+            result = rebuild(root, single_flight=True, incremental=True, paths=changed_paths)
+            return {
+                "enabled": True,
+                "rebuilt": True,
+                "reason": "hash_mismatch",
+                "path_count": len(changed_paths),
+                "result": result,
+            }
     return {"enabled": True, "rebuilt": False, "reason": "current"}
+
+
+def _changed_index_paths_by_hash(root: Path) -> set[str]:
+    try:
+        with connect(root) as conn:
+            init_schema(conn)
+            indexed = {
+                str(row["path"]): str(row["sha256"])
+                for row in conn.execute(
+                    """
+                    select c.path, c.sha256
+                    from chunks c
+                    join chunk_meta m on m.chunk_id = c.id
+                    where m.kind = 'file'
+                    """
+                ).fetchall()
+            }
+    except Exception:
+        return set()
+    if not indexed:
+        return set()
+
+    changed: set[str] = set()
+    seen: set[str] = set()
+    for path in iter_text_files(root):
+        rel = path.relative_to(root).as_posix()
+        seen.add(rel)
+        expected = indexed.get(rel)
+        if expected is None:
+            changed.add(rel)
+            continue
+        try:
+            redacted = str(redact_value(path.read_text(encoding="utf-8")))
+        except (OSError, UnicodeDecodeError):
+            changed.add(rel)
+            continue
+        digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+        if digest != expected:
+            changed.add(rel)
+    changed.update(set(indexed) - seen)
+    return changed
 
 
 def _git_dirty_paths(root: Path) -> set[str]:

@@ -11,17 +11,9 @@
 # `codex --help` (or its equivalent) and adjust to the keys your version
 # expects. Both common layouts are shown below; keep only the one your CLI
 # accepts.
+[features]
+hooks = true
 
 [mcp_servers.code-brain]
 command = ".ai/bin/ai-mcp"
 args = []
-
-# Alternative layout (some Codex versions) — uncomment if the section above is
-# not honored:
-# [[mcp_servers]]
-# name = "code-brain"
-# command = ".ai/bin/ai-mcp"
-# args = []
-
-[features]
-hooks = true

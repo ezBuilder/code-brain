@@ -9,13 +9,17 @@ set -euo pipefail
 
 payload="$(cat)"
 
-if [[ -n "${PYTHON:-}" ]]; then
+try_python() {
+  "$@" -c 'import sys' >/dev/null 2>&1
+}
+
+if [[ -n "${PYTHON:-}" ]] && try_python "$PYTHON"; then
   python_cmd=("$PYTHON")
-elif command -v python3 >/dev/null 2>&1; then
+elif command -v python3 >/dev/null 2>&1 && try_python python3; then
   python_cmd=(python3)
-elif command -v python >/dev/null 2>&1; then
+elif command -v python >/dev/null 2>&1 && try_python python; then
   python_cmd=(python)
-elif command -v py >/dev/null 2>&1; then
+elif command -v py >/dev/null 2>&1 && try_python py -3; then
   python_cmd=(py -3)
 else
   exit 0

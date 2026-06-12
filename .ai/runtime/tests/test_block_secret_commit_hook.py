@@ -47,6 +47,7 @@ def _run_hook(cwd: Path, command: str) -> str:
     payload = json.dumps({"tool_input": {"command": command}, "cwd": str(cwd)})
     bash = shutil.which("bash") or "bash"
     proc = subprocess.run([bash, str(HOOK)], input=payload, capture_output=True, text=True, timeout=20)
+    assert proc.returncode == 0, proc.stderr
     return proc.stdout
 
 

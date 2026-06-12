@@ -41,20 +41,32 @@ if not re.search(r"\bgit\b[^\n]{0,60}\bcommit\b", cmd):
 cwd = payload.get("cwd") or os.getcwd()
 
 
-def run(args, where):
+def normalize_git_path(path):
+    value = str(path).strip()
+    if re.match(r"^/[a-zA-Z]/", value):
+        return value[1].upper() + ":" + value[2:]
+    return value
+
+
+def run_git(where, *args):
     try:
-        return subprocess.run(args, cwd=where, capture_output=True, text=True, timeout=10).stdout
+        return subprocess.run(
+            ["git", "-C", normalize_git_path(where), *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
     except Exception:
         return ""
 
 
-root = run(["git", "rev-parse", "--show-toplevel"], cwd).strip() or cwd
+root = run_git(cwd, "rev-parse", "--show-toplevel").strip() or cwd
 
 # `-a/--all` commits include unstaged tracked edits, so diff HEAD; otherwise staged only.
 use_all = bool(re.search(r"--all\b|(?:^|\s)-[a-zA-Z]*a", cmd))
-base = ["git", "diff", "HEAD"] if use_all else ["git", "diff", "--cached"]
+base = ["diff", "HEAD"] if use_all else ["diff", "--cached"]
 
-names = [n for n in run(base + ["--name-only"], root).splitlines() if n.strip()]
+names = [n for n in run_git(root, *base, "--name-only").splitlines() if n.strip()]
 if not names:
     sys.exit(0)
 
@@ -72,7 +84,7 @@ targets = [n for n in names if n not in allow]
 if not targets:
     sys.exit(0)
 
-content = run(base + ["--"] + targets, root)[:2_000_000]
+content = run_git(root, *base, "--", *targets)[:2_000_000]
 added = "\n".join(
     line[1:] for line in content.splitlines()
     if line.startswith("+") and not line.startswith("+++")

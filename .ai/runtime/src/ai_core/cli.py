@@ -139,6 +139,29 @@ def build_parser() -> argparse.ArgumentParser:
     loop_recover.add_argument("--json", action="store_true", dest="command_json")
     loop_status = loop_sub.add_parser("status")
     loop_status.add_argument("--json", action="store_true", dest="command_json")
+    promptloop = sub.add_parser("prompt-loop", help="prompt self-improvement: pending prompt patches (human-approved)")
+    pl_sub = promptloop.add_subparsers(dest="prompt_loop_command", required=True)
+    pl_propose = pl_sub.add_parser("propose")
+    pl_propose.add_argument("--target", choices=["global_claude", "global_codex", "project_agents"], required=True)
+    pl_propose.add_argument("--rationale", required=True)
+    pl_propose.add_argument("--patch")
+    pl_propose.add_argument("--patch-file")
+    pl_propose.add_argument("--violation", default="")
+    pl_propose.add_argument("--evidence", default="")
+    pl_propose.add_argument("--json", action="store_true", dest="command_json")
+    pl_list = pl_sub.add_parser("list")
+    pl_list.add_argument("--status", choices=["pending", "accepted", "rejected", "superseded"])
+    pl_list.add_argument("--json", action="store_true", dest="command_json")
+    pl_accept = pl_sub.add_parser("accept")
+    pl_accept.add_argument("--id", required=True)
+    pl_accept.add_argument("--note", default="")
+    pl_accept.add_argument("--json", action="store_true", dest="command_json")
+    pl_reject = pl_sub.add_parser("reject")
+    pl_reject.add_argument("--id", required=True)
+    pl_reject.add_argument("--note", default="")
+    pl_reject.add_argument("--json", action="store_true", dest="command_json")
+    pl_signals = pl_sub.add_parser("signals")
+    pl_signals.add_argument("--json", action="store_true", dest="command_json")
     trust = sub.add_parser("trust")
     trust_sub = trust.add_subparsers(dest="trust_command", required=True)
     trust_init = trust_sub.add_parser("init")
@@ -823,6 +846,30 @@ def main(argv: list[str] | None = None) -> int:
             if args.loop_command == "status":
                 payload = loop_eng.status(root)
                 emit(payload, as_json=as_json)
+                return OK
+        if args.command == "prompt-loop":
+            from . import prompt_loop as pl
+
+            if args.prompt_loop_command == "propose":
+                reject_ci_write("prompt_loop")
+                patch = _read_loop_text(root, text=args.patch, file_path=args.patch_file)
+                payload = pl.propose(root, target=args.target, rationale=args.rationale, patch=patch,
+                                     violation=args.violation, evidence=args.evidence)
+                emit(payload, as_json=as_json)
+                return OK
+            if args.prompt_loop_command == "list":
+                emit(pl.list_patches(root, status=args.status), as_json=as_json)
+                return OK
+            if args.prompt_loop_command == "accept":
+                reject_ci_write("prompt_loop")
+                emit(pl.set_status(root, patch_id=args.id, status="accepted", note=args.note), as_json=as_json)
+                return OK
+            if args.prompt_loop_command == "reject":
+                reject_ci_write("prompt_loop")
+                emit(pl.set_status(root, patch_id=args.id, status="rejected", note=args.note), as_json=as_json)
+                return OK
+            if args.prompt_loop_command == "signals":
+                emit(pl.violation_signals(root), as_json=as_json)
                 return OK
         if args.command == "trust" and args.trust_command == "init":
             reject_ci_write("trust")

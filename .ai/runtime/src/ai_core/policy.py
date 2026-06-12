@@ -32,6 +32,7 @@ WRITE_COMMANDS = {
     "exec",
     "remote_memory",
     "loop",
+    "prompt_loop",
     "evidence",
     "security_finding",
 }

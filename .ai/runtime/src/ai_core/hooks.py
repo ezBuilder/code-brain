@@ -2018,6 +2018,28 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
         return
 
 
+def _prompt_patch_context(root: Path, hook_name: str) -> str:
+    """SessionStart banner for pending prompt patches (human accepts; never auto-applies)."""
+    if hook_name not in SKILL_RECOMMENDATION_HOOKS or _env_disabled("AI_PROMPT_LOOP"):
+        return ""
+    try:
+        from . import prompt_loop as pl
+
+        pending = pl.list_patches(root, status="pending").get("patches", [])
+    except Exception:
+        return ""
+    if not pending:
+        return ""
+    lines = ["Pending prompt patches (self-improvement loop). Review and accept only with user approval:"]
+    for rec in pending[:3]:
+        rid = str(rec.get("id", "?"))
+        target = str(rec.get("target", "?"))
+        rationale = str(rec.get("rationale", ""))[:80]
+        lines.append(f"  - {rid} | {target}: {rationale}")
+    lines.append("Approval: `ai prompt-loop accept <id>`; reject noise with `ai prompt-loop reject <id>`.")
+    return "\n".join(lines)
+
+
 def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None = None) -> str:
     agent = normalize_agent(payload)
     writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
@@ -2145,6 +2167,9 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     precall_recommendations = _precall_recommendation_context(root, hook_name, payload)
     if precall_recommendations:
         sections.append(precall_recommendations)
+    prompt_patches = _prompt_patch_context(root, hook_name)
+    if prompt_patches:
+        sections.append(prompt_patches)
     if _is_compact_mode():
         if hook_name in SKILL_RECOMMENDATION_HOOKS:
             meta = _compact_meta_line(root)

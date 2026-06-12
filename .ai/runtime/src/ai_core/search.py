@@ -986,7 +986,17 @@ def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[s
     return results
 
 
-def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
+def _record_evidence_candidates(root: Path, *, query_text: str, results: list[dict[str, Any]], source: str) -> None:
+    if is_ci():
+        return
+    try:
+        from .evidence import append_candidate_results
+        append_candidate_results(root, query=query_text, results=results, source=source)
+    except Exception:
+        pass
+
+
+def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None = None) -> dict[str, Any]:
     auto_refresh = _auto_refresh_if_stale(root)
     retriever = configured_retriever(root)
     if retriever != "bm25":
@@ -1124,7 +1134,7 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
         actual_policy += "+dense"
     if fallback_used:
         actual_policy += "+rg"
-    return {
+    payload = {
         "ok": True,
         "query": text,
         "retrieval_policy": actual_policy,
@@ -1134,11 +1144,16 @@ def query(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
         "dense_rerank": dense_used,
         "auto_refresh": auto_refresh,
     }
+    if evidence_source:
+        _record_evidence_candidates(root, query_text=text, results=payload["results"], source=evidence_source)
+    return payload
 
 
-def context_pack(root: Path, text: str, *, limit: int = 5) -> dict[str, Any]:
-    payload = query(root, text, limit=limit)
-    payload["additionalContext"] = "\n".join(f"- {item['path']}: {item['snippet']}" for item in payload["results"])
+def context_pack(root: Path, text: str, *, limit: int = 5, mode: str = "balanced") -> dict[str, Any]:
+    from .context_budget import apply as apply_context_budget
+
+    payload = query(root, text, limit=limit, evidence_source="context_pack")
+    payload.update(apply_context_budget(payload["results"], mode=mode, limit=limit))
     return payload
 
 

@@ -16,7 +16,7 @@ from .memory import (
     close_todo,
 )
 from .obs import health_summary, search_report, usage_report
-from .policy import is_ci
+from .policy import is_ci, reject_ci_write
 from .redact import redact_value
 from .sandbox import execute as sandbox_execute, fetch as sandbox_fetch, list_executions as sandbox_list
 from .search import context_pack, query, rebuild
@@ -51,7 +51,15 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": "BM25 query plus an additionalContext string suitable for hook injection.",
         "inputSchema": {
             "type": "object",
-            "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 5}},
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 5},
+                "mode": {
+                    "type": "string",
+                    "enum": ["high_fidelity", "balanced", "aggressive"],
+                    "default": "balanced",
+                },
+            },
             "required": ["query"],
         },
     },
@@ -267,6 +275,90 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "type": "object",
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
+        },
+    },
+    {
+        "name": "evidence_list",
+        "description": "List latest repo-local evidence records from .ai/memory/evidence.jsonl. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["candidate", "curated", "verified", "rejected"]},
+                "limit": {"type": "integer", "default": 20},
+            },
+        },
+    },
+    {
+        "name": "evidence_record",
+        "description": "Record an explicit repo-local evidence item. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "path": {"type": "string"},
+                "status": {"type": "string", "enum": ["candidate", "curated", "verified", "rejected"], "default": "candidate"},
+                "snippet": {"type": "string", "default": ""},
+                "source": {"type": "string", "default": "agent"},
+                "note": {"type": "string", "default": ""},
+            },
+            "required": ["query", "path"],
+        },
+    },
+    {
+        "name": "evidence_set_status",
+        "description": "Promote or reject an evidence record. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "status": {"type": "string", "enum": ["candidate", "curated", "verified", "rejected"]},
+                "note": {"type": "string", "default": ""},
+                "source": {"type": "string", "default": "agent"},
+            },
+            "required": ["id", "status"],
+        },
+    },
+    {
+        "name": "security_finding_list",
+        "description": "List latest repo-local security findings from .ai/memory/security-findings.jsonl. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["open", "verified_fixed", "accepted_risk", "false_positive"]},
+                "limit": {"type": "integer", "default": 50},
+            },
+        },
+    },
+    {
+        "name": "security_finding_record",
+        "description": "Record a redacted security finding with summary/hash evidence. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "affected_path": {"type": "string"},
+                "finding_type": {"type": "string"},
+                "detail_summary": {"type": "string"},
+                "evidence_hash": {"type": "string", "default": ""},
+                "repro_command": {"type": "string"},
+                "verification_command": {"type": "string"},
+                "status": {"type": "string", "enum": ["open", "verified_fixed", "accepted_risk", "false_positive"], "default": "open"},
+                "source": {"type": "string", "default": "agent"},
+            },
+            "required": ["affected_path", "finding_type", "detail_summary", "repro_command", "verification_command"],
+        },
+    },
+    {
+        "name": "security_finding_update",
+        "description": "Update a security finding status after verification. Write-class.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "status": {"type": "string", "enum": ["open", "verified_fixed", "accepted_risk", "false_positive"]},
+                "verification_command": {"type": "string"},
+                "source": {"type": "string", "default": "agent"},
+            },
+            "required": ["id", "status", "verification_command"],
         },
     },
     {
@@ -804,9 +896,14 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             raise ValueError("autoresearch_loop_stop requires session_id")
         return _loop.stop(root, sid)
     if name in ("memory_query", "code_query"):
-        return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
+        return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5), evidence_source="search")
     if name == "context_pack":
-        return context_pack(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5))
+        return context_pack(
+            root,
+            str(args.get("query", "")),
+            limit=int(args.get("limit", 5) or 5),
+            mode=str(args.get("mode", "balanced") or "balanced"),
+        )
     if name == "code_graph_callers":
         from .codegraph import query_callers
         return query_callers(root, str(args.get("qualname", "")), limit=int(args.get("limit", 20) or 20))
@@ -918,6 +1015,83 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         if not isinstance(text, str) or not text.strip():
             raise ValueError("append_session_note requires non-empty text")
         return append_session_note(root, text=text)
+    if name == "evidence_list":
+        from .evidence import list_evidence
+        status = args.get("status")
+        return list_evidence(
+            root,
+            status=status if isinstance(status, str) and status else None,
+            limit=int(args.get("limit", 20) or 20),
+        )
+    if name == "evidence_record":
+        from .evidence import record_evidence
+        reject_ci_write("evidence")
+        return record_evidence(
+            root,
+            query=str(args.get("query", "")),
+            path=str(args.get("path", "")),
+            status=str(args.get("status", "candidate") or "candidate"),
+            snippet=str(args.get("snippet", "")),
+            source=str(args.get("source", "agent") or "agent"),
+            note=str(args.get("note", "")),
+        )
+    if name == "evidence_set_status":
+        from .evidence import set_evidence_status
+        reject_ci_write("evidence")
+        eid = args.get("id")
+        status = args.get("status")
+        if not isinstance(eid, str) or not eid.strip():
+            raise ValueError("evidence_set_status requires id string")
+        if not isinstance(status, str) or not status.strip():
+            raise ValueError("evidence_set_status requires status string")
+        return set_evidence_status(
+            root,
+            evidence_id_value=eid,
+            status=status,
+            note=str(args.get("note", "")),
+            source=str(args.get("source", "agent")),
+        )
+    if name == "security_finding_list":
+        from .security_findings import list_records
+        status = args.get("status")
+        return list_records(
+            root,
+            status=status if isinstance(status, str) and status else None,
+            limit=int(args.get("limit", 50) or 50),
+        )
+    if name == "security_finding_record":
+        from .security_findings import record
+        reject_ci_write("security_finding")
+        return record(
+            root,
+            affected_path=str(args.get("affected_path", "")),
+            finding_type=str(args.get("finding_type", "")),
+            detail_summary=str(args.get("detail_summary", "")),
+            evidence_hash=str(args.get("evidence_hash", "")),
+            repro_command=str(args.get("repro_command", "")),
+            verification_command=str(args.get("verification_command", "")),
+            status=str(args.get("status", "open") or "open"),
+            source=str(args.get("source", "agent") or "agent"),
+        )
+    if name == "security_finding_update":
+        from .security_findings import update
+        reject_ci_write("security_finding")
+        fid = args.get("id")
+        status = args.get("status")
+        verification_command = args.get("verification_command")
+        if not isinstance(fid, str) or not fid.strip():
+            raise ValueError("security_finding_update requires id string")
+        if not isinstance(status, str) or not status.strip():
+            raise ValueError("security_finding_update requires status string")
+        if not isinstance(verification_command, str) or not verification_command.strip():
+            raise ValueError("security_finding_update requires verification_command string")
+        return update(
+            root,
+            finding_id=fid,
+            status=status,
+            verification_command=verification_command,
+            source=str(args.get("source", "agent") or "agent"),
+        )
     if name == "append_handoff":
         from .session_resume import write_handoff
 

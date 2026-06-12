@@ -270,6 +270,40 @@ def test_handoff_survives_size_cap(tmp_path: Path, monkeypatch) -> None:
     assert "session_tail" not in snap or "todos_open" not in snap
 
 
+def test_snapshot_exposes_context_budget_metadata(tmp_path: Path) -> None:
+    _memory(tmp_path)
+    write_snapshot(tmp_path, session_id="budget-meta", agent="codex", context_budget_mode="aggressive")
+    snap = _read_snapshot(tmp_path, "budget-meta")
+
+    assert snap["context_budget"]["mode"] == "aggressive"
+    assert snap["context_budget"]["max_bytes"] <= RESUME_MAX_BYTES
+    assert snap["context_budget"]["protected_signals"] == ["handoff", "rubric", "verdict", "blockers"]
+
+
+def test_budget_shrink_preserves_handoff_rubric_verdict_blockers() -> None:
+    import ai_core.session_resume as sr
+
+    payload = {
+        "handoff": {"goal": "keep handoff"},
+        "rubric": "keep rubric",
+        "verdict": "keep verdict",
+        "blockers": ["keep blocker"],
+        "audit_tail_actions": ["drop " + "a" * 200],
+        "session_tail": "drop " + "b" * 200,
+        "todos_open": [{"title": "drop " + "c" * 200}],
+    }
+
+    shrunk = sr._shrink_to_fit(payload, 80)
+
+    assert shrunk["handoff"]["goal"] == "keep handoff"
+    assert shrunk["rubric"] == "keep rubric"
+    assert shrunk["verdict"] == "keep verdict"
+    assert shrunk["blockers"] == ["keep blocker"]
+    assert "audit_tail_actions" not in shrunk
+    assert "session_tail" not in shrunk
+    assert "todos_open" not in shrunk
+
+
 def test_handoff_fallback_from_open_todo(tmp_path: Path) -> None:
     mem = _memory(tmp_path)
     _write_jsonl(mem / "todos.jsonl", [{"id": "t1", "title": "finish the migration", "status": "open"}])

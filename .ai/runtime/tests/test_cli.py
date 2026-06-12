@@ -1794,6 +1794,139 @@ def test_loop_submit_claim_complete_roundtrip(tmp_path: Path) -> None:
     assert "reviewer pass verdict" in decisions
 
 
+def test_loop_complete_phase_guard_reports_missing_reviewer_verdict(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    submitted = run_ai(
+        "loop",
+        "submit",
+        "--text",
+        "task",
+        "--goal",
+        "g",
+        "--rubric",
+        "review behavior and tests",
+        "--checklist",
+        "tests pass",
+        "--json",
+        cwd=repo,
+    )
+    assert submitted.returncode == 0, submitted.stdout + submitted.stderr
+    claimed = json.loads(run_ai("loop", "claim", "--orchestrator-id", "o", "--json", cwd=repo).stdout)["request"]
+
+    status_payload = json.loads(run_ai("loop", "status", "--json", cwd=repo).stdout)
+    assert status_payload["expected_phases"] == {"review": 1}
+    assert status_payload["phase_issue_count"] == 1
+    issue_entry = status_payload["phase_issues"][0]
+    assert issue_entry["out_of_plan"] is False
+    assert issue_entry["expected_phase"] == "review"
+    assert [issue["code"] for issue in issue_entry["phase_issues"]] == ["missing_reviewer_verdict"]
+
+    blocked = run_ai(
+        "loop",
+        "complete",
+        "--request-id",
+        claimed["id"],
+        "--lease-id",
+        claimed["lease_id"],
+        "--summary",
+        "done",
+        "--json",
+        cwd=repo,
+    )
+    assert blocked.returncode == 1
+    payload = json.loads(blocked.stdout)
+    assert "reviewer verdict pass required" in payload["error"]
+    assert payload["expected_phase"] == "review"
+    assert payload["out_of_plan"] is True
+    assert payload["phase_issues"][0]["code"] == "missing_reviewer_verdict"
+    assert "pass reviewer verdict" in payload["recovery_hint"]
+
+
+def test_loop_status_reports_failed_and_blocked_verdict_phases(tmp_path: Path) -> None:
+    for verdict, expected_phase, issue_code in (
+        ("fail", "fix", "reviewer_verdict_failed"),
+        ("blocked", "unblock", "reviewer_verdict_blocked"),
+    ):
+        case_root = tmp_path / verdict
+        case_root.mkdir()
+        repo = copy_repo(case_root)
+        submitted = run_ai(
+            "loop",
+            "submit",
+            "--text",
+            "task",
+            "--goal",
+            "g",
+            "--rubric",
+            "review behavior and tests",
+            "--checklist",
+            "tests pass",
+            "--json",
+            cwd=repo,
+        )
+        assert submitted.returncode == 0, submitted.stdout + submitted.stderr
+        claimed = json.loads(run_ai("loop", "claim", "--orchestrator-id", "o", "--json", cwd=repo).stdout)["request"]
+        verdict_result = run_ai(
+            "loop",
+            "verdict",
+            "--request-id",
+            claimed["id"],
+            "--lease-id",
+            claimed["lease_id"],
+            "--verdict",
+            verdict,
+            "--summary",
+            f"review {verdict}",
+            "--json",
+            cwd=repo,
+        )
+        assert verdict_result.returncode == 0, verdict_result.stdout + verdict_result.stderr
+
+        status_payload = json.loads(run_ai("loop", "status", "--json", cwd=repo).stdout)
+        assert status_payload["expected_phases"] == {expected_phase: 1}
+        assert status_payload["out_of_plan"] is True
+        assert status_payload["phase_issue_count"] == 1
+        issue_entry = status_payload["phase_issues"][0]
+        assert issue_entry["expected_phase"] == expected_phase
+        assert issue_entry["phase_issues"][0]["code"] == issue_code
+
+        blocked = run_ai(
+            "loop",
+            "complete",
+            "--request-id",
+            claimed["id"],
+            "--lease-id",
+            claimed["lease_id"],
+            "--summary",
+            "done",
+            "--json",
+            cwd=repo,
+        )
+        assert blocked.returncode == 1
+        payload = json.loads(blocked.stdout)
+        assert payload["expected_phase"] == expected_phase
+        assert payload["out_of_plan"] is True
+        assert payload["phase_issues"][0]["code"] == issue_code
+
+
+def test_loop_status_reports_missing_required_review_contract(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    submitted = run_ai("loop", "submit", "--text", "task", "--goal", "g", "--json", cwd=repo)
+    assert submitted.returncode == 0, submitted.stdout + submitted.stderr
+    request = json.loads(submitted.stdout)["request"]
+    assert request["expected_phase"] == "claim"
+    assert request["out_of_plan"] is True
+    assert [issue["code"] for issue in request["phase_issues"]] == ["missing_rubric", "missing_checklist"]
+
+    status_payload = json.loads(run_ai("loop", "status", "--json", cwd=repo).stdout)
+    assert status_payload["expected_phases"] == {"claim": 1}
+    assert status_payload["out_of_plan"] is True
+    assert status_payload["phase_issue_count"] == 2
+    issue_entry = status_payload["phase_issues"][0]
+    assert issue_entry["expected_phase"] == "claim"
+    assert [issue["code"] for issue in issue_entry["phase_issues"]] == ["missing_rubric", "missing_checklist"]
+
+
 def test_loop_recovers_expired_processing_request(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     submit = run_ai("loop", "submit", "--text", "Fix stale loop", "--goal", "Recover loop", "--json", cwd=repo)

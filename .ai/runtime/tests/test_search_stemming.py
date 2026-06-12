@@ -23,6 +23,7 @@ from ai_core.search import (  # noqa: E402
     rebuild,
     retrieval_policy_for_query,
 )
+from ai_core.context_budget import apply as apply_context_budget  # noqa: E402
 
 
 def _make_repo(tmp_path: Path) -> Path:
@@ -305,6 +306,37 @@ def test_query_and_context_pack_expose_retrieval_policy(tmp_path: Path) -> None:
     assert pack["retrieval_policy"] in {"bm25", "bm25+rg"}
     assert pack["recommended_retrieval_policy"] == "hybrid"
     assert pack["additionalContext"]
+
+
+def test_context_pack_aggressive_mode_exposes_budget_metadata(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    repo = _make_repo(tmp_path)
+    for idx in range(5):
+        _write(repo, f"doc-{idx}.md", f"sharedneedle content {idx}\n")
+    rebuild(repo)
+
+    pack = context_pack(repo, "sharedneedle", limit=5, mode="aggressive")
+
+    assert pack["context_budget"]["mode"] == "aggressive"
+    assert pack["context_budget"]["max_results"] == 3
+    assert pack["context_budget"]["selected_results"] == len(pack["results"])
+    assert len(pack["results"]) <= 3
+    assert pack["context_budget"]["truncated"] is True
+
+
+def test_context_budget_preserves_protected_signals_beyond_aggressive_limit() -> None:
+    results = [
+        {"path": f"doc-{idx}.md", "snippet": "ordinary context"}
+        for idx in range(5)
+    ]
+    results[4]["snippet"] = "handoff rubric verdict blockers stay visible"
+
+    payload = apply_context_budget(results, mode="aggressive", limit=5)
+
+    paths = [item["path"] for item in payload["results"]]
+    assert "doc-4.md" in paths
+    assert "handoff rubric verdict blockers" in payload["additionalContext"]
+    assert payload["context_budget"]["protected_signals"] == ["handoff", "rubric", "verdict", "blockers"]
 
 
 def test_rg_fallback_helper_returns_empty_when_disabled(tmp_path: Path, monkeypatch) -> None:

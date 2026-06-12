@@ -26,6 +26,12 @@ VALID_VERDICTS = {"pass", "fail", "blocked"}
 _REQUEST_ID_RE = re.compile(r"^loop-[0-9]+-[0-9a-f]+$")
 
 
+class LoopPhaseError(ValueError):
+    def __init__(self, message: str, metadata: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.metadata = metadata
+
+
 def _validate_request_id(request_id: str) -> str:
     if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
         raise ValueError(f"invalid request_id: {request_id!r}")
@@ -268,12 +274,32 @@ def recover_expired(root: Path) -> dict[str, Any]:
 def status(root: Path) -> dict[str, Any]:
     ensure_loop_dirs(root)
     expired_processing = 0
+    phase_issues: list[dict[str, Any]] = []
+    expected_phases: dict[str, int] = {}
     for path in (loop_root(root) / "processing").glob("*.json"):
         try:
-            if _is_expired(_read_json(path).get("lease_expires_at")):
+            request = _read_json(path)
+            if _is_expired(request.get("lease_expires_at")):
                 expired_processing += 1
         except Exception:
             continue
+    for queue_name in ("inbox", "processing"):
+        for path in sorted((loop_root(root) / queue_name).glob("*.json")):
+            try:
+                request = _read_json(path)
+            except Exception:
+                continue
+            guard = _phase_guard(request)
+            expected_phases[guard["expected_phase"]] = expected_phases.get(guard["expected_phase"], 0) + 1
+            if guard["phase_issues"]:
+                phase_issues.append(
+                    {
+                        "request_id": request.get("id"),
+                        "status": request.get("status"),
+                        "path": path.relative_to(root).as_posix(),
+                        **guard,
+                    }
+                )
     return {
         "ok": True,
         "pending": len(list((loop_root(root) / "inbox").glob("*.json"))),
@@ -281,6 +307,10 @@ def status(root: Path) -> dict[str, Any]:
         "expired_processing": expired_processing,
         "done": len(list((loop_root(root) / "done").glob("*.json"))),
         "dead": len(list((loop_root(root) / "dead").glob("*.json"))),
+        "expected_phases": expected_phases,
+        "out_of_plan": any(issue.get("out_of_plan") for issue in phase_issues),
+        "phase_issue_count": sum(len(issue.get("phase_issues") or []) for issue in phase_issues),
+        "phase_issues": phase_issues,
     }
 
 
@@ -297,7 +327,8 @@ def _finish(root: Path, *, request_id: str, lease_id: str, status: str, summary:
         if request.get("lease_id") != lease_id:
             raise ValueError("lease_id mismatch")
         if status == "done" and bool(request.get("reviewer_required", True)) and not _verdict_passed(request):
-            raise ValueError("reviewer verdict pass required before complete")
+            guard = _phase_guard(request, completion_attempt=True)
+            raise LoopPhaseError("reviewer verdict pass required before complete", guard)
         request.update(
             {
                 "status": status,
@@ -394,6 +425,127 @@ def _verdict_passed(request: dict[str, Any]) -> bool:
     return isinstance(verdict, dict) and verdict.get("verdict") == "pass"
 
 
+def _phase_guard(request: dict[str, Any], *, completion_attempt: bool = False) -> dict[str, Any]:
+    expected_phase = _expected_phase(request)
+    issues = _phase_issues(request)
+    out_of_plan_codes = {"missing_rubric", "missing_checklist", "reviewer_verdict_failed", "reviewer_verdict_blocked"}
+    if completion_attempt:
+        out_of_plan_codes.add("missing_reviewer_verdict")
+    out_of_plan = any(issue.get("code") in out_of_plan_codes for issue in issues)
+    return {
+        "expected_phase": expected_phase,
+        "recovery_hint": _recovery_hint(expected_phase, issues),
+        "out_of_plan": out_of_plan,
+        "phase_issues": issues,
+    }
+
+
+def _expected_phase(request: dict[str, Any]) -> str:
+    request_status = str(request.get("status") or "pending")
+    if request_status == "pending":
+        return "claim"
+    if request_status == "done":
+        return "distill"
+    if request_status == "dead":
+        return "postmortem"
+    if request_status != "processing":
+        return "inspect"
+    if not bool(request.get("reviewer_required", True)):
+        return "complete"
+    verdict = request.get("reviewer_verdict")
+    verdict_value = verdict.get("verdict") if isinstance(verdict, dict) else None
+    if verdict_value == "pass":
+        return "complete"
+    if verdict_value == "fail":
+        return "fix"
+    if verdict_value == "blocked":
+        return "unblock"
+    return "review"
+
+
+def _phase_issues(request: dict[str, Any]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    if not bool(request.get("reviewer_required", True)):
+        return issues
+    if not str(request.get("rubric") or "").strip():
+        issues.append(
+            _phase_issue(
+                "missing_rubric",
+                "reviewer_required request has no rubric",
+                "resubmit reviewer-gated loop work with a rubric or use --no-review for ungated work",
+            )
+        )
+    checklist = request.get("checklist") or []
+    if not isinstance(checklist, list):
+        checklist = [str(checklist)]
+    if not _clean_checklist(checklist):
+        issues.append(
+            _phase_issue(
+                "missing_checklist",
+                "reviewer_required request has no checklist",
+                "resubmit reviewer-gated loop work with at least one checklist item",
+            )
+        )
+    if str(request.get("status") or "") != "processing":
+        return issues
+    verdict = request.get("reviewer_verdict")
+    verdict_value = verdict.get("verdict") if isinstance(verdict, dict) else None
+    if verdict_value == "pass":
+        return issues
+    if verdict_value == "fail":
+        issues.append(
+            _phase_issue(
+                "reviewer_verdict_failed",
+                "reviewer verdict is fail",
+                "address reviewer findings, verify again, then record a pass verdict",
+            )
+        )
+    elif verdict_value == "blocked":
+        issues.append(
+            _phase_issue(
+                "reviewer_verdict_blocked",
+                "reviewer verdict is blocked",
+                "resolve or document the blocker before completing the loop",
+            )
+        )
+    else:
+        issues.append(
+            _phase_issue(
+                "missing_reviewer_verdict",
+                "reviewer verdict is required before complete",
+                "record a pass reviewer verdict before completing the loop",
+            )
+        )
+    return issues
+
+
+def _phase_issue(code: str, message: str, recovery_hint: str) -> dict[str, str]:
+    return {"code": code, "message": message, "recovery_hint": recovery_hint}
+
+
+def _recovery_hint(expected_phase: str, issues: list[dict[str, str]]) -> str:
+    priority = [
+        "reviewer_verdict_failed",
+        "reviewer_verdict_blocked",
+        "missing_reviewer_verdict",
+        "missing_rubric",
+        "missing_checklist",
+    ]
+    for code in priority:
+        for issue in issues:
+            if issue.get("code") == code:
+                return issue["recovery_hint"]
+    return {
+        "claim": "claim the loop request before starting work",
+        "review": "record a reviewer verdict before completing the loop",
+        "fix": "address reviewer findings before requesting another verdict",
+        "unblock": "resolve the blocker before completing the loop",
+        "complete": "complete the loop after local verification",
+        "distill": "distill verified lessons if the run produced durable knowledge",
+        "postmortem": "distill a postmortem lesson if useful",
+    }.get(expected_phase, "inspect the loop request state")
+
+
 _STOPWORDS = frozenset(
     "the a an and or but if then else when while for with from into onto of in on at to by is are was "
     "were be been being do does did not no nor so than that this these those it its as use used using "
@@ -465,6 +617,7 @@ def _public_request(request: dict[str, Any], path: Path, root: Path) -> dict[str
     if request.get("result"):
         public["result"] = str(request.get("result"))
     public["path"] = path.relative_to(root).as_posix()
+    public.update(_phase_guard(request))
     return public
 
 

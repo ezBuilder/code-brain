@@ -30,8 +30,13 @@ def test_dispatch_to_idle_worker(tmp_path: Path) -> None:
     le.submit(root, instruction="add a focused test", goal="test work", reviewer_required=False)
     out = loopd.dispatch_once(root, adapter=adapter)
     assert len(out["dispatched"]) == 1 and out["dispatched"][0]["worker_id"] == "codex-1"
-    assert adapter.injected and "loop claim" in adapter.injected[0]["text"]
+    # loopd claims for the worker; the injection forbids a generic claim and carries the lease
+    assert adapter.injected and "do NOT run loop claim" in adapter.injected[0]["text"]
+    assert "loop complete" in adapter.injected[0]["text"]
     assert wr.get_worker(root, "codex-1")["state"] == "assigned"
+    # the request was claimed (moved out of inbox) for the worker
+    import ai_core.loop_engineering as _le
+    assert not list((_le.loop_root(root) / "inbox").glob("*.json"))
 
 
 def test_high_risk_is_parked_not_dispatched(tmp_path: Path) -> None:

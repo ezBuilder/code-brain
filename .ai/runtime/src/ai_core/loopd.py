@@ -85,15 +85,17 @@ def select_worker(root: Path, request: dict[str, Any]) -> dict[str, Any] | None:
     return candidates[0]
 
 
-def _task_injection(request: dict[str, Any], worker: dict[str, Any]) -> str:
+def _task_injection(request: dict[str, Any], worker: dict[str, Any], lease_id: str) -> str:
+    # loopd already claimed the request for this worker — the worker must NOT call a generic
+    # claim (that races and steals other workers' tasks). It processes this id with this lease.
     rid = request.get("id", "")
     wid = worker.get("worker_id", "")
-    agent = worker.get("agent", "agent")
+    goal = str(request.get("goal", ""))[:200]
     return (
-        f"Code Brain assigned request {rid}\n"
-        f".ai/bin/ai loop claim --orchestrator-id loopd --agent {agent} --json\n"
-        f"Process only request id {rid}. Write heartbeat to "
-        f".ai/runtime/state/heartbeats/{wid}.json. Finish with verdict + complete/fail. "
+        f"Code Brain assigned you request {rid} (already claimed for you; do NOT run loop claim). "
+        f"Goal: {goal}. Do the work, then finish with "
+        f".ai/bin/ai loop complete --request-id {rid} --lease-id {lease_id} --summary \"<short>\" --json "
+        f"(or .ai/bin/ai loop fail --request-id {rid} --lease-id {lease_id} --reason \"<why>\" for a real blocker). "
         f"Respect approval gates for secrets/auth/billing/prod/destructive actions."
     )
 
@@ -143,7 +145,17 @@ def dispatch_once(root: Path, *, adapter: TmuxAdapterBase | None = None) -> dict
             skipped += 1
             continue
         pane = str((worker.get("tmux") or {}).get("pane_id") or "")
-        if not _PANE_RE.fullmatch(pane) or not adapter.inject(pane, _task_injection(request, worker)):
+        if not _PANE_RE.fullmatch(pane):
+            skipped += 1
+            continue
+        # claim this exact request for the worker BEFORE injecting, so two workers never collide.
+        claimed = le.claim(root, orchestrator_id="loopd", agent=str(worker.get("agent", "agent")),
+                           request_id=rid)
+        lease = (claimed.get("request") or {}).get("lease_id") if isinstance(claimed, dict) else None
+        if not lease:
+            skipped += 1
+            continue
+        if not adapter.inject(pane, _task_injection(request, worker, str(lease))):
             skipped += 1
             continue
         wr.set_state(root, worker_id=worker["worker_id"], state="assigned", request_id=rid)

@@ -105,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     loop_claim.add_argument("--orchestrator-id", required=True)
     loop_claim.add_argument("--agent", default="agent")
     loop_claim.add_argument("--priority", choices=["P0", "P1", "P2", "P3"])
+    loop_claim.add_argument("--request-id", dest="request_id", default=None)
     loop_claim.add_argument("--lease-seconds", type=int, default=300)
     loop_claim.add_argument("--json", action="store_true", dest="command_json")
     loop_complete = loop_sub.add_parser("complete")
@@ -843,6 +844,7 @@ def main(argv: list[str] | None = None) -> int:
                     orchestrator_id=args.orchestrator_id,
                     agent=args.agent,
                     priority=args.priority,
+                    request_id=args.request_id,
                     lease_seconds=args.lease_seconds,
                 )
                 emit(payload, as_json=as_json)

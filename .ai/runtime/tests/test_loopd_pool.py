@@ -47,11 +47,12 @@ def test_completion_frees_worker_to_idle(tmp_path: Path) -> None:
     wr.register_worker(root, worker_id="codex-1", agent="codex", pane_id="%1", state="idle")
     adapter = FakeTmuxAdapter(alive={"%1"})
     sub = le.submit(root, instruction="x", goal="y", reviewer_required=False)["request"]
-    loopd.dispatch_once(root, adapter=adapter)
+    loopd.dispatch_once(root, adapter=adapter)  # loopd claims the request for the worker
     assert wr.get_worker(root, "codex-1")["state"] == "assigned"
-    # worker completes the request → moves to done/
-    claim = le.claim(root, orchestrator_id="loopd", agent="codex")["request"]
-    le.complete(root, request_id=claim["id"], lease_id=claim["lease_id"], summary="done")
+    # the request is already in processing with loopd's lease — read it and complete
+    import json
+    proc = json.loads((le.loop_root(root) / "processing" / f"{sub['id']}.json").read_text())
+    le.complete(root, request_id=sub["id"], lease_id=proc["lease_id"], summary="done")
     out = loopd.recovery_tick(root)
     assert "codex-1" in out["freed_workers"]
     assert wr.get_worker(root, "codex-1")["state"] == "idle"

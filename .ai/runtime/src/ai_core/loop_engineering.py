@@ -121,15 +121,24 @@ def claim(
     orchestrator_id: str,
     agent: str = "agent",
     priority: str | None = None,
+    request_id: str | None = None,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
 ) -> dict[str, Any]:
     if lease_seconds < 60 or lease_seconds > 86_400:
         raise ValueError("lease_seconds must be between 60 and 86400")
+    if request_id is not None and not _REQUEST_ID_RE.fullmatch(str(request_id)):
+        raise ValueError("invalid request_id")
     with queue_lock(root):
         ensure_loop_dirs(root)
         recovered = _recover_expired_locked(root)
-        candidates = sorted((loop_root(root) / "inbox").glob("*.json"))
+        if request_id is not None:
+            # targeted claim: take exactly this request (loopd assigns; workers do not race).
+            candidates = [loop_root(root) / "inbox" / f"{request_id}.json"]
+        else:
+            candidates = sorted((loop_root(root) / "inbox").glob("*.json"))
         for source in candidates:
+            if not source.exists():
+                continue
             request = _read_json(source)
             if priority and request.get("priority") != priority:
                 continue

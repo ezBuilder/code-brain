@@ -183,6 +183,15 @@ def build_parser() -> argparse.ArgumentParser:
     for _name in ("status", "dispatch-once", "recover"):
         _sp = loopd_sub.add_parser(_name)
         _sp.add_argument("--json", action="store_true", dest="command_json")
+    ld_launch = loopd_sub.add_parser("launch")
+    ld_launch.add_argument("--worker-id", required=True, dest="worker_id")
+    ld_launch.add_argument("--agent", required=True)
+    ld_launch.add_argument("--profile", required=True)
+    ld_launch.add_argument("--dry-run", action="store_true", dest="dry_run")
+    ld_launch.add_argument("--json", action="store_true", dest="command_json")
+    ld_up = loopd_sub.add_parser("up")
+    ld_up.add_argument("--dry-run", action="store_true", dest="dry_run")
+    ld_up.add_argument("--json", action="store_true", dest="command_json")
 
     worker_sub = loopd_sub.add_parser("worker").add_subparsers(dest="worker_command", required=True)
     w_reg = worker_sub.add_parser("register")
@@ -888,6 +897,18 @@ def main(argv: list[str] | None = None) -> int:
             if args.loopd_command == "recover":
                 reject_ci_write("loopd")
                 emit(_ld.recovery_tick(root), as_json=as_json)
+                return OK
+            if args.loopd_command == "launch":
+                reject_ci_write("loopd")
+                from . import worker_launch as _wl
+                payload = _wl.launch_worker(root, worker_id=args.worker_id, agent=args.agent,
+                                            profile=args.profile, dry_run=args.dry_run)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.loopd_command == "up":
+                reject_ci_write("loopd")
+                from . import worker_launch as _wl
+                emit(_wl.launch_pool(root, dry_run=args.dry_run), as_json=as_json)
                 return OK
         if args.command == "loopd" and args.loopd_command == "worker":
             from . import worker_profiles as _wp

@@ -92,7 +92,13 @@ managed_files() {
         [[ -f "$path" ]] && printf '%s\n' "$path"
       done
     fi
-  ) | grep -vxE "\.ai/secret_scan_allowlist\.txt|\.ai/generated/install-manifest\.json" || true
+  ) | grep -vxE "\.ai/secret_scan_allowlist\.txt|\.ai/generated/install-manifest\.json" \
+    | awk '!(($0 ~ /^\.ai\/memory\// || $0 ~ /^\.ai\/runtime\/state\//) && $0 !~ /\.gitkeep$/)' \
+    || true
+  # ^ never propagate the SOURCE repo's private runtime memory/state DATA (audit chain, decisions,
+  #   sessions, evidence, prompt-growth, worker heartbeats). Seeding it pollutes the target project
+  #   and corrupts its audit chain. Directory structure still propagates via the .gitkeep files,
+  #   which ARE kept; the runtime creates each project's own memory on first use.
   printf '%s\n' "bootstrap-code-brain.sh"
 }
 

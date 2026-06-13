@@ -1,34 +1,36 @@
 ---
 name: "cb-loop-orchestrator"
-description: "Code Brain loop orchestrator - poll the queue continuously, claim tasks as they arrive, delegate maker/reviewer work, and record results."
+description: "Code Brain loop orchestrator - inspect loopd, dispatch once if needed, and process one assigned task. Never poll the queue yourself."
 ---
 
 # cb-loop-orchestrator
 
-Use this skill when the user wants this agent to act as the resident loop worker/orchestrator.
+Use this skill to operate the Code Brain loop. **Do NOT poll the queue with the LLM** — that
+wastes tokens. The deterministic `code-brain-loopd` watches the queue and wakes warm workers
+when work arrives; an empty queue costs zero tokens.
 
-This is a RESIDENT loop, not a one-shot check. An empty queue means "keep polling", not "done". Only stop when the user tells you to stop.
+## Inspect, do not poll
 
-## Poll for work
+1. `.ai/bin/ai loopd status --json` — see queue counts and worker states.
+2. If there are pending requests but nothing is being dispatched, run one deterministic tick:
+   `.ai/bin/ai loopd dispatch-once --json` (no LLM; assigns pending work to an idle worker).
+3. `.ai/bin/ai loopd recover --json` — recover expired leases / flag stale workers.
+4. Never write a "claim every 30s" loop. If no work exists, stop — loopd will dispatch when it does.
 
-Wait for the next task with a bounded blocking poll (~10 min per round, 30s interval):
+`.ai/bin/ai loop claim` is a **one-shot atomic claim**, not a resident loop. Use it only to take
+the single request loopd assigned to you.
 
-`bash -c 'r=""; for i in $(seq 1 20); do r="$(.ai/bin/ai loop claim --orchestrator-id <orchestrator-id> --agent <this-agent> --json)"; echo "$r" | grep -Eq "\"request\": ?null" || break; sleep 30; done; printf "%s\n" "$r"'`
-
-- If the poll returns a non-null `request`: process it (next section), then immediately poll again.
-- If it still returns `"request": null` after the round: report `loop queue empty - polling continues` and start the next poll round. Do NOT end the session over an empty queue. If the host cannot keep a long-running turn alive, re-arm yourself with the host's scheduler (Claude Code: `/loop` or a scheduled wakeup; otherwise re-run this poll command) instead of stopping.
-
-## Process a claimed task
+## Process an assigned task
 
 - Act as orchestrator, not sole implementer.
-- If the task instruction references a spec document, read the spec first; it is the source of truth.
-- Delegate maker work and reviewer work to separate subagents when available.
+- If the instruction references a spec document, read the spec first; it is the source of truth.
+- Delegate maker and reviewer work to separate subagents when available (maker/checker split).
 - Use the request `rubric` and `checklist` as the completion contract.
-- Record reviewer output with `.ai/bin/ai loop verdict --request-id <id> --lease-id <lease_id> --reviewer <name> --verdict pass|fail|blocked --summary "<review summary>" --json`.
-- Do not auto-merge or push.
-- Verify locally.
-- Finish only after a passing verdict with `.ai/bin/ai loop complete --request-id <id> --lease-id <lease_id> --summary "<short summary>" --json`, or `.ai/bin/ai loop fail ...` for real blockers.
-- After complete, distill verified reusable learning with `.ai/bin/ai loop distill --request-id <id> --text "<lesson>" --json` when there is a durable lesson. Failures can be distilled too (post-mortem). If it returns `ok:false` with `reason:potential_contradiction`, review the listed `conflicts` against your lesson; only re-run with `--force` once you confirm it does not contradict an existing decision.
-- After completing (or failing) a task, return to the poll loop.
+- Record review with `.ai/bin/ai loop verdict --request-id <id> --lease-id <lease_id> --reviewer <name> --verdict pass|fail|blocked --summary "..." --json`.
+- Do not auto-merge or push. Approval-gated work (secrets/auth/billing/prod/destructive) stays blocked.
+- Verify locally; finish only after a passing verdict with `.ai/bin/ai loop complete ...`, or `.ai/bin/ai loop fail ...` for real blockers.
 
-Status updates: one short Korean line per event (claimed / verdict / completed / queue empty, polling continues).
+## Bring up warm workers (optional)
+
+`.ai/bin/ai loopd up --dry-run` shows the planned isolated tmux workers; drop `--dry-run` to launch.
+Each Codex/AGY worker runs under its own profile (isolated HOME/XDG) so auth caches never collide.

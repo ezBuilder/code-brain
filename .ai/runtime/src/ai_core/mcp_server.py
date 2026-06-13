@@ -293,6 +293,16 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "loopd_status",
+        "description": "Code Brain loopd status: queue counts and warm-worker states. Read-only; llm_idle_polls is always 0.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "loopd_dispatch_once",
+        "description": "Run one deterministic loopd dispatch tick (assign pending work to idle workers; park high-risk). No LLM. Write-class.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "tool_search",
         "description": (
             "Find Code Brain MCP tools by keyword and get their full schemas. Use this when the "
@@ -1115,6 +1125,12 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             path=args.get("path") if isinstance(args.get("path"), str) else None,
             max_results=int(args.get("max_results", 40) or 40),
         )
+    if name == "loopd_status":
+        from . import loopd as _ld
+        return _ld.status(root)
+    if name == "loopd_dispatch_once":
+        from . import loopd as _ld
+        return _ld.dispatch_once(root)
     if name == "tool_search":
         q = str(args.get("query", "")).strip().lower()
         terms = [t for t in q.split() if t]

@@ -35,14 +35,19 @@ def session_name(project_root: Path) -> str:
 
 
 def build_launch_plan(root: Path, *, worker_id: str, agent: str, profile: str,
-                      session: str, window: str) -> dict[str, Any]:
-    """Pure: resolve the isolated env + the exact (validated) tmux launch for a worker."""
+                      session: str, window: str, inherit_auth: bool = False) -> dict[str, Any]:
+    """Pure: resolve the env + the exact (validated) tmux launch for a worker.
+
+    inherit_auth=True does NOT override HOME/XDG — the worker uses the inherited (default-login)
+    environment. Use it for a single already-logged-in account; use a profile (isolated HOME) for
+    multiple accounts of the same agent so their auth caches never collide.
+    """
     agent = str(agent).strip().lower()
     if agent not in AGENT_COMMANDS:
         return {"ok": False, "reason": f"unknown agent: {agent}"}
     if not _SESSION_RE.fullmatch(session):
         return {"ok": False, "reason": "invalid session name"}
-    env = wp.resolve_profile_env(root, profile)  # paths only, secrets refused upstream
+    env: dict[str, str] = {} if inherit_auth else wp.resolve_profile_env(root, profile)
     env["CODE_BRAIN_PROJECT_ROOT"] = str(root)
     env["CODE_BRAIN_WORKER_ID"] = str(worker_id)[:64]
     env["CODE_BRAIN_HEARTBEAT"] = str(wr.heartbeat_path(root, worker_id))
@@ -52,14 +57,16 @@ def build_launch_plan(root: Path, *, worker_id: str, agent: str, profile: str,
 
 def launch_worker(root: Path, *, worker_id: str, agent: str, profile: str,
                   session: str | None = None, window: str | None = None,
-                  adapter: TmuxAdapterBase | None = None, dry_run: bool = False) -> dict[str, Any]:
+                  adapter: TmuxAdapterBase | None = None, dry_run: bool = False,
+                  inherit_auth: bool = False) -> dict[str, Any]:
     session = session or session_name(root)
     window = window or worker_id
     plan = build_launch_plan(root, worker_id=worker_id, agent=agent, profile=profile,
-                             session=session, window=window)
+                             session=session, window=window, inherit_auth=inherit_auth)
     if not plan.get("ok"):
         return plan
-    wp.ensure_profile_dirs(root, profile)
+    if not inherit_auth:
+        wp.ensure_profile_dirs(root, profile)
     if dry_run:
         return {"ok": True, "dry_run": True, "plan": plan}
     adapter = adapter or get_adapter()

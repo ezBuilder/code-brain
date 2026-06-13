@@ -186,7 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
     ld_launch = loopd_sub.add_parser("launch")
     ld_launch.add_argument("--worker-id", required=True, dest="worker_id")
     ld_launch.add_argument("--agent", required=True)
-    ld_launch.add_argument("--profile", required=True)
+    ld_launch.add_argument("--profile", default="")
+    ld_launch.add_argument("--inherit-auth", action="store_true", dest="inherit_auth")
     ld_launch.add_argument("--dry-run", action="store_true", dest="dry_run")
     ld_launch.add_argument("--json", action="store_true", dest="command_json")
     ld_up = loopd_sub.add_parser("up")
@@ -902,7 +903,8 @@ def main(argv: list[str] | None = None) -> int:
                 reject_ci_write("loopd")
                 from . import worker_launch as _wl
                 payload = _wl.launch_worker(root, worker_id=args.worker_id, agent=args.agent,
-                                            profile=args.profile, dry_run=args.dry_run)
+                                            profile=args.profile or args.worker_id,
+                                            inherit_auth=args.inherit_auth, dry_run=args.dry_run)
                 emit(payload, as_json=as_json)
                 return OK if payload.get("ok") else GENERIC_ERROR
             if args.loopd_command == "up":

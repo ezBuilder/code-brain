@@ -330,6 +330,17 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "selfimprove_run",
+        "description": (
+            "Trigger one closed-loop self-improvement cycle: queue a self-review task for a cheap "
+            "non-self judge worker (then call loopd_dispatch_once). The judge proposes one prompt "
+            "rule; it passes the M_core safety gate and is kept only if real tokens do not regress "
+            "(auto-rollback). Background only — never blocks. Write-class."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "tier": {"type": "string", "enum": ["cheap", "balanced", "best"], "default": "cheap"}}},
+    },
+    {
         "name": "loopd_agents",
         "description": (
             "Auto-detect which agent CLIs (codex/claude/agy) and tmux are installed here. Call this "
@@ -1177,6 +1188,9 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "loopd_agents":
         from . import worker_launch as _wl
         return _wl.capabilities()
+    if name == "selfimprove_run":
+        from . import self_improve as _si
+        return _si.enqueue_review(root, tier=args.get("tier") if args.get("tier") in ("cheap", "balanced", "best") else "cheap")
     if name == "loop_submit":
         instruction = args.get("instruction")
         if not isinstance(instruction, str) or not instruction.strip():
@@ -1184,20 +1198,10 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         from . import loop_engineering as _le
         dispatch = {"model_tier": args["model_tier"]} if args.get("model_tier") in ("cheap", "balanced", "best") else None
         goal = str(args.get("goal") or "").strip() or instruction.strip().splitlines()[0][:120]
-        res = _le.submit(root, instruction=instruction, goal=goal,
-                         reviewer_required=bool(args.get("reviewer_required", False)),
-                         priority=str(args.get("priority", "P1") or "P1"))
-        if dispatch and res.get("ok"):
-            # tag the queued request with the forced tier so the orchestrator honors it
-            from .loop_engineering import loop_root as _lr
-            import json as _json
-            p = _lr(root) / "inbox" / f"{res['request']['id']}.json"
-            try:
-                d = _json.loads(p.read_text(encoding="utf-8")); d["dispatch"] = dispatch
-                p.write_text(_json.dumps(d), encoding="utf-8")
-            except Exception:
-                pass
-        return res
+        # tier pinned atomically at submit (no read-modify-write of the queued file → no TOCTOU)
+        return _le.submit(root, instruction=instruction, goal=goal,
+                          reviewer_required=bool(args.get("reviewer_required", False)),
+                          priority=str(args.get("priority", "P1") or "P1"), dispatch=dispatch)
     if name == "loopd_up":
         from . import worker_launch as _wl
         return _wl.launch_pool(root, dry_run=bool(args.get("dry_run", False)),

@@ -68,6 +68,7 @@ def submit(
     reviewer_required: bool = True,
     rubric: str = "",
     checklist: list[str] | None = None,
+    dispatch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if priority not in {"P0", "P1", "P2", "P3"}:
         raise ValueError(f"invalid priority: {priority}")
@@ -105,6 +106,19 @@ def submit(
         "updated_at": now_iso(),
         "attempts": 0,
     }
+    if isinstance(dispatch, dict):
+        allowed = {}
+        mt = str(dispatch.get("model_tier", "")).lower()
+        if mt in ("cheap", "balanced", "best"):
+            allowed["model_tier"] = mt
+        rt = str(dispatch.get("risk_tier", "")).lower()
+        if rt in ("low", "medium", "high"):
+            allowed["risk_tier"] = rt
+        for key in ("preferred_agents", "required_capabilities"):
+            if isinstance(dispatch.get(key), list):
+                allowed[key] = [_bounded(v, 40) for v in dispatch[key]][:8]
+        if allowed:
+            payload["dispatch"] = allowed
     with queue_lock(root):
         ensure_loop_dirs(root)
         tmp = loop_root(root) / ".tmp" / f"{request_id}.json.tmp"

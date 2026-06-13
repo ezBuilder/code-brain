@@ -34,6 +34,7 @@ WRITE_COMMANDS = {
     "loop",
     "loopd",
     "worker",
+    "selfimprove",
     "evidence",
     "security_finding",
 }

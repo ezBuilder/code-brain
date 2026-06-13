@@ -179,6 +179,18 @@ def build_parser() -> argparse.ArgumentParser:
     pgrowth_status = pgrowth_sub.add_parser("status")
     pgrowth_status.add_argument("--json", action="store_true", dest="command_json")
 
+    si = sub.add_parser("selfimprove")
+    si_sub = si.add_subparsers(dest="selfimprove_command", required=True)
+    si_run = si_sub.add_parser("run")
+    si_run.add_argument("--tier", choices=["cheap", "balanced", "best"], default="cheap")
+    si_run.add_argument("--json", action="store_true", dest="command_json")
+    si_propose = si_sub.add_parser("propose")
+    si_propose.add_argument("--text", required=True)
+    si_propose.add_argument("--rationale", default="")
+    si_propose.add_argument("--json", action="store_true", dest="command_json")
+    si_status = si_sub.add_parser("status")
+    si_status.add_argument("--json", action="store_true", dest="command_json")
+
     loopd_p = sub.add_parser("loopd")
     loopd_sub = loopd_p.add_subparsers(dest="loopd_command", required=True)
     for _name in ("status", "dispatch-once", "recover", "agents"):
@@ -912,6 +924,21 @@ def main(argv: list[str] | None = None) -> int:
 
             emit(_pg.status(root), as_json=as_json)
             return OK
+        if args.command == "selfimprove":
+            from . import self_improve as _si
+
+            if args.selfimprove_command == "run":
+                reject_ci_write("selfimprove")
+                emit(_si.enqueue_review(root, tier=args.tier), as_json=as_json)
+                return OK
+            if args.selfimprove_command == "propose":
+                reject_ci_write("selfimprove")
+                payload = _si.propose_rule(root, text=args.text, rationale=args.rationale)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.selfimprove_command == "status":
+                emit(_si.status(root), as_json=as_json)
+                return OK
         if args.command == "loopd":
             from . import loopd as _ld
 

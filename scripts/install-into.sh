@@ -771,8 +771,14 @@ def cmd(event: str) -> str:
 def matchers(event: str, timeout: int):
     return [{"matcher": "", "hooks": [{"type": "command", "command": cmd(event), "timeout": timeout}]}]
 
+# NOTE: no PreToolUse hook for Antigravity. Its jsonhook contract is deny-by-default —
+# unless the hook returns an approve schema agy recognizes, EVERY tool call is denied
+# (verified live: empty stdout, "{}", and a Claude-style permissionDecision:allow were all
+# treated as deny, hard-stalling the worker). Code Brain's PreToolUse therefore broke agy
+# rather than protecting it. PostToolUse (redaction/recording) and Stop (memory refresh) work
+# fine. Pre-execution risk for agy workers is covered by the loopd dispatch approval-gate.
 code_brain_spec = {
-    "PreToolUse": matchers("PreToolUse", 15),
+    "PreToolUse": None,
     "PostToolUse": matchers("PostToolUse", 15),
     "PreInvocation": None,
     "PostInvocation": None,

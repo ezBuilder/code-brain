@@ -215,9 +215,13 @@ def test_install_into_writes_antigravity_hooks(install_into_target: Path) -> Non
     spec = payload["code-brain"]
     assert set(spec) == {"PreToolUse", "PostToolUse", "PreInvocation", "PostInvocation", "Stop"}
     assert "SessionStart" not in spec and "UserPromptSubmit" not in spec
-    # PreInvocation/PostInvocation unused (null); the side-effect events carry handlers.
+    # PreInvocation/PostInvocation unused (null). PreToolUse is also null for Antigravity:
+    # its jsonhook contract is deny-by-default, so a Code Brain PreToolUse hook denies EVERY
+    # agy tool call (it broke the worker rather than protecting it). Only the side-effect events
+    # PostToolUse (redaction/recording) and Stop (memory refresh) carry handlers.
     assert spec["PreInvocation"] is None and spec["PostInvocation"] is None
-    for event_name in ("PreToolUse", "PostToolUse", "Stop"):
+    assert spec["PreToolUse"] is None
+    for event_name in ("PostToolUse", "Stop"):
         entries = spec[event_name]
         assert isinstance(entries, list) and entries, event_name
         for entry in entries:

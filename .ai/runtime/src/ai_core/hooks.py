@@ -1693,21 +1693,6 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     "additionalContext": additional_context,
                 }
                 response["rewritten"] = True
-            elif normalize_agent(payload) == "antigravity":
-                # Antigravity retries a hard-denied command in a loop (it cannot gracefully
-                # reroute like Claude/Codex), stalling autonomous workers. Make the search-route
-                # ADVISORY for agy: allow the command, attach the better-tool suggestion as
-                # context. (Dangerous/secret blocks below still hard-deny for every agent.)
-                response["hookSpecificOutput"] = {
-                    "hookEventName": effective_hook,
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": (
-                        f"Code Brain routing (advisory): {precall_decision.get('reason')}. "
-                        f"Prefer: {suggestion} (or MCP code_query) to save tokens."
-                    ),
-                    "additionalContext": additional_context,
-                }
-                response["advisory"] = True
             else:
                 response["decision"] = "block"
                 response["hookSpecificOutput"] = {

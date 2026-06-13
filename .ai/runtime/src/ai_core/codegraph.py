@@ -230,6 +230,113 @@ def hotspot_callees(root: Path, *, limit: int = 20) -> dict:
     }
 
 
+def trace_call_path(root: Path, *, src: str, dst: str, max_depth: int = 6) -> dict:
+    """Shortest caller→callee chain from `src` to `dst` (multi-hop BFS). Orientation aid only."""
+    from collections import deque
+
+    from .search import connect, init_schema
+
+    with connect(root) as conn:
+        init_schema(conn)
+        seen = {src}
+        q: deque[list[str]] = deque([[src]])
+        while q:
+            chain = q.popleft()
+            if len(chain) > max(1, int(max_depth)):
+                continue
+            node = chain[-1]
+            rows = conn.execute(
+                "select distinct callee from code_calls where caller = ? limit 200", (node,)
+            ).fetchall()
+            for r in rows:
+                callee = r["callee"]
+                if callee == dst:
+                    return {"ok": True, "found": True, "path": chain + [callee], "hops": len(chain)}
+                if callee not in seen:
+                    seen.add(callee)
+                    q.append(chain + [callee])
+    return {"ok": True, "found": False, "path": [], "scanned": len(seen)}
+
+
+def blast_radius(root: Path, *, symbols: list[str], max_depth: int = 4, limit: int = 200) -> dict:
+    """Transitive callers of `symbols` (reverse BFS) = the impact set of changing them."""
+    from collections import deque
+
+    from .search import connect, init_schema
+
+    seeds = [s for s in (symbols or []) if isinstance(s, str) and s]
+    impacted: dict[str, int] = {}
+    with connect(root) as conn:
+        init_schema(conn)
+        q: deque[tuple[str, int]] = deque((s, 0) for s in seeds)
+        seen = set(seeds)
+        while q and len(impacted) < limit:
+            node, depth = q.popleft()
+            if depth >= max(1, int(max_depth)):
+                continue
+            rows = conn.execute(
+                "select distinct caller from code_calls where callee = ? limit 200", (node,)
+            ).fetchall()
+            for r in rows:
+                caller = r["caller"]
+                if not caller or caller in seen:
+                    continue
+                seen.add(caller)
+                impacted[caller] = depth + 1
+                q.append((caller, depth + 1))
+    ranked = sorted(impacted.items(), key=lambda kv: (kv[1], kv[0]))
+    return {"ok": True, "seeds": seeds, "count": len(ranked),
+            "impacted": [{"symbol": s, "distance": d} for s, d in ranked[:limit]]}
+
+
+def impacted_by_paths(root: Path, *, paths: list[str], max_depth: int = 4) -> dict:
+    """Map changed file paths → the symbols they define → transitive callers (git-diff blast radius)."""
+    from .search import connect, init_schema
+
+    norm = [str(p).split("::", 1)[0] for p in (paths or []) if isinstance(p, str) and p]
+    symbols: list[str] = []
+    with connect(root) as conn:
+        init_schema(conn)
+        for p in norm[:100]:
+            rows = conn.execute(
+                "select qualname from code_symbols where path = ? limit 500", (p,)
+            ).fetchall()
+            symbols.extend(r["qualname"] for r in rows)
+    out = blast_radius(root, symbols=symbols, max_depth=max_depth)
+    out["changed_paths"] = norm
+    out["changed_symbols"] = len(symbols)
+    return out
+
+
+def architecture_summary(root: Path, *, limit: int = 8) -> dict:
+    """Cheap whole-repo orientation: top modules by symbol count and incoming-call centrality."""
+    from .search import connect, init_schema
+
+    with connect(root) as conn:
+        init_schema(conn)
+        sym_rows = conn.execute(
+            "select path, count(*) as n from code_symbols group by path order by n desc limit 500"
+        ).fetchall()
+        call_rows = conn.execute(
+            "select c.path as path, count(*) as n from code_calls c group by c.path "
+            "order by n desc limit 500"
+        ).fetchall()
+    calls_by_path = {r["path"]: r["n"] for r in call_rows}
+
+    def _module(p: str) -> str:
+        return str(p).split("::", 1)[0]
+
+    agg: dict[str, dict[str, int]] = {}
+    for r in sym_rows:
+        m = _module(r["path"])
+        a = agg.setdefault(m, {"symbols": 0, "calls": 0})
+        a["symbols"] += int(r["n"])
+        a["calls"] += int(calls_by_path.get(r["path"], 0))
+    ranked = sorted(agg.items(), key=lambda kv: (kv[1]["symbols"] + kv[1]["calls"]), reverse=True)
+    return {"ok": True, "count": len(ranked),
+            "modules": [{"module": m, **v} for m, v in ranked[:limit]]}
+
+
 def iter_python_files(root: Path) -> Iterator[Path]:
     """Yield project Python files, skipping common cache/venv dirs and hidden files."""
     skip_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build", ".ai"}

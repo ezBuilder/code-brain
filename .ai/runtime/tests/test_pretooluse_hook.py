@@ -376,7 +376,10 @@ def test_recommend_memory_deps_include_all_audit_session_and_codex_global(tmp_pa
     assert any(path.endswith(".codex/memories/raw_memories.md") for path in outside)
 
 
-def test_pretooluse_antigravity_run_command_blocks() -> None:
+def test_pretooluse_antigravity_run_command_advisory() -> None:
+    # The search-route is token-optimization, not a security control. antigravity retries a hard
+    # deny in a loop, so for agy it is ADVISORY (allow + suggestion); the route binary is still
+    # detected. (Dangerous/secret blocks remain hard-deny for every agent — tested elsewhere.)
     result = run_hook(
         "PreToolUse",
         {
@@ -386,12 +389,12 @@ def test_pretooluse_antigravity_run_command_blocks() -> None:
         },
     )
     payload = _parse_ok(result)
-    assert payload.get("decision") == "block"
+    assert payload.get("decision") != "block"
+    assert payload.get("advisory") is True
     assert payload.get("precall", {}).get("binary") == "rg"
     hso = payload.get("hookSpecificOutput")
     assert isinstance(hso, dict)
-    assert hso.get("permissionDecision") == "deny"
-    assert "rg pattern" in hso.get("permissionDecisionReason", "")
+    assert hso.get("permissionDecision") == "allow"
 
 
 def test_pretooluse_antigravity_run_command_rewrites() -> None:
@@ -416,3 +419,28 @@ def test_pretooluse_antigravity_run_command_rewrites() -> None:
     assert updated.get("command") == ".ai/bin/ai exec run -- rg pattern"
 
 
+
+
+def test_pretooluse_antigravity_route_is_advisory_not_deny() -> None:
+    # agy retries hard-denied commands in a loop → search-route is advisory (allow) for antigravity
+    result = run_hook(
+        "PreToolUse",
+        {"agent": "antigravity", "tool_name": "run_command",
+         "tool_input": {"command": "grep -rn useEffect src/"}},
+    )
+    payload = _parse_ok(result)
+    assert payload.get("decision") != "block"
+    assert payload.get("advisory") is True
+    assert payload.get("hookSpecificOutput", {}).get("permissionDecision") == "allow"
+
+
+def test_pretooluse_claude_route_still_denies() -> None:
+    # Claude can reroute, so the hard deny (token-saving) is kept for claude/codex
+    result = run_hook(
+        "PreToolUse",
+        {"agent": "claude", "tool_name": "Bash",
+         "tool_input": {"command": "grep -rn useEffect src/"}},
+    )
+    payload = _parse_ok(result)
+    assert payload.get("decision") == "block"
+    assert payload.get("advisory") is not True

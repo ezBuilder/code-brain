@@ -385,7 +385,9 @@ import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
-desired = {"command": ".ai/bin/ai-mcp", "args": [], "env": {}}
+# Compact tools on by default: tools/list ships only the ~15 hot core tools; the rest load on
+# demand via tool_search. Big per-session schema-token cut, no capability loss. (AI_MCP_COMPACT_TOOLS)
+desired = {"command": ".ai/bin/ai-mcp", "args": [], "env": {"AI_MCP_COMPACT_TOOLS": "1"}}
 if dst.exists():
     try:
         payload = json.loads(dst.read_text(encoding="utf-8"))
@@ -416,6 +418,9 @@ block = (
     "[mcp_servers.code-brain]\n"
     "command = \".ai/bin/ai-mcp\"\n"
     "args = []\n"
+    # Compact tools on by default (parity with .mcp.json): only hot core tools in tools/list,
+    # rest load on demand via tool_search. Per-session schema-token cut, no capability loss.
+    "env = { AI_MCP_COMPACT_TOOLS = \"1\" }\n"
 )
 existing = dst.read_text(encoding="utf-8") if dst.exists() else ""
 

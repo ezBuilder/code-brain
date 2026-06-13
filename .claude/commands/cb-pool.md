@@ -5,7 +5,9 @@ argument-hint: "[작업 설명 | status | up | down]"
 
 `$ARGUMENTS`를 해석해 Code Brain 워커 풀을 MCP 도구로 운영한다. 사용자는 CLI를 외우지 않는다.
 
-도구(전부 MCP): `loopd_status`, `loopd_up`, `loop_submit`, `loopd_dispatch_once`, `loopd_recover`.
+도구(전부 MCP): `loopd_agents`, `loopd_status`, `loopd_up`, `loop_submit`, `loopd_dispatch_once`, `loopd_recover`.
+
+**항상 먼저** `loopd_agents`로 설치된 에이전트(codex/claude/agy)와 tmux 가용 여부를 확인한다. 설치 안 된 에이전트는 자동 스킵된다(에러 아님). 하나도 없으면 "사용 가능한 에이전트 없음 — 풀 비활성"이라고 1줄 보고하고 종료.
 
 분기:
 - **인자 없음 또는 `status`** → `loopd_status` 호출 후 1줄 요약(큐 pending/processing/done, 워커 idle/working 수).

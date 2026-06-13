@@ -181,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     loopd_p = sub.add_parser("loopd")
     loopd_sub = loopd_p.add_subparsers(dest="loopd_command", required=True)
-    for _name in ("status", "dispatch-once", "recover"):
+    for _name in ("status", "dispatch-once", "recover", "agents"):
         _sp = loopd_sub.add_parser(_name)
         _sp.add_argument("--json", action="store_true", dest="command_json")
     ld_launch = loopd_sub.add_parser("launch")
@@ -917,6 +917,10 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.loopd_command == "status":
                 emit(_ld.status(root), as_json=as_json)
+                return OK
+            if args.loopd_command == "agents":
+                from . import worker_launch as _wl
+                emit(_wl.capabilities(), as_json=as_json)
                 return OK
             if args.loopd_command == "dispatch-once":
                 reject_ci_write("loopd")

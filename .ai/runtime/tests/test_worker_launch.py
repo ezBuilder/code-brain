@@ -72,3 +72,30 @@ def test_pool_idempotent(tmp_path: Path) -> None:
     assert first["launched"][0]["ok"]
     second = wl.launch_pool(root, adapter=adapter, dry_run=False)
     assert second["launched"][0].get("skipped") == "already up"
+
+
+def test_launch_skips_uninstalled_agent(tmp_path: Path, monkeypatch) -> None:
+    root = _seed(tmp_path)
+    import ai_core.worker_launch as _wl
+    # pretend no agent CLI is installed
+    monkeypatch.setattr(_wl, "agent_available", lambda a: False)
+    monkeypatch.setattr(_wl, "tmux_available", lambda: True)
+    res = _wl.launch_worker(root, worker_id="codex-1", agent="codex", profile="codex-1",
+                            inherit_auth=True, dry_run=False)
+    assert res["ok"] is False and res.get("skipped") is True and "not installed" in res["reason"]
+
+
+def test_launch_skips_when_no_tmux(tmp_path: Path, monkeypatch) -> None:
+    root = _seed(tmp_path)
+    import ai_core.worker_launch as _wl
+    monkeypatch.setattr(_wl, "tmux_available", lambda: False)
+    res = _wl.launch_worker(root, worker_id="codex-1", agent="codex", profile="codex-1",
+                            inherit_auth=True, dry_run=False)
+    assert res["ok"] is False and "tmux" in res["reason"]
+
+
+def test_capabilities_shape(tmp_path: Path) -> None:
+    import ai_core.worker_launch as _wl
+    cap = _wl.capabilities()
+    assert set(cap["agents"]) == {"codex", "claude", "agy"}
+    assert isinstance(cap["tmux"], bool) and isinstance(cap["available_agents"], list)

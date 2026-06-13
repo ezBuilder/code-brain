@@ -19,8 +19,34 @@ from . import worker_registry as wr
 from .memory import append_audit
 from .tmux_adapter import TmuxAdapterBase, get_adapter
 
+import shutil
+
 # Fixed agent → CLI binary. Only these may be launched (no arbitrary command strings).
 AGENT_COMMANDS = {"codex": "codex", "claude": "claude", "agy": "agy"}
+
+
+def tmux_available() -> bool:
+    return bool(shutil.which("tmux"))
+
+
+def agent_available(agent: str) -> bool:
+    """True iff this agent's CLI binary is installed on PATH (so a worker can actually run)."""
+    binary = AGENT_COMMANDS.get(str(agent).strip().lower())
+    return bool(binary and shutil.which(binary))
+
+
+def available_agents() -> list[str]:
+    return [a for a in AGENT_COMMANDS if agent_available(a)]
+
+
+def capabilities() -> dict[str, Any]:
+    """What the pool can actually run here — auto-detected, no config needed."""
+    return {
+        "ok": True,
+        "tmux": tmux_available(),
+        "agents": {a: agent_available(a) for a in AGENT_COMMANDS},
+        "available_agents": available_agents(),
+    }
 _SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _BOOT = (
     "You are Code Brain worker {wid}. Do not poll the queue yourself. Wait for explicit task "
@@ -78,10 +104,17 @@ def launch_worker(root: Path, *, worker_id: str, agent: str, profile: str,
                              autonomous=autonomous, tier=tier)
     if not plan.get("ok"):
         return plan
+    if dry_run:
+        plan["agent_installed"] = agent_available(agent)
+        plan["tmux"] = tmux_available()
+        return {"ok": True, "dry_run": True, "plan": plan}
+    # auto-detect: if this agent's CLI (or tmux) isn't installed, skip gracefully — never crash.
+    if not tmux_available():
+        return {"ok": False, "skipped": True, "reason": "tmux not installed", "worker_id": worker_id}
+    if not agent_available(agent):
+        return {"ok": False, "skipped": True, "reason": f"{agent} CLI not installed", "worker_id": worker_id}
     if not inherit_auth:
         wp.ensure_profile_dirs(root, profile)
-    if dry_run:
-        return {"ok": True, "dry_run": True, "plan": plan}
     adapter = adapter or get_adapter()
     pane = adapter.new_window(session, window, plan["env"], plan["command"])  # type: ignore[attr-defined]
     if not pane:
@@ -165,10 +198,15 @@ def launch_pool(root: Path, *, adapter: TmuxAdapterBase | None = None,
     results: list[dict[str, Any]] = []
     for prof in wp.list_profiles(root):
         wid = str(prof.get("worker_id") or f"{prof.get('agent')}-{prof.get('profile')}")
+        ag = str(prof.get("agent"))
         if wid in existing:
             results.append({"worker_id": wid, "skipped": "already up"})
             continue
-        results.append(launch_worker(root, worker_id=wid, agent=str(prof.get("agent")),
+        if not agent_available(ag):  # auto-skip an agent whose CLI is not installed
+            results.append({"worker_id": wid, "skipped": f"{ag} CLI not installed"})
+            continue
+        results.append(launch_worker(root, worker_id=wid, agent=ag,
                                      profile=str(prof.get("profile")), session=session,
                                      adapter=adapter, dry_run=dry_run, autonomous=autonomous, tier=tier))
-    return {"ok": True, "session": session, "dry_run": dry_run, "autonomous": autonomous, "launched": results}
+    return {"ok": True, "session": session, "dry_run": dry_run, "autonomous": autonomous,
+            "available_agents": available_agents(), "tmux": tmux_available(), "launched": results}

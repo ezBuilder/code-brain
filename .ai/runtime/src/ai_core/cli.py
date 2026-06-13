@@ -190,10 +190,12 @@ def build_parser() -> argparse.ArgumentParser:
     ld_launch.add_argument("--profile", default="")
     ld_launch.add_argument("--inherit-auth", action="store_true", dest="inherit_auth")
     ld_launch.add_argument("--autonomous", action="store_true", dest="autonomous")
+    ld_launch.add_argument("--tier", choices=["cheap", "balanced", "best"], default=None)
     ld_launch.add_argument("--dry-run", action="store_true", dest="dry_run")
     ld_launch.add_argument("--json", action="store_true", dest="command_json")
     ld_up = loopd_sub.add_parser("up")
     ld_up.add_argument("--autonomous", action="store_true", dest="autonomous")
+    ld_up.add_argument("--tier", choices=["cheap", "balanced", "best"], default=None)
     ld_up.add_argument("--dry-run", action="store_true", dest="dry_run")
     ld_up.add_argument("--json", action="store_true", dest="command_json")
     acct_sub = loopd_sub.add_parser("account").add_subparsers(dest="account_command", required=True)
@@ -930,13 +932,14 @@ def main(argv: list[str] | None = None) -> int:
                 payload = _wl.launch_worker(root, worker_id=args.worker_id, agent=args.agent,
                                             profile=args.profile or args.worker_id,
                                             inherit_auth=args.inherit_auth, autonomous=args.autonomous,
-                                            dry_run=args.dry_run)
+                                            tier=args.tier, dry_run=args.dry_run)
                 emit(payload, as_json=as_json)
                 return OK if payload.get("ok") else GENERIC_ERROR
             if args.loopd_command == "up":
                 reject_ci_write("loopd")
                 from . import worker_launch as _wl
-                emit(_wl.launch_pool(root, dry_run=args.dry_run, autonomous=args.autonomous), as_json=as_json)
+                emit(_wl.launch_pool(root, dry_run=args.dry_run, autonomous=args.autonomous,
+                                     tier=args.tier), as_json=as_json)
                 return OK
             if args.loopd_command == "account":
                 reject_ci_write("loopd")

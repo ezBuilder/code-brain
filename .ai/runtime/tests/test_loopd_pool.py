@@ -15,24 +15,29 @@ def _seed(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_best_model_per_agent(tmp_path: Path) -> None:
-    assert wm.resolve_model(tmp_path, "claude")["flags"] == ["--model", "claude-opus-4-8"]
-    assert wm.resolve_model(tmp_path, "codex")["model"] == "gpt-5.5"
-    wm.set_model(tmp_path, agent="codex", model="gpt-6", flags=["-m", "gpt-6"])
-    assert wm.resolve_model(tmp_path, "codex")["flags"] == ["-m", "gpt-6"]
+def test_tiered_models_default_is_balanced_not_best(tmp_path: Path) -> None:
+    # default tier is cost-aware (balanced), NOT the most expensive model
+    assert wm.resolve_model(tmp_path, "claude")["model"] == "claude-sonnet-4-6"
+    assert wm.resolve_model(tmp_path, "claude", tier="cheap")["model"] == "claude-haiku-4-5"
+    assert wm.resolve_model(tmp_path, "claude", tier="best")["model"] == "claude-opus-4-8"
+    assert wm.resolve_model(tmp_path, "agy", tier="best")["model"] == "Gemini 3.1 Pro (High)"
+    assert wm.resolve_model(tmp_path, "agy", tier="cheap")["model"].startswith("Gemini 3.5 Flash")
 
 
-def test_launch_command_includes_model_flags(tmp_path: Path) -> None:
+def test_launch_command_uses_tier(tmp_path: Path) -> None:
     _seed(tmp_path)
-    plan = wl.build_launch_plan(tmp_path, worker_id="claude-1", agent="claude", profile="claude-1",
+    bal = wl.build_launch_plan(tmp_path, worker_id="claude-1", agent="claude", profile="claude-1",
                                session="cb-x", window="claude-1", inherit_auth=True)
-    assert plan["command"] == "claude --model claude-opus-4-8"
+    assert bal["command"] == "claude --model claude-sonnet-4-6"  # balanced default
+    best = wl.build_launch_plan(tmp_path, worker_id="claude-1", agent="claude", profile="claude-1",
+                                session="cb-x", window="claude-1", inherit_auth=True, tier="best")
+    assert best["command"] == "claude --model claude-opus-4-8"
 
 
-def test_agy_best_model_quoted(tmp_path: Path) -> None:
+def test_agy_best_tier_model_quoted(tmp_path: Path) -> None:
     _seed(tmp_path)
     plan = wl.build_launch_plan(tmp_path, worker_id="agy-1", agent="agy", profile="agy-1",
-                               session="cb-x", window="agy-1", inherit_auth=True)
+                               session="cb-x", window="agy-1", inherit_auth=True, tier="best")
     # spaced/parenthesized model name is shlex-quoted into one safe argv element
     assert plan["command"] == "agy --model 'Gemini 3.1 Pro (High)'"
 
@@ -93,6 +98,33 @@ def test_completion_frees_worker_to_idle(tmp_path: Path) -> None:
     out = loopd.recovery_tick(root)
     assert "codex-1" in out["freed_workers"]
     assert wr.get_worker(root, "codex-1")["state"] == "idle"
+
+
+def test_assess_tier_complexity(tmp_path: Path) -> None:
+    assert loopd.assess_tier({"id": "loop-1-a", "goal": "fix typo", "instruction": "fix a typo"}) == "cheap"
+    assert loopd.assess_tier({"id": "loop-1-a", "goal": "x", "instruction": "refactor the auth module"}) == "best"
+    assert loopd.assess_tier({"id": "loop-1-a", "goal": "deploy to prod", "instruction": "deploy"}) == "best"
+    medium = ("add a helper function that formats the report header and wire it into the two "
+              "call sites; keep the existing style and add a short unit test for the happy path "
+              "and one empty-input case, then update the module docstring to mention it briefly")
+    assert loopd.assess_tier({"id": "loop-1-a", "goal": "add helper", "instruction": medium}) == "balanced"
+    # explicit override wins
+    assert loopd.assess_tier({"id": "loop-1-a", "goal": "refactor", "dispatch": {"model_tier": "cheap"}}) == "cheap"
+
+
+def test_select_worker_routes_cheapest_adequate(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    # a cheap and a best worker are both idle
+    wr.register_worker(root, worker_id="agy-cheap", agent="agy", pane_id="%1", state="idle",
+                       model={"tier": "cheap"}, risk_tier_allowed=["low", "medium"])
+    wr.register_worker(root, worker_id="codex-best", agent="codex", pane_id="%2", state="idle",
+                       model={"tier": "best"}, risk_tier_allowed=["low", "medium"])
+    # trivial task → cheapest adequate (cheap) wins, sparing the best model
+    simple = {"id": "loop-1-a", "goal": "fix typo", "instruction": "fix typo"}
+    assert loopd.select_worker(root, simple)["worker_id"] == "agy-cheap"
+    # complex task → needs best; only the best-tier worker is adequate
+    hard = {"id": "loop-2-b", "goal": "x", "instruction": "refactor the concurrency model"}
+    assert loopd.select_worker(root, hard)["worker_id"] == "codex-best"
 
 
 def test_nudge_clears_benign_interrupt(tmp_path: Path) -> None:

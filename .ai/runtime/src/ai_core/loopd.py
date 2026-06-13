@@ -89,9 +89,44 @@ def infer_risk(request: dict[str, Any]) -> str:
     return "high" if _GATED.search(text) else "medium"
 
 
+_TIER_ORDER = {"cheap": 0, "balanced": 1, "best": 2}
+# Signals that a task is hard enough to deserve the strongest (most expensive) model.
+_COMPLEX = re.compile(
+    r"(refactor|리팩터|debug|디버그|architecture|아키텍처|design|설계|migrat|마이그레이|"
+    r"security|보안|concurren|race\s*condition|algorithm|알고리즘|optimi|성능|perf\b|"
+    r"multi[-\s]?file|여러\s*파일|complex|복잡|root\s*cause|근본\s*원인|prove|증명)",
+    re.IGNORECASE,
+)
+
+
+def assess_tier(request: dict[str, Any]) -> str:
+    """Cheapest model tier adequate for this task — cost-aware routing, not always the best.
+
+    high-risk / explicitly complex / long multi-step work → best; trivial short work → cheap;
+    everything else → balanced (the default). An explicit dispatch.model_tier overrides.
+    """
+    dispatch = request.get("dispatch") if isinstance(request.get("dispatch"), dict) else {}
+    declared = str(dispatch.get("model_tier", "")).strip().lower()
+    if declared in _TIER_ORDER:
+        return declared
+    text = " ".join(str(request.get(k, "")) for k in ("goal", "instruction", "role"))
+    checklist = request.get("checklist") if isinstance(request.get("checklist"), list) else []
+    if infer_risk(request) == "high" or _COMPLEX.search(text) or len(checklist) >= 4 or len(text) > 1200:
+        return "best"
+    if len(text) <= 200 and not checklist:
+        return "cheap"
+    return "balanced"
+
+
+def _worker_tier(w: dict[str, Any]) -> str:
+    t = str((w.get("model") or {}).get("tier") or "balanced")
+    return t if t in _TIER_ORDER else "balanced"
+
+
 def select_worker(root: Path, request: dict[str, Any]) -> dict[str, Any] | None:
-    """PRD §7.1 worker selection: hard constraints then soft scoring. Returns a worker or None."""
+    """PRD §7.1 worker selection: hard constraints then cost-aware soft scoring. Returns worker or None."""
     risk = infer_risk(request)
+    need_tier = _TIER_ORDER[assess_tier(request)]
     dispatch = request.get("dispatch") if isinstance(request.get("dispatch"), dict) else {}
     required = set(dispatch.get("required_capabilities") or [])
     preferred = [str(a) for a in (dispatch.get("preferred_agents") or [])]
@@ -112,11 +147,16 @@ def select_worker(root: Path, request: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     def score(w: dict[str, Any]) -> tuple:
+        wtier = _TIER_ORDER[_worker_tier(w)]
+        adequate = 1 if wtier >= need_tier else 0   # meets the task's required model strength
+        # cost-aware: among adequate workers prefer the CHEAPEST that still meets the need, so a
+        # simple task does not burn the best model. (-wtier sorts cheaper-first within adequate.)
+        thrift = -wtier if adequate else -99
         prefer = 1 if w.get("agent") in preferred else 0
         quota_ok = 1 if str((w.get("usage") or {}).get("quota_state")) != "quota_exhausted" else 0
-        # Codex/Claude favored for high-risk code/review; AGY pool favored for low-risk/research.
         tie = 1 if (risk == "high") == (w.get("agent") in ("codex", "claude")) else 0
-        return (prefer, quota_ok, tie, -int((w.get("usage") or {}).get("requests_today", 0) or 0))
+        return (adequate, prefer, quota_ok, thrift, tie,
+                -int((w.get("usage") or {}).get("requests_today", 0) or 0))
 
     candidates.sort(key=score, reverse=True)
     return candidates[0]

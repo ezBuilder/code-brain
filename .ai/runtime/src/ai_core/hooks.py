@@ -2089,6 +2089,28 @@ def _render_failure_lines(entry: dict[str, Any], live: dict[str, str], today: st
     return out
 
 
+def _lessons_context(root: Path, hook_name: str) -> str:
+    """Inject the few strongest distilled lessons (experience replay). Bounded; recall MCP for more."""
+    if hook_name not in SKILL_RECOMMENDATION_HOOKS or _env_disabled("AI_LESSONS_INJECT"):
+        return ""
+    try:
+        from .lessons import score_lessons
+
+        items = score_lessons(root, include_stale=False).get("items", [])
+    except Exception:
+        return ""
+    items = [i for i in items if float(i.get("confidence", 0) or 0) >= 0.3][:3]
+    if not items:
+        return ""
+    lines = ["Lessons (distilled from past runs — apply; call lessons_recall for query-specific recall):"]
+    for it in items:
+        conf = it.get("confidence")
+        body = str(it.get("fix") or it.get("failure") or it.get("cause") or it.get("command") or "")[:120]
+        kind = str(it.get("kind") or "")
+        lines.append(f"  - ({conf}) {body}" + (f" [{kind}]" if kind else ""))
+    return "\n".join(lines)
+
+
 def _learned_prompt_context(root: Path) -> str:
     """Inject auto-grown project rules (prompt growth). Empty until the loop has grown one."""
     if _env_disabled("AI_PROMPT_GROWTH"):
@@ -2287,6 +2309,9 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     learned = _learned_prompt_context(root)
     if learned:
         sections.append(learned)
+    lessons = _lessons_context(root, hook_name)
+    if lessons:
+        sections.append(lessons)
     # T37 — cloudflare remote_memory removed (.ai/ git sync handles cross-device).
     composed = "\n\n".join(sections)
     max_bytes = _max_injection_bytes_for(hook_name)

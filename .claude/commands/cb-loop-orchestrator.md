@@ -5,8 +5,13 @@ argument-hint: "[orchestrator-id]"
 
 Use `$ARGUMENTS` as orchestrator id. If empty, use `claude-loop`.
 
-Run `.ai/bin/ai loop claim --orchestrator-id "<orchestrator-id>" --agent claude --json`.
-If `request` is null, reply exactly: `loop queue empty`.
+Do NOT poll the queue in a loop — `code-brain-loopd` watches it and dispatches to warm workers
+with zero tokens. First check `.ai/bin/ai loopd status --json`; if work is pending but idle, run
+`.ai/bin/ai loopd dispatch-once --json`.
+
+`.ai/bin/ai loop claim` is a one-shot atomic claim. Use it once to take an assigned request:
+`.ai/bin/ai loop claim --orchestrator-id "<orchestrator-id>" --agent claude --json`.
+If `request` is null, reply exactly: `loop queue empty` (loopd dispatches when work arrives).
 
 Otherwise:
 - Act as orchestrator, not sole implementer.

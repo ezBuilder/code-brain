@@ -178,6 +178,39 @@ def build_parser() -> argparse.ArgumentParser:
     pgrowth_status = pgrowth_sub.add_parser("status")
     pgrowth_status.add_argument("--json", action="store_true", dest="command_json")
 
+    loopd_p = sub.add_parser("loopd")
+    loopd_sub = loopd_p.add_subparsers(dest="loopd_command", required=True)
+    for _name in ("status", "dispatch-once", "recover"):
+        _sp = loopd_sub.add_parser(_name)
+        _sp.add_argument("--json", action="store_true", dest="command_json")
+
+    worker_sub = loopd_sub.add_parser("worker").add_subparsers(dest="worker_command", required=True)
+    w_reg = worker_sub.add_parser("register")
+    w_reg.add_argument("--worker-id", required=True, dest="worker_id")
+    w_reg.add_argument("--agent", required=True)
+    w_reg.add_argument("--profile", default="")
+    w_reg.add_argument("--pane-id", default="", dest="pane_id")
+    w_reg.add_argument("--cwd", default="")
+    w_reg.add_argument("--state", default="booting")
+    w_reg.add_argument("--json", action="store_true", dest="command_json")
+    w_list = worker_sub.add_parser("list")
+    w_list.add_argument("--state", default=None)
+    w_list.add_argument("--json", action="store_true", dest="command_json")
+    w_hb = worker_sub.add_parser("heartbeat")
+    w_hb.add_argument("--worker-id", required=True, dest="worker_id")
+    w_hb.add_argument("--state", required=True)
+    w_hb.add_argument("--request-id", default=None, dest="request_id")
+    w_hb.add_argument("--json", action="store_true", dest="command_json")
+    w_prof = worker_sub.add_parser("profile")
+    w_prof_sub = w_prof.add_subparsers(dest="worker_profile_command", required=True)
+    w_prof_reg = w_prof_sub.add_parser("register")
+    w_prof_reg.add_argument("--profile", required=True)
+    w_prof_reg.add_argument("--agent", required=True)
+    w_prof_reg.add_argument("--worker-id", default="", dest="worker_id")
+    w_prof_reg.add_argument("--json", action="store_true", dest="command_json")
+    w_prof_list = w_prof_sub.add_parser("list")
+    w_prof_list.add_argument("--json", action="store_true", dest="command_json")
+
     obs = sub.add_parser("obs")
     obs_sub = obs.add_subparsers(dest="obs_command", required=True)
     obs_log = obs_sub.add_parser("log")
@@ -842,6 +875,46 @@ def main(argv: list[str] | None = None) -> int:
 
             emit(_pg.status(root), as_json=as_json)
             return OK
+        if args.command == "loopd":
+            from . import loopd as _ld
+
+            if args.loopd_command == "status":
+                emit(_ld.status(root), as_json=as_json)
+                return OK
+            if args.loopd_command == "dispatch-once":
+                reject_ci_write("loopd")
+                emit(_ld.dispatch_once(root), as_json=as_json)
+                return OK
+            if args.loopd_command == "recover":
+                reject_ci_write("loopd")
+                emit(_ld.recovery_tick(root), as_json=as_json)
+                return OK
+        if args.command == "loopd" and args.loopd_command == "worker":
+            from . import worker_profiles as _wp
+            from . import worker_registry as _wr
+
+            if args.worker_command == "register":
+                reject_ci_write("worker")
+                emit(_wr.register_worker(root, worker_id=args.worker_id, agent=args.agent,
+                                         profile=args.profile, cwd=args.cwd, pane_id=args.pane_id,
+                                         state=args.state), as_json=as_json)
+                return OK
+            if args.worker_command == "list":
+                emit({"ok": True, "workers": _wr.list_workers(root, state=args.state)}, as_json=as_json)
+                return OK
+            if args.worker_command == "heartbeat":
+                reject_ci_write("worker")
+                emit(_wr.write_heartbeat(root, worker_id=args.worker_id, state=args.state,
+                                         request_id=args.request_id), as_json=as_json)
+                return OK
+            if args.worker_command == "profile" and args.worker_profile_command == "register":
+                reject_ci_write("worker")
+                emit(_wp.register_profile(root, profile=args.profile, agent=args.agent,
+                                          worker_id=args.worker_id), as_json=as_json)
+                return OK
+            if args.worker_command == "profile" and args.worker_profile_command == "list":
+                emit({"ok": True, "profiles": _wp.list_profiles(root)}, as_json=as_json)
+                return OK
         if args.command == "trust" and args.trust_command == "init":
             reject_ci_write("trust")
             payload = init_machine(root, name=args.name)

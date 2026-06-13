@@ -29,6 +29,43 @@ def test_launch_command_includes_model_flags(tmp_path: Path) -> None:
     assert plan["command"] == "claude --model claude-opus-4-8"
 
 
+def test_agy_best_model_quoted(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    plan = wl.build_launch_plan(tmp_path, worker_id="agy-1", agent="agy", profile="agy-1",
+                               session="cb-x", window="agy-1", inherit_auth=True)
+    # spaced/parenthesized model name is shlex-quoted into one safe argv element
+    assert plan["command"] == "agy --model 'Gemini 3.1 Pro (High)'"
+
+
+def test_autonomous_appends_per_agent_flags(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    cx = wl.build_launch_plan(tmp_path, worker_id="codex-1", agent="codex", profile="codex-1",
+                              session="cb-x", window="codex-1", inherit_auth=True, autonomous=True)
+    assert cx["command"].endswith("--dangerously-bypass-approvals-and-sandbox")
+    cl = wl.build_launch_plan(tmp_path, worker_id="claude-1", agent="claude", profile="claude-1",
+                              session="cb-x", window="claude-1", inherit_auth=True, autonomous=True)
+    assert cl["command"].endswith("--permission-mode bypassPermissions")
+    # default (no autonomous) keeps no bypass flag
+    safe = wl.build_launch_plan(tmp_path, worker_id="codex-1", agent="codex", profile="codex-1",
+                                session="cb-x", window="codex-1", inherit_auth=True)
+    assert "dangerously" not in safe["command"]
+
+
+def test_gate_catches_expanded_high_risk(tmp_path: Path) -> None:
+    for bad in ("release to production now", "set the OPENAI_API_KEY", "kubectl apply -f x",
+                "drop database prod", "terraform apply", "remove all rows from users",
+                "gh pr merge 5", "rimraf the build", "rotate the oauth token", "find . -delete"):
+        assert loopd.infer_risk({"id": "loop-1-a", "goal": bad}) == "high", bad
+
+
+def test_override_cannot_smuggle_bypass_flag(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    wm.set_model(tmp_path, agent="codex", model="x",
+                 flags=["--dangerously-bypass-approvals-and-sandbox", "--model", "x"])
+    flags = wm.resolve_model(tmp_path, "codex")["flags"]
+    assert all("bypass" not in f and "dangerous" not in f for f in flags)
+
+
 def test_multi_account_isolated_homes(tmp_path: Path) -> None:
     _seed(tmp_path)
     a = wp.add_account(tmp_path, agent="claude", account="work")

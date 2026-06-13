@@ -22,9 +22,15 @@ from .tmux_adapter import TmuxAdapterBase, get_adapter, output_hash
 
 # PRD §7.2 / §12.2 — work that must never auto-dispatch without explicit approval.
 _GATED = re.compile(
-    r"(deploy|prod(uction)?|배포|billing|결제|구독|subscrib|secret|시크릿|토큰|token|auth\b|인증|"
-    r"권한|authoriz|destructive|drop\s+table|truncate|삭제|데이터\s*삭제|delete\s+from|"
-    r"\bgit\s+(push|merge|rebase|reset\s+--hard)|rm\s+-rf)",
+    r"(deploy|prod(uction)?|배포|release\s+to\s+prod|ship\s+(the\s+)?build|"
+    r"billing|결제|구독|subscrib|invoice|"
+    r"secret|시크릿|토큰|token|auth\b|oauth|인증|권한|authoriz|"
+    r"password|passwd|credential|api[\s._-]?key|private[\s._-]?key|secret[\s._-]?key|access[\s._-]?key|"
+    r"kubectl|terraform\s+apply|ansible-playbook|helm\s+(upgrade|install)|docker\s+push|registry|"
+    r"destructive|drop\s+(table|database|schema|index)|truncate|삭제|데이터\s*삭제|"
+    r"delete\s+from|remove\s+all\s+rows|wipe\s+the|clear\s+the\s+(database|table)|"
+    r"\bgit\s+(push|merge|rebase|reset\s+--hard)|git-push|gh\s+(pr\s+merge|repo\s+delete)|"
+    r"rm\s+-r|rimraf|find\s+.*-delete|rmtree)",
     re.IGNORECASE,
 )
 HEARTBEAT_TTL_SECONDS = 120
@@ -152,8 +158,8 @@ def dispatch_once(root: Path, *, adapter: TmuxAdapterBase | None = None) -> dict
         claimed = le.claim(root, orchestrator_id="loopd", agent=str(worker.get("agent", "agent")),
                            request_id=rid)
         lease = (claimed.get("request") or {}).get("lease_id") if isinstance(claimed, dict) else None
-        if not lease:
-            skipped += 1
+        if not lease or not re.fullmatch(r"[0-9a-f]{8,64}", str(lease)):
+            skipped += 1   # only a well-formed hex lease is injected (no control chars into tmux)
             continue
         if not adapter.inject(pane, _task_injection(request, worker, str(lease))):
             skipped += 1

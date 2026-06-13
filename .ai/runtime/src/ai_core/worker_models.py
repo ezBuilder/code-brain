@@ -22,12 +22,43 @@ MODELS_PARTS = (".ai", "runtime", "state", "worker-models.json")
 DEFAULTS: dict[str, dict[str, Any]] = {
     "codex": {"model": "gpt-5.5", "reasoning": "xhigh", "flags": []},
     "claude": {"model": "claude-opus-4-8", "reasoning": "high", "flags": ["--model", "claude-opus-4-8"]},
-    "agy": {"model": "default", "reasoning": "high", "flags": []},
+    "agy": {"model": "Gemini 3.1 Pro (High)", "reasoning": "high",
+            "flags": ["--model", "Gemini 3.1 Pro (High)"]},
 }
+
+
+# Opt-in autonomy flags per agent: skip interactive permission prompts so a warm worker can
+# run the loop protocol unattended. The SAFETY BOUNDARY is loopd's dispatch approval-gate
+# (high-risk/secret/destructive work is parked, never dispatched) — these flags only remove
+# the per-command prompt for the low-risk work loopd already cleared. Off by default.
+AUTONOMY_FLAGS: dict[str, list[str]] = {
+    "codex": ["--dangerously-bypass-approvals-and-sandbox"],
+    "claude": ["--permission-mode", "bypassPermissions"],
+    "agy": ["--dangerously-skip-permissions"],
+}
+
+
+def autonomy_flags(agent: str) -> list[str]:
+    return list(AUTONOMY_FLAGS.get(str(agent).strip().lower(), []))
 
 
 def models_path(root: Path) -> Path:
     return root.joinpath(*MODELS_PARTS)
+
+
+# Operator config (worker-models.json) may NOT smuggle permission-bypass flags through the model
+# flags list — autonomy is reachable ONLY via the explicit --autonomous launch flag.
+_FORBIDDEN_FLAG = ("bypass", "dangerous", "skip-permission", "permission-mode", "no-sandbox", "yolo")
+
+
+def _sanitize_flags(flags: Any) -> list[str]:
+    out: list[str] = []
+    for f in (flags or []):
+        s = str(f)
+        if any(bad in s.lower() for bad in _FORBIDDEN_FLAG):
+            continue
+        out.append(s)
+    return out
 
 
 def _overrides(root: Path) -> dict[str, Any]:
@@ -48,8 +79,7 @@ def resolve_model(root: Path, agent: str) -> dict[str, Any]:
         base["source"] = "operator-override"
     else:
         base["source"] = "wrapper-default"
-    flags = base.get("flags")
-    base["flags"] = [str(f) for f in flags] if isinstance(flags, list) else []
+    base["flags"] = _sanitize_flags(base.get("flags"))  # never carry a bypass flag via config
     return base
 
 

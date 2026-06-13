@@ -159,10 +159,21 @@ def recovery_tick(root: Path, *, now_seconds: float | None = None) -> dict[str, 
     from datetime import datetime, timezone
 
     moment = datetime.now(timezone.utc).timestamp() if now_seconds is None else now_seconds
+    qroot = le.loop_root(root)
+    freed: list[str] = []
     stale: list[str] = []
     for w in wr.list_workers(root):
         if w.get("state") not in ("assigned", "working", "reviewing"):
             continue
+        # completion → idle: if the worker's request left processing (done/dead), free the worker.
+        rid = str(w.get("current_request_id") or "")
+        if rid:
+            in_processing = (qroot / "processing" / f"{rid}.json").exists()
+            settled = (qroot / "done" / f"{rid}.json").exists() or (qroot / "dead" / f"{rid}.json").exists()
+            if settled and not in_processing:
+                wr.set_state(root, worker_id=w["worker_id"], state="idle", request_id=None)
+                freed.append(w["worker_id"])
+                continue
         beat = wr.read_heartbeat(root, w["worker_id"]) or {}
         seen = str(beat.get("last_seen_at") or w.get("heartbeat_at") or "")
         try:
@@ -178,7 +189,8 @@ def recovery_tick(root: Path, *, now_seconds: float | None = None) -> dict[str, 
         recovered = int(rec.get("recovered", 0)) if isinstance(rec, dict) else 0
     except Exception:
         pass
-    return {"ok": True, "stale_workers": stale, "recovered_requests": recovered, "llm_idle_polls": 0}
+    return {"ok": True, "freed_workers": freed, "stale_workers": stale,
+            "recovered_requests": recovered, "llm_idle_polls": 0}
 
 
 def status(root: Path) -> dict[str, Any]:

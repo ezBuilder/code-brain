@@ -193,6 +193,27 @@ def build_parser() -> argparse.ArgumentParser:
     ld_up = loopd_sub.add_parser("up")
     ld_up.add_argument("--dry-run", action="store_true", dest="dry_run")
     ld_up.add_argument("--json", action="store_true", dest="command_json")
+    acct_sub = loopd_sub.add_parser("account").add_subparsers(dest="account_command", required=True)
+    a_add = acct_sub.add_parser("add")
+    a_add.add_argument("--agent", required=True, choices=["codex", "claude", "agy"])
+    a_add.add_argument("--account", required=True)
+    a_add.add_argument("--json", action="store_true", dest="command_json")
+    a_login = acct_sub.add_parser("login")
+    a_login.add_argument("--agent", required=True, choices=["codex", "claude", "agy"])
+    a_login.add_argument("--account", required=True)
+    a_login.add_argument("--json", action="store_true", dest="command_json")
+    a_list = acct_sub.add_parser("list")
+    a_list.add_argument("--agent", default=None, choices=["codex", "claude", "agy"])
+    a_list.add_argument("--json", action="store_true", dest="command_json")
+    models_sub = loopd_sub.add_parser("models").add_subparsers(dest="models_command", required=True)
+    m_list = models_sub.add_parser("list")
+    m_list.add_argument("--json", action="store_true", dest="command_json")
+    m_set = models_sub.add_parser("set")
+    m_set.add_argument("--agent", required=True, choices=["codex", "claude", "agy"])
+    m_set.add_argument("--model", required=True)
+    m_set.add_argument("--reasoning", default="high")
+    m_set.add_argument("--flag", action="append", default=[], dest="model_flags")
+    m_set.add_argument("--json", action="store_true", dest="command_json")
 
     worker_sub = loopd_sub.add_parser("worker").add_subparsers(dest="worker_command", required=True)
     w_reg = worker_sub.add_parser("register")
@@ -912,6 +933,29 @@ def main(argv: list[str] | None = None) -> int:
                 from . import worker_launch as _wl
                 emit(_wl.launch_pool(root, dry_run=args.dry_run), as_json=as_json)
                 return OK
+            if args.loopd_command == "account":
+                reject_ci_write("loopd")
+                from . import worker_profiles as _wp
+                if args.account_command == "add":
+                    emit(_wp.add_account(root, agent=args.agent, account=args.account), as_json=as_json)
+                    return OK
+                if args.account_command == "list":
+                    emit({"ok": True, "accounts": _wp.list_accounts(root, agent=args.agent)}, as_json=as_json)
+                    return OK
+                if args.account_command == "login":
+                    from . import worker_launch as _wl
+                    emit(_wl.account_login(root, agent=args.agent, account=args.account), as_json=as_json)
+                    return OK
+            if args.loopd_command == "models":
+                from . import worker_models as _wm
+                if args.models_command == "list":
+                    emit(_wm.list_models(root), as_json=as_json)
+                    return OK
+                if args.models_command == "set":
+                    reject_ci_write("loopd")
+                    emit(_wm.set_model(root, agent=args.agent, model=args.model,
+                                       reasoning=args.reasoning, flags=args.model_flags), as_json=as_json)
+                    return OK
         if args.command == "loopd" and args.loopd_command == "worker":
             from . import worker_profiles as _wp
             from . import worker_registry as _wr

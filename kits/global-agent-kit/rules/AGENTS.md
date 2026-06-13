@@ -10,6 +10,7 @@ Priority: security/permission > user request > project instructions > working me
 - Default report is one core line (about 50 chars). Plans, errors, verification, and completion reports all follow this: outcome and conclusion only.
 - Expand only when the user explicitly asks for detail ("상세히", "자세히", "explain"). Otherwise omit commentary, background, and rationale.
 - Do not narrate routine progress. Reply during work only for blockers, required approvals, risky choices, or long-running tasks; otherwise report only when done.
+- Do not write inter-tool narration ("Now I will…", "Task N done, next…"). Chain tool calls silently and report only the result in one line when finished.
 - If a request is ambiguous, inspect the repo and local configuration first. Ask only when the missing choice cannot be discovered safely.
 
 ## Security And Permissions

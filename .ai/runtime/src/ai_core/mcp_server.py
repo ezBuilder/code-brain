@@ -293,6 +293,15 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "tool_search",
+        "description": (
+            "Find Code Brain MCP tools by keyword and get their full schemas. Use this when the "
+            "default tool list is compact (AI_MCP_COMPACT_TOOLS) and the tool you need is not loaded."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "query": {"type": "string"}, "limit": {"type": "integer", "default": 8}}, "required": ["query"]},
+    },
+    {
         "name": "lessons_recall",
         "description": (
             "Recall distilled lessons relevant to a query (failure-prevention strategies mined "
@@ -833,8 +842,26 @@ TOOL_NAMES = frozenset(MCP_METHODS)
 _TOOLS_LIST_CACHE: dict[str, Any] | None = None
 
 
+# Hot tools surfaced by default in compact mode; the rest load on demand via tool_search.
+# Opt-in (AI_MCP_COMPACT_TOOLS=1) — cuts the fixed per-session tool-schema token cost for
+# clients without their own deferred-loading (landscape P1). Default OFF = no behavior change.
+_CORE_TOOLS = frozenset({
+    "code_query", "context_pack", "code_read_hashline",
+    "code_graph_callers", "code_graph_callees", "code_graph_symbol", "code_graph_architecture",
+    "ast_grep_search", "lessons_recall", "record_decision", "record_todo", "memory_query",
+    "tool_search",
+})
+
+
+def _compact_tools_enabled() -> bool:
+    import os
+    return str(os.environ.get("AI_MCP_COMPACT_TOOLS", "")).strip() not in ("", "0", "false", "no")
+
+
 def _build_tools_list_payload() -> dict[str, Any]:
     """Build the tools/list result payload. Pure function over module constants."""
+    if _compact_tools_enabled():
+        return {"tools": [dict(t) for t in TOOLS if t["name"] in _CORE_TOOLS]}
     return {"tools": [dict(tool) for tool in TOOLS]}
 
 
@@ -1088,6 +1115,18 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             path=args.get("path") if isinstance(args.get("path"), str) else None,
             max_results=int(args.get("max_results", 40) or 40),
         )
+    if name == "tool_search":
+        q = str(args.get("query", "")).strip().lower()
+        terms = [t for t in q.split() if t]
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for tool in TOOLS:
+            hay = (tool["name"] + " " + str(tool.get("description", ""))).lower()
+            score = sum(1 for t in terms if t in hay)
+            if score:
+                scored.append((score, tool))
+        scored.sort(key=lambda s: s[0], reverse=True)
+        limit = int(args.get("limit", 8) or 8)
+        return {"ok": True, "tools": [dict(t) for _, t in scored[:limit]]}
     if name == "lessons_recall":
         recall_query = args.get("query")
         if not isinstance(recall_query, str) or not recall_query.strip():

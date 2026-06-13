@@ -298,6 +298,38 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "loop_submit",
+        "description": (
+            "Queue a task for the multi-agent worker pool. The orchestrator later routes it to the "
+            "cheapest adequate worker/model. Use this when the user wants work delegated to "
+            "codex/claude/agy workers. Then call loopd_dispatch_once. Write-class."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "instruction": {"type": "string", "description": "the full task to perform"},
+            "goal": {"type": "string", "description": "one-line goal"},
+            "model_tier": {"type": "string", "enum": ["cheap", "balanced", "best"], "description": "force a tier (else auto by complexity)"},
+            "reviewer_required": {"type": "boolean", "default": False},
+            "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"], "default": "P1"}},
+            "required": ["instruction"]},
+    },
+    {
+        "name": "loopd_up",
+        "description": (
+            "Bring up the warm worker pool (one tmux worker per registered profile). dry_run shows "
+            "the plan. autonomous skips per-command prompts (safety = dispatch gate). tier sets the "
+            "model cost tier. Use when the user wants to start the codex/claude/agy pool. Write-class."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "autonomous": {"type": "boolean", "default": False},
+            "tier": {"type": "string", "enum": ["cheap", "balanced", "best"]},
+            "dry_run": {"type": "boolean", "default": False}}},
+    },
+    {
+        "name": "loopd_recover",
+        "description": "loopd maintenance tick: free completed workers to idle, flag stale, nudge benign interrupts. No LLM.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "loopd_dispatch_once",
         "description": "Run one deterministic loopd dispatch tick (assign pending work to idle workers; park high-risk). No LLM. Write-class.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -1131,6 +1163,35 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "loopd_dispatch_once":
         from . import loopd as _ld
         return _ld.dispatch_once(root)
+    if name == "loopd_recover":
+        from . import loopd as _ld
+        return _ld.recovery_tick(root)
+    if name == "loop_submit":
+        instruction = args.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError("loop_submit requires non-empty instruction")
+        from . import loop_engineering as _le
+        dispatch = {"model_tier": args["model_tier"]} if args.get("model_tier") in ("cheap", "balanced", "best") else None
+        goal = str(args.get("goal") or "").strip() or instruction.strip().splitlines()[0][:120]
+        res = _le.submit(root, instruction=instruction, goal=goal,
+                         reviewer_required=bool(args.get("reviewer_required", False)),
+                         priority=str(args.get("priority", "P1") or "P1"))
+        if dispatch and res.get("ok"):
+            # tag the queued request with the forced tier so the orchestrator honors it
+            from .loop_engineering import loop_root as _lr
+            import json as _json
+            p = _lr(root) / "inbox" / f"{res['request']['id']}.json"
+            try:
+                d = _json.loads(p.read_text(encoding="utf-8")); d["dispatch"] = dispatch
+                p.write_text(_json.dumps(d), encoding="utf-8")
+            except Exception:
+                pass
+        return res
+    if name == "loopd_up":
+        from . import worker_launch as _wl
+        return _wl.launch_pool(root, dry_run=bool(args.get("dry_run", False)),
+                               autonomous=bool(args.get("autonomous", False)),
+                               tier=args.get("tier") if args.get("tier") in ("cheap", "balanced", "best") else None)
     if name == "tool_search":
         q = str(args.get("query", "")).strip().lower()
         terms = [t for t in q.split() if t]

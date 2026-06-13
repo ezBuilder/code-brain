@@ -255,6 +255,24 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "ast_grep_search",
+        "description": (
+            "Structural (AST) code search: find code matching a syntactic pattern in a language "
+            "(e.g. pattern 'except: $$$' lang python, or 'fetch($URL)' lang ts). Precise refactor/"
+            "audit retrieval BM25 cannot do. Read-only, repo-scoped. Use code_query for intent/keyword search."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "ast-grep pattern; $VAR / $$$ metavars"},
+                "lang": {"type": "string", "description": "python|javascript|typescript|tsx|go|rust|java|..."},
+                "path": {"type": "string", "description": "optional repo-relative subpath to scope"},
+                "max_results": {"type": "integer", "default": 40},
+            },
+            "required": ["pattern", "lang"],
+        },
+    },
+    {
         "name": "lessons_recall",
         "description": (
             "Recall distilled lessons relevant to a query (failure-prevention strategies mined "
@@ -1024,6 +1042,18 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             retest_after=args.get("retest_after") if isinstance(args.get("retest_after"), str) else None,
             status=args.get("status") if isinstance(args.get("status"), str) else None,
             supersedes_id=args.get("supersedes_id") if isinstance(args.get("supersedes_id"), str) else None,
+        )
+    if name == "ast_grep_search":
+        pattern = args.get("pattern")
+        lang = args.get("lang")
+        if not isinstance(pattern, str) or not isinstance(lang, str):
+            raise ValueError("ast_grep_search requires pattern and lang")
+        from .astgrep_integration import ast_grep_search
+
+        return ast_grep_search(
+            root, pattern=pattern, lang=lang,
+            path=args.get("path") if isinstance(args.get("path"), str) else None,
+            max_results=int(args.get("max_results", 40) or 40),
         )
     if name == "lessons_recall":
         query = args.get("query")

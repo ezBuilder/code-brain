@@ -146,6 +146,61 @@ def scan_path(
     return findings
 
 
+_SG_LANGS = {
+    "python", "py", "javascript", "js", "typescript", "ts", "tsx", "jsx",
+    "go", "rust", "rs", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "scala",
+}
+_SG_LANG_ALIAS = {"py": "python", "js": "javascript", "ts": "typescript", "rs": "rust"}
+
+
+def ast_grep_search(
+    root: Path,
+    *,
+    pattern: str,
+    lang: str,
+    path: str | None = None,
+    max_results: int = 40,
+    timeout_seconds: float = 8.0,
+) -> dict:
+    """Agent-facing structural (AST) search: find code matching ``pattern`` in ``lang``.
+
+    Read-only, repo-scoped, no shell. Returns compact {file,line,text} hits — precise
+    structural matching BM25 cannot do (refactor/audit queries). Fails soft.
+    """
+    # validate inputs first (always enforced, even when ast-grep is absent)
+    lang_norm = _SG_LANG_ALIAS.get(str(lang or "").strip().lower(), str(lang or "").strip().lower())
+    if lang_norm not in _SG_LANGS:
+        return {"ok": False, "reason": f"unsupported lang: {lang}", "matches": []}
+    pat = str(pattern or "").strip()
+    if not pat:
+        return {"ok": False, "reason": "empty pattern", "matches": []}
+    # scope target strictly inside the repo (no traversal outside root)
+    root = Path(root).resolve()
+    target = root
+    if path:
+        cand = (root / path).resolve()
+        if root == cand or root in cand.parents:
+            target = cand
+        else:
+            return {"ok": False, "reason": "path escapes repo", "matches": []}
+    if not astgrep_available():
+        return {"ok": False, "reason": "ast-grep not installed", "matches": []}
+    rule_yaml = "id: cb-search\nlanguage: {lang}\nrule:\n  pattern: |\n    {pat}\n".format(
+        lang=lang_norm, pat=pat.replace("\n", "\n    "))
+    from .redact import redact_value
+
+    findings = scan_path(target, rule_yaml, timeout_seconds=timeout_seconds)
+    matches: list[dict] = []
+    for f in findings[: max(1, int(max_results))]:
+        rng = f.get("range") if isinstance(f, dict) else None
+        start = (rng or {}).get("start") if isinstance(rng, dict) else None
+        line = (start or {}).get("line") if isinstance(start, dict) else None
+        rel = str(f.get("file", ""))
+        text = str(redact_value(str(f.get("text", ""))))[:200]
+        matches.append({"file": rel, "line": (line + 1) if isinstance(line, int) else None, "text": text})
+    return {"ok": True, "count": len(matches), "lang": lang_norm, "matches": matches}
+
+
 def extract_symbols_js(file_path: str) -> list[dict]:
     """Extract function/class symbols from JS/TS file using ast-grep.
 

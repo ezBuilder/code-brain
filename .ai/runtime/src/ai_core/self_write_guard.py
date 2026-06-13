@@ -54,10 +54,49 @@ M_CORE: tuple[dict[str, Any], ...] = (
 )
 
 
-def validate_self_write(text: str) -> dict[str, Any]:
-    """Return {ok, violations}. ok=False means the text tries to weaken a core invariant."""
+# A self-improvement rule may only tune BEHAVIOUR/STYLE (brevity, verification, reporting). It may
+# never even MENTION a security-sensitive domain — that is an allow-by-domain defence that closes
+# the open-ended "soften the rule" phrasings keyword-verb matching misses. Any rule touching these
+# domains is refused outright; legitimate behavioural rules never need these words.
+_FORBIDDEN_DOMAIN = re.compile(
+    r"(보안|security|safety|인증|\bauth|oauth|권한|permission|승인|approval|허가|consent|"
+    r"시크릿|secret|크리덴셜|credential|토큰|token|\.env|환경\s*변수|env\s*var|api[\s._\-]?key|"
+    r"private[\s._\-]?key|비밀번호|password|passwd|배포|deploy|prod|커밋|commit|푸시|push|"
+    r"머지|merge|리베이스|rebase|삭제|delete|drop|truncate|rm\s|redact|마스킹|결제|billing|payment|"
+    r"sandbox|샌드박스|bypass|우회|disable|비활성|kubectl|terraform)",
+    re.IGNORECASE,
+)
+
+
+# Common Cyrillic/Greek homoglyphs → Latin, so "аuth"/"ѕecret" cannot smuggle a domain word past
+# the ASCII patterns. (unicodedata has no confusables table; this small map covers the usual ones.)
+_CONFUSABLE = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "с": "c", "р": "p", "х": "x", "у": "y", "ѕ": "s", "і": "i",
+    "ј": "j", "ԁ": "d", "ո": "n", "ɡ": "g", "ｅ": "e", "А": "A", "Е": "E", "О": "O", "С": "C",
+    "Р": "P", "Х": "X", "ο": "o", "ν": "v", "α": "a",
+})
+
+
+def _fold(text: str) -> str:
+    """Canonical form for matching: NFKC folds fullwidth/compatibility forms WITHOUT decomposing
+    Hangul (so Korean keywords stay intact), and confusable homoglyphs are mapped to Latin. The
+    original, NFKC, and de-confused copies are all searched so KO and Latin patterns both match."""
+    import unicodedata
+
     body = str(text or "")
+    nfkc = unicodedata.normalize("NFKC", body)
+    deconf = nfkc.translate(_CONFUSABLE)
+    return f"{body} {nfkc} {deconf}"
+
+
+def validate_self_write(text: str) -> dict[str, Any]:
+    """Return {ok, violations}. ok=False means the text touches a protected domain / weakens a core invariant."""
+    body = _fold(text)
     violations: list[dict[str, str]] = []
+    dom = _FORBIDDEN_DOMAIN.search(body)
+    if dom:
+        # a behavioural self-improvement rule has no business mentioning a security domain at all
+        violations.append({"invariant": "out_of_scope_domain", "matched": dom.group(0)[:60]})
     for inv in M_CORE:
         for pat in inv["forbid"]:
             m = re.search(pat, body, re.IGNORECASE)

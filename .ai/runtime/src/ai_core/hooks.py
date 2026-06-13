@@ -1602,8 +1602,18 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
 
                     last_msg = payload.get("last_assistant_message")
                     output_chars = len(last_msg) if isinstance(last_msg, str) else 0
-                    prompt_growth.tick(root, output_chars=output_chars,
-                                       agent=normalize_agent(payload))
+                    grew = prompt_growth.tick(root, output_chars=output_chars,
+                                              agent=normalize_agent(payload))
+                    # closed self-improvement loop (opt-in): periodically queue a cheap-judge
+                    # review for the loopd pool. Enqueue only — no LLM here, never blocks.
+                    if _env_enabled("AI_SELF_IMPROVE_AUTO", default="0"):
+                        turns = int(grew.get("turns", 0)) if isinstance(grew, dict) else 0
+                        if turns and turns % 25 == 0:
+                            try:
+                                from . import self_improve
+                                self_improve.enqueue_review(root, tier="cheap")
+                            except Exception:
+                                pass
                 except Exception:
                     pass
             # T35 autonomous page-out: when MemGPT pressure breaches threshold,

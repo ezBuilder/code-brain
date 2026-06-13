@@ -22,14 +22,29 @@ from typing import Any
 from .memory import append_audit, append_jsonl, now_iso, read_jsonl_all
 
 
+_ALLOWED_RULE_SOURCES = frozenset({
+    "prompt_growth.deterministic", "self-improve", "self-improve-judge", "cli",
+})
+
+
+def _sanitize_rule_text(text: str) -> str:
+    """A learned rule is injected into the agent's context — strip prompt-injection vectors:
+    collapse newlines (no closing the block / opening a fake section) and drop structural markdown."""
+    import re
+
+    one_line = " ".join(str(text or "").split())
+    one_line = re.sub(r"(^|\s)([#>]|---+|```+|===+)", " ", one_line)  # headers / hr / fences / blockquote
+    return one_line.replace("`", "").strip()[:400]
+
+
 def _guard_self_write(text: str) -> dict[str, Any]:
-    """Fail-open wrapper: if the guard errors, do not block growth (deterministic rule is safe)."""
+    """Fail-CLOSED: if the guard errors, REFUSE the self-write (never inject an unvetted rule)."""
     try:
         from .self_write_guard import validate_self_write
 
         return validate_self_write(text)
-    except Exception:
-        return {"ok": True, "violations": []}
+    except Exception as exc:
+        return {"ok": False, "violations": [{"invariant": "guard_error", "matched": str(exc)[:60]}]}
 
 LOG_PARTS = (".ai", "memory", "prompt_growth.jsonl")
 LEARNED_PARTS = (".ai", "memory", "learned_prompt.md")
@@ -93,6 +108,14 @@ def _recent(root: Path, n: int) -> list[dict[str, Any]]:
         return read_jsonl_all(log_path(root))[-n:]
     except Exception:
         return []
+
+
+def _recent_output_avg(root: Path, n: int) -> float:
+    """Mean output_chars over the last n turn-observations — a direct, per-turn, non-cumulative
+    signal for the ratchet (immune to the cumulative-token distortion/gaming)."""
+    obs = _recent(root, max(1, int(n)))
+    vals = [int(o.get("output_chars", 0) or 0) for o in obs if isinstance(o, dict)]
+    return (sum(vals) / len(vals)) if vals else 0.0
 
 
 # --- 2. measurement (real tokens only, no estimates) ---
@@ -159,6 +182,61 @@ def learned_prompt_text(root: Path) -> str:
         return ""
 
 
+def apply_external_rule(root: Path, *, rule_id: str, text: str, source: str = "self-improve",
+                        rationale: str = "") -> dict[str, Any]:
+    """Apply a judge-proposed prompt rule under the SAME ratchet as deterministic growth.
+
+    The closed self-improvement loop calls this: a cheap non-self judge proposes a generalized
+    rule, it passes the M_core write-gate here, and it enters the prompt_growth state as an
+    `active` rule with a measured token baseline — the existing ratchet then KEEPS it only if real
+    output tokens do not regress, else rolls it back. Never blocks a turn; fully reversible.
+    """
+    rule_id = "".join(c for c in str(rule_id) if c.isalnum() or c in "-_")[:64] or "ext"
+    source = str(source or "self-improve")[:64]
+    if source not in _ALLOWED_RULE_SOURCES:
+        return {"ok": False, "reason": "untrusted_source", "source": source}
+    text = _sanitize_rule_text(text)  # strip newlines / markdown injection vectors
+    if not text:
+        return {"ok": False, "reason": "empty_rule"}
+    verdict = _guard_self_write(text)
+    if not verdict.get("ok", True):
+        append_audit(root, action="prompt_growth.blocked", category="prompt_growth",
+                     payload={"id": rule_id, "violations": verdict.get("violations", [])})
+        return {"ok": False, "reason": "core_invariant_violation", "violations": verdict.get("violations", [])}
+    try:
+        state = _read_state(root)
+        rules = dict(_active_rules(state))
+        existing = rules.get(rule_id)
+        if existing and existing.get("status") in {"active", "kept"}:
+            return {"ok": True, "status": "already_active", "id": rule_id}
+        if existing and existing.get("status") == "regressed":
+            return {"ok": True, "status": "previously_regressed", "id": rule_id}
+        # dedup by text too — do not re-add a rule the judge already proposed under another id
+        for r in rules.values():
+            if str(r.get("text", "")).strip() == text and r.get("status") in {"active", "kept", "regressed"}:
+                return {"ok": True, "status": "duplicate_text", "id": r.get("id")}
+        rules[rule_id] = {
+            "id": rule_id,
+            "text": text,
+            "status": "active",
+            "applied_at": now_iso(),
+            "applied_turns": int(state.get("turns", 0)),
+            "baseline_tokens": _output_tokens(root),
+            "baseline_obs_avg": _recent_output_avg(root, RATCHET_WINDOW),
+            "rationale": str(rationale or "")[:300],
+            "source": str(source or "self-improve")[:64],
+        }
+        state["rules"] = rules
+        _write_state(root, state)
+        _render_learned(root, state)
+        _snapshot_version(root, state, reason=f"apply:{rule_id}")
+        append_audit(root, action="prompt_growth.external_apply", category="prompt_growth",
+                     payload={"id": rule_id, "source": source})
+        return {"ok": True, "status": "applied", "id": rule_id}
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc)}
+
+
 # --- 4. the deterministic growth + ratchet loop ---
 
 def evaluate_and_grow(root: Path) -> dict[str, Any]:
@@ -180,15 +258,19 @@ def _evaluate_and_grow(root: Path) -> dict[str, Any]:
     for rid, rule in list(rules.items()):
         if rule.get("status") != "active":
             continue
-        baseline = rule.get("baseline_tokens")
-        applied_turns = rule.get("applied_turns")
         turns_now = state.get("turns", 0)
-        if baseline is None or applied_turns is None:
+        applied_turns = rule.get("applied_turns")
+        if applied_turns is None:
             continue
-        if turns_now - applied_turns < RATCHET_WINDOW:
+        window_turns = turns_now - applied_turns
+        if window_turns < RATCHET_WINDOW:
             continue
-        # judge once: did real output tokens regress since applying this rule?
-        if baseline > 0 and cur_tokens > baseline * RATCHET_REGRESS:
+        # Judge by output_chars averaged over a WINDOW (per-turn, non-cumulative → not gameable by
+        # usage volume). pre = the window captured just before applying the rule; post = the window
+        # since. A rule that genuinely worsened output (longer) over a fair window is rolled back.
+        pre_avg = float(rule.get("baseline_obs_avg") or 0.0)
+        post_avg = _recent_output_avg(root, min(window_turns, RATCHET_WINDOW))
+        if pre_avg > 0 and post_avg > pre_avg * RATCHET_REGRESS:
             rule["status"] = "regressed"
             rule["rolled_back_at"] = now_iso()
             actions.append(f"rollback:{rid}")
@@ -222,6 +304,7 @@ def _evaluate_and_grow(root: Path) -> dict[str, Any]:
                     "applied_at": now_iso(),
                     "applied_turns": state.get("turns", 0),
                     "baseline_tokens": cur_tokens,
+                    "baseline_obs_avg": _recent_output_avg(root, RATCHET_WINDOW),
                     "violation_rate": round(rate, 3),
                     "source": "prompt_growth.deterministic",
                 }

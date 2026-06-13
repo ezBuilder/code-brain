@@ -580,7 +580,10 @@ def _conflicting_decisions(root: Path, text: str, *, limit: int = 5) -> list[dic
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
-    hits: list[dict[str, Any]] = []
+    # Fold by id first so a superseded/retired failure (reused-id reappend) does not get
+    # double-counted, and its now-retired original is dropped from the conflict scan.
+    folded: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for line in lines[-_CONFLICT_SCAN:]:
         line = line.strip()
         if not line:
@@ -589,6 +592,17 @@ def _conflicting_decisions(root: Path, text: str, *, limit: int = 5) -> list[dic
             record = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(record, dict):
+            continue
+        rid = str(record.get("id") or f"_anon{len(order)}")
+        if rid not in folded:
+            order.append(rid)
+        folded[rid] = record
+    hits: list[dict[str, Any]] = []
+    for rid in order:
+        record = folded[rid]
+        if record.get("kind") == "failure" and str(record.get("status", "observed")) in {"stale", "refuted"}:
+            continue  # retired failures are not durable rules; never a contradiction source
         existing = str(record.get("decision", ""))
         existing_tokens = _significant_tokens(existing)
         if not existing_tokens:

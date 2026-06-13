@@ -259,6 +259,14 @@ def build_parser() -> argparse.ArgumentParser:
     memory_decision_add.add_argument("--text", required=True)
     memory_decision_add.add_argument("--tag", action="append", default=[])
     memory_decision_add.add_argument("--source", default="operator")
+    memory_decision_add.add_argument("--kind", choices=["decision", "failure"])
+    memory_decision_add.add_argument("--observed-at", dest="observed_at")
+    memory_decision_add.add_argument("--observed-version", action="append", default=[], dest="observed_version",
+                                     help="key=value; repeatable (failure only)")
+    memory_decision_add.add_argument("--environment")
+    memory_decision_add.add_argument("--retest-after", dest="retest_after")
+    memory_decision_add.add_argument("--status", choices=["observed", "confirmed", "stale", "refuted"])
+    memory_decision_add.add_argument("--supersedes-id", dest="supersedes_id")
     memory_decision_add.add_argument("--json", action="store_true", dest="command_json")
     memory_todo = memory_sub.add_parser("todo")
     memory_todo_sub = memory_todo.add_subparsers(dest="memory_todo_command", required=True)
@@ -1002,7 +1010,22 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "memory" and args.memory_command == "decision" and args.memory_decision_command == "add":
             reject_ci_write("memory")
             from .memory import append_decision
-            payload = append_decision(root, text=args.text, tags=args.tag, source=args.source)
+            obs_versions: dict[str, str] = {}
+            for pair in (getattr(args, "observed_version", None) or []):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    if k.strip():
+                        obs_versions[k.strip()] = v.strip()
+            payload = append_decision(
+                root, text=args.text, tags=args.tag, source=args.source,
+                kind=getattr(args, "kind", None),
+                observed_at=getattr(args, "observed_at", None),
+                observed_versions=obs_versions or None,
+                environment=getattr(args, "environment", None),
+                retest_after=getattr(args, "retest_after", None),
+                status=getattr(args, "status", None),
+                supersedes_id=getattr(args, "supersedes_id", None),
+            )
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "memory" and args.memory_command == "todo" and args.memory_todo_command == "add":

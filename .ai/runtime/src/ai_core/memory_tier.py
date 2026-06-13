@@ -425,7 +425,18 @@ def retention_report(root: Path, *, evict_limit: int = 50) -> dict[str, Any]:
 
     scored: list[dict[str, Any]] = []
 
+    # Fold by id so a superseded failure (reused-id reappend) is scored once, not N times.
+    _decisions_by_id: dict[str, dict[str, Any]] = {}
+    _decisions_order: list[str] = []
     for rec in read_jsonl_all(decisions_path(root)):
+        if not isinstance(rec, dict):
+            continue
+        rid = str(rec.get("id") or f"_anon{len(_decisions_order)}")
+        if rid not in _decisions_by_id:
+            _decisions_order.append(rid)
+        _decisions_by_id[rid] = rec
+    for rid in _decisions_order:
+        rec = _decisions_by_id[rid]
         s = retention_score(mem_type="decision", age_days=_age_days(rec))
         scored.append({
             "kind": "decision",

@@ -230,13 +230,26 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "record_decision",
-        "description": "Persist decision to .ai/memory/decisions.jsonl. Auto-injected next session. Write-class.",
+        "description": (
+            "Persist a decision (or a re-testable failure) to .ai/memory/decisions.jsonl. "
+            "Auto-injected next session. For a failure/negative result set kind='failure' and "
+            "record observed_versions/environment/retest_after so it reads as a dated, re-testable "
+            "observation — NOT a permanent ban. A later success retires it: kind='failure', "
+            "status='refuted', supersedes_id=<original id>. Write-class."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "source": {"type": "string", "default": "agent"},
+                "kind": {"type": "string", "enum": ["decision", "failure"]},
+                "observed_at": {"type": "string", "description": "ISO-8601; when the failure was reproduced"},
+                "observed_versions": {"type": "object", "description": "versions seen under, e.g. {torch: 2.4.0}"},
+                "environment": {"type": "string", "description": "scope: host/preset/codepath"},
+                "retest_after": {"type": "string", "description": "ISO date; re-test backstop"},
+                "status": {"type": "string", "enum": ["observed", "confirmed", "stale", "refuted"]},
+                "supersedes_id": {"type": "string", "description": "retire this prior failure id"},
             },
             "required": ["text"],
         },
@@ -988,6 +1001,13 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             text=text,
             tags=args.get("tags") if isinstance(args.get("tags"), list) else None,
             source=str(args.get("source", "agent")),
+            kind=args.get("kind") if isinstance(args.get("kind"), str) else None,
+            observed_at=args.get("observed_at") if isinstance(args.get("observed_at"), str) else None,
+            observed_versions=args.get("observed_versions") if isinstance(args.get("observed_versions"), dict) else None,
+            environment=args.get("environment") if isinstance(args.get("environment"), str) else None,
+            retest_after=args.get("retest_after") if isinstance(args.get("retest_after"), str) else None,
+            status=args.get("status") if isinstance(args.get("status"), str) else None,
+            supersedes_id=args.get("supersedes_id") if isinstance(args.get("supersedes_id"), str) else None,
         )
     if name == "record_todo":
         title = args.get("title")

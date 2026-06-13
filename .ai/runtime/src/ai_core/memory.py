@@ -58,28 +58,114 @@ def _short_id(prefix: str) -> str:
     return f"{prefix}-{secrets.token_hex(4)}"
 
 
+FAILURE_STATUSES = ("observed", "confirmed", "stale", "refuted")
+_RETIRED_STATUSES = frozenset({"stale", "refuted"})
+
+
+def _norm_kind(kind: str | None) -> str:
+    # unknown coerces to "decision" so a typo can never WIDEN surfacing (fail-safe)
+    return "failure" if str(kind or "").strip().lower() == "failure" else "decision"
+
+
+def _norm_status(status: str | None) -> str:
+    s = str(status or "").strip().lower()
+    return s if s in FAILURE_STATUSES else "observed"
+
+
+def _redact_versions(obj: dict[str, str]) -> dict[str, str]:
+    """Redact BOTH keys and values (redact_value only recurses values) and clamp."""
+    from .redact import redact_value
+
+    out: dict[str, str] = {}
+    for k, v in list(obj.items())[:8]:
+        ck = str(redact_value(str(k)))[:40].strip()
+        cv = str(redact_value(str(v)))[:60]
+        if ck:
+            out[ck] = cv
+    return out
+
+
+def _decision_id_exists(root: Path, dec_id: str) -> bool:
+    for rec in read_jsonl_all(decisions_path(root)):
+        if isinstance(rec, dict) and rec.get("id") == dec_id and rec.get("kind") == "failure":
+            return True
+    return False
+
+
 def append_decision(
     root: Path,
     *,
     text: str,
     tags: list[str] | None = None,
     source: str | None = None,
+    kind: str | None = None,
+    observed_at: str | None = None,
+    observed_versions: dict[str, str] | None = None,
+    environment: str | None = None,
+    retest_after: str | None = None,
+    status: str | None = None,
+    supersedes_id: str | None = None,
 ) -> dict[str, Any]:
     from .redact import redact_value
     text_clean = redact_value(str(text)).strip()
     if not text_clean:
         return {"ok": False, "reason": "empty_text"}
     tag_list = [str(t).strip() for t in (tags or []) if str(t).strip()]
-    record = {
+    # legacy plain decisions stay byte-identical: no new keys are written for them.
+    record: dict[str, Any] = {
         "id": _short_id("dec"),
         "decided_at": now_iso(),
         "decision": text_clean[:1024],
         "tags": tag_list,
         "source": str(source or "operator")[:64],
     }
+    if _norm_kind(kind) == "failure":
+        record["kind"] = "failure"
+        record["status"] = _norm_status(status)
+        if observed_at:
+            record["observed_at"] = str(observed_at)[:32]
+        if observed_versions and isinstance(observed_versions, dict):
+            red = _redact_versions(observed_versions)
+            if red:
+                record["observed_versions"] = red
+        if environment:
+            record["environment"] = str(redact_value(str(environment)))[:128]
+        if retest_after:
+            record["retest_after"] = str(retest_after)[:32]
+        # supersession: reuse the target id so the fold-by-id retires the original
+        if supersedes_id and _decision_id_exists(root, str(supersedes_id)):
+            record["id"] = str(supersedes_id)
     append_jsonl(decisions_path(root), record)
-    append_audit(root, action="memory.decision_add", category="memory", payload={"id": record["id"]})
+    append_audit(root, action="memory.decision_add", category="memory",
+                 payload={"id": record["id"], "kind": record.get("kind", "decision")})
     return {"ok": True, "record": record}
+
+
+def read_decisions_for_surface(root: Path, *, limit: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """One full-file pass → (recent plain decisions, live folded failures newest-first).
+
+    Failures fold by id (last write wins) so a later 'stale'/'refuted' reappend retires the
+    original; retired failures are dropped. Plain decisions and failures are partitioned so
+    failures never consume the plain tail window and retired rows never leak. Fail-soft.
+    """
+    plain: list[dict[str, Any]] = []
+    failures: dict[str, dict[str, Any]] = {}
+    try:
+        rows = read_jsonl_all(decisions_path(root))
+    except Exception:
+        return [], []
+    for rec in rows:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("kind") == "failure":
+            fid = str(rec.get("id") or "")
+            if fid:
+                failures[fid] = rec  # fold
+        else:
+            plain.append(rec)
+    live = [r for r in failures.values() if str(r.get("status", "observed")) not in _RETIRED_STATUSES]
+    live.sort(key=lambda r: str(r.get("observed_at") or r.get("decided_at") or ""), reverse=True)
+    return plain[-limit:], live
 
 
 def append_todo(

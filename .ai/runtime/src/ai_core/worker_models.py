@@ -16,14 +16,31 @@ from typing import Any
 
 MODELS_PARTS = (".ai", "runtime", "state", "worker-models.json")
 
-# Best model per agent + the launch flags that select it.
-# codex/agy: empty flags → use the CLI's configured default (already the strongest tier),
-#            avoiding a wrong-flag launch failure. claude: --model is a known-safe flag.
-DEFAULTS: dict[str, dict[str, Any]] = {
-    "codex": {"model": "gpt-5.5", "reasoning": "xhigh", "flags": []},
-    "claude": {"model": "claude-opus-4-8", "reasoning": "high", "flags": ["--model", "claude-opus-4-8"]},
-    "agy": {"model": "Gemini 3.1 Pro (High)", "reasoning": "high",
-            "flags": ["--model", "Gemini 3.1 Pro (High)"]},
+TIERS = ("cheap", "balanced", "best")
+DEFAULT_TIER = "balanced"  # cost-aware default — NOT the most expensive model
+
+# Per-agent model by tier. The orchestrator routes a task to the cheapest adequate tier; only
+# complex/high-risk work gets the best (most expensive) model. codex keeps its CLI-configured
+# model (flags empty) to avoid a wrong-flag launch failure; claude/agy switch via --model.
+TIER_MODELS: dict[str, dict[str, dict[str, Any]]] = {
+    "codex": {
+        "cheap": {"model": "gpt-5.5", "reasoning": "low", "flags": []},
+        "balanced": {"model": "gpt-5.5", "reasoning": "high", "flags": []},
+        "best": {"model": "gpt-5.5", "reasoning": "xhigh", "flags": []},
+    },
+    "claude": {
+        "cheap": {"model": "claude-haiku-4-5", "reasoning": "low", "flags": ["--model", "claude-haiku-4-5"]},
+        "balanced": {"model": "claude-sonnet-4-6", "reasoning": "high", "flags": ["--model", "claude-sonnet-4-6"]},
+        "best": {"model": "claude-opus-4-8", "reasoning": "high", "flags": ["--model", "claude-opus-4-8"]},
+    },
+    "agy": {
+        "cheap": {"model": "Gemini 3.5 Flash (Medium)", "reasoning": "low",
+                  "flags": ["--model", "Gemini 3.5 Flash (Medium)"]},
+        "balanced": {"model": "Gemini 3.5 Flash (High)", "reasoning": "high",
+                     "flags": ["--model", "Gemini 3.5 Flash (High)"]},
+        "best": {"model": "Gemini 3.1 Pro (High)", "reasoning": "high",
+                 "flags": ["--model", "Gemini 3.1 Pro (High)"]},
+    },
 }
 
 
@@ -69,16 +86,31 @@ def _overrides(root: Path) -> dict[str, Any]:
         return {}
 
 
-def resolve_model(root: Path, agent: str) -> dict[str, Any]:
-    """The model spec to launch `agent` with: {model, reasoning, flags, source}."""
+def norm_tier(tier: str | None) -> str:
+    t = str(tier or "").strip().lower()
+    return t if t in TIERS else DEFAULT_TIER
+
+
+def resolve_model(root: Path, agent: str, *, tier: str | None = None) -> dict[str, Any]:
+    """The model spec to launch `agent` with at the given cost tier: {model, reasoning, flags, tier, source}.
+
+    Operator override (worker-models.json) may pin a whole agent or a specific tier; absent that,
+    the per-agent TIER_MODELS table is used. Default tier is cost-aware (balanced), not the best.
+    """
     a = str(agent).strip().lower()
-    base = dict(DEFAULTS.get(a, {"model": "default", "reasoning": "high", "flags": []}))
+    t = norm_tier(tier)
+    agent_tiers = TIER_MODELS.get(a, {})
+    base = dict(agent_tiers.get(t) or {"model": "default", "reasoning": "high", "flags": []})
     over = _overrides(root).get(a)
     if isinstance(over, dict):
-        base.update({k: over[k] for k in ("model", "reasoning", "flags") if k in over})
+        # override can be a flat spec (applies to all tiers) or {tiers: {best: {...}}}
+        tier_over = (over.get("tiers", {}) or {}).get(t) if isinstance(over.get("tiers"), dict) else None
+        spec = tier_over if isinstance(tier_over, dict) else over
+        base.update({k: spec[k] for k in ("model", "reasoning", "flags") if k in spec})
         base["source"] = "operator-override"
     else:
         base["source"] = "wrapper-default"
+    base["tier"] = t
     base["flags"] = _sanitize_flags(base.get("flags"))  # never carry a bypass flag via config
     return base
 
@@ -103,4 +135,5 @@ def set_model(root: Path, *, agent: str, model: str, reasoning: str = "high",
 
 
 def list_models(root: Path) -> dict[str, Any]:
-    return {"ok": True, "agents": {a: resolve_model(root, a) for a in DEFAULTS}}
+    return {"ok": True, "default_tier": DEFAULT_TIER,
+            "agents": {a: {t: resolve_model(root, a, tier=t) for t in TIERS} for a in TIER_MODELS}}

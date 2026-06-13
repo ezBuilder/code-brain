@@ -36,7 +36,7 @@ def session_name(project_root: Path) -> str:
 
 def build_launch_plan(root: Path, *, worker_id: str, agent: str, profile: str,
                       session: str, window: str, inherit_auth: bool = False,
-                      autonomous: bool = False) -> dict[str, Any]:
+                      autonomous: bool = False, tier: str | None = None) -> dict[str, Any]:
     """Pure: resolve the env + the exact (validated) tmux launch for a worker.
 
     inherit_auth=True does NOT override HOME/XDG — the worker uses the inherited (default-login)
@@ -55,7 +55,7 @@ def build_launch_plan(root: Path, *, worker_id: str, agent: str, profile: str,
     import shlex
 
     from . import worker_models as wm
-    model = wm.resolve_model(root, agent)
+    model = wm.resolve_model(root, agent, tier=tier)
     parts = [AGENT_COMMANDS[agent], *model.get("flags", [])]
     if autonomous:
         parts += wm.autonomy_flags(agent)  # opt-in: skip prompts; loopd dispatch-gate is the boundary
@@ -69,12 +69,13 @@ def build_launch_plan(root: Path, *, worker_id: str, agent: str, profile: str,
 def launch_worker(root: Path, *, worker_id: str, agent: str, profile: str,
                   session: str | None = None, window: str | None = None,
                   adapter: TmuxAdapterBase | None = None, dry_run: bool = False,
-                  inherit_auth: bool = False, autonomous: bool = False) -> dict[str, Any]:
+                  inherit_auth: bool = False, autonomous: bool = False,
+                  tier: str | None = None) -> dict[str, Any]:
     session = session or session_name(root)
     window = window or worker_id
     plan = build_launch_plan(root, worker_id=worker_id, agent=agent, profile=profile,
                              session=session, window=window, inherit_auth=inherit_auth,
-                             autonomous=autonomous)
+                             autonomous=autonomous, tier=tier)
     if not plan.get("ok"):
         return plan
     if not inherit_auth:
@@ -157,7 +158,7 @@ def account_login(root: Path, *, agent: str, account: str,
 
 
 def launch_pool(root: Path, *, adapter: TmuxAdapterBase | None = None,
-                dry_run: bool = False, autonomous: bool = False) -> dict[str, Any]:
+                dry_run: bool = False, autonomous: bool = False, tier: str | None = None) -> dict[str, Any]:
     """Launch a worker for every registered profile that is not already up (idempotent)."""
     session = session_name(root)
     existing = {w["worker_id"] for w in wr.list_workers(root) if w.get("state") not in ("stopped", "lost")}
@@ -169,5 +170,5 @@ def launch_pool(root: Path, *, adapter: TmuxAdapterBase | None = None,
             continue
         results.append(launch_worker(root, worker_id=wid, agent=str(prof.get("agent")),
                                      profile=str(prof.get("profile")), session=session,
-                                     adapter=adapter, dry_run=dry_run, autonomous=autonomous))
+                                     adapter=adapter, dry_run=dry_run, autonomous=autonomous, tier=tier))
     return {"ok": True, "session": session, "dry_run": dry_run, "autonomous": autonomous, "launched": results}

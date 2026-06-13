@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from . import loop_engineering as le
+from . import route_floor
+from . import task_router
 from . import worker_registry as wr
 from .memory import append_audit, now_iso
 from .tmux_adapter import TmuxAdapterBase, get_adapter, output_hash
@@ -90,6 +92,7 @@ def infer_risk(request: dict[str, Any]) -> str:
 
 
 _TIER_ORDER = {"cheap": 0, "balanced": 1, "best": 2}
+_INV_TIER_ORDER = {v: k for k, v in _TIER_ORDER.items()}
 # Signals that a task is hard enough to deserve the strongest (most expensive) model.
 _COMPLEX = re.compile(
     r"(refactor|리팩터|debug|디버그|architecture|아키텍처|design|설계|migrat|마이그레이|"
@@ -123,14 +126,36 @@ def _worker_tier(w: dict[str, Any]) -> str:
     return t if t in _TIER_ORDER else "balanced"
 
 
+def route_plan(root: Path, request: dict[str, Any]) -> dict[str, Any]:
+    """Capability-fit + minimum-adequate routing decision for a request (no worker lookup).
+
+    axis 1 — classify the task TYPE → preferred agent families (or an explicit override).
+    axis 2 — need_tier = max(per-task assess_tier, the category's learned/adaptive floor). The floor
+    is a LOWER BOUND only: it can raise a too-cheap default but never lowers a genuinely hard task,
+    and it never bypasses the risk/approval gate (which is enforced separately before dispatch).
+    """
+    dispatch = request.get("dispatch") if isinstance(request.get("dispatch"), dict) else {}
+    category = task_router.classify(request)
+    explicit = [str(a) for a in (dispatch.get("preferred_agents") or [])]
+    preferred = explicit or list(task_router.preferred_families(category))
+    base_idx = _TIER_ORDER[assess_tier(request)]
+    floor_idx = route_floor.effective_floor(root, category)
+    need_idx = max(base_idx, floor_idx)
+    return {"category": category, "preferred": preferred, "need_tier": _INV_TIER_ORDER[need_idx],
+            "need_idx": need_idx, "floor_tier": _INV_TIER_ORDER[floor_idx]}
+
+
 def select_worker(root: Path, request: dict[str, Any]) -> dict[str, Any] | None:
-    """PRD §7.1 worker selection: hard constraints then cost-aware soft scoring. Returns worker or None."""
+    """PRD §7.1 worker selection: hard constraints, then capability-fit + minimum-adequate scoring."""
     risk = infer_risk(request)
-    need_tier = _TIER_ORDER[assess_tier(request)]
+    plan = route_plan(root, request)
+    need_tier = plan["need_idx"]
+    preferred = plan["preferred"]
     dispatch = request.get("dispatch") if isinstance(request.get("dispatch"), dict) else {}
     required = set(dispatch.get("required_capabilities") or [])
-    preferred = [str(a) for a in (dispatch.get("preferred_agents") or [])]
     req_cwd = str(request.get("cwd") or "")
+    maker = str(request.get("source_agent") or "")
+    is_review = plan["category"] == "review_verify"
 
     candidates: list[dict[str, Any]] = []
     for w in wr.list_workers(root):
@@ -147,15 +172,17 @@ def select_worker(root: Path, request: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     def score(w: dict[str, Any]) -> tuple:
+        agent = w.get("agent")
         wtier = _TIER_ORDER[_worker_tier(w)]
-        adequate = 1 if wtier >= need_tier else 0   # meets the task's required model strength
-        # cost-aware: among adequate workers prefer the CHEAPEST that still meets the need, so a
-        # simple task does not burn the best model. (-wtier sorts cheaper-first within adequate.)
+        adequate = 1 if wtier >= need_tier else 0    # meets the category's minimum-adequate strength
+        fit = 1 if agent in preferred else 0         # axis-1 capability fit (right family for the type)
+        # a review should ideally be done by a DIFFERENT family than the maker (independent check).
+        independent = 1 if (not is_review or not maker or agent != maker) else 0
+        # minimum-adequate: among adequate+fit workers prefer the CHEAPEST that still meets the need,
+        # so the right family's cheap tier wins and a simple task never burns the best model.
         thrift = -wtier if adequate else -99
-        prefer = 1 if w.get("agent") in preferred else 0
         quota_ok = 1 if str((w.get("usage") or {}).get("quota_state")) != "quota_exhausted" else 0
-        tie = 1 if (risk == "high") == (w.get("agent") in ("codex", "claude")) else 0
-        return (adequate, prefer, quota_ok, thrift, tie,
+        return (adequate, fit, independent, quota_ok, thrift,
                 -int((w.get("usage") or {}).get("requests_today", 0) or 0))
 
     candidates.sort(key=score, reverse=True)
@@ -226,8 +253,10 @@ def dispatch_once(root: Path, *, adapter: TmuxAdapterBase | None = None) -> dict
             skipped += 1
             continue
         # claim this exact request for the worker BEFORE injecting, so two workers never collide.
+        # stamp the routed tier/agent so the adaptive floor can attribute the outcome correctly.
         claimed = le.claim(root, orchestrator_id="loopd", agent=str(worker.get("agent", "agent")),
-                           request_id=rid)
+                           request_id=rid, routed_tier=_worker_tier(worker),
+                           routed_agent=str(worker.get("agent", "")))
         lease = (claimed.get("request") or {}).get("lease_id") if isinstance(claimed, dict) else None
         if not lease or not re.fullmatch(r"[0-9a-f]{8,64}", str(lease)):
             skipped += 1   # only a well-formed hex lease is injected (no control chars into tmux)

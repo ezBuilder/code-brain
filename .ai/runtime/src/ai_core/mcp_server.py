@@ -330,6 +330,14 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "loopd_agents",
+        "description": (
+            "Auto-detect which agent CLIs (codex/claude/agy) and tmux are installed here. Call this "
+            "FIRST before launching a pool — only available agents can run; the rest are skipped."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "loopd_dispatch_once",
         "description": "Run one deterministic loopd dispatch tick (assign pending work to idle workers; park high-risk). No LLM. Write-class.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -1166,6 +1174,9 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "loopd_recover":
         from . import loopd as _ld
         return _ld.recovery_tick(root)
+    if name == "loopd_agents":
+        from . import worker_launch as _wl
+        return _wl.capabilities()
     if name == "loop_submit":
         instruction = args.get("instruction")
         if not isinstance(instruction, str) or not instruction.strip():

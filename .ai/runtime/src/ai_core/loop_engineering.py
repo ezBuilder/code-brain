@@ -106,6 +106,10 @@ def submit(
         "updated_at": now_iso(),
         "attempts": 0,
     }
+    # axis-1 capability classification, stamped once at submit so dispatch routing and the adaptive
+    # floor both read the same deterministic category for this request.
+    from . import task_router
+    payload["category"] = task_router.classify(payload)
     if isinstance(dispatch, dict):
         allowed = {}
         mt = str(dispatch.get("model_tier", "")).lower()
@@ -137,6 +141,8 @@ def claim(
     priority: str | None = None,
     request_id: str | None = None,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    routed_tier: str | None = None,
+    routed_agent: str | None = None,
 ) -> dict[str, Any]:
     if lease_seconds < 60 or lease_seconds > 86_400:
         raise ValueError("lease_seconds must be between 60 and 86400")
@@ -174,6 +180,12 @@ def claim(
                     "updated_at": now_iso(),
                 }
             )
+            # stamp the model tier/agent this request is actually being run at, so the adaptive
+            # floor can attribute the outcome to the right (category, tier) at finish time.
+            if str(routed_tier) in ("cheap", "balanced", "best"):
+                request["routed_tier"] = str(routed_tier)
+            if routed_agent:
+                request["routed_agent"] = _bounded(str(routed_agent), 40)
             _write_json(target, request)
             handoff = _write_goal_handoff(root, request, agent=agent)
             append_audit(
@@ -365,6 +377,22 @@ def _finish(root: Path, *, request_id: str, lease_id: str, status: str, summary:
         _write_json(target, request)
         source.unlink()
     append_audit(root, action=f"loop.{status}", category="loop", payload={"request_id": request_id})
+    # feed the adaptive minimum-tier floor (axis 2). Fail-soft: routing bookkeeping must never break
+    # the loop finish, and it only ever writes a bounded per-category tier int (never a gate).
+    try:
+        from . import route_floor
+        route_floor.record_outcome(
+            root,
+            category=str(request.get("category") or "standard"),
+            tier=str(request.get("routed_tier") or "balanced"),
+            status=status,
+            attempts=int(request.get("attempts", 0) or 0),
+            reviewer_required=bool(request.get("reviewer_required", True)),
+            verdict_pass=_verdict_passed(request),
+            reason=(summary or "") if status == "dead" else "",
+        )
+    except Exception:
+        pass
     return {"ok": True, "request": _public_request(request, target, root)}
 
 

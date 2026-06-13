@@ -997,6 +997,20 @@ def _record_evidence_candidates(root: Path, *, query_text: str, results: list[di
         pass
 
 
+def _result_scope(path: str, summary: str | None) -> str:
+    """Compact contextual header so a snippet is self-sufficient (Anthropic Contextual Retrieval).
+
+    Purely derived from existing fields (no extra query, no schema change): the module path and,
+    for function chunks whose path encodes ``file::symbol``, the enclosing symbol.
+    """
+    p = str(path or "")
+    if "::" in p:
+        file_part, _, symbol = p.partition("::")
+        return f"{file_part} › {symbol}"[:160]
+    head = (str(summary or "").strip().splitlines() or [""])[0]
+    return (f"{p} — {head}"[:160]) if head else p[:160]
+
+
 def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None = None) -> dict[str, Any]:
     auto_refresh = _auto_refresh_if_stale(root)
     retriever = configured_retriever(root)
@@ -1053,6 +1067,7 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
         fts_results.append({
             "id": int(row["id"]),
             "path": row["path"],
+            "scope": _result_scope(row["path"], row["summary"]),
             "snippet": snippet_from_file(root, row["path"], text, fallback=row["summary"], expected_sha=row["sha256"]),
             "provenance": {
                 "processor": row["processor"],

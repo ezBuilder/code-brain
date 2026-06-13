@@ -255,6 +255,26 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "code_graph_trace",
+        "description": "Trace the shortest caller→callee chain between two symbols (multi-hop). Orientation aid; feed results into code_query.",
+        "inputSchema": {"type": "object", "properties": {
+            "src": {"type": "string"}, "dst": {"type": "string"}, "max_depth": {"type": "integer", "default": 6}},
+            "required": ["src", "dst"]},
+    },
+    {
+        "name": "code_graph_impact",
+        "description": "Blast radius of changing files/symbols: transitive callers impacted. Pass changed repo-relative paths to scope a review.",
+        "inputSchema": {"type": "object", "properties": {
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "symbols": {"type": "array", "items": {"type": "string"}},
+            "max_depth": {"type": "integer", "default": 4}}},
+    },
+    {
+        "name": "code_graph_architecture",
+        "description": "Whole-repo orientation: top modules by symbol count and call centrality. Cheap map for a supervisor.",
+        "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 8}}},
+    },
+    {
         "name": "ast_grep_search",
         "description": (
             "Structural (AST) code search: find code matching a syntactic pattern in a language "
@@ -963,6 +983,19 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "code_graph_hotspots":
         from .codegraph import hotspot_callees
         return hotspot_callees(root, limit=int(args.get("limit", 20) or 20))
+    if name == "code_graph_trace":
+        from .codegraph import trace_call_path
+        return trace_call_path(root, src=str(args.get("src", "")), dst=str(args.get("dst", "")),
+                               max_depth=int(args.get("max_depth", 6) or 6))
+    if name == "code_graph_impact":
+        from .codegraph import blast_radius, impacted_by_paths
+        paths = args.get("paths") if isinstance(args.get("paths"), list) else None
+        if paths:
+            return impacted_by_paths(root, paths=paths, max_depth=int(args.get("max_depth", 4) or 4))
+        return blast_radius(root, symbols=args.get("symbols") or [], max_depth=int(args.get("max_depth", 4) or 4))
+    if name == "code_graph_architecture":
+        from .codegraph import architecture_summary
+        return architecture_summary(root, limit=int(args.get("limit", 8) or 8))
     if name == "code_verify":
         from .ast_verify import verify_source
         return verify_source(str(args.get("source", ""))).to_dict()

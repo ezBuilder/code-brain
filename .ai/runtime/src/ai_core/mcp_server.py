@@ -1056,12 +1056,12 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             max_results=int(args.get("max_results", 40) or 40),
         )
     if name == "lessons_recall":
-        query = args.get("query")
-        if not isinstance(query, str) or not query.strip():
+        recall_query = args.get("query")
+        if not isinstance(recall_query, str) or not recall_query.strip():
             raise ValueError("lessons_recall requires non-empty query")
         from .lessons import recall_lessons
 
-        return recall_lessons(root, query=query, limit=int(args.get("limit", 5) or 5))
+        return recall_lessons(root, query=recall_query, limit=int(args.get("limit", 5) or 5))
     if name == "record_todo":
         title = args.get("title")
         if not isinstance(title, str) or not title.strip():

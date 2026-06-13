@@ -111,8 +111,19 @@ class TmuxAdapter(TmuxAdapterBase):
         sent = self._run("send-keys", "-t", pane_id, "-l", line)
         if sent is None or sent.returncode != 0:
             return False
+        # Some TUIs (codex) need the input to settle before Enter submits — a lone Enter races
+        # and leaves the prompt unsent. Send Enter, settle, send Enter again. A second Enter at an
+        # already-submitted/empty prompt is harmless (empty submit ignored).
         enter = self._run("send-keys", "-t", pane_id, "Enter")
-        return enter is not None and enter.returncode == 0
+        if enter is None or enter.returncode != 0:
+            return False
+        try:
+            import time
+            time.sleep(0.5)
+        except Exception:
+            pass
+        self._run("send-keys", "-t", pane_id, "Enter")
+        return True
 
     def capture(self, pane_id: str) -> str:
         proc = self._run("capture-pane", "-p", "-t", pane_id)

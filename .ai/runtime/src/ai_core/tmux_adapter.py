@@ -59,6 +59,14 @@ class FakeTmuxAdapter(TmuxAdapterBase):
     def capture(self, pane_id: str) -> str:
         return self._output.get(pane_id, "")
 
+    def new_window(self, session: str, window: str, env: dict[str, str], command: str) -> str | None:
+        pane = f"%{len(self.injected) + len(self._alive) + 100}"
+        self._alive.add(pane)
+        self.launched = getattr(self, "launched", [])
+        self.launched.append({"session": session, "window": window, "env": dict(env),
+                              "command": command, "pane_id": pane})
+        return pane
+
 
 class TmuxAdapter(TmuxAdapterBase):
     """Real tmux via send-keys / capture-pane / list-panes. Read+inject; never spawns logins."""
@@ -101,6 +109,32 @@ class TmuxAdapter(TmuxAdapterBase):
     def capture(self, pane_id: str) -> str:
         proc = self._run("capture-pane", "-p", "-t", pane_id)
         return (proc.stdout if proc and proc.returncode == 0 else "") or ""
+
+    def new_window(self, session: str, window: str, env: dict[str, str], command: str) -> str | None:
+        """Create (or reuse) a session and open a window running `command` under `env`.
+
+        env holds ONLY directory paths (HOME/XDG/CODE_BRAIN_*), never secrets. Each `-e k=v`
+        is a separate argv element (no shell). `command` is a fixed binary name validated by
+        the caller. Returns the new pane id or None.
+        """
+        if not self._bin:
+            return None
+        has = self._run("has-session", "-t", session)
+        env_args: list[str] = []
+        for k, v in env.items():
+            env_args += ["-e", f"{k}={v}"]
+        if has is None or has.returncode != 0:
+            created = self._run("new-session", "-d", "-s", session, "-n", window, *env_args, command)
+        else:
+            created = self._run("new-window", "-t", session, "-n", window, *env_args, command)
+        if created is None or created.returncode != 0:
+            return None
+        # resolve the pane id of the just-created window
+        got = self._run("display-message", "-p", "-t", f"{session}:{window}", "#{pane_id}")
+        if got is None or got.returncode != 0:
+            return None
+        pane = (got.stdout or "").strip().split("\n")[0]
+        return pane if _PANE_RE.fullmatch(pane) else None
 
 
 def output_hash(text: str) -> str:

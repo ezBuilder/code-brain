@@ -35,7 +35,8 @@ def session_name(project_root: Path) -> str:
 
 
 def build_launch_plan(root: Path, *, worker_id: str, agent: str, profile: str,
-                      session: str, window: str, inherit_auth: bool = False) -> dict[str, Any]:
+                      session: str, window: str, inherit_auth: bool = False,
+                      autonomous: bool = False) -> dict[str, Any]:
     """Pure: resolve the env + the exact (validated) tmux launch for a worker.
 
     inherit_auth=True does NOT override HOME/XDG — the worker uses the inherited (default-login)
@@ -51,22 +52,29 @@ def build_launch_plan(root: Path, *, worker_id: str, agent: str, profile: str,
     env["CODE_BRAIN_PROJECT_ROOT"] = str(root)
     env["CODE_BRAIN_WORKER_ID"] = str(worker_id)[:64]
     env["CODE_BRAIN_HEARTBEAT"] = str(wr.heartbeat_path(root, worker_id))
+    import shlex
+
     from . import worker_models as wm
     model = wm.resolve_model(root, agent)
-    # flags come from operator config / safe defaults only (never request input)
-    command = " ".join([AGENT_COMMANDS[agent], *model.get("flags", [])]).strip()
-    return {"ok": True, "worker_id": worker_id, "agent": agent, "profile": profile,
+    parts = [AGENT_COMMANDS[agent], *model.get("flags", [])]
+    if autonomous:
+        parts += wm.autonomy_flags(agent)  # opt-in: skip prompts; loopd dispatch-gate is the boundary
+    # flags come from operator config / safe defaults only (never request input). shlex-quote so a
+    # spaced/parenthesized model name (e.g. agy "Gemini 3.1 Pro (High)") is one safe argv element.
+    command = " ".join(shlex.quote(part) for part in parts).strip()
+    return {"ok": True, "worker_id": worker_id, "agent": agent, "profile": profile, "autonomous": autonomous,
             "session": session, "window": window, "command": command, "model": model, "env": env}
 
 
 def launch_worker(root: Path, *, worker_id: str, agent: str, profile: str,
                   session: str | None = None, window: str | None = None,
                   adapter: TmuxAdapterBase | None = None, dry_run: bool = False,
-                  inherit_auth: bool = False) -> dict[str, Any]:
+                  inherit_auth: bool = False, autonomous: bool = False) -> dict[str, Any]:
     session = session or session_name(root)
     window = window or worker_id
     plan = build_launch_plan(root, worker_id=worker_id, agent=agent, profile=profile,
-                             session=session, window=window, inherit_auth=inherit_auth)
+                             session=session, window=window, inherit_auth=inherit_auth,
+                             autonomous=autonomous)
     if not plan.get("ok"):
         return plan
     if not inherit_auth:
@@ -86,7 +94,8 @@ def launch_worker(root: Path, *, worker_id: str, agent: str, profile: str,
     wr.set_state(root, worker_id=worker_id, state="idle")
     wr.write_heartbeat(root, worker_id=worker_id, state="idle", pane_id=pane)
     append_audit(root, action="worker.launch", category="loopd",
-                 payload={"worker_id": worker_id, "agent": agent, "profile": profile, "pane_id": pane})
+                 payload={"worker_id": worker_id, "agent": agent, "profile": profile,
+                          "pane_id": pane, "autonomous": bool(autonomous)})
     return {"ok": True, "worker_id": worker_id, "pane_id": pane, "session": session}
 
 
@@ -148,7 +157,7 @@ def account_login(root: Path, *, agent: str, account: str,
 
 
 def launch_pool(root: Path, *, adapter: TmuxAdapterBase | None = None,
-                dry_run: bool = False) -> dict[str, Any]:
+                dry_run: bool = False, autonomous: bool = False) -> dict[str, Any]:
     """Launch a worker for every registered profile that is not already up (idempotent)."""
     session = session_name(root)
     existing = {w["worker_id"] for w in wr.list_workers(root) if w.get("state") not in ("stopped", "lost")}
@@ -160,5 +169,5 @@ def launch_pool(root: Path, *, adapter: TmuxAdapterBase | None = None,
             continue
         results.append(launch_worker(root, worker_id=wid, agent=str(prof.get("agent")),
                                      profile=str(prof.get("profile")), session=session,
-                                     adapter=adapter, dry_run=dry_run))
-    return {"ok": True, "session": session, "dry_run": dry_run, "launched": results}
+                                     adapter=adapter, dry_run=dry_run, autonomous=autonomous))
+    return {"ok": True, "session": session, "dry_run": dry_run, "autonomous": autonomous, "launched": results}

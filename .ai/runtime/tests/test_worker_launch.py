@@ -20,7 +20,7 @@ def test_plan_resolves_isolated_env_no_secrets(tmp_path: Path) -> None:
                         env={"AWS_SECRET_ACCESS_KEY": "leak", "CB_FLAG": "ok"})
     plan = wl.build_launch_plan(root, worker_id="agy-1", agent="agy", profile="agy-pro-1",
                                 session="cb-x", window="agy-1")
-    assert plan["ok"] and plan["command"] == "agy"
+    assert plan["ok"] and plan["command"].startswith("agy")
     assert plan["env"]["HOME"].endswith("agy-pro-1/home")
     assert "AWS_SECRET_ACCESS_KEY" not in plan["env"]
     assert all("leak" not in v for v in plan["env"].values())

@@ -122,6 +122,43 @@ def get_profile(root: Path, profile: str) -> dict[str, Any] | None:
     return None
 
 
+def account_profile(agent: str, account: str) -> str:
+    raw = f"{str(agent).strip().lower()}-{str(account).strip()}"
+    return "".join(c for c in raw if c.isalnum() or c in "-_")[:64]
+
+
+def add_account(root: Path, *, agent: str, account: str) -> dict[str, Any]:
+    """Register an isolated account profile so its OAuth/login cache lives in its own HOME.
+
+    Returns the env + command the user runs ONCE to log in (browser OAuth) into this account;
+    the agent CLI then stores its credentials under the isolated HOME, separate from every
+    other account. Code Brain never reads those credentials.
+    """
+    prof = account_profile(agent, account)
+    res = register_profile(root, profile=prof, agent=agent,
+                           worker_id=f"{str(agent).strip().lower()}-{account}",
+                           env={"CODE_BRAIN_ACCOUNT": str(account)[:64]})
+    env = resolve_profile_env(root, prof)
+    binary = {"codex": "codex", "claude": "claude", "agy": "agy"}.get(str(agent).strip().lower(), str(agent))
+    login_env = " ".join(f"{k}={v}" for k, v in env.items() if k in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"))
+    return {"ok": True, "profile": prof, "agent": agent, "account": account,
+            "login_command": f"env {login_env} {binary}",
+            "note": "Run login_command once and complete the browser login; credentials stay isolated to this profile.",
+            "registered": res["profile"]}
+
+
+def list_accounts(root: Path, *, agent: str | None = None) -> list[dict[str, Any]]:
+    out = []
+    for p in list_profiles(root):
+        if agent and p.get("agent") != str(agent).strip().lower():
+            continue
+        acct = (p.get("env") or {}).get("CODE_BRAIN_ACCOUNT")
+        if acct:
+            out.append({"profile": p["profile"], "agent": p.get("agent"), "account": acct,
+                        "home": p.get("home")})
+    return out
+
+
 def resolve_profile_env(root: Path, profile: str) -> dict[str, str]:
     """The env a wrapper exports to isolate a worker. Paths only — never secret values."""
     p = get_profile(root, profile)

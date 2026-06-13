@@ -53,11 +53,16 @@ class FakeTmuxAdapter(TmuxAdapterBase):
     def inject(self, pane_id: str, text: str) -> bool:
         if pane_id not in self._alive:
             return False
-        self.injected.append({"pane_id": pane_id, "text": text})
+        self.injected.append({"pane_id": pane_id, "text": " ".join(str(text).split())})
         return True
 
     def capture(self, pane_id: str) -> str:
         return self._output.get(pane_id, "")
+
+    def send_key(self, pane_id: str, key: str) -> bool:
+        self.keys = getattr(self, "keys", [])
+        self.keys.append({"pane_id": pane_id, "key": key})
+        return True
 
     def new_window(self, session: str, window: str, env: dict[str, str], command: str) -> str | None:
         pane = f"%{len(self.injected) + len(self._alive) + 100}"
@@ -99,8 +104,11 @@ class TmuxAdapter(TmuxAdapterBase):
             return False  # never target a non-pane (e.g. someone else's session:window)
         if not self.pane_alive(pane_id):
             return False
-        # send the literal task text, then Enter — text only, never secrets
-        sent = self._run("send-keys", "-t", pane_id, "-l", text)
+        # Collapse to a single line: interactive TUIs (codex/claude) treat embedded newlines
+        # as line breaks, so a multi-line prompt never submits on one Enter. One line + Enter
+        # submits reliably. Text only, never secrets.
+        line = " ".join(str(text).split())
+        sent = self._run("send-keys", "-t", pane_id, "-l", line)
         if sent is None or sent.returncode != 0:
             return False
         enter = self._run("send-keys", "-t", pane_id, "Enter")
@@ -109,6 +117,12 @@ class TmuxAdapter(TmuxAdapterBase):
     def capture(self, pane_id: str) -> str:
         proc = self._run("capture-pane", "-p", "-t", pane_id)
         return (proc.stdout if proc and proc.returncode == 0 else "") or ""
+
+    def send_key(self, pane_id: str, key: str) -> bool:
+        if not _PANE_RE.fullmatch(str(pane_id)):
+            return False
+        proc = self._run("send-keys", "-t", pane_id, key)
+        return proc is not None and proc.returncode == 0
 
     def new_window(self, session: str, window: str, env: dict[str, str], command: str) -> str | None:
         """Create (or reuse) a session and open a window running `command` under `env`.

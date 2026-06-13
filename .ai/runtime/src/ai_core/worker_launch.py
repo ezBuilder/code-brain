@@ -51,8 +51,12 @@ def build_launch_plan(root: Path, *, worker_id: str, agent: str, profile: str,
     env["CODE_BRAIN_PROJECT_ROOT"] = str(root)
     env["CODE_BRAIN_WORKER_ID"] = str(worker_id)[:64]
     env["CODE_BRAIN_HEARTBEAT"] = str(wr.heartbeat_path(root, worker_id))
+    from . import worker_models as wm
+    model = wm.resolve_model(root, agent)
+    # flags come from operator config / safe defaults only (never request input)
+    command = " ".join([AGENT_COMMANDS[agent], *model.get("flags", [])]).strip()
     return {"ok": True, "worker_id": worker_id, "agent": agent, "profile": profile,
-            "session": session, "window": window, "command": AGENT_COMMANDS[agent], "env": env}
+            "session": session, "window": window, "command": command, "model": model, "env": env}
 
 
 def launch_worker(root: Path, *, worker_id: str, agent: str, profile: str,
@@ -73,15 +77,74 @@ def launch_worker(root: Path, *, worker_id: str, agent: str, profile: str,
     pane = adapter.new_window(session, window, plan["env"], plan["command"])  # type: ignore[attr-defined]
     if not pane:
         return {"ok": False, "reason": "tmux launch failed", "plan": plan}
+    dismiss_onboarding(adapter, pane, agent)  # clear first-run trust gate so boot isn't swallowed
     wr.register_worker(root, worker_id=worker_id, agent=agent, profile=profile,
                        project_root=str(root), cwd=str(root), pane_id=pane,
-                       session=session, window=window, state="booting")
+                       session=session, window=window, state="booting",
+                       model={**plan.get("model", {}), "command": plan["command"]})
     adapter.inject(pane, _BOOT.format(wid=worker_id))
     wr.set_state(root, worker_id=worker_id, state="idle")
     wr.write_heartbeat(root, worker_id=worker_id, state="idle", pane_id=pane)
     append_audit(root, action="worker.launch", category="loopd",
                  payload={"worker_id": worker_id, "agent": agent, "profile": profile, "pane_id": pane})
     return {"ok": True, "worker_id": worker_id, "pane_id": pane, "session": session}
+
+
+# Known first-run onboarding gates: capture-pane pattern → safe dismissal keys (best-effort).
+# codex shows a hook-trust dialog; "3" = continue without trusting (hooks won't run).
+_ONBOARDING = {
+    "codex": [("Trust all and continue", ["3", "Enter"]), ("Review hooks", ["3", "Enter"])],
+    "claude": [("Do you trust", ["1", "Enter"]), ("trust the files", ["1", "Enter"])],
+    "agy": [],
+}
+
+
+def dismiss_onboarding(adapter: TmuxAdapterBase, pane: str, agent: str, *, rounds: int = 8) -> bool:
+    """Best-effort: clear a CLI's first-run trust/onboarding gate so the boot prompt is not swallowed.
+
+    No-op on the fake adapter (capture returns ""). Real adapter polls and sends the safe choice.
+    """
+    import time
+
+    gates = _ONBOARDING.get(str(agent).strip().lower(), [])
+    if not gates or not hasattr(adapter, "capture"):
+        return False
+    for _ in range(max(1, rounds)):
+        screen = adapter.capture(pane) or ""
+        for pattern, keys in gates:
+            if pattern in screen:
+                for k in keys:
+                    if hasattr(adapter, "send_key"):
+                        adapter.send_key(pane, k)  # type: ignore[attr-defined]
+                time.sleep(1.0)
+                return True
+        time.sleep(1.5)
+    return False
+
+
+def account_login(root: Path, *, agent: str, account: str,
+                  adapter: TmuxAdapterBase | None = None) -> dict[str, Any]:
+    """Open a tmux window under the account's isolated HOME running the CLI so the user can log in.
+
+    The browser OAuth the user completes is stored under the isolated HOME — separate per account.
+    Code Brain never reads the credentials.
+    """
+    prof = wp.account_profile(agent, account)
+    wp.ensure_profile_dirs(root, prof)
+    env = wp.resolve_profile_env(root, prof)
+    session = session_name(root) + "-login"
+    window = prof
+    command = AGENT_COMMANDS.get(str(agent).strip().lower())
+    if not command:
+        return {"ok": False, "reason": f"unknown agent: {agent}"}
+    adapter = adapter or get_adapter()
+    pane = adapter.new_window(session, window, env, command)  # type: ignore[attr-defined]
+    if not pane:
+        return {"ok": False, "reason": "tmux launch failed"}
+    return {"ok": True, "agent": agent, "account": account, "profile": prof,
+            "session": session, "pane_id": pane,
+            "note": f"Attach with `tmux attach -t {session}` and complete the browser login; "
+                    f"credentials are stored isolated under {env['HOME']}."}
 
 
 def launch_pool(root: Path, *, adapter: TmuxAdapterBase | None = None,

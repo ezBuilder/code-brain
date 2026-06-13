@@ -95,6 +95,17 @@ def test_completion_frees_worker_to_idle(tmp_path: Path) -> None:
     assert wr.get_worker(root, "codex-1")["state"] == "idle"
 
 
+def test_nudge_clears_benign_interrupt(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    wr.register_worker(root, worker_id="agy-1", agent="agy", pane_id="%5", state="working")
+    adapter = FakeTmuxAdapter(alive={"%5"})
+    adapter.set_output("%5", "...\nHow's the CLI experience so far? Help us improve:\n[0] Skip")
+    out = loopd.recovery_tick(root, adapter=adapter)
+    assert "agy-1" in out["nudged_workers"]
+    # the skip key was sent to the worker pane
+    assert any(k["pane_id"] == "%5" and k["key"] == "0" for k in getattr(adapter, "keys", []))
+
+
 def test_inject_collapses_to_single_line(tmp_path: Path) -> None:
     adapter = FakeTmuxAdapter(alive={"%1"})
     adapter.inject("%1", "line one\nline two\n  line three")

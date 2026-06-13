@@ -36,6 +36,37 @@ _GATED = re.compile(
 HEARTBEAT_TTL_SECONDS = 120
 BLOCKED_PARTS = (".ai", "memory", "loop", "blocked")
 _PANE_RE = re.compile(r"^%\d+$")  # tmux pane ids only; refuse session:window targets (cross-session inject)
+# Benign mid-task interrupts a 3rd-party CLI can pop up that stall an autonomous worker; map a
+# capture-pane substring → the safe key(s) to clear it. Best-effort self-healing in recovery_tick.
+_BENIGN_INTERRUPTS = (
+    ("How's the CLI experience", ["0", "Enter"]),   # agy feedback survey → Skip
+    ("Help us improve", ["0", "Enter"]),
+)
+
+
+def nudge_workers(root: Path, *, adapter: TmuxAdapterBase | None = None) -> list[str]:
+    """Clear known benign interrupts on busy workers so they don't stall. Fail-soft, no LLM."""
+    adapter = adapter or get_adapter()
+    if not hasattr(adapter, "capture") or not hasattr(adapter, "send_key"):
+        return []
+    nudged: list[str] = []
+    for w in wr.list_workers(root):
+        if w.get("state") not in ("assigned", "working", "reviewing"):
+            continue
+        pane = str((w.get("tmux") or {}).get("pane_id") or "")
+        if not _PANE_RE.fullmatch(pane):
+            continue
+        try:
+            screen = adapter.capture(pane) or ""
+        except Exception:
+            continue
+        for pattern, keys in _BENIGN_INTERRUPTS:
+            if pattern in screen:
+                for k in keys:
+                    adapter.send_key(pane, k)  # type: ignore[attr-defined]
+                nudged.append(w["worker_id"])
+                break
+    return nudged
 
 
 def _blocked_dir(root: Path) -> Path:
@@ -172,9 +203,12 @@ def dispatch_once(root: Path, *, adapter: TmuxAdapterBase | None = None) -> dict
     return {"ok": True, "dispatched": dispatched, "blocked": blocked, "skipped": skipped, "llm_idle_polls": 0}
 
 
-def recovery_tick(root: Path, *, now_seconds: float | None = None) -> dict[str, Any]:
-    """PRD §8.6 — recover expired leases & flag stale/lost workers. Deterministic, no LLM."""
+def recovery_tick(root: Path, *, now_seconds: float | None = None,
+                  adapter: TmuxAdapterBase | None = None) -> dict[str, Any]:
+    """PRD §8.6 — recover expired leases, free completed/stale workers, nudge benign interrupts."""
     from datetime import datetime, timezone
+
+    nudged = nudge_workers(root, adapter=adapter)
 
     moment = datetime.now(timezone.utc).timestamp() if now_seconds is None else now_seconds
     qroot = le.loop_root(root)
@@ -207,7 +241,7 @@ def recovery_tick(root: Path, *, now_seconds: float | None = None) -> dict[str, 
         recovered = int(rec.get("recovered", 0)) if isinstance(rec, dict) else 0
     except Exception:
         pass
-    return {"ok": True, "freed_workers": freed, "stale_workers": stale,
+    return {"ok": True, "freed_workers": freed, "stale_workers": stale, "nudged_workers": nudged,
             "recovered_requests": recovered, "llm_idle_polls": 0}
 
 

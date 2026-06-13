@@ -10,6 +10,7 @@ from .memory import (
     all_audit_files,
     append_event,
     audit_path,
+    now_iso,
     read_jsonl_open_todos as _read_jsonl_open_todos,
     read_jsonl_tail as _read_jsonl_tail,
     read_text_tail as _read_text_tail,
@@ -2030,6 +2031,64 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
         return
 
 
+_FAILURE_MAX_SURFACE = 3   # bound the AS-OF block so it cannot push other sections off the budget cliff
+
+
+def _failure_live_versions(root: Path) -> dict[str, str]:
+    """Optional on-disk environment snapshot for the version-diff re-test. Fail-soft → {}."""
+    path = root / ".ai" / "memory" / "env-versions.json"
+    try:
+        if not path.exists() or path.stat().st_size > 64_000:
+            return {}
+        import json as _json
+
+        from .redact import redact_value
+
+        data = _json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return {str(k)[:40]: str(redact_value(str(v)))[:60] for k, v in list(data.items())[:64]}
+    except Exception:
+        return {}
+
+
+def _failure_retest_flag(entry: dict[str, Any], live: dict[str, str], today: str) -> str:
+    """retest | fresh | unknown — read-time, deterministic, never a false 'still broken'."""
+    versions = entry.get("observed_versions")
+    if isinstance(versions, dict) and versions:
+        if live:
+            for k, v in versions.items():
+                if str(live.get(str(k), "")) != str(v):
+                    return "retest"  # a known version moved → escalate
+            return "fresh"
+        return "unknown"  # no live snapshot → soft reminder only
+    retest_after = str(entry.get("retest_after") or "")
+    if retest_after and today >= retest_after[:10]:
+        return "retest"
+    return "unknown"
+
+
+def _render_failure_lines(entry: dict[str, Any], live: dict[str, str], today: str) -> list[str]:
+    """≤2-line AS-OF block for a live failure. Never a bare prohibition; always re-testable."""
+    when = str(entry.get("observed_at") or entry.get("decided_at") or "")[:10]
+    head = str(entry.get("decision") or "")[:200]
+    confirmed = " [confirmed]" if str(entry.get("status")) == "confirmed" else ""
+    out = [f"  - [FAILURE as-of {when}]{confirmed} {head}"]
+    versions = entry.get("observed_versions")
+    vtail = ""
+    if isinstance(versions, dict) and versions:
+        vtail = " ".join(f"{k}={v}" for k, v in versions.items())[:120]
+    env = str(entry.get("environment") or "")[:80]
+    scope = (f"under: {vtail}" if vtail else "") + ((" " + env) if env else "")
+    flag = _failure_retest_flag(entry, live, today)
+    if flag == "retest":
+        tail = "RE-TEST: a version may have changed since this observation — verify before relying; not a permanent rule"
+    else:
+        tail = "point-in-time observation; re-test before relying; not a permanent ban"
+    out.append(f"    {scope.strip() + ' — ' if scope.strip() else ''}{tail}")
+    return out
+
+
 def _learned_prompt_context(root: Path) -> str:
     """Inject auto-grown project rules (prompt growth). Empty until the loop has grown one."""
     if _env_disabled("AI_PROMPT_GROWTH"):
@@ -2128,8 +2187,16 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
                     f"Use memory_query/context_pack here for detail."
                 )
             for entry in (prior.get("decisions_tail") or [])[-3:]:
+                # best-effort: a snapshot can hold a since-retired failure; drop retired,
+                # and frame surviving failures as re-testable, never as permanent bans.
+                if entry.get("kind") == "failure" and str(entry.get("status", "observed")) in {"stale", "refuted"}:
+                    continue
                 text = str(entry.get("decision") or entry.get("summary") or entry.get("text") or "")[:160]
-                if text:
+                if not text:
+                    continue
+                if entry.get("kind") == "failure":
+                    lines.append(f"  failure (re-testable, not a permanent ban): {text}")
+                else:
                     lines.append(f"  decision: {text}")
             for entry in (prior.get("todos_open") or [])[-3:]:
                 text = str(entry.get("title") or entry.get("text") or entry.get("summary") or "")[:160]
@@ -2145,14 +2212,30 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
                 for line in tail_lines:
                     lines.append(f"    {line[:220]}")
             sections.append("\n".join(lines))
-    decisions = _read_jsonl_tail(root / ".ai" / "memory" / "decisions.jsonl", DECISIONS_TAIL)
-    if decisions:
+    try:
+        from .memory import read_decisions_for_surface
+
+        plain_decisions, live_failures = read_decisions_for_surface(root, limit=DECISIONS_TAIL)
+    except Exception:
+        plain_decisions, live_failures = (
+            _read_jsonl_tail(root / ".ai" / "memory" / "decisions.jsonl", DECISIONS_TAIL), [])
+    if plain_decisions:
         lines = ["Recent decisions:"]
-        for entry in decisions:
+        for entry in plain_decisions:
             ts = str(entry.get("decided_at") or entry.get("timestamp") or "")[:19]
             text = str(entry.get("decision") or entry.get("summary") or entry.get("text") or "")[:160]
             lines.append(f"  - [{ts}] {text}" if ts else f"  - {text}")
         sections.append("\n".join(lines))
+    if live_failures:
+        live_versions = _failure_live_versions(root)
+        today = now_iso()[:10]
+        flines = ["Known failures (point-in-time, re-testable — NOT permanent bans):"]
+        for entry in live_failures[:_FAILURE_MAX_SURFACE]:
+            flines.extend(_render_failure_lines(entry, live_versions, today))
+        extra = len(live_failures) - _FAILURE_MAX_SURFACE
+        if extra > 0:
+            flines.append(f"  (+{extra} older re-testable findings — query memory for detail)")
+        sections.append("\n".join(flines))
     todos = _read_jsonl_open_todos(root / ".ai" / "memory" / "todos.jsonl", TODOS_LIMIT)
     if todos:
         lines = ["Open todos:"]

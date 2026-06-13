@@ -21,6 +21,16 @@ from typing import Any
 
 from .memory import append_audit, append_jsonl, now_iso, read_jsonl_all
 
+
+def _guard_self_write(text: str) -> dict[str, Any]:
+    """Fail-open wrapper: if the guard errors, do not block growth (deterministic rule is safe)."""
+    try:
+        from .self_write_guard import validate_self_write
+
+        return validate_self_write(text)
+    except Exception:
+        return {"ok": True, "violations": []}
+
 LOG_PARTS = (".ai", "memory", "prompt_growth.jsonl")
 LEARNED_PARTS = (".ai", "memory", "learned_prompt.md")
 STATE_PARTS = (".ai", "memory", "prompt_growth_state.json")
@@ -197,16 +207,25 @@ def _evaluate_and_grow(root: Path) -> dict[str, Any]:
         already = existing and existing.get("status") in {"active", "kept"}
         regressed = existing and existing.get("status") == "regressed"
         if rate >= VIOLATION_RATE and not already and not regressed:
-            rules[rid] = {
-                "id": rid,
-                "text": "보고는 핵심 1줄(≤50자)로 강제한다. 명시 요청이 없으면 해설·다이어그램·목록을 만들지 않는다.",
-                "status": "active",
-                "applied_at": now_iso(),
-                "applied_turns": state.get("turns", 0),
-                "baseline_tokens": cur_tokens,
-                "violation_rate": round(rate, 3),
-            }
-            actions.append(f"apply:{rid}")
+            rule_text = "보고는 핵심 1줄(≤50자)로 강제한다. 명시 요청이 없으면 해설·다이어그램·목록을 만들지 않는다."
+            # ASI06 write-validation gate: a self-applied rule may never weaken a core invariant.
+            verdict = _guard_self_write(rule_text)
+            if not verdict.get("ok", True):
+                append_audit(root, action="prompt_growth.blocked", category="prompt_growth",
+                             payload={"id": rid, "violations": verdict.get("violations", [])})
+                actions.append(f"blocked:{rid}")
+            else:
+                rules[rid] = {
+                    "id": rid,
+                    "text": rule_text,
+                    "status": "active",
+                    "applied_at": now_iso(),
+                    "applied_turns": state.get("turns", 0),
+                    "baseline_tokens": cur_tokens,
+                    "violation_rate": round(rate, 3),
+                    "source": "prompt_growth.deterministic",
+                }
+                actions.append(f"apply:{rid}")
 
     if not actions:
         return {"ok": True, "actions": [], "active": len([r for r in rules.values() if r.get("status") in {"active", "kept"}])}

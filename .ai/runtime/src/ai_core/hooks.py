@@ -1660,7 +1660,6 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
     response = {
         "ok": True,
         "hook": effective_hook,
-        "agent": normalize_agent(payload),
         "mode": mode,
         "persisted": persisted,
         "elapsed_ms": elapsed_ms,
@@ -1830,10 +1829,6 @@ def codex_wire_output(response: dict[str, Any]) -> dict[str, Any]:
             return {"hookSpecificOutput": out}
     if hook == "Stop":
         return {"continue": True}
-    if hook == "PreToolUse" and response.get("agent") == "antigravity":
-        # Antigravity treats a hook response WITHOUT an explicit allow as a deny (empty reason),
-        # so a non-blocking {} silently hard-denies every agy tool call. Return an explicit allow.
-        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
     return {}
 
 

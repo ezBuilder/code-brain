@@ -444,33 +444,3 @@ def test_pretooluse_claude_route_still_denies() -> None:
     payload = _parse_ok(result)
     assert payload.get("decision") == "block"
     assert payload.get("advisory") is not True
-
-
-def _wire_hook(payload: dict) -> dict:
-    """Invoke the real (non --json) wire output that the agent CLI actually receives."""
-    merged = os.environ.copy()
-    for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "AI_CI"):
-        merged.pop(name, None)
-    merged["PYTHONPATH"] = str(ROOT / ".ai" / "runtime" / "src")
-    result = subprocess.run(
-        [PYTHON, "-m", "ai_core.cli", "hook", "PreToolUse"],
-        cwd=ROOT, env=merged, text=True, input=json.dumps({**payload, "dry": True}),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    return json.loads(result.stdout)
-
-
-def test_pretooluse_antigravity_safe_tool_explicit_allow() -> None:
-    # A non-blocked agy tool (e.g. write_to_file) must get an EXPLICIT allow on the WIRE, else agy
-    # treats the empty response as a deny and stalls every tool call.
-    wire = _wire_hook({"agent": "antigravity", "tool_name": "write_to_file",
-                       "tool_input": {"path": "docs/x.md", "content": "hi"}})
-    assert wire.get("hookSpecificOutput", {}).get("permissionDecision") == "allow"
-
-
-def test_pretooluse_claude_safe_tool_silent_wire() -> None:
-    # Claude/Codex keep the empty (implicit-allow) wire response — no explicit decision needed.
-    wire = _wire_hook({"agent": "claude", "tool_name": "Write",
-                       "tool_input": {"file_path": "/tmp/x", "content": "hi"}})
-    assert wire == {}

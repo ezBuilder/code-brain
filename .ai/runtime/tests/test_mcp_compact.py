@@ -10,7 +10,8 @@ def test_default_is_full(monkeypatch) -> None:
     monkeypatch.delenv("AI_MCP_COMPACT_TOOLS", raising=False)
     m._invalidate_tools_list_cache()
     tools = m._build_tools_list_payload()["tools"]
-    assert len(tools) > 60  # full catalog by default — no behavior change
+    # full catalog by default — every non-removed tool, and far more than the compact core.
+    assert len(tools) == len(m.TOOLS) > len(m._CORE_TOOLS)
 
 
 def test_compact_returns_core_plus_search(monkeypatch) -> None:

@@ -32,9 +32,12 @@ def code_brain_stdio_entry(windows: bool | None = None) -> dict[str, Any]:
     import os as _os
 
     is_win = _os.name == "nt" if windows is None else windows
+    # Compact tools on by default: tools/list ships only the hot core tools; the rest load on
+    # demand via tool_search. Per-session schema-token cut, no capability loss. (AI_MCP_COMPACT_TOOLS)
+    env = {"AI_MCP_COMPACT_TOOLS": "1"}
     if is_win:
-        return {"command": "powershell", "args": ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"], "env": {}}
-    return {"command": ".ai/bin/ai-mcp", "args": [], "env": {}}
+        return {"command": "powershell", "args": ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"], "env": env}
+    return {"command": ".ai/bin/ai-mcp", "args": [], "env": env}
 
 
 def _normalize_remote_url_keys(server: dict[str, Any], *, target_key: str) -> dict[str, Any]:

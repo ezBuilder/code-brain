@@ -100,23 +100,6 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
-        "name": "code_graph_hotspots",
-        "description": "Most-called callees across the indexed codebase. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"limit": {"type": "integer", "default": 20}},
-        },
-    },
-    {
-        "name": "code_verify",
-        "description": "AST-based policy gate: rejects forbidden imports/calls/sandbox escapes. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"source": {"type": "string", "description": "Python source to verify"}},
-            "required": ["source"],
-        },
-    },
-    {
         "name": "code_read_hashline",
         "description": "Read a repo file with line+hash anchors for stale-edit detection. Read-only; refuses credential-like paths.",
         "inputSchema": {
@@ -140,16 +123,6 @@ TOOLS: tuple[dict[str, Any], ...] = (
             },
             "required": ["text"],
         },
-    },
-    {
-        "name": "memory_tier",
-        "description": "MemGPT-style hot/warm/cold memory classification + page-out signal + retention scoring (decay/reinforcement) of decisions/lessons/procedures. Read-only.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "ai_status",
-        "description": "Worker health envelope.",
-        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "ai_request_rebuild",
@@ -204,28 +177,6 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "timeout": {"type": "integer", "default": 30},
             },
             "required": ["command"],
-        },
-    },
-    {
-        "name": "sandbox_fetch",
-        "description": "Fetch a line range or grep filter from a stored sandbox execution.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "exec_id": {"type": "string"},
-                "line_start": {"type": "integer", "default": 1},
-                "line_end": {"type": "integer"},
-                "grep_pattern": {"type": "string"},
-            },
-            "required": ["exec_id"],
-        },
-    },
-    {
-        "name": "sandbox_list",
-        "description": "List recent sandbox executions (newest first).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"limit": {"type": "integer", "default": 20}},
         },
     },
     {
@@ -519,205 +470,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             },
         },
     },
-    {
-        "name": "recommend_skills",
-        "description": "Propose slash-command skills from cross-session memory. May persist pending catalog entries; does not install.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "default": 5},
-                "include_global": {"type": "boolean", "default": True},
-                "min_signal": {"type": "integer", "default": 3},
-            },
-        },
-    },
-    {
-        "name": "recommend_skills_accept",
-        "description": "Install candidate slash command. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "recommend_skills_reject",
-        "description": "Mark a candidate as rejected so it is not surfaced again. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "skills_list",
-        "description": "List catalog entries (pending/installed/rejected/uninstalled). Read-only.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "skills_uninstall",
-        "description": "Uninstall skill; rejects on drift unless force=true. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "slug": {"type": "string"},
-                "force": {"type": "boolean", "default": False},
-            },
-            "required": ["slug"],
-        },
-    },
-    {
-        "name": "precall_recommend",
-        "description": "Propose precall rules from accumulated Bash invocations. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "default": 5},
-                "min_signal": {"type": "integer", "default": 5},
-                "include_transcripts": {"type": "boolean", "default": False},
-            },
-        },
-    },
-    {
-        "name": "precall_list",
-        "description": "List precall rule catalog. Read-only.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "precall_accept",
-        "description": "Promote pending → dry_run (safety probe + regex compile). Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "precall_activate",
-        "description": "Promote dry_run → active; refuses if observed<required unless force=true. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "force": {"type": "boolean", "default": False},
-            },
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "precall_reject",
-        "description": "Mark a candidate as rejected (no longer surfaced). Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "precall_disable",
-        "description": "Disable an active or dry_run rule. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "federated_summary",
-        "description": "Cross-project pattern counts (no raw text leak). Read-only.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "agents_recommend",
-        "description": "Propose .claude/agents/<slug>.md from transcripts+decisions. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "default": 5},
-                "min_signal": {"type": "integer", "default": 3},
-            },
-        },
-    },
-    {
-        "name": "agents_list",
-        "description": "List agent catalog entries. Read-only.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "agents_accept",
-        "description": "Install a candidate sub-agent definition into .claude/agents. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "agents_reject",
-        "description": "Mark an agent candidate as rejected. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "agents_uninstall",
-        "description": "Uninstall agent; rejects on drift unless force=true. Write-class.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "slug": {"type": "string"},
-                "force": {"type": "boolean", "default": False},
-            },
-            "required": ["slug"],
-        },
-    },
     # remote_memory_* tools removed (T37) — .ai/ git sync replaces Cloudflare round-trip.
     # ---- Innovation modules (PoC; safe — no hot-path mutation) ----
-    {
-        "name": "lsp_available",
-        "description": "Detect LSP backend readiness (multilspy + language servers on PATH).",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "lsp_find_references",
-        "description": "LSP find_references — precise cross-file reference graph for a symbol.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "line": {"type": "integer"},
-                "column": {"type": "integer"},
-            },
-            "required": ["file_path", "line", "column"],
-        },
-    },
-    {
-        "name": "lsp_goto_definition",
-        "description": "LSP goto_definition for a symbol at file:line:column.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "line": {"type": "integer"},
-                "column": {"type": "integer"},
-            },
-            "required": ["file_path", "line", "column"],
-        },
-    },
-    {
-        "name": "lsp_workspace_symbols",
-        "description": "LSP workspace_symbols — fuzzy symbol search across the workspace.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer", "default": 20},
-            },
-            "required": ["query"],
-        },
-    },
     {
         "name": "speculative_mine_patterns",
         "description": "Mine 2-gram tool-call patterns from audit/2026.jsonl for speculative execution.",
@@ -888,6 +642,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
 )
 
+
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
 TOOL_NAMES = frozenset(MCP_METHODS)
 
@@ -910,6 +665,9 @@ _CORE_TOOLS = frozenset({
     "code_query", "context_pack", "code_read_hashline",
     "code_graph_callers", "code_graph_callees", "code_graph_symbol", "code_graph_architecture",
     "ast_grep_search", "lessons_recall", "record_decision", "record_todo", "memory_query",
+    # measured hot tools (obs mcp_tool_breakdown top-5): used heavily, kept loaded so compact
+    # mode never forces a tool_search round-trip for them.
+    "doctor_strict", "ai_request_rebuild",
     "tool_search",
 })
 
@@ -1068,9 +826,6 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "code_graph_symbol":
         from .codegraph import find_symbol
         return find_symbol(root, str(args.get("name", "")), limit=int(args.get("limit", 20) or 20))
-    if name == "code_graph_hotspots":
-        from .codegraph import hotspot_callees
-        return hotspot_callees(root, limit=int(args.get("limit", 20) or 20))
     if name == "code_graph_trace":
         from .codegraph import trace_call_path
         return trace_call_path(root, src=str(args.get("src", "")), dst=str(args.get("dst", "")),
@@ -1084,9 +839,6 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "code_graph_architecture":
         from .codegraph import architecture_summary
         return architecture_summary(root, limit=int(args.get("limit", 8) or 8))
-    if name == "code_verify":
-        from .ast_verify import verify_source
-        return verify_source(str(args.get("source", ""))).to_dict()
     if name == "code_read_hashline":
         from .hashline import read_hashline
         target = args.get("path")
@@ -1101,13 +853,6 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "stream_guard_scan":
         from .stream_guard import scan_text
         return scan_text(str(args.get("text", "")), scope=str(args.get("scope", "tool") or "tool"))
-    if name == "memory_tier":
-        from .memory_tier import classify, hot_pressure, retention_report
-        cls = classify(root)
-        pres = hot_pressure(root)
-        return {**cls, "pressure": pres, "retention": retention_report(root)}
-    if name == "ai_status":
-        return health(root)
     if name == "ai_request_rebuild":
         return rebuild(root)
     if name == "obs_usage":
@@ -1134,19 +879,6 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             cwd=str(args["cwd"]) if isinstance(args.get("cwd"), str) else None,
             timeout=int(args.get("timeout", 30) or 30),
         )
-    if name == "sandbox_fetch":
-        exec_id = args.get("exec_id")
-        if not isinstance(exec_id, str) or not exec_id:
-            raise ValueError("sandbox_fetch requires exec_id string")
-        return sandbox_fetch(
-            root,
-            exec_id=exec_id,
-            line_start=int(args.get("line_start", 1) or 1),
-            line_end=(int(args["line_end"]) if isinstance(args.get("line_end"), int) else None),
-            grep_pattern=(str(args["grep_pattern"]) if isinstance(args.get("grep_pattern"), str) else None),
-        )
-    if name == "sandbox_list":
-        return sandbox_list(root, limit=int(args.get("limit", 20) or 20))
     if name == "record_decision":
         text = args.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -1345,125 +1077,8 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             agent=str(args.get("agent") or "agent"),
             clear=bool(args.get("clear")),
         )
-    if name == "recommend_skills":
-        from .recommend import recommend as rec_run
-        return rec_run(
-            root,
-            limit=int(args.get("limit", 5) or 5),
-            include_global=bool(args.get("include_global", True)),
-            min_signal=int(args.get("min_signal", 3) or 3),
-        )
-    if name == "recommend_skills_accept":
-        from .recommend import accept as rec_accept_fn
-        cid = args.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise ValueError("recommend_skills_accept requires id string")
-        return rec_accept_fn(root, cid)
-    if name == "recommend_skills_reject":
-        from .recommend import reject as rec_reject_fn
-        cid = args.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise ValueError("recommend_skills_reject requires id string")
-        return rec_reject_fn(root, cid)
-    if name == "skills_list":
-        from .recommend import list_visible
-        return {"ok": True, "skills": list_visible(root)}
-    if name == "skills_uninstall":
-        from .recommend import uninstall as skills_uninstall_fn
-        slug = args.get("slug")
-        if not isinstance(slug, str) or not slug:
-            raise ValueError("skills_uninstall requires slug string")
-        return skills_uninstall_fn(root, slug, force=bool(args.get("force", False)))
-    if name == "precall_recommend":
-        from .precall_recommend import recommend as pc_run
-        return pc_run(
-            root,
-            limit=int(args.get("limit", 5) or 5),
-            min_signal=int(args.get("min_signal", 5) or 5),
-            include_transcripts=bool(args.get("include_transcripts", False)),
-        )
-    if name == "precall_list":
-        from .precall_recommend import list_visible
-        return {"ok": True, "rules": list_visible(root)}
-    if name == "precall_accept":
-        from .precall_recommend import accept as pc_accept_fn
-        cid = args.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise ValueError("precall_accept requires id string")
-        return pc_accept_fn(root, cid)
-    if name == "precall_activate":
-        from .precall_recommend import activate as pc_activate_fn
-        cid = args.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise ValueError("precall_activate requires id string")
-        return pc_activate_fn(root, cid, force=bool(args.get("force", False)))
-    if name == "precall_reject":
-        from .precall_recommend import reject as pc_reject_fn
-        cid = args.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise ValueError("precall_reject requires id string")
-        return pc_reject_fn(root, cid)
-    if name == "precall_disable":
-        from .precall_recommend import disable as pc_disable_fn
-        cid = args.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise ValueError("precall_disable requires id string")
-        return pc_disable_fn(root, cid)
-    if name == "federated_summary":
-        from .federated import cross_project_summary
-        return cross_project_summary(root)
-    if name == "agents_recommend":
-        from .agent_recommend import recommend as ag_run
-        return ag_run(root, limit=int(args.get("limit", 5) or 5), min_signal=int(args.get("min_signal", 3) or 3))
-    if name == "agents_list":
-        from .agent_recommend import list_visible
-        return {"ok": True, "agents": list_visible(root)}
-    if name == "agents_accept":
-        from .agent_recommend import accept as ag_accept_fn
-        cid = args.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise ValueError("agents_accept requires id string")
-        return ag_accept_fn(root, cid)
-    if name == "agents_reject":
-        from .agent_recommend import reject as ag_reject_fn
-        cid = args.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise ValueError("agents_reject requires id string")
-        return ag_reject_fn(root, cid)
-    if name == "agents_uninstall":
-        from .agent_recommend import uninstall as ag_uninstall_fn
-        slug = args.get("slug")
-        if not isinstance(slug, str) or not slug:
-            raise ValueError("agents_uninstall requires slug string")
-        return ag_uninstall_fn(root, slug, force=bool(args.get("force", False)))
     # remote_memory_* dispatchers removed (T37)
     # ---- Innovation modules (PoC dispatch) ----
-    if name == "lsp_available":
-        from .lsp import lsp_available
-        return lsp_available(root)
-    if name == "lsp_find_references":
-        from .lsp import find_references
-        return find_references(
-            root,
-            str(args.get("file_path", "")),
-            int(args.get("line", 0) or 0),
-            int(args.get("column", 0) or 0),
-        )
-    if name == "lsp_goto_definition":
-        from .lsp import goto_definition
-        return goto_definition(
-            root,
-            str(args.get("file_path", "")),
-            int(args.get("line", 0) or 0),
-            int(args.get("column", 0) or 0),
-        )
-    if name == "lsp_workspace_symbols":
-        from .lsp import workspace_symbols
-        return workspace_symbols(
-            root,
-            str(args.get("query", "")),
-            limit=int(args.get("limit", 20) or 20),
-        )
     if name == "speculative_mine_patterns":
         from .speculative import mine_patterns
         return mine_patterns(

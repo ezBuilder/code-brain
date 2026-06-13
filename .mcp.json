@@ -3,7 +3,7 @@
     "code-brain": {
       "args": [],
       "command": ".ai/bin/ai-mcp",
-      "env": {}
+      "env": { "AI_MCP_COMPACT_TOOLS": "1" }
     }
   }
 }

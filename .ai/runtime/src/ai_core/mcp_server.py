@@ -255,6 +255,22 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "lessons_recall",
+        "description": (
+            "Recall distilled lessons relevant to a query (failure-prevention strategies mined "
+            "from past runs), ranked by confidence*relevance*recency. Read-only. Call before a "
+            "risky/repeated task to reuse prior experience."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "record_todo",
         "description": "Persist open todo to .ai/memory/todos.jsonl. Auto-injected next session. Write-class.",
         "inputSchema": {
@@ -1009,6 +1025,13 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             status=args.get("status") if isinstance(args.get("status"), str) else None,
             supersedes_id=args.get("supersedes_id") if isinstance(args.get("supersedes_id"), str) else None,
         )
+    if name == "lessons_recall":
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("lessons_recall requires non-empty query")
+        from .lessons import recall_lessons
+
+        return recall_lessons(root, query=query, limit=int(args.get("limit", 5) or 5))
     if name == "record_todo":
         title = args.get("title")
         if not isinstance(title, str) or not title.strip():

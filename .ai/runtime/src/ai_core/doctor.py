@@ -93,7 +93,10 @@ def check_antigravity_artifacts(root: Path) -> Check:
                 if not isinstance(spec, dict):
                     issues.append("hooks.json missing code-brain entry")
                 else:
-                    for required in ("PreToolUse", "PostToolUse", "Stop"):
+                    # PreToolUse is intentionally omitted for Antigravity (its jsonhook contract
+                    # is deny-by-default and would block every agy tool call); only the working
+                    # side-effect events are required.
+                    for required in ("PostToolUse", "Stop"):
                         ev = spec.get(required)
                         if not isinstance(ev, list) or not ev:
                             issues.append(f"hooks.json code-brain missing event {required}")

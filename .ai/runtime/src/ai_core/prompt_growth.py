@@ -59,6 +59,11 @@ VIOLATION_RATE = 0.5         # >=50% of recent reports verbose → warrant a bre
 RATCHET_WINDOW = 30          # turns to measure a freshly applied rule before judging it
 RATCHET_REGRESS = 1.10       # post-rule avg output > 110% of baseline → rollback
 LEARNED_HEADER = "# Learned project rules (auto-grown by Code Brain; do not edit by hand)"
+BREVITY_RULE_TEXT = (
+    "기본 응답은 10글자 이내로 강제한다. 명시적 상세 요청, 심각한 오류, "
+    "사용자에게 필요한 질문만 예외다. 종료 시 다음 조치 안내를 쓰지 말고 "
+    "필요한 작업은 자율 완주한다."
+)
 
 
 def log_path(root: Path) -> Path:
@@ -145,10 +150,10 @@ def _active_rules(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def _render_learned(root: Path, state: dict[str, Any]) -> None:
     rules = _active_rules(state)
-    live = [r for r in rules.values() if r.get("status") == "active"]
+    live = [r for r in rules.values() if r.get("status") in {"active", "kept"}]
     path = learned_path(root)
     if not live:
-        # remove the file entirely when nothing is active (clean rollback)
+        # remove the file entirely when nothing should be injected (clean rollback)
         try:
             path.unlink()
         except FileNotFoundError:
@@ -280,16 +285,26 @@ def _evaluate_and_grow(root: Path) -> dict[str, Any]:
             actions.append(f"keep:{rid}")
         rules[rid] = rule
 
-    # (b) consider applying the brevity rule when sustained verbosity is observed
+    # (b) consider applying or upgrading the brevity rule when sustained verbosity is observed
+    rid = "brevity-boost"
+    existing = rules.get(rid)
+    if (
+        existing
+        and existing.get("status") in {"active", "kept"}
+        and str(existing.get("text") or "") != BREVITY_RULE_TEXT
+    ):
+        existing["text"] = BREVITY_RULE_TEXT
+        existing["updated_at"] = now_iso()
+        rules[rid] = existing
+        actions.append(f"update:{rid}")
     window = _recent(root, WINDOW)
     if len(window) >= MIN_SAMPLES:
         rate = sum(int(o.get("verbose", 0)) for o in window) / len(window)
-        rid = "brevity-boost"
         existing = rules.get(rid)
         already = existing and existing.get("status") in {"active", "kept"}
         regressed = existing and existing.get("status") == "regressed"
         if rate >= VIOLATION_RATE and not already and not regressed:
-            rule_text = "보고는 핵심 1줄(≤50자)로 강제한다. 명시 요청이 없으면 해설·다이어그램·목록을 만들지 않는다."
+            rule_text = BREVITY_RULE_TEXT
             # ASI06 write-validation gate: a self-applied rule may never weaken a core invariant.
             verdict = _guard_self_write(rule_text)
             if not verdict.get("ok", True):

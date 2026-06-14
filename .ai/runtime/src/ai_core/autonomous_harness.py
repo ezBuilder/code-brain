@@ -74,8 +74,8 @@ def analyze(root: Path) -> dict[str, Any]:
             "own paths before editing; avoid protected paths unless explicitly approved",
             "implement in small iterations",
             "run closest verification first",
-            "record pass/fail evidence and remaining gap",
-            "repeat until release/readiness confidence is at least 95% or a concrete blocker is proven",
+            "record pass/fail evidence internally and keep working on remaining gaps",
+            "repeat until release/readiness confidence is at least 95%, no required work remains, or a concrete blocker is proven",
         ],
     }
     return redact_value(payload)
@@ -85,11 +85,11 @@ def context_line(root: Path) -> str:
     payload = analyze(root)
     signals = payload["signals"]
     return (
-        "Autonomous harness: "
+        "자율 하니스: "
         f"mode={payload['mode']}, target={int(COMPLETION_TARGET * 100)}%, "
         f"src={signals['source_files']}, tests={signals['test_files']}, dirty={signals['dirty_files']}. "
         "For new builds or hardening, self-apply: define acceptance criteria, own paths, iterate with tests/doctor/release-gate, "
-        "and continue until target confidence or a concrete blocker."
+        "and continue until target confidence, no required work remains, or a concrete blocker."
     )
 
 
@@ -106,7 +106,7 @@ def directive(root: Path, *, explicit: bool = False) -> str:
         f"mode={payload['mode']}, target={int(COMPLETION_TARGET * 100)}%. "
         "Do not wait for a separate `ai harness` command. Convert the user goal into scoped tasks and acceptance criteria, "
         "declare owned paths before edits, enforce protected-path and dependency-manifest gates, run the closest verification, "
-        "and iterate until target confidence or a concrete blocker."
+        "and iterate until target confidence, no required work remains, or a concrete blocker."
     )
 
 

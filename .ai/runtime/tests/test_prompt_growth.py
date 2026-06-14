@@ -20,7 +20,7 @@ def test_grows_brevity_rule_after_sustained_verbosity(tmp_path: Path) -> None:
     assert last["grew"] is True
     assert "apply:brevity-boost" in last["actions"]
     assert pg.learned_path(root).exists()
-    assert "≤50자" in pg.learned_prompt_text(root)
+    assert "10글자" in pg.learned_prompt_text(root)
 
 
 def test_no_growth_when_concise(tmp_path: Path) -> None:
@@ -43,6 +43,34 @@ def test_apply_is_idempotent(tmp_path: Path) -> None:
         pg.tick(root, output_chars=1200, cooldown=5)
     active = [r for r in pg.status(root)["rules"] if r["status"] in {"active", "kept"}]
     assert len(active) == 1  # rule applied once, never duplicated
+
+
+def test_kept_rule_stays_injected(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    for _ in range(55):
+        pg.tick(root, output_chars=1200, cooldown=5)
+    rule = [r for r in pg.status(root)["rules"] if r["id"] == "brevity-boost"][0]
+    assert rule["status"] == "kept"
+    assert "10글자" in pg.learned_prompt_text(root)
+
+
+def test_old_kept_brevity_rule_upgrades_text(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    state = {
+        "turns": 50,
+        "rules": {
+            "brevity-boost": {
+                "id": "brevity-boost",
+                "text": "보고는 핵심 1줄(≤50자)로 강제한다.",
+                "status": "kept",
+                "applied_at": "2026-01-01T00:00:00Z",
+            }
+        },
+    }
+    pg._write_state(root, state)
+    result = pg.evaluate_and_grow(root)
+    assert "update:brevity-boost" in result["actions"]
+    assert "10글자" in pg.learned_prompt_text(root)
 
 
 def test_injection_reflects_learned_file(tmp_path: Path) -> None:

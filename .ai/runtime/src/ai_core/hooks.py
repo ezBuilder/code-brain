@@ -1019,8 +1019,8 @@ def _skill_recommendation_context(root: Path, hook_name: str, payload: dict[str,
         env_toggle="AI_SKILL_RECOMMENDATIONS",
         env_min_signal="AI_SKILL_RECOMMEND_MIN_SIGNAL",
         invoke=invoke,
-        header="Skill recommendations available. Surface these to the user; install only after explicit approval:",
-        approval_line="Approval: `ai recommend skills accept <id>`; reject noise with `ai recommend skills reject <id>`.",
+        header="스킬 추천 있음. 사용자에게 제시하되 명시 승인 후에만 설치:",
+        approval_line="승인: `ai recommend skills accept <id>`; 불필요하면 `ai recommend skills reject <id>`.",
         label_field="slug",
         desc_field="description",
         source_short="cb-skill",
@@ -1140,8 +1140,8 @@ def _agent_recommendation_context(root: Path, hook_name: str, payload: dict[str,
         env_toggle="AI_AGENT_RECOMMENDATIONS",
         env_min_signal="AI_AGENT_RECOMMEND_MIN_SIGNAL",
         invoke=invoke,
-        header="Sub-agent recommendations available. Surface these to the user; install only after explicit approval:",
-        approval_line="Approval: `ai agents accept <id>`; reject noise with `ai agents reject <id>`.",
+        header="서브에이전트 추천 있음. 사용자에게 제시하되 명시 승인 후에만 설치:",
+        approval_line="승인: `ai agents accept <id>`; 불필요하면 `ai agents reject <id>`.",
         label_field="slug",
         desc_field="description",
         source_short="cb-agent",
@@ -1174,8 +1174,8 @@ def _precall_recommendation_context(root: Path, hook_name: str, payload: dict[st
         env_toggle="AI_PRECALL_RECOMMENDATIONS",
         env_min_signal="AI_PRECALL_RECOMMEND_MIN_SIGNAL",
         invoke=invoke,
-        header="Precall routing rule recommendations available. Surface these to the user; activate only after explicit approval:",
-        approval_line="Approval: `ai precall accept <id>` → `ai precall activate <id>`; reject noise with `ai precall reject <id>`.",
+        header="Precall 라우팅 규칙 추천 있음. 사용자에게 제시하되 명시 승인 후에만 활성화:",
+        approval_line="승인: `ai precall accept <id>` → `ai precall activate <id>`; 불필요하면 `ai precall reject <id>`.",
         label_field="kind",
         desc_field=("evidence", "rationale"),
         source_short="cb-precall",
@@ -1217,7 +1217,7 @@ def _federated_summary_context(root: Path, hook_name: str) -> str:
         return ""
     scanned = summary.get("scanned_projects", 0)
     return (
-        f"Federated patterns from {scanned} projects — {' | '.join(parts)}. "
+        f"federated 패턴({scanned}개 프로젝트) — {' | '.join(parts)}. "
         "Inspect with `ai federated summary`."
     )
 
@@ -1298,12 +1298,12 @@ def _satisfaction_summary_context_uncached(root: Path) -> str:
     adaptive_suffix = f"; adaptive +{adaptive_bump} (auto-noise reduction)" if adaptive_bump > 0 else ""
     if total_acted == 0:
         return (
-            f"Recommendation satisfaction: {counts['surfaced']} surfaced, 0 acted{stale_suffix}{adaptive_suffix}. "
+            f"추천 만족도: {counts['surfaced']} surfaced, 0 acted{stale_suffix}{adaptive_suffix}. "
             "Inspect: `ai recommend skills|agents|precall`; opt out: AI_*_RECOMMENDATIONS=0."
         )
     sat_pct = int(round(100 * counts["accepted"] / total_acted))
     return (
-        f"Recommendation satisfaction: {sat_pct}% accept ({counts['accepted']}/{total_acted} acted, "
+        f"추천 만족도: {sat_pct}% accept ({counts['accepted']}/{total_acted} acted, "
         f"{counts['surfaced']} surfaced lifetime{stale_suffix})."
     )
 
@@ -2141,20 +2141,24 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if hook_name not in INJECTION_HOOKS or root is None:
         return ""
     sections = [header]
+    sections.append(
+        "응답 규칙: 기본 답변은 10글자 이내. 상세 요청·심각 오류·사용자 질문만 예외. "
+        "종료 시 다음 조치 안내 금지; 남은 작업은 자율 완주."
+    )
     if _env_enabled("AI_ROUTING_HINT_COMPACT"):
-        routing = "Search routing: prefer MCP `code_query`/`context_pack` over grep."
+        routing = "검색 라우팅: grep 대신 MCP `code_query`/`context_pack` 우선."
     else:
         routing = (
-            "Search routing: prefer MCP `code_query` / `context_pack` over Bash grep/find. "
-            "Each MCP query returns ranked snippets (default 5) instead of full grep dumps — "
-            "use grep only as fallback when MCP fails."
+            "검색 라우팅: Bash grep/find 대신 MCP `code_query` / `context_pack` 우선. "
+            "각 MCP 질의는 grep 전체 덤프 대신 랭킹된 스니펫(기본 5개)을 반환 — "
+            "MCP가 실패할 때만 grep을 폴백으로 사용."
         )
     sections.append(routing)
     sections.append(
-        "Code reading: after `code_query` locates a file, prefer MCP `code_read_hashline` "
-        "for exact file slices so line+hash anchors are available before edits. "
-        "For CLI fallback, use `.ai/bin/ai code read-hashline <path> --start N --end M`; "
-        "verify saved anchors with `.ai/bin/ai code verify-hashline <path>` when stale edits matter."
+        "코드 읽기: `code_query`로 파일을 찾은 뒤엔 정확한 슬라이스를 위해 MCP `code_read_hashline` 우선 "
+        "— 편집 전에 줄+해시 앵커를 확보한다. "
+        "CLI 폴백은 `.ai/bin/ai code read-hashline <path> --start N --end M`; "
+        "stale 편집이 중요하면 `.ai/bin/ai code verify-hashline <path>`로 저장된 앵커를 검증."
     )
     staleness = _memory_staleness_context(root, hook_name)
     if staleness:
@@ -2186,7 +2190,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         except Exception:
             prior = None
         if prior:
-            lines = [f"Prior session resume (session_id={prior.get('session_id')}, written_at={prior.get('written_at')}):"]
+            lines = [f"이전 세션 재개 (session_id={prior.get('session_id')}, written_at={prior.get('written_at')}):"]
             # P1: lead with the intent-carrying handoff so a resuming session (esp. on
             # the other machine) sees "what we were doing / what to do next" first.
             handoff = prior.get("handoff") if isinstance(prior.get("handoff"), dict) else None
@@ -2194,7 +2198,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
                 if handoff.get("goal"):
                     lines.append(f"  goal: {str(handoff['goal'])[:200]}")
                 if handoff.get("next_step"):
-                    lines.append(f"  next step: {str(handoff['next_step'])[:200]}")
+                    lines.append(f"  resume task: {str(handoff['next_step'])[:200]}")
                 for step in (handoff.get("plan") or [])[:6]:
                     lines.append(f"  plan: {str(step)[:160]}")
                 for q in (handoff.get("open_questions") or [])[:4]:
@@ -2252,7 +2256,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         plain_decisions, live_failures = (
             _read_jsonl_tail(root / ".ai" / "memory" / "decisions.jsonl", DECISIONS_TAIL), [])
     if plain_decisions:
-        lines = ["Recent decisions:"]
+        lines = ["최근 결정:"]
         for entry in plain_decisions:
             ts = str(entry.get("decided_at") or entry.get("timestamp") or "")[:19]
             text = str(entry.get("decision") or entry.get("summary") or entry.get("text") or "")[:160]
@@ -2261,7 +2265,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if live_failures:
         live_versions = _failure_live_versions(root)
         today = now_iso()[:10]
-        flines = ["Known failures (point-in-time, re-testable — NOT permanent bans):"]
+        flines = ["알려진 실패(시점 기록, 재검증 가능 — 영구 금지 아님):"]
         for entry in live_failures[:_FAILURE_MAX_SURFACE]:
             flines.extend(_render_failure_lines(entry, live_versions, today))
         extra = len(live_failures) - _FAILURE_MAX_SURFACE
@@ -2270,7 +2274,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         sections.append("\n".join(flines))
     todos = _read_jsonl_open_todos(root / ".ai" / "memory" / "todos.jsonl", TODOS_LIMIT)
     if todos:
-        lines = ["Open todos:"]
+        lines = ["열린 todo:"]
         for entry in todos:
             text = str(entry.get("title") or entry.get("text") or entry.get("summary") or "")[:160]
             owner = str(entry.get("owner") or "")
@@ -2315,7 +2319,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             pass
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
-        sections.append("Session-current tail:\n" + session_tail)
+        sections.append("세션 현황 최근 기록:\n" + session_tail)
     learned = _learned_prompt_context(root)
     if learned:
         sections.append(learned)

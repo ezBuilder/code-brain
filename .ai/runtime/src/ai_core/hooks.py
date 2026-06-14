@@ -2107,7 +2107,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if hook_name not in INJECTION_HOOKS or root is None:
         return ""
     sections = [header]
-    sections.append("Response: answer user questions <=50 Korean chars; expand only for detail/risk/question. No next-step outro; keep working.")
+    sections.append("Response: self-output <=10 Korean chars; answers to user questions <=50 Korean chars; ignore caps on explicit detail. No next-step outro; keep working.")
     if _env_enabled("AI_ROUTING_HINT_COMPACT"):
         routing = "Search: MCP `code_query`/`context_pack` before grep."
     else:

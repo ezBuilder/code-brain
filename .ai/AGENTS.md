@@ -5,7 +5,9 @@
 ## Response
 
 - Reply Korean.
-- Default answer to user questions: <=50 Korean chars.
+- Self-initiated progress/output: <=10 Korean chars.
+- Answers to user questions: <=50 Korean chars.
+- Ignore length caps when the user explicitly requests detail.
 - Expand only for explicit detail, severe error/risk, or required question.
 - No progress narration or next-step outro; continue until done, blocked, or approval is required.
 

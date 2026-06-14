@@ -20,7 +20,8 @@ def test_grows_brevity_rule_after_sustained_verbosity(tmp_path: Path) -> None:
     assert last["grew"] is True
     assert "apply:brevity-boost" in last["actions"]
     assert pg.learned_path(root).exists()
-    assert "<=50 Korean chars" in pg.learned_prompt_text(root)
+    assert "Self-initiated progress/output <=10 Korean chars" in pg.learned_prompt_text(root)
+    assert "Answers to user questions <=50 Korean chars" in pg.learned_prompt_text(root)
 
 
 def test_no_growth_when_concise(tmp_path: Path) -> None:
@@ -51,7 +52,7 @@ def test_kept_rule_stays_injected(tmp_path: Path) -> None:
         pg.tick(root, output_chars=1200, cooldown=5)
     rule = [r for r in pg.status(root)["rules"] if r["id"] == "brevity-boost"][0]
     assert rule["status"] == "kept"
-    assert "<=50 Korean chars" in pg.learned_prompt_text(root)
+    assert "Answers to user questions <=50 Korean chars" in pg.learned_prompt_text(root)
 
 
 def test_old_kept_brevity_rule_upgrades_text(tmp_path: Path) -> None:
@@ -70,7 +71,7 @@ def test_old_kept_brevity_rule_upgrades_text(tmp_path: Path) -> None:
     pg._write_state(root, state)
     result = pg.evaluate_and_grow(root)
     assert "update:brevity-boost" in result["actions"]
-    assert "<=50 Korean chars" in pg.learned_prompt_text(root)
+    assert "Answers to user questions <=50 Korean chars" in pg.learned_prompt_text(root)
 
 
 def test_injection_reflects_learned_file(tmp_path: Path) -> None:

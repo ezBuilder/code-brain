@@ -28,20 +28,20 @@ CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "SubagentStart"}
 SKILL_RECOMMENDATION_HOOKS = {"SessionStart"}
 
 try:
-    MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "4096"))))
+    MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "2048"))))
 except (ValueError, TypeError):
-    MAX_INJECTION_BYTES = 4096
+    MAX_INJECTION_BYTES = 2048
 try:
     SESSION_START_MAX_INJECTION_BYTES = max(
         MAX_INJECTION_BYTES,
-        min(32768, int(_os.environ.get("AI_SESSION_START_MAX_BYTES", "12288"))),
+        min(32768, int(_os.environ.get("AI_SESSION_START_MAX_BYTES", "8192"))),
     )
 except (ValueError, TypeError):
-    SESSION_START_MAX_INJECTION_BYTES = max(MAX_INJECTION_BYTES, 12288)
-DECISIONS_TAIL = 5
-TODOS_LIMIT = 5
-SESSION_TAIL_LINES = 8
-PRIOR_SESSION_TAIL_LINES = 8
+    SESSION_START_MAX_INJECTION_BYTES = max(MAX_INJECTION_BYTES, 8192)
+DECISIONS_TAIL = 3
+TODOS_LIMIT = 3
+SESSION_TAIL_LINES = 4
+PRIOR_SESSION_TAIL_LINES = 4
 
 KNOWN_AGENTS = {"claude", "codex", "antigravity"}
 

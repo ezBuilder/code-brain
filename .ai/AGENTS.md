@@ -33,7 +33,7 @@
 - Single-file fixes and explicit user-scoped work can proceed directly.
 - If new risk appears, stop only when approval or a decision is required.
 
-## Search
+## Search Routing
 
 - Code discovery: MCP `code_query` first, `context_pack` next.
 - Call graph: `code_graph_callers`, `code_graph_callees`, `code_graph_symbol`.

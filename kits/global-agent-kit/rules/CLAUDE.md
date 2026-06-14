@@ -7,7 +7,7 @@ Priority: security > user > project > method > response.
 ## Response
 
 - Reply Korean.
-- Default visible output: <=10 Korean chars.
+- Default answer to user questions: <=50 Korean chars.
 - Expand only for explicit detail, severe error/risk, or required question.
 - No routine progress, next-step outro, or "ask me to continue".
 - If work remains and no approval is needed, keep working.

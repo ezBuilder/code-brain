@@ -288,7 +288,7 @@
     "scripts/env-check.sh",
     "scripts/preflight.sh"
   ],
-  "installed_at": "2026-06-14T07:02:12Z",
+  "installed_at": "2026-06-14T07:09:52Z",
   "merged_config_files": [
     ".mcp.json",
     ".codex/config.toml",
@@ -299,6 +299,6 @@
   ],
   "project": "code-brain",
   "schema_version": 1,
-  "source_git_sha": "4a6ffeeb9a7af216980fb704cefe9b00f82ebf55",
+  "source_git_sha": "1dcd2a94f9cae005ad62c511bacb66e6d3f52031",
   "tool": "code-brain"
 }

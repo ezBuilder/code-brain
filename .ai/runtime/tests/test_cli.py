@@ -3468,7 +3468,7 @@ def test_session_start_hook_injects_decisions_todos_session_tail(tmp_path: Path)
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
     ctx = response["additionalContext"]
-    assert "Search routing" in ctx
+    assert "Search:" in ctx
     assert "code_query" in ctx
     assert "code_read_hashline" in ctx
     assert "Adopt MCP code_query as default search" in ctx
@@ -3477,7 +3477,7 @@ def test_session_start_hook_injects_decisions_todos_session_tail(tmp_path: Path)
     assert "Already done" not in ctx
     assert "검색 라우팅 점검" in ctx
     assert response["additional_context_bytes"] == len(ctx.encode("utf-8"))
-    assert response["additional_context_bytes"] <= 12288
+    assert response["additional_context_bytes"] <= 8192
     assert response["elapsed_ms"] <= 200
 
 
@@ -3564,7 +3564,7 @@ def test_session_start_hook_injects_prior_session_tail(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     ctx = json.loads(result.stdout)["additionalContext"]
-    assert "Prior session resume" in ctx
+    assert "이전 세션 재개" in ctx
     assert "session tail:" in ctx
     assert "prior milestone 11" in ctx
     assert "prior milestone 3" not in ctx
@@ -3586,7 +3586,7 @@ def test_session_start_hook_surfaces_skill_recommendations(tmp_path: Path) -> No
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
     ctx = response["additionalContext"]
-    assert "Skill recommendations available" in ctx
+    assert "스킬 추천 있음" in ctx
     assert "ai recommend skills accept" in ctx
     assert "recall-deploy-decisions" in ctx
     catalog = repo / ".ai" / "skills" / "catalog.jsonl"
@@ -3611,7 +3611,7 @@ def test_session_start_hook_satisfaction_summary_includes_surfaced_count(tmp_pat
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
     ctx = response["additionalContext"]
-    assert "Recommendation satisfaction:" in ctx
+    assert "추천 만족도:" in ctx
     assert "surfaced" in ctx
 
 
@@ -3633,7 +3633,7 @@ def test_session_start_hook_compact_mode_collapses_sections(tmp_path: Path, monk
     assert result.returncode == 0, result.stdout + result.stderr
     ctx = json.loads(result.stdout)["additionalContext"]
     assert "cb-skill" in ctx, "compact mode must use 'cb-skill' prefix line"
-    assert "Skill recommendations available" not in ctx, "verbose header must be omitted in compact mode"
+    assert "스킬 추천 있음" not in ctx, "verbose header must be omitted in compact mode"
 
 
 def test_session_start_hook_cooldown_suppresses_repeat_surfacing(tmp_path: Path) -> None:
@@ -3650,14 +3650,14 @@ def test_session_start_hook_cooldown_suppresses_repeat_surfacing(tmp_path: Path)
     )
     first = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
     assert first.returncode == 0
-    assert "Skill recommendations available" in json.loads(first.stdout)["additionalContext"]
+    assert "스킬 추천 있음" in json.loads(first.stdout)["additionalContext"]
     second = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
     assert second.returncode == 0
     ctx2 = json.loads(second.stdout)["additionalContext"]
-    assert "Skill recommendations available" not in ctx2, (
+    assert "스킬 추천 있음" not in ctx2, (
         "cooldown should suppress identical surfacing on the next SessionStart"
     )
-    assert "Recommendation satisfaction:" in ctx2
+    assert "추천 만족도:" in ctx2
 
 
 def test_post_tool_use_hook_skips_injection(tmp_path: Path) -> None:
@@ -3683,7 +3683,7 @@ def test_user_prompt_submit_hook_includes_routing_when_memory_empty(tmp_path: Pa
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
     ctx = response["additionalContext"]
-    assert "Search routing" in ctx
+    assert "검색 라우팅" in ctx
     assert "code_read_hashline" in ctx
     assert "Recent decisions" not in ctx
 

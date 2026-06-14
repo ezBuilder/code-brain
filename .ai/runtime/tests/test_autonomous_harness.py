@@ -56,9 +56,9 @@ def test_analyze_code_brain_runtime_layout(tmp_path: Path) -> None:
 def test_context_line_is_short_and_actionable(tmp_path: Path) -> None:
     line = context_line(tmp_path)
 
-    assert "Autonomous harness:" in line
+    assert "cb-harness:" in line
     assert "target=95%" in line
-    assert "self-apply" in line
+    assert "verify" in line
     assert len(line.encode("utf-8")) < 600
 
 
@@ -70,6 +70,6 @@ def test_requested_detects_korean_harness_command() -> None:
 def test_directive_says_no_separate_command_needed(tmp_path: Path) -> None:
     text = directive(tmp_path, explicit=True)
 
-    assert "Explicit harness request detected" in text
-    assert "Do not wait for a separate `ai harness` command" in text
+    assert "Harness requested" in text
+    assert "iterate until done/blocker" in text
     assert "target=95%" in text

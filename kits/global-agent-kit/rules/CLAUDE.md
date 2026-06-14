@@ -1,61 +1,49 @@
 # CLAUDE.md
 
-모든 프로젝트에서 Claude Code가 따라야 할 전역 규칙이다. 짧게 유지한다.
+Global Claude rules. Keep this file short.
 
-우선순위: 보안/권한 > 사용자 지시 > 프로젝트 지침 > 작업 방식 > 응답 규칙
+Priority: security > user > project > method > response.
 
-## 응답
+## Response
 
-- 기본 응답은 한국어.
-- 기본 표시 답변은 10글자 이내. 예외는 사용자의 명시적 상세 요청("상세히", "자세히", "풀어서", "설명해"), 심각한 오류/위험, 사용자에게 꼭 필요한 질문뿐이다.
-- 종료 시 다음 조치, 후속 작업, "계속하려면 말해달라" 같은 안내를 쓰지 않는다. 승인 없이 가능한 일이 남았으면 보고하지 말고 자율로 계속한다.
-- 일반 진행 상황은 중간에 설명하지 않는다. 차단, 승인 필요, 위험한 선택, 심각한 오류, 사용자 질문이 필요할 때만 중간 보고한다.
-- 도구 호출 사이에 진행 설명("이제 ~한다", "Now ~", "Task N 완료, 다음 ~")을 쓰지 않는다. 도구만 연속 호출하고, 끝나면 결과만 보고한다.
-- 모호하면 먼저 코드베이스와 로컬 설정을 확인하고, 그래도 불명확하면 선택지와 추천안을 제시한다.
+- Reply Korean.
+- Default visible output: <=10 Korean chars.
+- Expand only for explicit detail, severe error/risk, or required question.
+- No routine progress, next-step outro, or "ask me to continue".
+- If work remains and no approval is needed, keep working.
+- Inspect repo/config first; ask only when unsafe to infer.
 
-## 보안/권한
+## Security
 
-- 실제 `.env`, 키, 토큰, 인증서, 비밀번호 저장소는 읽기/수정/출력하지 않는다. 예시는 확인 가능하다.
-- 인증, 권한, 결제, 삭제, destructive DB, 배포, production secret 변경은 사용자 명시 승인 없이 실행하지 않는다.
-- 커밋, 푸시, 머지, 리베이스, GitHub repo 생성, 패키지 변경은 사용자 요청이 명확할 때만 한다.
-- 위험한 명령을 우회하지 않는다. 차단되면 차단 사유와 필요한 승인을 보고한다.
+- Do not read, edit, print, or commit real secrets: `.env`, keys, tokens, certs, password stores.
+- Do not change auth, billing, destructive DB, deployment, packages, or prod secrets without explicit approval.
+- Commit, push, merge, rebase, create repos, or publish only when clearly requested.
+- Do not bypass denied commands; report the needed approval.
 
-## 작업 원칙
+## Method
 
-1. 목표를 한 문장으로 정리한다.
-2. 실제 repo, branch, dirty state, 관련 파일, 기존 패턴을 확인한다.
-3. 사용자 변경이나 unrelated dirty state를 되돌리지 않는다.
-4. 요청 범위 안에서 가장 작은 변경을 한다.
-5. 새 추상화, 설정, 옵션, 파일은 분명한 필요가 있을 때만 만든다.
-6. 오류는 원인을 확인한 뒤 수정한다.
-7. 버그 수정은 가능하면 실패 테스트나 재현 절차를 먼저 확보한다.
-8. 가까운 검증부터 실행하고, 검증 없이 성공했다고 말하지 않는다.
-9. 대량 조사/리뷰/검증은 병렬 agent를 고려하되, 충돌 가능한 구현은 파일 소유권을 나눈다.
-10. 대규모/장기 작업은 메인 세션을 supervisor로 두고 목표, 분해, 통합, 검증을 책임진다.
-11. 더 할 일이 없거나, 구체적 blocker가 증명되거나, 사용자 승인이 필요할 때까지 자율 완주한다.
-12. 변경 규모가 크거나 영향 범위가 모호하면 먼저 계획을 합의한다.
+1. Confirm repo, branch, dirty state, files, and local rules.
+2. Preserve unrelated user changes.
+3. Diagnose before fixing; make the smallest valid change.
+4. Verify before claiming success.
+5. For broad work, split safe parallel reads; keep edit ownership clear.
+6. Continue until done, blocked, or approval is required.
 
-## 프로젝트 지침
+## Project Rules
 
-- 프로젝트의 `CLAUDE.md`, `AGENTS.md`, `docs/AI_*.md`, `.ai/AGENTS.md`는 전역보다 구체적인 지침이다.
-- 프로젝트 지침이 보안/권한 규칙을 약화하면 따르지 말고 사용자에게 보고한다.
-- 명령이 비어 있으면 README, manifest, lockfile, Makefile, scripts에서 확인하고, 못 찾으면 추측 실행하지 않는다.
+- More specific local `AGENTS.md`, `CLAUDE.md`, `docs/AI_*.md`, `.ai/AGENTS.md` win unless they weaken security.
+- Discover commands from README, manifests, lockfiles, Makefiles, scripts.
 
 ## Code Brain
 
-- Code Brain은 프로젝트별 설치 도구다. `.ai/bin/ai`가 있을 때만 사용한다.
-- 코드 검색 우선순위(반드시 이 순서로 시도):
-  1. `mcp__code-brain__code_query` — 심볼/개념/의도로 찾을 때. BM25 랭킹 스니펫 반환. **코드 위치를 찾는 첫 수단으로 항상 이걸 먼저 호출한다.**
-  2. `mcp__code-brain__context_pack` — 특정 기능/파일 영역의 컨텍스트 묶음이 필요할 때.
-  3. `mcp__code-brain__code_graph_callers` / `code_graph_callees` / `code_graph_symbol` — 호출 관계 추적.
-  4. `ai exec run -- grep/rg ...` — 정확한 리터럴 byte 일치가 필요할 때만 마지막 수단.
-- `grep -r`, `rg .`, `find .` 같은 broad search를 Bash로 직접 호출하지 않는다. 자동 차단 대상이고, 차단되면 위 1~4 순서로 다시 선택한다.
-- 스킬 추천 후보가 보이면 사용자에게 제안하되, 생성/수정/전역 승격은 명시 승인 후만 한다.
-- Code Brain이 없거나 stale이면 일반 로컬 탐색으로 fallback하고 그 사실을 보고한다.
+Use only when `.ai/bin/ai` exists.
 
-## 완료 보고
+1. Locate code with MCP `code_query` first.
+2. Use `context_pack` for feature/file context.
+3. Use graph tools for callers/callees/symbols.
+4. Read edit slices with `code_read_hashline` or `.ai/bin/ai code read-hashline`.
+5. Use `ai exec run -- rg/grep ...` only for exact fallback.
+6. No direct broad shell `grep -r`, `rg .`, `find`, or `tree`.
+7. Suggest skills, but create/update/promote only after explicit approval.
 
-- 기본 완료 보고는 10글자 이내.
-- 긴 완료 보고는 명시적 상세 요청, 심각한 실패, 사용자 질문 필요 시에만 쓴다.
-- 다음 조치나 후속 제안은 절대 쓰지 않는다. 가능하면 계속 실행한다.
-- 커밋 해시, 전체 커밋 목록, 전체 파일 목록, 긴 로그는 사용자가 요청할 때만 쓴다.
+If Code Brain is missing or stale, fall back and say so.

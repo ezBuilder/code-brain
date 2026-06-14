@@ -27,40 +27,6 @@ AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop", "FileChanged"}
 CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "SubagentStart"}
 SKILL_RECOMMENDATION_HOOKS = {"SessionStart"}
 
-KNOWN_AGENTS = {"claude", "codex", "antigravity"}
-
-
-def normalize_agent(payload: dict[str, Any]) -> str:
-    """Map a hook payload's agent identifier to one of the canonical names.
-
-    Returns one of ``claude``, ``codex``, ``antigravity``, or ``unknown``. We
-    prefer an explicit ``agent`` (or ``agent_name``) field; otherwise we fall
-    back to environment variables each host sets (``CLAUDE_PROJECT_DIR`` for
-    Claude Code, ``CODEX_HOME`` for OpenAI Codex CLI, ``ANTIGRAVITY_CLI`` /
-    ``AGY_HOME`` for Google Antigravity). The result is used both for
-    inject-context headers and for obs/audit breakdown.
-    """
-    raw = payload.get("agent") or payload.get("agent_name") or ""
-    norm = str(raw).strip().lower()
-    aliases = {
-        "claude": "claude", "claude-code": "claude", "claudecode": "claude",
-        "codex": "codex", "codex-cli": "codex",
-        "antigravity": "antigravity", "agy": "antigravity", "antigravity-cli": "antigravity",
-    }
-    if norm in aliases:
-        return aliases[norm]
-    if norm and norm != "unknown":
-        return norm
-    env = _os.environ
-    if env.get("CLAUDE_PROJECT_DIR"):
-        return "claude"
-    if env.get("CODEX_HOME") or env.get("CODEX_TURN_ID"):
-        return "codex"
-    if env.get("ANTIGRAVITY_CLI") or env.get("AGY_HOME"):
-        return "antigravity"
-    return "unknown"
-
-
 try:
     MAX_INJECTION_BYTES = max(256, min(8192, int(_os.environ.get("AI_INJECTION_MAX_BYTES", "4096"))))
 except (ValueError, TypeError):
@@ -1019,8 +985,8 @@ def _skill_recommendation_context(root: Path, hook_name: str, payload: dict[str,
         env_toggle="AI_SKILL_RECOMMENDATIONS",
         env_min_signal="AI_SKILL_RECOMMEND_MIN_SIGNAL",
         invoke=invoke,
-        header="스킬 추천 있음. 사용자에게 제시하되 명시 승인 후에만 설치:",
-        approval_line="승인: `ai recommend skills accept <id>`; 불필요하면 `ai recommend skills reject <id>`.",
+        header="Skill candidates; install only after explicit approval:",
+        approval_line="Approve: `ai recommend skills accept <id>`; reject: `ai recommend skills reject <id>`.",
         label_field="slug",
         desc_field="description",
         source_short="cb-skill",
@@ -1140,8 +1106,8 @@ def _agent_recommendation_context(root: Path, hook_name: str, payload: dict[str,
         env_toggle="AI_AGENT_RECOMMENDATIONS",
         env_min_signal="AI_AGENT_RECOMMEND_MIN_SIGNAL",
         invoke=invoke,
-        header="서브에이전트 추천 있음. 사용자에게 제시하되 명시 승인 후에만 설치:",
-        approval_line="승인: `ai agents accept <id>`; 불필요하면 `ai agents reject <id>`.",
+        header="Agent candidates; install only after explicit approval:",
+        approval_line="Approve: `ai agents accept <id>`; reject: `ai agents reject <id>`.",
         label_field="slug",
         desc_field="description",
         source_short="cb-agent",
@@ -1174,8 +1140,8 @@ def _precall_recommendation_context(root: Path, hook_name: str, payload: dict[st
         env_toggle="AI_PRECALL_RECOMMENDATIONS",
         env_min_signal="AI_PRECALL_RECOMMEND_MIN_SIGNAL",
         invoke=invoke,
-        header="Precall 라우팅 규칙 추천 있음. 사용자에게 제시하되 명시 승인 후에만 활성화:",
-        approval_line="승인: `ai precall accept <id>` → `ai precall activate <id>`; 불필요하면 `ai precall reject <id>`.",
+        header="Precall rule candidates; activate only after explicit approval:",
+        approval_line="Approve: `ai precall accept <id>` then `ai precall activate <id>`; reject: `ai precall reject <id>`.",
         label_field="kind",
         desc_field=("evidence", "rationale"),
         source_short="cb-precall",
@@ -1217,7 +1183,7 @@ def _federated_summary_context(root: Path, hook_name: str) -> str:
         return ""
     scanned = summary.get("scanned_projects", 0)
     return (
-        f"federated 패턴({scanned}개 프로젝트) — {' | '.join(parts)}. "
+        f"federated patterns({scanned} projects): {' | '.join(parts)}. "
         "Inspect with `ai federated summary`."
     )
 
@@ -1298,12 +1264,12 @@ def _satisfaction_summary_context_uncached(root: Path) -> str:
     adaptive_suffix = f"; adaptive +{adaptive_bump} (auto-noise reduction)" if adaptive_bump > 0 else ""
     if total_acted == 0:
         return (
-            f"추천 만족도: {counts['surfaced']} surfaced, 0 acted{stale_suffix}{adaptive_suffix}. "
+            f"recommend satisfaction: {counts['surfaced']} surfaced, 0 acted{stale_suffix}{adaptive_suffix}. "
             "Inspect: `ai recommend skills|agents|precall`; opt out: AI_*_RECOMMENDATIONS=0."
         )
     sat_pct = int(round(100 * counts["accepted"] / total_acted))
     return (
-        f"추천 만족도: {sat_pct}% accept ({counts['accepted']}/{total_acted} acted, "
+        f"recommend satisfaction: {sat_pct}% accept ({counts['accepted']}/{total_acted} acted, "
         f"{counts['surfaced']} surfaced lifetime{stale_suffix})."
     )
 
@@ -2141,24 +2107,18 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if hook_name not in INJECTION_HOOKS or root is None:
         return ""
     sections = [header]
-    sections.append(
-        "응답 규칙: 기본 답변은 10글자 이내. 상세 요청·심각 오류·사용자 질문만 예외. "
-        "종료 시 다음 조치 안내 금지; 남은 작업은 자율 완주."
-    )
+    sections.append("Response: <=10 Korean chars; expand only for detail/risk/question. No next-step outro; keep working.")
     if _env_enabled("AI_ROUTING_HINT_COMPACT"):
-        routing = "검색 라우팅: grep 대신 MCP `code_query`/`context_pack` 우선."
+        routing = "Search: MCP `code_query`/`context_pack` before grep."
     else:
         routing = (
-            "검색 라우팅: Bash grep/find 대신 MCP `code_query` / `context_pack` 우선. "
-            "각 MCP 질의는 grep 전체 덤프 대신 랭킹된 스니펫(기본 5개)을 반환 — "
-            "MCP가 실패할 때만 grep을 폴백으로 사용."
+            "Search: MCP `code_query`/`context_pack` first; graph tools for call paths; "
+            "`ai exec run -- rg/grep` only for exact fallback."
         )
     sections.append(routing)
     sections.append(
-        "코드 읽기: `code_query`로 파일을 찾은 뒤엔 정확한 슬라이스를 위해 MCP `code_read_hashline` 우선 "
-        "— 편집 전에 줄+해시 앵커를 확보한다. "
-        "CLI 폴백은 `.ai/bin/ai code read-hashline <path> --start N --end M`; "
-        "stale 편집이 중요하면 `.ai/bin/ai code verify-hashline <path>`로 저장된 앵커를 검증."
+        "Read: after locating code, use `code_read_hashline` or "
+        "`.ai/bin/ai code read-hashline <path> --start N --end M` before edits."
     )
     staleness = _memory_staleness_context(root, hook_name)
     if staleness:
@@ -2190,7 +2150,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         except Exception:
             prior = None
         if prior:
-            lines = [f"이전 세션 재개 (session_id={prior.get('session_id')}, written_at={prior.get('written_at')}):"]
+            lines = [f"resume session_id={prior.get('session_id')} written_at={prior.get('written_at')}:"]
             # P1: lead with the intent-carrying handoff so a resuming session (esp. on
             # the other machine) sees "what we were doing / what to do next" first.
             handoff = prior.get("handoff") if isinstance(prior.get("handoff"), dict) else None
@@ -2202,7 +2162,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
                 for step in (handoff.get("plan") or [])[:6]:
                     lines.append(f"  plan: {str(step)[:160]}")
                 for q in (handoff.get("open_questions") or [])[:4]:
-                    lines.append(f"  open question: {str(q)[:160]}")
+                    lines.append(f"  question: {str(q)[:160]}")
                 for b in (handoff.get("blockers") or [])[:4]:
                     lines.append(f"  blocker: {str(b)[:160]}")
             # P2: cross-machine pointer — if the prior thread ran on another machine,
@@ -2256,7 +2216,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         plain_decisions, live_failures = (
             _read_jsonl_tail(root / ".ai" / "memory" / "decisions.jsonl", DECISIONS_TAIL), [])
     if plain_decisions:
-        lines = ["최근 결정:"]
+        lines = ["decisions:"]
         for entry in plain_decisions:
             ts = str(entry.get("decided_at") or entry.get("timestamp") or "")[:19]
             text = str(entry.get("decision") or entry.get("summary") or entry.get("text") or "")[:160]
@@ -2265,7 +2225,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if live_failures:
         live_versions = _failure_live_versions(root)
         today = now_iso()[:10]
-        flines = ["알려진 실패(시점 기록, 재검증 가능 — 영구 금지 아님):"]
+        flines = ["failures (retest; not permanent):"]
         for entry in live_failures[:_FAILURE_MAX_SURFACE]:
             flines.extend(_render_failure_lines(entry, live_versions, today))
         extra = len(live_failures) - _FAILURE_MAX_SURFACE
@@ -2274,7 +2234,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         sections.append("\n".join(flines))
     todos = _read_jsonl_open_todos(root / ".ai" / "memory" / "todos.jsonl", TODOS_LIMIT)
     if todos:
-        lines = ["열린 todo:"]
+        lines = ["todos:"]
         for entry in todos:
             text = str(entry.get("title") or entry.get("text") or entry.get("summary") or "")[:160]
             owner = str(entry.get("owner") or "")
@@ -2319,7 +2279,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             pass
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
-        sections.append("세션 현황 최근 기록:\n" + session_tail)
+        sections.append("session tail:\n" + session_tail)
     learned = _learned_prompt_context(root)
     if learned:
         sections.append(learned)
@@ -2433,14 +2393,14 @@ def _auto_milestone_on_stale(root: Path) -> bool:
     commits = info.get("commits") or []
     count = int(info.get("commit_count") or 0)
     dirty = int(info.get("dirty_count") or 0)
-    bits = [f"{marker} 에이전트 미기록 자동 캡처(git 사실 기반)"]
+    bits = [f"{marker} auto capture: git advanced without agent note"]
     if count:
         subject = str(commits[0].get("subject") or "") if commits else ""
-        more = f" 외 {count - 1}개" if count > 1 else ""
-        bits.append(f"커밋 {count}개{more} 최근:{subject[:70]}")
+        more = f"+{count - 1}" if count > 1 else ""
+        bits.append(f"commits={count}{more} latest:{subject[:70]}")
     if dirty:
-        bits.append(f"dirty {dirty}파일")
-    text = " · ".join(bits) + ". 어디까지 진행했는지는 git log/status가 정답."
+        bits.append(f"dirty={dirty}")
+    text = " · ".join(bits) + ". Use git log/status as source of truth."
     try:
         from .memory import append_session_note
 

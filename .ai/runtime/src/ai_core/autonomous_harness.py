@@ -85,11 +85,10 @@ def context_line(root: Path) -> str:
     payload = analyze(root)
     signals = payload["signals"]
     return (
-        "자율 하니스: "
+        "cb-harness: "
         f"mode={payload['mode']}, target={int(COMPLETION_TARGET * 100)}%, "
         f"src={signals['source_files']}, tests={signals['test_files']}, dirty={signals['dirty_files']}. "
-        "For new builds or hardening, self-apply: define acceptance criteria, own paths, iterate with tests/doctor/release-gate, "
-        "and continue until target confidence, no required work remains, or a concrete blocker."
+        "For build/harden: scope, own paths, verify, iterate until done/blocker."
     )
 
 
@@ -100,13 +99,11 @@ def requested(payload: dict[str, Any]) -> bool:
 
 def directive(root: Path, *, explicit: bool = False) -> str:
     payload = analyze(root)
-    prefix = "Explicit harness request detected." if explicit else "Autonomous harness available."
+    prefix = "Harness requested." if explicit else "Harness ready."
     return (
-        f"{prefix} Apply the Code Brain autonomous harness now: "
+        f"{prefix} "
         f"mode={payload['mode']}, target={int(COMPLETION_TARGET * 100)}%. "
-        "Do not wait for a separate `ai harness` command. Convert the user goal into scoped tasks and acceptance criteria, "
-        "declare owned paths before edits, enforce protected-path and dependency-manifest gates, run the closest verification, "
-        "and iterate until target confidence, no required work remains, or a concrete blocker."
+        "Scope, own paths, enforce gates, verify, iterate until done/blocker."
     )
 
 

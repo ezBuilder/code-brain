@@ -52,7 +52,7 @@ STATE_PARTS = (".ai", "memory", "prompt_growth_state.json")
 VERSIONS_PARTS = (".ai", "memory", "prompt_growth", "versions")
 
 # --- tunables (deliberately conservative; growth is slow and reversible) ---
-BREVITY_LIMIT = 600          # an agent report well over the ≤50-char / 1-line default rule
+BREVITY_LIMIT = 600          # verbose enough to violate the terse default
 WINDOW = 40                  # observations considered per evaluation
 MIN_SAMPLES = 20             # do not grow until enough signal
 VIOLATION_RATE = 0.5         # >=50% of recent reports verbose → warrant a brevity rule
@@ -60,9 +60,8 @@ RATCHET_WINDOW = 30          # turns to measure a freshly applied rule before ju
 RATCHET_REGRESS = 1.10       # post-rule avg output > 110% of baseline → rollback
 LEARNED_HEADER = "# Learned project rules (auto-grown by Code Brain; do not edit by hand)"
 BREVITY_RULE_TEXT = (
-    "기본 응답은 10글자 이내로 강제한다. 명시적 상세 요청, 심각한 오류, "
-    "사용자에게 필요한 질문만 예외다. 종료 시 다음 조치 안내를 쓰지 말고 "
-    "필요한 작업은 자율 완주한다."
+    "Reply <=10 Korean chars by default. Expand only for explicit detail, severe risk/error, "
+    "or a required question. No next-step outro; keep working."
 )
 
 

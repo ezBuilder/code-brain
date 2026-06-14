@@ -60,7 +60,7 @@ RATCHET_WINDOW = 30          # turns to measure a freshly applied rule before ju
 RATCHET_REGRESS = 1.10       # post-rule avg output > 110% of baseline → rollback
 LEARNED_HEADER = "# Learned project rules (auto-grown by Code Brain; do not edit by hand)"
 BREVITY_RULE_TEXT = (
-    "Reply <=10 Korean chars by default. Expand only for explicit detail, severe risk/error, "
+    "Answer user questions <=50 Korean chars by default. Expand only for explicit detail, severe risk/error, "
     "or a required question. No next-step outro; keep working."
 )
 

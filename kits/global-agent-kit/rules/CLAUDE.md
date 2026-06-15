@@ -26,11 +26,13 @@ Priority: security > user > project > method > response.
 1. Confirm repo, branch, dirty state, files, and local rules.
 2. Preserve unrelated user changes.
 3. Diagnose before fixing; make the smallest valid change.
-4. Verify before claiming success.
-5. Select tests by changed files and likely impact; skip unrelated suites. Run full suites only when broad shared contracts changed or the user asks.
-6. For broad work, split safe parallel reads; keep edit ownership clear.
+4. Prefer no code, stdlib/native, installed dependency, one-liner, then the minimum implementation; never remove validation, security, accessibility, data-loss handling, or explicit requirements.
+5. Mark intentional simplifications with `cb-simplify: <ceiling>; revisit when <trigger>` only when a known limit remains.
+6. Verify before claiming success.
+7. Select tests by changed files and likely impact; skip unrelated suites. Run full suites only when broad shared contracts changed or the user asks.
+8. For broad work, split safe parallel reads; keep edit ownership clear.
    Reserve multi-agent fan-out (workflows) for big items — architecture, security, broad audits, large/risky refactors. Keep small/local changes solo, verified by tests + direct check. Estimate cost and get approval before a large fan-out; do not auto-fan-out small work.
-7. Continue until done, blocked, or approval is required.
+9. Continue until done, blocked, or approval is required.
 
 ## Project Rules
 

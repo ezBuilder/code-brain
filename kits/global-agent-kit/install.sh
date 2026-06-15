@@ -349,6 +349,8 @@ verify_install() {
     test -f "$HOME/.claude/policies/hook-policy.json"
     test -f "$HOME/.claude/agents/security-reviewer.md"
     test -f "$HOME/.claude/skills/implement-feature/SKILL.md"
+    test -f "$HOME/.claude/skills/lean-review/SKILL.md"
+    test -f "$HOME/.claude/skills/lean-debt/SKILL.md"
     test -f "$HOME/.claude/commands/kit-upgrade-loop.md"
     python3 -m json.tool "$HOME/.claude/settings.json" >/dev/null
     python3 - "$HOME/.claude/settings.json" "$HOME/.claude/hooks" <<'PY'

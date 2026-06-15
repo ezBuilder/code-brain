@@ -171,6 +171,7 @@ def upgrade_latest(
         "checkout": ref,
         "install": "<tmp>/code-brain/scripts/install-into.sh upgrade " + str(root),
         "bootstrap": "bash ./bootstrap-code-brain.sh",
+        "audit_repair": ".ai/bin/ai audit repair-chain --json",
         "doctor": ".ai/bin/ai doctor --strict --json",
     }
     if dry_run:
@@ -230,7 +231,9 @@ def upgrade_latest(
                     "install": _command_result(install),
                     "bootstrap": bootstrap_payload,
                 }
-        doctor = _run([str(root / ".ai" / "bin" / "ai"), "doctor", "--strict", "--json"], cwd=root)
+        ai_bin = root / ".ai" / "bin" / "ai"
+        audit_repair = _run([str(ai_bin), "audit", "repair-chain", "--json"], cwd=root)
+        doctor = _run([str(ai_bin), "doctor", "--strict", "--json"], cwd=root)
         payload = {
             "ok": doctor.returncode == 0,
             "dry_run": False,
@@ -242,6 +245,7 @@ def upgrade_latest(
             "clone_path": str(temp_root) if keep_clone else None,
             "install": _command_result(install),
             "bootstrap": bootstrap_payload,
+            "audit_repair": _command_result(audit_repair),
             "doctor": _command_result(doctor),
         }
         if payload["ok"]:

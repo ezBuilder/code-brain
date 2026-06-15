@@ -67,8 +67,8 @@ curl -fsSL https://raw.githubusercontent.com/ezBuilder/code-brain/main/scripts/u
 Pin a version or branch:
 
 ```bash
-.ai/bin/ai upgrade latest --ref v0.1.1 --json
-CODE_BRAIN_REF=v0.1.1 bash scripts/upgrade-from-github.sh /path/to/project
+.ai/bin/ai upgrade latest --ref v0.1.2 --json
+CODE_BRAIN_REF=v0.1.2 bash scripts/upgrade-from-github.sh /path/to/project
 ```
 
 Upgrades are explicit. `SessionStart` hooks and MCP hot paths do not call the network.

@@ -108,14 +108,19 @@ def launch_worker(root: Path, *, worker_id: str, agent: str, profile: str,
         plan["agent_installed"] = agent_available(agent)
         plan["tmux"] = tmux_available()
         return {"ok": True, "dry_run": True, "plan": plan}
-    # auto-detect: if this agent's CLI (or tmux) isn't installed, skip gracefully — never crash.
-    if not tmux_available():
-        return {"ok": False, "skipped": True, "reason": "tmux not installed", "worker_id": worker_id}
-    if not agent_available(agent):
-        return {"ok": False, "skipped": True, "reason": f"{agent} CLI not installed", "worker_id": worker_id}
+    # auto-detect for the real adapter: if this agent's CLI (or tmux) isn't
+    # installed, skip gracefully. Explicit adapters are deterministic test/dev
+    # doubles and must not depend on host tmux or agent binaries.
+    if adapter is None:
+        if not tmux_available():
+            return {"ok": False, "skipped": True, "reason": "tmux not installed", "worker_id": worker_id}
+        if not agent_available(agent):
+            return {"ok": False, "skipped": True, "reason": f"{agent} CLI not installed", "worker_id": worker_id}
+        adapter = get_adapter()
+    elif not adapter.available():
+        return {"ok": False, "skipped": True, "reason": "tmux adapter unavailable", "worker_id": worker_id}
     if not inherit_auth:
         wp.ensure_profile_dirs(root, profile)
-    adapter = adapter or get_adapter()
     pane = adapter.new_window(session, window, plan["env"], plan["command"])  # type: ignore[attr-defined]
     if not pane:
         return {"ok": False, "reason": "tmux launch failed", "plan": plan}

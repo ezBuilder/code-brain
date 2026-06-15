@@ -182,6 +182,20 @@ manifest_path() {
   printf '%s\n' "$TARGET_ROOT/.ai/generated/install-manifest.json"
 }
 
+legacy_code_brain_install() {
+  [[ -x "$TARGET_ROOT/.ai/bin/ai" || -f "$TARGET_ROOT/.ai/AGENTS.md" ]]
+}
+
+is_code_brain_managed_rel() {
+  local rel="$1"
+  case "$rel" in
+    .ai/*|.githooks/*|.claude/commands/*|.codex/prompts/*|.agents/skills/*|scripts/env-check.sh|scripts/preflight.sh)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 is_managed_existing_file() {
   local rel="$1"
   local manifest
@@ -197,6 +211,9 @@ payload = json.loads(manifest.read_text(encoding="utf-8"))
 raise SystemExit(0 if rel in payload.get("files", []) else 1)
 PY
   then
+    return 0
+  fi
+  if [[ "$ACTION" == "upgrade" ]] && [[ ! -f "$manifest" ]] && legacy_code_brain_install && is_code_brain_managed_rel "$rel"; then
     return 0
   fi
   local target="$TARGET_ROOT/$rel"
@@ -1152,7 +1169,7 @@ case "$ACTION" in
     echo "next: cd '$TARGET_ROOT' && .ai/bin/ai session start --agent codex --json"
     ;;
   upgrade)
-    if [[ ! -f "$(manifest_path)" ]]; then
+    if [[ ! -f "$(manifest_path)" ]] && ! legacy_code_brain_install; then
       echo "install-into failed: Code Brain is not installed; use install" >&2
       exit 4
     fi

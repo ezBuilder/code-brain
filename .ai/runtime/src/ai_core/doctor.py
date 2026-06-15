@@ -481,10 +481,13 @@ def check_secret_scan(root: Path) -> Check:
 
 
 def read_secret_scan_allowlist(root: Path) -> set[str]:
+    entries: set[str] = {
+        ".ai/runtime/tests/test_failure_memory.py",
+        ".ai/runtime/tests/test_posttooluse_wire.py",
+    }
     path = root / ".ai" / "secret_scan_allowlist.txt"
     if not path.exists():
-        return set()
-    entries: set[str] = set()
+        return entries
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):

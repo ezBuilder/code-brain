@@ -22,6 +22,8 @@ cd code-brain
 bash scripts/install.sh /path/to/project
 ```
 
+In einer interaktiven macOS/Linux-Shell bietet der Installer standardmaessig auch das globale Claude/Codex-Kit an. Vorhandene `~/.claude/CLAUDE.md` und `~/.codex/AGENTS.md` werden gesichert und behalten; Code Brain fuegt nur seinen verwalteten Block hinzu oder aktualisiert ihn. In CI oder nicht interaktiven Installationen werden globale Schreibvorgaenge ohne `--global` uebersprungen.
+
 Windows:
 
 ```powershell

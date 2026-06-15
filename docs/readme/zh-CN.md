@@ -22,6 +22,8 @@ cd code-brain
 bash scripts/install.sh /path/to/project
 ```
 
+在交互式 macOS/Linux shell 中，安装器会默认建议安装 Claude/Codex 全局 kit。已有的 `~/.claude/CLAUDE.md` 和 `~/.codex/AGENTS.md` 会先备份并保留，Code Brain 只添加或刷新自己的 managed block。CI 和非交互式安装默认跳过全局写入，除非传入 `--global`。
+
 Windows:
 
 ```powershell

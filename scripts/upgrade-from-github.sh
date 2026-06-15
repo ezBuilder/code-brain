@@ -8,6 +8,7 @@ ACTION="auto"
 DRY_RUN=0
 KEEP_CLONE="${CODE_BRAIN_KEEP_UPGRADE_CLONE:-0}"
 TARGET_ARG=""
+GLOBAL_INSTALL_ARG=()
 
 usage() {
   cat >&2 <<'EOF'
@@ -21,14 +22,17 @@ Options:
   --repo URL            alias for --repo-url
   --ref REF             branch, tag, or commit to install
   --dry-run             print the planned action only
+  --global              install/refresh the Claude/Codex global kit by managed merge
+  --no-global           skip global kit install
   --keep-clone          keep the temporary clone for debugging
 
 Defaults:
   repo: https://github.com/ezBuilder/code-brain.git
   ref:  main
   target: current directory
+  global: first install prompts in interactive shells; CI/non-interactive shells skip unless --global
 
-No global Claude/Codex files are written. Antigravity global setup remains opt-in.
+Antigravity global setup remains opt-in.
 EOF
 }
 
@@ -54,6 +58,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --global)
+      GLOBAL_INSTALL_ARG=(--global)
+      shift
+      ;;
+    --no-global)
+      GLOBAL_INSTALL_ARG=(--no-global)
       shift
       ;;
     --keep-clone)
@@ -106,7 +118,7 @@ if [[ "$ACTION" == "auto" ]]; then
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  printf '[code-brain] dry-run repo=%s ref=%s action=%s target=%s\n' "$REPO_URL" "$REF" "$ACTION" "$TARGET"
+  printf '[code-brain] dry-run repo=%s ref=%s action=%s target=%s global=%s\n' "$REPO_URL" "$REF" "$ACTION" "$TARGET" "${GLOBAL_INSTALL_ARG[*]:-auto}"
   exit 0
 fi
 
@@ -136,12 +148,16 @@ fi
 export CODE_BRAIN_REPO_URL="$REPO_URL"
 export CODE_BRAIN_REF="$REF"
 if [[ "$ACTION" == "install" ]]; then
-  bash "$CHECKOUT/scripts/install.sh" "$TARGET"
+  bash "$CHECKOUT/scripts/install.sh" "${GLOBAL_INSTALL_ARG[@]}" "$TARGET"
 else
   bash "$CHECKOUT/scripts/install-into.sh" upgrade "$TARGET"
   if [[ -f "$TARGET/bootstrap-code-brain.sh" ]]; then
     ( cd "$TARGET" && bash ./bootstrap-code-brain.sh )
   fi
   ( cd "$TARGET" && .ai/bin/ai doctor --strict --json >/dev/null )
+  if [[ "${GLOBAL_INSTALL_ARG[*]:-}" == "--global" ]]; then
+    ( cd "$CHECKOUT/kits/global-agent-kit" && ./install.sh --all --yes >/dev/null )
+    echo "[code-brain] global Claude/Codex kit refreshed by managed merge" >&2
+  fi
   echo "[code-brain] upgraded from $REPO_URL@$REF into $TARGET" >&2
 fi

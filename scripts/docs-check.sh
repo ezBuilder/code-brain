@@ -7,7 +7,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 cd "$ROOT"
-unset CI GITHUB_ACTIONS
+unset CI GITHUB_ACTIONS GITLAB_CI AI_CI
 
 if [[ ! -f OPERATIONS.md ]]; then
   echo "OPERATIONS.md is missing" >&2
@@ -177,7 +177,7 @@ tar \
   -C "$ROOT" -cf - . | tar -C "$COPY" -xf -
 
 cd "$COPY"
-unset CI GITHUB_ACTIONS
+unset CI GITHUB_ACTIONS GITLAB_CI AI_CI
 uv run --project .ai/runtime ai render --json >/dev/null
 ./scripts/preflight.sh --check-only --json >/dev/null
 uv run --project .ai/runtime ai queue recover-expired --json >/dev/null

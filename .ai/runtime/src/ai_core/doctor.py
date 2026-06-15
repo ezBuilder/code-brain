@@ -576,11 +576,11 @@ def check_mcp_methods_registered(root: Path) -> Check:
         return Check("mcp_methods_registered", False, ".mcp.json code-brain server is not an object")
     command = server.get("command")
     args = server.get("args", [])
-    if os.name == "nt":
-        if command not in {"powershell", "pwsh"} or ".ai/bin/ai-mcp.ps1" not in " ".join(str(arg) for arg in args):
-            return Check("mcp_methods_registered", False, ".mcp.json code-brain command is not Windows ai-mcp.ps1")
-    elif command != ".ai/bin/ai-mcp":
-        return Check("mcp_methods_registered", False, ".mcp.json code-brain.command is not .ai/bin/ai-mcp")
+    arg_text = " ".join(str(arg) for arg in args)
+    unix_entry = command == ".ai/bin/ai-mcp"
+    windows_entry = command in {"powershell", "pwsh"} and ".ai/bin/ai-mcp.ps1" in arg_text
+    if not (unix_entry or windows_entry):
+        return Check("mcp_methods_registered", False, ".mcp.json code-brain command is not a managed ai-mcp entry")
     missing_slash = [path for path in REQUIRED_SLASH_COMMAND_FILES if not (root / path).exists()]
     missing_codex = [path for path in REQUIRED_CODEX_PROMPT_FILES if not (root / path).exists()]
     method_count = len(MCP_METHODS)

@@ -104,6 +104,8 @@ check_executable "$HOME/.claude/hooks/post-tool-use.sh" "post tool follow-up hoo
 check_file "$HOME/.claude/policies/hook-policy.json" "Claude hook policy"
 check_file "$HOME/.claude/agents/security-reviewer.md" "security reviewer agent"
 check_file "$HOME/.claude/skills/implement-feature/SKILL.md" "implement-feature skill"
+check_file "$HOME/.claude/skills/lean-review/SKILL.md" "lean-review skill"
+check_file "$HOME/.claude/skills/lean-debt/SKILL.md" "lean-debt skill"
 check_file "$HOME/.claude/commands/kit-upgrade-loop.md" "kit upgrade loop command"
 
 if [[ -f "$HOME/.claude/settings.json" ]]; then

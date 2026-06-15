@@ -121,6 +121,8 @@ Do not trust synthetic benchmark claims. Code Brain ships checks you can run in 
 
 ```bash
 make lint
+scripts/lockfile-check.sh
+uv lock --check --project .ai/runtime
 uv run --project .ai/runtime python -m pytest .ai/runtime/tests/test_cli.py -k "upgrade_latest or cb_upgrade_command_assets"
 .ai/bin/ai upgrade latest --dry-run --json
 .ai/bin/ai index rebuild --json

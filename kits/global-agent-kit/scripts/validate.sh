@@ -30,6 +30,8 @@ required_files=(
   ".claude/commands/kit-doctor.md"
   ".claude/commands/kit-research.md"
   ".claude/commands/kit-upgrade-loop.md"
+  ".claude/skills/lean-review/SKILL.md"
+  ".claude/skills/lean-debt/SKILL.md"
   "scripts/doctor.sh"
   "scripts/codex-doctor.sh"
   "scripts/harness.sh"
@@ -124,6 +126,40 @@ if ! rg -q "AI_TOKEN_OPTIMIZATION.md" CLAUDE.md README.md; then
 fi
 
 python3 - <<'PY'
+from pathlib import Path
+
+required_phrases = [
+    "Prefer no code, stdlib/native, installed dependency, one-liner",
+    "never remove validation, security, accessibility, data-loss handling, or explicit requirements",
+    "cb-simplify: <ceiling>; revisit when <trigger>",
+]
+
+claude = Path("rules/CLAUDE.md").read_text(encoding="utf-8")
+agents = Path("rules/AGENTS.md").read_text(encoding="utf-8")
+
+for phrase in required_phrases:
+    for label, text in (("rules/CLAUDE.md", claude), ("rules/AGENTS.md", agents)):
+        if phrase not in text:
+            raise SystemExit(f"{label} missing lean invariant: {phrase}")
+
+def comparable(text):
+    return (
+        text.replace("# CLAUDE.md", "# RULE.md", 1)
+        .replace("# AGENTS.md", "# RULE.md", 1)
+        .replace("Global Claude rules.", "Global agent rules.", 1)
+        .replace("Global Codex rules.", "Global agent rules.", 1)
+    )
+
+if comparable(claude) != comparable(agents):
+    raise SystemExit("rules/CLAUDE.md and rules/AGENTS.md drifted beyond title")
+
+for skill in ("lean-review", "lean-debt"):
+    path = Path(".claude/skills") / skill / "SKILL.md"
+    if not path.is_file():
+        raise SystemExit(f"missing lean skill: {path}")
+PY
+
+python3 - <<'PY'
 import json
 from pathlib import Path
 
@@ -203,6 +239,8 @@ test -x "$tmp_home/.claude/hooks/post-tool-use.sh"
 test -f "$tmp_home/.claude/policies/hook-policy.json"
 test -f "$tmp_home/.claude/agents/security-reviewer.md"
 test -f "$tmp_home/.claude/skills/implement-feature/SKILL.md"
+test -f "$tmp_home/.claude/skills/lean-review/SKILL.md"
+test -f "$tmp_home/.claude/skills/lean-debt/SKILL.md"
 test -f "$tmp_home/.claude/commands/kit-upgrade-loop.md"
 
 python3 - "$tmp_home/.claude/settings.json" "$tmp_home/.claude/hooks" <<'PY'

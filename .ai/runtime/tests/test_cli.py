@@ -3109,8 +3109,8 @@ def test_mcp_methods_registered_invariant(tmp_path: Path) -> None:
     check = next(c for c in payload["checks"] if c["name"] == "mcp_methods_registered")
     assert check["ok"] is True
     assert "mcp_methods=" in check["detail"]
-    assert "claude_commands=5" in check["detail"]
-    assert "codex_prompts=5" in check["detail"]
+    assert "claude_commands=6" in check["detail"]
+    assert "codex_prompts=6" in check["detail"]
 
 
 def test_mcp_methods_registered_fails_when_command_file_missing(tmp_path: Path) -> None:

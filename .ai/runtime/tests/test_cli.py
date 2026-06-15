@@ -599,9 +599,10 @@ def test_preflight_accepts_namespaced_code_brain_bootstrap(tmp_path: Path) -> No
     repo = copy_repo(tmp_path)
     (repo / "bootstrap-code-brain.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (repo / "bootstrap.sh").unlink()
+    bash = usable_bash_or_skip()
 
     result = subprocess.run(
-        ["./scripts/preflight.sh", "--check-only", "--json"],
+        [bash, "scripts/preflight.sh", "--check-only", "--json"],
         cwd=repo,
         text=True,
         stdout=subprocess.PIPE,

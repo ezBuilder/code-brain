@@ -146,6 +146,16 @@ tmp_home="$(mktemp -d)"
 trap 'rm -rf "$tmp_home"' EXIT
 
 mkdir -p "$tmp_home/.claude" "$tmp_home/.codex"
+cat >"$tmp_home/.claude/CLAUDE.md" <<'MD'
+# Personal Claude Rules
+
+Keep this custom Claude instruction.
+MD
+cat >"$tmp_home/.codex/AGENTS.md" <<'MD'
+# Personal Codex Rules
+
+Keep this custom Codex instruction.
+MD
 cat >"$tmp_home/.claude/settings.json" <<'JSON'
 {
   "autoMemoryEnabled": true,
@@ -171,6 +181,7 @@ cat >"$tmp_home/.claude/settings.json" <<'JSON'
 JSON
 
 HOME="$tmp_home" ./install.sh --all --yes >/dev/null
+HOME="$tmp_home" ./install.sh --all --yes >/dev/null
 HOME="$tmp_home" ./scripts/doctor.sh >/dev/null
 HOME="$tmp_home" ./scripts/codex-doctor.sh --self-test >/dev/null
 HOME="$tmp_home" ./scripts/evolve-capture.sh --self-test >/dev/null
@@ -180,6 +191,10 @@ HOME="$tmp_home" ./scripts/evolve-snapshot.sh --self-test >/dev/null
 
 test -f "$tmp_home/.claude/CLAUDE.md"
 test -f "$tmp_home/.codex/AGENTS.md"
+grep -q "Keep this custom Claude instruction." "$tmp_home/.claude/CLAUDE.md"
+grep -q "Keep this custom Codex instruction." "$tmp_home/.codex/AGENTS.md"
+test "$(grep -c 'code-brain-global-kit:start' "$tmp_home/.claude/CLAUDE.md")" -eq 1
+test "$(grep -c 'code-brain-global-kit:start' "$tmp_home/.codex/AGENTS.md")" -eq 1
 test -x "$tmp_home/.claude/hooks/block-dangerous.sh"
 test -x "$tmp_home/.claude/hooks/protect-secrets.sh"
 test -x "$tmp_home/.claude/hooks/session-context.sh"

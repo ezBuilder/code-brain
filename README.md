@@ -26,6 +26,8 @@ cd code-brain
 bash scripts/install.sh /path/to/project
 ```
 
+In an interactive shell, the macOS/Linux installer also offers the Claude/Codex global kit by default. Existing `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` are backed up and preserved; Code Brain adds or refreshes only its managed block. CI and non-interactive installs skip global writes unless you pass `--global`; use `--no-global` to opt out explicitly.
+
 ```powershell
 # Windows PowerShell
 git clone https://github.com/ezBuilder/code-brain.git
@@ -64,11 +66,17 @@ For first-time bootstrap without keeping a local clone:
 curl -fsSL https://raw.githubusercontent.com/ezBuilder/code-brain/main/scripts/upgrade-from-github.sh | bash -s -- /path/to/project
 ```
 
+For non-interactive bootstrap with the global kit:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ezBuilder/code-brain/main/scripts/upgrade-from-github.sh | bash -s -- --global /path/to/project
+```
+
 Pin a version or branch:
 
 ```bash
-.ai/bin/ai upgrade latest --ref v0.1.2 --json
-CODE_BRAIN_REF=v0.1.2 bash scripts/upgrade-from-github.sh /path/to/project
+.ai/bin/ai upgrade latest --ref v0.1.3 --json
+CODE_BRAIN_REF=v0.1.3 bash scripts/upgrade-from-github.sh /path/to/project
 ```
 
 Upgrades are explicit. `SessionStart` hooks and MCP hot paths do not call the network.
@@ -162,7 +170,7 @@ Antigravity global MCP is opt-in only:
 AI_INSTALL_GLOBAL_ANTIGRAVITY=1 bash scripts/setup-antigravity-global.sh
 ```
 
-Claude/Codex install and upgrade do not write global config. Antigravity global setup only updates the `code-brain` entry when explicitly requested.
+The macOS/Linux top-level installer can install the Claude/Codex global kit. It backs up existing files and merges only the managed Code Brain block into `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`; Claude settings, hooks, commands, agents, and skills are merged or copied under `~/.claude/`. Antigravity global setup only updates the `code-brain` entry when explicitly requested.
 
 ## Token And Disk Defaults
 

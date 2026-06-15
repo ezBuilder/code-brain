@@ -25,6 +25,8 @@ cd code-brain
 bash scripts/install.sh /path/to/project
 ```
 
+대화형 macOS/Linux 설치는 Claude/Codex 전역 kit도 기본으로 제안한다. 기존 `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`는 백업하고 보존하며, Code Brain managed block만 추가/갱신한다. CI나 비대화형 설치는 `--global`을 명시하지 않으면 전역 쓰기를 건너뛴다.
+
 Windows:
 
 ```powershell
@@ -48,6 +50,12 @@ cd /path/to/project
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ezBuilder/code-brain/main/scripts/upgrade-from-github.sh | bash -s -- /path/to/project
+```
+
+비대화형 bootstrap에서 전역 kit까지 설치하려면 `--global`을 붙인다.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ezBuilder/code-brain/main/scripts/upgrade-from-github.sh | bash -s -- --global /path/to/project
 ```
 
 ## 벤치마크 대신 증명

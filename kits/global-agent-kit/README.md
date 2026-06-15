@@ -43,6 +43,8 @@ Codex 전역 규칙만 설치:
 - Claude: `~/.claude/CLAUDE.md`, `~/.claude/settings.json`, `~/.claude/hooks/`, `~/.claude/policies/`, `~/.claude/agents/`, `~/.claude/skills/`, `~/.claude/commands/`
 - Codex: `~/.codex/AGENTS.md`
 
+기존 `CLAUDE.md`/`AGENTS.md`는 덮어쓰지 않는다. 설치기는 파일을 백업한 뒤 `code-brain-global-kit` managed block만 추가하거나 갱신한다.
+
 규칙 파일만 갱신하려면:
 
 ```bash

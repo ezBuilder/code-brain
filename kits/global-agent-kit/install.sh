@@ -12,6 +12,8 @@ INSTALL_CLAUDE_ASSETS=0
 RULES_ONLY=0
 DRY_RUN=0
 YES=0
+MANAGED_START="<!-- code-brain-global-kit:start -->"
+MANAGED_END="<!-- code-brain-global-kit:end -->"
 
 usage() {
   cat <<'USAGE'
@@ -84,12 +86,53 @@ confirm() {
 install_rule() {
   local source="$1"
   local target="$2"
+  local tmp_rule
 
   require_file "$source"
-  echo "install: $source -> $target"
+  echo "merge: $source -> $target"
 
-  if [[ -f "$target" ]] && cmp -s "$source" "$target"; then
+  tmp_rule="$(mktemp)"
+  python3 - "$source" "$target" "$tmp_rule" "$MANAGED_START" "$MANAGED_END" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+output = Path(sys.argv[3])
+start = sys.argv[4]
+end = sys.argv[5]
+
+source_text = source.read_text(encoding="utf-8").strip() + "\n"
+block = f"{start}\n{source_text}{end}\n"
+
+if not target.exists():
+    output.write_text(block, encoding="utf-8")
+    raise SystemExit(0)
+
+current = target.read_text(encoding="utf-8")
+if current.strip() == source_text.strip():
+    output.write_text(block, encoding="utf-8")
+    raise SystemExit(0)
+
+has_start = start in current
+has_end = end in current
+if has_start != has_end:
+    raise SystemExit(f"managed block markers are incomplete in {target}")
+
+if has_start:
+    before, rest = current.split(start, 1)
+    _, after = rest.split(end, 1)
+    rendered = before.rstrip() + "\n\n" + block + after.lstrip("\n")
+else:
+    sep = "" if current.endswith("\n") else "\n"
+    rendered = current + sep + "\n" + block
+
+output.write_text(rendered, encoding="utf-8")
+PY
+
+  if [[ -f "$target" ]] && cmp -s "$tmp_rule" "$target"; then
     echo "skip unchanged: $target"
+    rm -f "$tmp_rule"
     return
   fi
 
@@ -97,6 +140,7 @@ install_rule() {
     if [[ -f "$target" ]]; then
       echo "backup: $target -> $BACKUP_DIR/$(basename "$target")"
     fi
+    rm -f "$tmp_rule"
     return
   fi
 
@@ -105,11 +149,32 @@ install_rule() {
     cp -p "$target" "$BACKUP_DIR/$(basename "$target")"
   fi
 
-  install -m 0644 "$source" "$target"
-  if ! cmp -s "$source" "$target"; then
-    echo "install verification failed for $target" >&2
-    exit 1
-  fi
+  install -m 0644 "$tmp_rule" "$target"
+  rm -f "$tmp_rule"
+  verify_managed_rule "$source" "$target"
+}
+
+verify_managed_rule() {
+  local source="$1"
+  local target="$2"
+
+  python3 - "$source" "$target" "$MANAGED_START" "$MANAGED_END" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+start = sys.argv[3]
+end = sys.argv[4]
+
+source_text = source.read_text(encoding="utf-8").strip() + "\n"
+current = target.read_text(encoding="utf-8")
+if start not in current or end not in current:
+    raise SystemExit(f"managed block missing in {target}")
+body = current.split(start, 1)[1].split(end, 1)[0].lstrip("\n")
+if body != source_text:
+    raise SystemExit(f"managed block content mismatch in {target}")
+PY
 }
 
 backup_path() {
@@ -272,10 +337,7 @@ verify_install() {
   fi
 
   if [[ "$INSTALL_CLAUDE" -eq 1 ]]; then
-    cmp -s "$ROOT_DIR/rules/CLAUDE.md" "$HOME/.claude/CLAUDE.md" || {
-      echo "install verification failed for $HOME/.claude/CLAUDE.md" >&2
-      exit 1
-    }
+    verify_managed_rule "$ROOT_DIR/rules/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
   fi
 
   if [[ "$INSTALL_CLAUDE_ASSETS" -eq 1 ]]; then
@@ -318,10 +380,7 @@ PY
   fi
 
   if [[ "$INSTALL_CODEX" -eq 1 ]]; then
-    cmp -s "$ROOT_DIR/rules/AGENTS.md" "$HOME/.codex/AGENTS.md" || {
-      echo "install verification failed for $HOME/.codex/AGENTS.md" >&2
-      exit 1
-    }
+    verify_managed_rule "$ROOT_DIR/rules/AGENTS.md" "$HOME/.codex/AGENTS.md"
   fi
 }
 

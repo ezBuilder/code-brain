@@ -30,7 +30,7 @@ Codex CLI:
 
 - `./install.sh --all --yes`는 Claude 규칙, Claude settings, hooks, agents, skills, Codex 규칙을 한 번에 설치한다.
 - `./scripts/harness.sh --once --install`은 설치 품질 루프를 한 번 실행하고, `--forever --install`은 명시적인 tmux/장시간 세션에서 반복 실행한다.
-- 기존 파일이나 디렉터리는 `~/.local/state/code-brain-global-kit/backups/` 아래에 백업한다.
+- 기존 파일이나 디렉터리는 `~/.local/state/code-brain-global-kit/backups/` 아래에 백업한다. 전역 `CLAUDE.md`/`AGENTS.md`는 덮어쓰기보다 managed block을 추가/갱신한다.
 - 반복 하네스 실행으로 백업이 무한 증가하지 않게 기본 20개만 보존한다.
 - 기존 Claude user settings는 덮어쓰기보다 permissions/hooks를 병합한다.
 - Claude hooks는 user-level 설치 후에도 동작하도록 `~/.claude/hooks/` 절대 경로로 변환한다.

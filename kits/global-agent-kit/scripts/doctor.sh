@@ -50,6 +50,39 @@ check_file() {
   fi
 }
 
+check_managed_rule() {
+  local source="$1"
+  local target="$2"
+  local label="$3"
+  if [[ ! -f "$target" ]]; then
+    fail "$label missing: $target"
+    return
+  fi
+  if python3 - "$source" "$target" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+start = "<!-- code-brain-global-kit:start -->"
+end = "<!-- code-brain-global-kit:end -->"
+
+source_text = source.read_text(encoding="utf-8").strip() + "\n"
+current = target.read_text(encoding="utf-8")
+if current.strip() == source_text.strip():
+    raise SystemExit(0)
+if start not in current or end not in current:
+    raise SystemExit(1)
+body = current.split(start, 1)[1].split(end, 1)[0].lstrip("\n")
+raise SystemExit(0 if body == source_text else 1)
+PY
+  then
+    ok "$label"
+  else
+    fail "$label stale or missing managed block: $target"
+  fi
+}
+
 check_executable() {
   local path="$1"
   local label="$2"
@@ -60,8 +93,8 @@ check_executable() {
   fi
 }
 
-check_file "$HOME/.claude/CLAUDE.md" "Claude global rule"
-check_file "$HOME/.codex/AGENTS.md" "Codex global rule"
+check_managed_rule "$ROOT_DIR/rules/CLAUDE.md" "$HOME/.claude/CLAUDE.md" "Claude global rule"
+check_managed_rule "$ROOT_DIR/rules/AGENTS.md" "$HOME/.codex/AGENTS.md" "Codex global rule"
 check_file "$HOME/.claude/settings.json" "Claude settings"
 check_executable "$HOME/.claude/hooks/block-dangerous.sh" "dangerous command hook"
 check_executable "$HOME/.claude/hooks/protect-secrets.sh" "secret protection hook"

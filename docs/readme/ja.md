@@ -22,6 +22,8 @@ cd code-brain
 bash scripts/install.sh /path/to/project
 ```
 
+対話型の macOS/Linux shell では、Claude/Codex global kit のインストールも既定で提案されます。既存の `~/.claude/CLAUDE.md` と `~/.codex/AGENTS.md` はバックアップして保持し、Code Brain の managed block だけを追加または更新します。CI と非対話インストールでは、`--global` を指定しない限り global 書き込みをスキップします。
+
 Windows:
 
 ```powershell

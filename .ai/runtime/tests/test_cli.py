@@ -146,7 +146,7 @@ def test_version_json() -> None:
     result = run_ai("--json", "version")
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert payload["version"] == "0.1.2"
+    assert payload["version"] == "0.1.3"
     assert payload["protocol_version"] == 1
 
 
@@ -188,7 +188,7 @@ def test_release_gate_summary_schema_and_redaction(monkeypatch) -> None:
         "release_ready": True,
         "release_artifacts": {
             "all_current": True,
-            "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.2.release-notes.md"},
+            "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.3.release-notes.md"},
         },
         "doctor": {"checks": [{"name": "layout", "ok": True, "detail": "ok"}]},
     }
@@ -1659,7 +1659,7 @@ def test_obs_health_summary_release_artifacts_are_redacted_and_informational(tmp
                     "all_present": True,
                     "all_valid": True,
                     "all_current": False,
-                    "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.2.release-notes.md"},
+                    "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.3.release-notes.md"},
                 },
             },
             sort_keys=True,
@@ -2919,7 +2919,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
     status_result = run_ai("report", "status", "--json", cwd=repo)
     assert status_result.returncode == 0, status_result.stdout + status_result.stderr
     payload = json.loads(status_result.stdout)
-    assert payload["runtime_version"] == "0.1.2"
+    assert payload["runtime_version"] == "0.1.3"
     assert payload["protocol_version"] == 1
     assert payload["doctor"]["ok"] is True
     assert isinstance(payload["release_ready"], bool)
@@ -2942,7 +2942,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
         assert artifacts["archive"]["archive_exists"] is False
     notes_result = run_ai("report", "release-notes", cwd=repo)
     assert notes_result.returncode == 0, notes_result.stdout + notes_result.stderr
-    assert "Code Brain 0.1.2 Release Notes" in notes_result.stdout
+    assert "Code Brain 0.1.3 Release Notes" in notes_result.stdout
     assert "SBOM" in notes_result.stdout
     assert "./scripts/docs-check.sh" in notes_result.stdout
     assert "./scripts/release-gate.sh" in notes_result.stdout
@@ -2950,7 +2950,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
 
 def test_report_status_rejects_release_notes_git_mismatch(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
-    notes_path = repo / "dist" / "code-brain-0.1.2.release-notes.md"
+    notes_path = repo / "dist" / "code-brain-0.1.3.release-notes.md"
     if not notes_path.exists():
         return
     text = notes_path.read_text(encoding="utf-8")

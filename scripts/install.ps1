@@ -4,8 +4,8 @@
 #
 # Ensures `uv` is present (auto-installs it), copies the repo-local runtime into
 # <target>/.ai, wires the agent CLIs (Claude/Codex/Antigravity, all configured and inert
-# if absent), and bootstraps the venv. Writes NOTHING to global config. Unix peer:
-# scripts/install.sh.
+# if absent), and bootstraps the venv. The PowerShell installer writes no global
+# config; the Unix peer can offer a managed global Claude/Codex merge.
 $ErrorActionPreference = "Stop"
 $env:PYTHONIOENCODING = "utf-8"
 $SourceRoot = (Resolve-Path "$PSScriptRoot/..").Path

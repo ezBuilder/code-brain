@@ -315,6 +315,12 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade_rollback.add_argument("--json", action="store_true", dest="command_json")
     upgrade_clean = upgrade_sub.add_parser("clean-cache")
     upgrade_clean.add_argument("--json", action="store_true", dest="command_json")
+    upgrade_latest_parser = upgrade_sub.add_parser("latest", help="upgrade this install from the public Code Brain repo")
+    upgrade_latest_parser.add_argument("--repo-url", default=None)
+    upgrade_latest_parser.add_argument("--ref", default=None)
+    upgrade_latest_parser.add_argument("--dry-run", action="store_true")
+    upgrade_latest_parser.add_argument("--keep-clone", action="store_true")
+    upgrade_latest_parser.add_argument("--json", action="store_true", dest="command_json")
     hook_parser = sub.add_parser("hook")
     hook_parser.add_argument("hook_name", nargs="?")
     hook_parser.add_argument("--json", action="store_true", dest="command_json")
@@ -1160,6 +1166,13 @@ def main(argv: list[str] | None = None) -> int:
             payload = clean_upgrade_cache(root)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "upgrade" and args.upgrade_command == "latest":
+            reject_ci_write("upgrade", dry_run=args.dry_run)
+            from .upgrade import upgrade_latest
+
+            payload = upgrade_latest(root, repo_url=args.repo_url, ref=args.ref, dry_run=args.dry_run, keep_clone=args.keep_clone)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "hook":
             payload = handle_hook(root, args.hook_name, read_payload())
             emit(payload if args.command_json else codex_wire_output(payload), as_json=True)

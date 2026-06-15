@@ -1,14 +1,14 @@
 {
   "artifacts": [
     {
-      "action": "shim",
+      "action": "mirror",
       "path": "AGENTS.md",
-      "source_sha": "41b037c1c28c4f9c2170c215e70fcaa6d7a39d595076382e4388b0f2d5d20edc"
+      "source_sha": "8c357067c6c9d9f1a976095046440aaf26c68d6dd0abea0e0869ac7df8834f37"
     },
     {
-      "action": "shim",
+      "action": "mirror",
       "path": "CLAUDE.md",
-      "source_sha": "41b037c1c28c4f9c2170c215e70fcaa6d7a39d595076382e4388b0f2d5d20edc"
+      "source_sha": "8c357067c6c9d9f1a976095046440aaf26c68d6dd0abea0e0869ac7df8834f37"
     }
   ],
   "chunker": {
@@ -22,7 +22,7 @@
   },
   "generator": {
     "name": "code-brain-runtime",
-    "version": "0.1.0"
+    "version": "0.1.1"
   },
   "git": {
     "attributes_hash": "ac10ed2ddfd8800eddbbdec84d3a525752497f206a2c8c812b415a6e088ed6de",
@@ -32,7 +32,7 @@
   },
   "processor": {
     "versions": {
-      "runtime": "0.1.0"
+      "runtime": "0.1.1"
     }
   },
   "schema_version": 1,

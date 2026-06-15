@@ -30,6 +30,8 @@ def test_tools_list_response_shape(tmp_path: Path) -> None:
     assert "security_finding_list" in names
     assert "security_finding_update" in names
     assert "stream_guard_scan" in names
+    hashline_tool = next(t for t in tools if t["name"] == "code_read_hashline")
+    assert "편집하기 전" in hashline_tool["description"]
 
 
 def test_tools_list_response_cached(tmp_path: Path, monkeypatch) -> None:

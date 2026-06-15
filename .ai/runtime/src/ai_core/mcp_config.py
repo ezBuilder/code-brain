@@ -32,9 +32,12 @@ def code_brain_stdio_entry(windows: bool | None = None) -> dict[str, Any]:
     import os as _os
 
     is_win = _os.name == "nt" if windows is None else windows
-    # Compact tools on by default: tools/list ships only the hot core tools; the rest load on
-    # demand via tool_search. Per-session schema-token cut, no capability loss. (AI_MCP_COMPACT_TOOLS)
-    env = {"AI_MCP_COMPACT_TOOLS": "1"}
+    # Usage profile keeps tools/list tiny by default; hidden tools remain callable
+    # directly or discoverable through tool_search when an operator asks for them.
+    env = {
+        "AI_CODE_BRAIN_PROFILE": "usage",
+        "AI_MCP_COMPACT_TOOLS": "1",
+    }
     if is_win:
         return {"command": "powershell", "args": ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"], "env": env}
     return {"command": ".ai/bin/ai-mcp", "args": [], "env": env}

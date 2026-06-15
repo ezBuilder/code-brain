@@ -53,7 +53,7 @@ def build_codebase_map(root: Path, *, max_entries: int = MAX_ENTRIES, include_un
 
 
 def render_context(entries: list[dict[str, Any]], *, root_commands: list[str] | None = None) -> str:
-    lines = ["Codebase map: start in the narrowest matching path; read local AGENTS/CLAUDE before editing."]
+    lines = ["코드베이스 지도: start in the narrowest matching path; read local AGENTS/CLAUDE before editing."]
     for entry in entries[:CONTEXT_ENTRY_LIMIT]:
         langs = ",".join(entry.get("languages") or [])
         bits = [str(entry.get("path") or "")]
@@ -71,7 +71,7 @@ def render_context(entries: list[dict[str, Any]], *, root_commands: list[str] | 
         lines.append("  - " + "; ".join(bits))
     root_commands = root_commands or []
     if root_commands:
-        lines.append("Root commands: " + " | ".join(root_commands[:3]))
+        lines.append("루트 명령: " + " | ".join(root_commands[:3]))
     return "\n".join(lines)
 
 

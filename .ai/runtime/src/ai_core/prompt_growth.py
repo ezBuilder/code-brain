@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .memory import append_audit, append_jsonl, now_iso, read_jsonl_all
+from .memory import append_audit, append_jsonl, now_iso, read_jsonl_all, rotate_jsonl_tail
 
 
 _ALLOWED_RULE_SOURCES = frozenset({
@@ -58,10 +58,14 @@ MIN_SAMPLES = 20             # do not grow until enough signal
 VIOLATION_RATE = 0.5         # >=50% of recent reports verbose → warrant a brevity rule
 RATCHET_WINDOW = 30          # turns to measure a freshly applied rule before judging it
 RATCHET_REGRESS = 1.10       # post-rule avg output > 110% of baseline → rollback
+PROMPT_GROWTH_MAX_BYTES = 512_000
+PROMPT_GROWTH_KEEP = 2000
+PROMPT_GROWTH_VERSION_KEEP = 30
 LEARNED_HEADER = "# Learned project rules (auto-grown by Code Brain; do not edit by hand)"
 BREVITY_RULE_TEXT = (
-    "Self-initiated progress/output <=10 Korean chars. Answers to user questions <=50 Korean chars. "
-    "Ignore caps on explicit detail. No next-step outro; keep working."
+    "Self-initiated progress/output <=10 words. Answers to user questions concise by default. "
+    "Match the user's language unless requested otherwise. "
+    "Expand for explicit detail, severe error/risk, or required question. No next-step outro; keep working."
 )
 
 
@@ -92,6 +96,37 @@ def _write_state(root: Path, state: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def rotate_logs(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "log": rotate_jsonl_tail(
+            log_path(root),
+            max_bytes=PROMPT_GROWTH_MAX_BYTES,
+            keep_lines=PROMPT_GROWTH_KEEP,
+            dry_run=dry_run,
+        ),
+        "versions": prune_versions(root, dry_run=dry_run),
+    }
+
+
+def prune_versions(root: Path, *, keep: int | None = None, dry_run: bool = False) -> dict[str, Any]:
+    vdir = root.joinpath(*VERSIONS_PARTS)
+    if not vdir.is_dir():
+        return {"ok": True, "pruned": [], "kept": 0, "dry_run": dry_run}
+    versions = sorted(path for path in vdir.glob("*.json") if path.is_file())
+    keep_count = max(0, int(PROMPT_GROWTH_VERSION_KEEP if keep is None else keep))
+    remove = versions if keep_count == 0 else versions[:-keep_count]
+    pruned: list[str] = []
+    for path in remove:
+        pruned.append(path.name)
+        if not dry_run:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    return {"ok": True, "pruned": pruned, "kept": len(versions) - len(remove), "dry_run": dry_run}
+
+
 # --- 1. capture (called from Stop hook; append-only, never raises) ---
 
 def record_turn(root: Path, *, output_chars: int, agent: str = "claude") -> None:
@@ -103,6 +138,7 @@ def record_turn(root: Path, *, output_chars: int, agent: str = "claude") -> None
             "output_chars": int(output_chars or 0),
             "verbose": 1 if int(output_chars or 0) > BREVITY_LIMIT else 0,
         })
+        rotate_jsonl_tail(log_path(root), max_bytes=PROMPT_GROWTH_MAX_BYTES, keep_lines=PROMPT_GROWTH_KEEP)
     except Exception:
         pass
 
@@ -174,6 +210,7 @@ def _snapshot_version(root: Path, state: dict[str, Any], reason: str) -> None:
             json.dumps({"reason": reason, "state": state}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        prune_versions(root)
     except Exception:
         pass
 

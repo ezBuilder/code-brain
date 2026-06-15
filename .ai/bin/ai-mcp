@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export AI_CODE_BRAIN_PROFILE="${AI_CODE_BRAIN_PROFILE:-usage}"
+export AI_MCP_COMPACT_TOOLS="${AI_MCP_COMPACT_TOOLS:-1}"
 PYTHON="$ROOT/.ai/runtime/.venv/bin/python"
 if [[ -x "$PYTHON" ]] && "$PYTHON" -c 'import ai_core.cli' >/dev/null 2>&1; then
   exec "$PYTHON" -m ai_core.cli mcp "$@"

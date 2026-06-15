@@ -79,6 +79,11 @@ DELTA_NOTICE_SHORT = "cb-ctx: Δ"
 DELTA_NOTICE_VERBOSE = "Code Brain context unchanged since last injection (delta-skipped)."
 SKILL_RECOMMENDATION_DISABLE_VALUES = {"0", "false", "no", "off"}
 _ENV_ENABLE_VALUES = {"1", "true", "yes", "on"}
+_RECOMMENDATION_OPT_IN_ENVS = {
+    "AI_SKILL_RECOMMENDATIONS",
+    "AI_AGENT_RECOMMENDATIONS",
+    "AI_PRECALL_RECOMMENDATIONS",
+}
 
 
 def _env_enabled(name: str, default: str = "0") -> bool:
@@ -745,7 +750,8 @@ def _recommendation_section(
 ) -> str:
     if hook_name not in SKILL_RECOMMENDATION_HOOKS:
         return ""
-    if _env_disabled(env_toggle):
+    default_toggle = "0" if env_toggle in _RECOMMENDATION_OPT_IN_ENVS else "1"
+    if _env_disabled(env_toggle, default=default_toggle):
         return ""
     try:
         base_min_signal = int(_os.environ.get(env_min_signal, "3"))
@@ -1152,7 +1158,7 @@ def _precall_recommendation_context(root: Path, hook_name: str, payload: dict[st
 def _federated_summary_context(root: Path, hook_name: str) -> str:
     if hook_name not in SKILL_RECOMMENDATION_HOOKS:
         return ""
-    if _env_disabled("AI_FEDERATED_SUMMARY"):
+    if _env_disabled("AI_FEDERATED_SUMMARY", default="0"):
         return ""
     try:
         from .federated import cross_project_summary
@@ -1191,7 +1197,7 @@ def _federated_summary_context(root: Path, hook_name: str) -> str:
 def _satisfaction_summary_context(root: Path, hook_name: str) -> str:
     if hook_name not in SKILL_RECOMMENDATION_HOOKS:
         return ""
-    if _env_disabled("AI_SATISFACTION_SUMMARY"):
+    if _env_disabled("AI_SATISFACTION_SUMMARY", default="0"):
         return ""
     deps = _recommend_memory_deps(root)
     return _cached_hook_summary(
@@ -2107,7 +2113,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if hook_name not in INJECTION_HOOKS or root is None:
         return ""
     sections = [header]
-    sections.append("Response: self-output <=10 Korean chars; answers to user questions <=50 Korean chars; ignore caps on explicit detail. No next-step outro; keep working.")
+    sections.append("Response: match the user's language; self-output <=10 words; answers concise by default; expand for explicit detail or severe risk. No next-step outro; keep working.")
     if _env_enabled("AI_ROUTING_HINT_COMPACT"):
         routing = "Search: MCP `code_query`/`context_pack` before grep."
     else:
@@ -2117,8 +2123,8 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         )
     sections.append(routing)
     sections.append(
-        "Read: after locating code, use `code_read_hashline` or "
-        "`.ai/bin/ai code read-hashline <path> --start N --end M` before edits."
+        "Read: before editing existing files, use exact target slices with "
+        "`code_read_hashline` or `.ai/bin/ai code read-hashline PATH --start START --end END`."
     )
     staleness = _memory_staleness_context(root, hook_name)
     if staleness:

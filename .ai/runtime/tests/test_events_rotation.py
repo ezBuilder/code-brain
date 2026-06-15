@@ -28,3 +28,25 @@ def test_append_event_no_rotate_when_small(tmp_path: Path, monkeypatch) -> None:
         memory.append_event(tmp_path, {"hook": "PreToolUse", "i": i})
     lines = _events_path(tmp_path).read_text(encoding="utf-8").splitlines()
     assert len(lines) == 20  # under threshold → nothing dropped
+
+
+def test_append_event_rotates_when_few_large_lines_exceed_byte_cap(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(memory, "EVENTS_MAX_BYTES", 1200)
+    monkeypatch.setattr(memory, "EVENTS_KEEP", 100)
+    for i in range(8):
+        memory.append_event(tmp_path, {"hook": "PreToolUse", "i": i, "blob": "x" * 700})
+    lines = _events_path(tmp_path).read_text(encoding="utf-8").splitlines()
+    assert len(lines) < 8
+    assert _events_path(tmp_path).stat().st_size <= 1200
+    assert json.loads(lines[-1])["payload"]["i"] == 7
+
+
+def test_append_event_truncates_single_huge_payload(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(memory, "EVENT_PAYLOAD_MAX_BYTES", 600)
+    monkeypatch.setattr(memory, "EVENT_PAYLOAD_PREVIEW_CHARS", 120)
+    monkeypatch.setattr(memory, "EVENTS_MAX_BYTES", 10_000)
+    memory.append_event(tmp_path, {"hook": "PreToolUse", "blob": "x" * 5000})
+    record = json.loads(_events_path(tmp_path).read_text(encoding="utf-8").splitlines()[-1])
+    assert record["payload"]["truncated"] is True
+    assert record["payload"]["original_bytes"] > 600
+    assert len(record["payload"]["preview"]) <= 120

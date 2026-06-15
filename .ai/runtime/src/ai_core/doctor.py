@@ -34,6 +34,7 @@ def run_checks(root: Path) -> list[Check]:
         check_manifest(root),
         check_trust(root),
         check_jsonl(root),
+        check_generated_artifacts_bounded(root),
         check_audit_index(root),
         check_audit_chain(root),
         check_hot_path_slo(root),
@@ -317,6 +318,34 @@ def check_jsonl(root: Path) -> Check:
     return Check("jsonl", not bad, "ok" if not bad else "invalid: " + ", ".join(bad))
 
 
+def check_generated_artifacts_bounded(root: Path) -> Check:
+    from .evidence import EVIDENCE_MAX_BYTES, evidence_path
+    from .memory import _SESSION_NOTE_MAX_BYTES, EVENTS_MAX_BYTES, events_path, session_current_path
+    from .prompt_growth import PROMPT_GROWTH_MAX_BYTES, log_path
+
+    targets = (
+        (events_path(root), EVENTS_MAX_BYTES),
+        (log_path(root), PROMPT_GROWTH_MAX_BYTES),
+        (evidence_path(root), EVIDENCE_MAX_BYTES),
+        (session_current_path(root), _SESSION_NOTE_MAX_BYTES),
+    )
+    oversized: list[str] = []
+    for path, cap in targets:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > cap:
+            oversized.append(f"{path.relative_to(root).as_posix()}={size}>{cap}")
+    if oversized:
+        return Check(
+            "generated_artifacts_bounded",
+            False,
+            "oversized: " + ", ".join(oversized[:8]) + "; run ai memory page-out --json",
+        )
+    return Check("generated_artifacts_bounded", True, f"ok checked={len(targets)}")
+
+
 def read_jsonl(path: Path) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     if not path.exists():
@@ -514,6 +543,7 @@ REQUIRED_SLASH_COMMAND_FILES = (
     ".claude/commands/cb-search.md",
     ".claude/commands/cb-doctor.md",
     ".claude/commands/cb-exec.md",
+    ".claude/commands/cb-upgrade.md",
 )
 
 REQUIRED_CODEX_PROMPT_FILES = (
@@ -522,6 +552,7 @@ REQUIRED_CODEX_PROMPT_FILES = (
     ".codex/prompts/cb-search.md",
     ".codex/prompts/cb-doctor.md",
     ".codex/prompts/cb-exec.md",
+    ".codex/prompts/cb-upgrade.md",
 )
 
 

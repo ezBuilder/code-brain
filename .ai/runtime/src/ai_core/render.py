@@ -29,8 +29,8 @@ def build_manifest(root: Path) -> dict[str, Any]:
         "schema_version": 1,
         "generator": {"name": "code-brain-runtime", "version": __version__},
         "artifacts": [
-            {"path": "AGENTS.md", "source_sha": file_sha(root / ".ai" / "AGENTS.md"), "action": "shim"},
-            {"path": "CLAUDE.md", "source_sha": file_sha(root / ".ai" / "AGENTS.md"), "action": "shim"},
+            {"path": "AGENTS.md", "source_sha": file_sha(root / ".ai" / "AGENTS.md"), "action": "mirror"},
+            {"path": "CLAUDE.md", "source_sha": file_sha(root / ".ai" / "AGENTS.md"), "action": "mirror"},
         ],
         "embedding": {"enabled": False, "model": None, "dim": None, "hash": None},
         "sqlite_vec": {"version": None},
@@ -48,11 +48,20 @@ def file_sha(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def agent_contract_text(root: Path) -> str:
+    source = root / ".ai" / "AGENTS.md"
+    if source.is_file():
+        text = source.read_text(encoding="utf-8")
+        return text if text.endswith("\n") else text + "\n"
+    return "# Code Brain Agent Contract\n\nRepo-local agent contract missing: `.ai/AGENTS.md`.\n"
+
+
 def render(root: Path, *, dry_run: bool = False, no_overwrite: bool = False, manifest_only: bool = False) -> dict[str, Any]:
     manifest = build_manifest(root)
+    contract = agent_contract_text(root)
     writes = {
-        root / "AGENTS.md": "# AGENTS.md\n\nCanonical agent instructions live in `.ai/AGENTS.md`.\n",
-        root / "CLAUDE.md": "# CLAUDE.md\n\nCanonical Claude instructions live in `.ai/AGENTS.md`.\n",
+        root / "AGENTS.md": contract,
+        root / "CLAUDE.md": contract,
         root / ".ai" / "generated" / "manifest.json": json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     }
     if manifest_only:

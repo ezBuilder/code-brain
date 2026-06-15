@@ -64,7 +64,7 @@ def test_codebase_map_detects_local_instructions_and_scoped_commands(tmp_path: P
     assert "cd api && pytest" in by_path["api"]["commands"]
     assert "cd web && npm run test" in by_path["web"]["commands"]
     assert "cd . && make test" in payload["root_commands"]
-    assert "Codebase map:" in payload["additionalContext"]
+    assert "코드베이스 지도:" in payload["additionalContext"]
 
 
 def test_code_map_cli_outputs_json(tmp_path: Path) -> None:
@@ -103,5 +103,5 @@ def test_session_start_context_includes_codebase_map(tmp_path: Path) -> None:
 
     assert payload["ok"] is True
     context = payload["additionalContext"]
-    assert "Codebase map:" in context
+    assert "코드베이스 지도:" in context
     assert "web; lang=typescript" in context

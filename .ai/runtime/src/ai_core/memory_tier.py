@@ -253,7 +253,8 @@ def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
     sessions older than AI_MEMORY_ARCHIVE_DAYS (default 30) + fold audit
     entries older than AI_AUDIT_FOLD_DAYS (default 30)."""
     from .memory import (
-        _SESSION_NOTE_MAX_BYTES, _SESSION_NOTE_KEEP_BYTES, session_current_path,
+        _SESSION_NOTE_MAX_BYTES, _SESSION_NOTE_KEEP_BYTES, EVENTS_KEEP, EVENTS_MAX_BYTES,
+        events_path, rotate_jsonl_tail, session_current_path,
     )
     from .audit_fold import fold_old_entries
 
@@ -284,6 +285,26 @@ def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
 
     arch = archive_old_sessions(root, age_days=age_days, dry_run=dry_run)
     result["archived"] = arch
+
+    volatile: dict[str, Any] = {
+        "events": rotate_jsonl_tail(
+            events_path(root),
+            max_bytes=EVENTS_MAX_BYTES,
+            keep_lines=EVENTS_KEEP,
+            dry_run=dry_run,
+        )
+    }
+    try:
+        from . import prompt_growth
+        volatile["prompt_growth"] = prompt_growth.rotate_logs(root, dry_run=dry_run)
+    except Exception as exc:
+        volatile["prompt_growth"] = {"ok": False, "error": str(exc)}
+    try:
+        from . import evidence
+        volatile["evidence"] = evidence.rotate_ledger(root, dry_run=dry_run)
+    except Exception as exc:
+        volatile["evidence"] = {"ok": False, "error": str(exc)}
+    result["volatile_logs"] = volatile
 
     # Fold old audit entries (separated, never blocks page_out)
     if audit_fold_days <= 0:

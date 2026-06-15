@@ -471,12 +471,89 @@ def read_text_tail(path: Path, lines: int) -> str:
     return "\n".join(tail)
 
 
+def rotate_jsonl_tail(
+    path: Path,
+    *,
+    max_bytes: int,
+    keep_lines: int,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Keep the newest JSONL tail within both a line and byte budget."""
+    rel = path.as_posix()
+    try:
+        before = path.stat().st_size
+    except OSError:
+        return {"ok": True, "path": rel, "exists": False, "rotated": False, "bytes_before": 0, "bytes_after": 0}
+    if before <= max_bytes:
+        return {"ok": True, "path": rel, "exists": True, "rotated": False, "bytes_before": before, "bytes_after": before}
+
+    try:
+        with path.open("r+", encoding="utf-8") as handle:
+            _lock_exclusive(handle)
+            try:
+                lines = handle.read().splitlines()
+                tail = lines[-max(1, int(keep_lines)):]
+                kept_reversed: list[str] = []
+                total = 0
+                for line in reversed(tail):
+                    line_bytes = len((line + "\n").encode("utf-8"))
+                    if kept_reversed and total + line_bytes > max_bytes:
+                        break
+                    kept_reversed.append(line)
+                    total += line_bytes
+                    if total >= max_bytes:
+                        break
+                if not kept_reversed and tail:
+                    kept_reversed.append(tail[-1])
+                    total = len((tail[-1] + "\n").encode("utf-8"))
+                kept = list(reversed(kept_reversed))
+                after = total if kept else 0
+                if not dry_run:
+                    handle.seek(0)
+                    handle.write(("\n".join(kept) + "\n") if kept else "")
+                    handle.truncate()
+                    after = path.stat().st_size
+                return {
+                    "ok": True,
+                    "path": rel,
+                    "exists": True,
+                    "rotated": True,
+                    "dry_run": dry_run,
+                    "bytes_before": before,
+                    "bytes_after": after,
+                    "lines_before": len(lines),
+                    "lines_after": len(kept),
+                }
+            finally:
+                _unlock(handle)
+    except OSError as exc:
+        return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": str(exc)}
+
+
 EVENTS_MAX_BYTES = 4_000_000  # events.jsonl is hook telemetry mined only for RECENT command
 EVENTS_KEEP = 5000            # patterns — rotate to the most recent N lines, drop the rest.
+EVENT_PAYLOAD_MAX_BYTES = 20_000
+EVENT_PAYLOAD_PREVIEW_CHARS = 12_000
+
+
+def events_path(root: Path) -> Path:
+    return root / ".ai" / "memory" / "events" / "events.jsonl"
+
+
+def _bounded_event_payload(event: dict[str, Any]) -> Any:
+    payload = redact_value(event)
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) <= EVENT_PAYLOAD_MAX_BYTES:
+        return payload
+    return {
+        "truncated": True,
+        "original_bytes": len(encoded.encode("utf-8")),
+        "preview": encoded[:EVENT_PAYLOAD_PREVIEW_CHARS],
+    }
 
 
 def _maybe_rotate_events(path: Path) -> None:
-    """Best-effort: keep events.jsonl bounded to the most recent EVENTS_KEEP lines.
+    """Best-effort: keep events.jsonl bounded to the most recent useful tail.
 
     events.jsonl is append-only hook telemetry whose only consumer (precall_recommend) mines
     recent command patterns, so unbounded growth is pure waste (it grew to hundreds of MB).
@@ -484,25 +561,7 @@ def _maybe_rotate_events(path: Path) -> None:
     appends use, and never raises (telemetry must not break the hook path). Unlike the audit
     log (hash-chained — never truncated), events carry no integrity requirement.
     """
-    try:
-        if path.stat().st_size <= EVENTS_MAX_BYTES:
-            return
-    except OSError:
-        return
-    try:
-        with path.open("r+", encoding="utf-8") as handle:
-            _lock_exclusive(handle)
-            try:
-                lines = handle.read().splitlines()
-                if len(lines) <= EVENTS_KEEP:
-                    return
-                handle.seek(0)
-                handle.write("\n".join(lines[-EVENTS_KEEP:]) + "\n")
-                handle.truncate()
-            finally:
-                _unlock(handle)
-    except OSError:
-        pass
+    rotate_jsonl_tail(path, max_bytes=EVENTS_MAX_BYTES, keep_lines=EVENTS_KEEP)
 
 
 def append_event(root: Path, event: dict[str, Any]) -> dict[str, Any]:
@@ -511,9 +570,9 @@ def append_event(root: Path, event: dict[str, Any]) -> dict[str, Any]:
         "kind": event.get("hook", event.get("kind", "unknown")),
         "agent": event.get("agent", "unknown"),
         "agent_session_id": event.get("agent_session_id"),
-        "payload": redact_value(event),
+        "payload": _bounded_event_payload(event),
     }
-    path = root / ".ai" / "memory" / "events" / "events.jsonl"
+    path = events_path(root)
     append_jsonl(path, record)
     _maybe_rotate_events(path)
     append_audit(root, action="event.append", category="memory", payload={"kind": record["kind"], "agent": record["agent"]})

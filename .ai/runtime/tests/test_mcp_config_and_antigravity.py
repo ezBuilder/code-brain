@@ -33,6 +33,7 @@ def test_code_brain_stdio_entry_is_os_aware() -> None:
 
     unix = code_brain_stdio_entry(windows=False)
     assert unix["command"] == ".ai/bin/ai-mcp"
+    assert unix["env"]["AI_CODE_BRAIN_PROFILE"] == "usage"
     win = code_brain_stdio_entry(windows=True)
     # On Windows the bash shim is not executable → launch the .ps1 via powershell.
     assert win["command"] == "powershell"
@@ -236,7 +237,16 @@ def test_install_into_publishes_root_agents_md(install_into_target: Path) -> Non
     agents = install_into_target / "AGENTS.md"
     assert agents.exists(), "expected root AGENTS.md forwarder"
     text = agents.read_text(encoding="utf-8")
-    assert ".ai/AGENTS.md" in text
+    assert text == (install_into_target / ".ai" / "AGENTS.md").read_text(encoding="utf-8")
+
+
+def test_install_into_publishes_root_claude_md_with_response_defaults(install_into_target: Path) -> None:
+    claude = install_into_target / "CLAUDE.md"
+    assert claude.exists(), "expected root CLAUDE.md for Claude Code"
+    text = claude.read_text(encoding="utf-8")
+    assert text == (install_into_target / ".ai" / "AGENTS.md").read_text(encoding="utf-8")
+    assert "Match the user's language unless they request otherwise." in text
+    assert "Keep self-initiated progress/output under 10 words." in text
 
 
 def test_install_into_preserves_user_authored_agents_md(tmp_path: Path) -> None:
@@ -265,6 +275,56 @@ def test_install_into_preserves_user_authored_agents_md(tmp_path: Path) -> None:
         pytest.skip(f"install-into.sh skipped: {res.stderr[-400:]}")
     final = (target / "AGENTS.md").read_text(encoding="utf-8")
     assert final == user_agents, "user AGENTS.md must not be overwritten"
+
+
+def test_install_into_preserves_user_authored_claude_md(tmp_path: Path) -> None:
+    target = tmp_path / "victim-claude"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=target, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=target, check=True)
+    user_claude = "# Custom Claude rules\n\nProject-specific Claude instructions.\n"
+    (target / "CLAUDE.md").write_text(user_claude, encoding="utf-8")
+    (target / "README.md").write_text("# v\n", encoding="utf-8")
+    subprocess.run(["git", "add", "CLAUDE.md", "README.md"], cwd=target, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=target, check=True)
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    res = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "install-into.sh"), "install", str(target)],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,
+    )
+    if res.returncode != 0:
+        pytest.skip(f"install-into.sh skipped: {res.stderr[-400:]}")
+    final = (target / "CLAUDE.md").read_text(encoding="utf-8")
+    assert final == user_claude, "user CLAUDE.md must not be overwritten"
+
+
+def test_install_into_replaces_old_claude_pointer_stub(tmp_path: Path) -> None:
+    target = tmp_path / "victim-claude-stub"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=target, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=target, check=True)
+    (target / "CLAUDE.md").write_text("# CLAUDE.md\n\nCanonical Claude instructions live in `.ai/AGENTS.md`.\n", encoding="utf-8")
+    (target / "README.md").write_text("# v\n", encoding="utf-8")
+    subprocess.run(["git", "add", "CLAUDE.md", "README.md"], cwd=target, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=target, check=True)
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    res = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "install-into.sh"), "install", str(target)],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,
+    )
+    if res.returncode != 0:
+        pytest.skip(f"install-into.sh skipped: {res.stderr[-400:]}")
+    final = (target / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "Match the user's language unless they request otherwise." in final
+    assert "Keep self-initiated progress/output under 10 words." in final
+    assert "Canonical Claude instructions live" not in final
+    assert final == (target / ".ai" / "AGENTS.md").read_text(encoding="utf-8")
 
 
 def test_install_into_manifest_records_antigravity_targets(install_into_target: Path) -> None:

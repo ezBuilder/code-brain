@@ -11,8 +11,11 @@ dist/
 !.claude/commands/
 .agents/*
 !.agents/skills/
-.ai/memory/events/
-# AGENTS.md is a Code Brain-managed, auto-loaded memory mirror (agy reads it inline).
-# It is refreshed every session, so it is git-ignored to avoid churn. Durable,
-# user-authored agent instructions belong in the tracked .ai/AGENTS.md instead.
+.ai/memory/**
+!.ai/memory/**/
+!.ai/memory/**/.gitkeep
+.ai/generated/install-manifest.json
+.ai/runtime/state/
+# AGENTS.md mirrors tracked .ai/AGENTS.md for agents that auto-load root files.
+# It is generated/seeded, so keep durable user instructions in .ai/AGENTS.md.
 /AGENTS.md

@@ -75,26 +75,30 @@ fi
 managed_files() {
   (
     cd "$SOURCE_ROOT"
-    if git rev-parse --show-toplevel >/dev/null 2>&1; then
-      git ls-files --cached --others --exclude-standard -- \
-        .ai \
-        .githooks \
-        .claude/commands \
-        .codex/prompts \
-        .agents/skills \
-        scripts/env-check.sh \
-        scripts/preflight.sh
-    else
-      for path in .ai .githooks .claude/commands .codex/prompts .agents/skills; do
-        [[ -e "$path" ]] && find "$path" -type f
+    {
+      if git rev-parse --show-toplevel >/dev/null 2>&1; then
+        git ls-files --cached --others --exclude-standard -- \
+          .ai \
+          .githooks \
+          .claude/commands \
+          .codex/prompts \
+          .agents/skills \
+          scripts/env-check.sh \
+          scripts/preflight.sh
+      else
+        for path in .ai .githooks .claude/commands .codex/prompts .agents/skills; do
+          [[ -e "$path" ]] && find "$path" -type f
+        done
+        for path in scripts/env-check.sh scripts/preflight.sh; do
+          [[ -f "$path" ]] && printf '%s\n' "$path"
+        done
+      fi
+    } | grep -vxE "\.ai/secret_scan_allowlist\.txt|\.ai/generated/install-manifest\.json" \
+      | awk '!(($0 ~ /^\.ai\/memory\// || $0 ~ /^\.ai\/runtime\/state\//) && $0 !~ /\.gitkeep$/)' \
+      | while IFS= read -r rel; do
+        [[ -f "$rel" ]] && printf '%s\n' "$rel"
       done
-      for path in scripts/env-check.sh scripts/preflight.sh; do
-        [[ -f "$path" ]] && printf '%s\n' "$path"
-      done
-    fi
-  ) | grep -vxE "\.ai/secret_scan_allowlist\.txt|\.ai/generated/install-manifest\.json" \
-    | awk '!(($0 ~ /^\.ai\/memory\// || $0 ~ /^\.ai\/runtime\/state\//) && $0 !~ /\.gitkeep$/)' \
-    || true
+  ) || true
   # ^ never propagate the SOURCE repo's private runtime memory/state DATA (audit chain, decisions,
   #   sessions, evidence, prompt-growth, worker heartbeats). Seeding it pollutes the target project
   #   and corrupts its audit chain. Directory structure still propagates via the .gitkeep files,
@@ -104,9 +108,9 @@ managed_files() {
 
 # User-owned files seeded on first install but never managed afterwards.
 # Manifest does NOT track these — uninstall will leave them alone.
-# AGENTS.md is seeded as a thin forwarder when missing; if the target already
-# has a user-authored AGENTS.md (common in long-lived repos), we never touch
-# it — that file is part of the project's contract, not Code Brain's.
+# Root agent instruction files are seeded when missing; if the target already
+# has user-authored instructions (common in long-lived repos), we never touch
+# them — those files are part of the project's contract, not Code Brain's.
 seed_user_owned_files() {
   local seeds=(".ai/secret_scan_allowlist.txt")
   for rel in "${seeds[@]}"; do
@@ -118,33 +122,55 @@ seed_user_owned_files() {
     fi
   done
   seed_agents_md
+  seed_claude_md
 }
 
-# AGENTS.md is a Code Brain-managed, auto-loaded memory mirror: Antigravity auto-loads it
-# and Code Brain refreshes an inline memory block in it every session. To avoid churning a
-# tracked file we (a) seed it from a FIXED literal when missing (never copy the source
-# repo's runtime-mutated AGENTS.md), and (b) git-ignore it in the target. Durable,
-# user-authored instructions go in the tracked .ai/AGENTS.md instead. If the target already
-# has its own tracked AGENTS.md we leave it (and the .gitignore line is a no-op for it).
+# Root AGENTS.md/CLAUDE.md mirror the tracked .ai/AGENTS.md contract so agents
+# that only auto-load one filename still receive the same rules. They are seed-only
+# for user-authored targets and git-ignored to avoid churn.
 seed_agents_md() {
   local dst="$TARGET_ROOT/AGENTS.md"
-  if [[ ! -e "$dst" ]]; then
-    cat >"$dst" <<'MD'
-# AGENTS.md
-
-Canonical agent instructions live in `.ai/AGENTS.md`.
-
-Below, Code Brain auto-maintains a cross-session memory snapshot (handoff, recent
-decisions, open todos, staleness) so every agent — including Antigravity, which auto-loads
-this file — resumes from the same context. It is regenerated each session (do not edit by
-hand) and is git-ignored to avoid churn.
-MD
+  if [[ ! -e "$dst" ]] || is_code_brain_agents_stub "$dst"; then
+    write_agent_contract "$dst"
   fi
   local gi="$TARGET_ROOT/.gitignore"
   if [[ -f "$gi" ]]; then
     grep -qxF '/AGENTS.md' "$gi" 2>/dev/null || printf '\n# Code Brain-managed auto-loaded memory mirror (regenerated each session)\n/AGENTS.md\n' >>"$gi"
   else
     printf '/AGENTS.md\n' >"$gi"
+  fi
+}
+
+is_code_brain_agents_stub() {
+  local dst="$1"
+  [[ -f "$dst" ]] && grep -qxF 'Canonical agent instructions live in `.ai/AGENTS.md`.' "$dst"
+}
+
+is_code_brain_claude_stub() {
+  local dst="$1"
+  [[ -f "$dst" ]] && {
+    grep -qxF 'Canonical Claude instructions live in `.ai/AGENTS.md`.' "$dst" \
+      || grep -qxF 'Full repo-local contract: `.ai/AGENTS.md`.' "$dst"
+  }
+}
+
+write_agent_contract() {
+  local dst="$1"
+  if [[ -f "$SOURCE_ROOT/.ai/AGENTS.md" ]]; then
+    cp "$SOURCE_ROOT/.ai/AGENTS.md" "$dst"
+  else
+    cat >"$dst" <<'MD'
+# Code Brain Agent Contract
+
+Repo-local agent contract missing: `.ai/AGENTS.md`.
+MD
+  fi
+}
+
+seed_claude_md() {
+  local dst="$TARGET_ROOT/CLAUDE.md"
+  if [[ ! -e "$dst" ]] || is_code_brain_claude_stub "$dst"; then
+    write_agent_contract "$dst"
   fi
 }
 
@@ -229,6 +255,7 @@ write_install_manifest() {
   mkdir -p "$TARGET_ROOT/.ai/generated"
   py -c '
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -241,14 +268,30 @@ try:
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source_root, text=True).strip()
 except Exception:
     source = None
+source_repo_url = os.environ.get("CODE_BRAIN_REPO_URL")
+if not source_repo_url:
+    try:
+        source_repo_url = subprocess.check_output(["git", "config", "--get", "remote.origin.url"], cwd=source_root, text=True).strip() or None
+    except Exception:
+        source_repo_url = None
+source_ref = os.environ.get("CODE_BRAIN_REF")
+if not source_ref:
+    try:
+        source_ref = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=source_root, text=True).strip() or None
+    except Exception:
+        source_ref = None
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "tool": "code-brain",
     "installed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "project": root.name,
     "files": sorted(set(files)),
     "merged_config_files": [".mcp.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json", ".agents/mcp_config.json", ".agents/hooks.json"],
     "source_git_sha": source,
+    "source_ref": source_ref,
+    "source_repo_url": source_repo_url,
+    "upgrade_channel": "github" if source_repo_url else "local",
+    "upgrade_command": ".ai/bin/ai upgrade latest --json",
 }
 print(json.dumps(payload, indent=2, sort_keys=True))
 ' "$TARGET_ROOT" "$SOURCE_ROOT" >"$(manifest_path)" < <(managed_files)
@@ -353,6 +396,7 @@ restore_managed_owner_if_root() {
     "$TARGET_ROOT/.agents/hooks.json" \
     "$TARGET_ROOT/.agents/skills" \
     "$TARGET_ROOT/AGENTS.md" \
+    "$TARGET_ROOT/CLAUDE.md" \
     "$TARGET_ROOT/bootstrap-code-brain.sh"
   do
     if [[ -e "$path" ]]; then

@@ -1,20 +1,52 @@
 # Code Brain
 
-[한국어](../../README.md) · [English](en.md) · 中文 · [日本語](ja.md) · [Español](es.md) · [Français](fr.md) · [Deutsch](de.md)
+[한국어](ko.md) · [English](../../README.md) · 中文 · [日本語](ja.md) · [Español](es.md) · [Français](fr.md) · [Deutsch](de.md)
 
-如果 AI 只读这个 README，只需要运行下面一条安装命令。安装完成后，新的 Claude Code、Codex CLI 和 Antigravity 会话会自动加载同一套 `.ai/` 记忆、搜索、hooks 和 MCP 配置。
+Code Brain 是仓库本地的 AI 编码基础设施。Claude Code、Codex CLI 和 Google Antigravity 可以在同一个工作区共享 `.ai/` 记忆、BM25 代码搜索、hook 策略、MCP 工具、审计轨迹和升级路径。
+
+## 亮点
+
+- 多个 AI 代理共享同一个 repo-local brain。
+- 默认 `usage` MCP profile，只暴露少量高频工具，降低 token 压力。
+- BM25/FTS5 搜索和 `context_pack` 让代理先缩小范围，而不是盲目读取大量文件。
+- `code_read_hashline` 在编辑前提供 line+sha 锚点。
+- hooks 会拦截危险 git、secret leak、宽泛 grep/find、超长输出。
+- runtime JSONL/log/evidence 文件有大小上限，并由 `doctor` 检查。
+- `/cb-upgrade` 或 `.ai/bin/ai upgrade latest --json` 可从公开 GitHub repo 升级。
+
+## 安装
+
 ```bash
-# macOS / Linux
-git clone https://github.com/ezBuilder/code-brain.git && cd code-brain
+git clone https://github.com/ezBuilder/code-brain.git
+cd code-brain
 bash scripts/install.sh /path/to/project
+```
 
-# Windows PowerShell
-git clone https://github.com/ezBuilder/code-brain.git; cd code-brain
+Windows:
+
+```powershell
+git clone https://github.com/ezBuilder/code-brain.git
+cd code-brain
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\path\to\project
 ```
 
-成功标志：最后一行显示 `[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.`
+安装后打开新的 Claude/Codex/Antigravity 会话。
 
-Code Brain 是仓库本地的基础设施，让 Claude Code、Codex CLI 和 Google Antigravity 在同一个工作区共享记忆、代码搜索、策略、hooks 和审计记录。
+## 升级
 
-它以 BM25 词法搜索为核心，并加入 hashline 完整性检查、MCP 工具、hooks 和跨会话记忆。热路径在本地离线运行，并避免网络调用。
+```bash
+.ai/bin/ai upgrade latest --json
+```
+
+在代理会话中运行 `/cb-upgrade`。成功后需要打开新会话。
+
+## 可复现验证
+
+```bash
+make lint
+.ai/bin/ai upgrade latest --dry-run --json
+.ai/bin/ai doctor --strict --json
+.ai/bin/ai obs usage --json
+```
+
+License: Apache-2.0.

@@ -1109,8 +1109,9 @@ def test_federated_summary_context_renders_top_patterns(tmp_root: Path, monkeypa
         }
 
     monkeypatch.setattr("ai_core.federated.cross_project_summary", fake_summary)
+    monkeypatch.setenv("AI_FEDERATED_SUMMARY", "1")
     out = _federated_summary_context(tmp_root, "SessionStart")
-    assert "Federated patterns from 4 projects" in out
+    assert "federated patterns(4 projects" in out
     assert "deploy nightly(3)" in out
     assert "compound_pipeline(2)" in out
 
@@ -1263,8 +1264,8 @@ def test_compact_mode_combines_federated_and_satisfaction(tmp_root: Path, monkey
     ctx = build_context("SessionStart", {"agent": "claude"}, root=tmp_root)
 
     assert "cb-meta:" in ctx, f"expected combined cb-meta line, got:\n{ctx}"
-    assert "Federated patterns from" not in ctx, "verbose federated form must be suppressed in compact mode"
-    assert "Recommendation satisfaction:" not in ctx, "verbose satisfaction form must be suppressed in compact mode"
+    assert "federated 패턴(" not in ctx, "verbose federated form must be suppressed in compact mode"
+    assert "추천 만족도:" not in ctx, "verbose satisfaction form must be suppressed in compact mode"
     # Sanity: both halves of the combined line are present.
     assert "5 surfaced" in ctx
     assert "fed 3 proj" in ctx
@@ -1382,8 +1383,9 @@ def test_e2e_autonomous_loop_full_cycle(tmp_root: Path, monkeypatch):
     from ai_core.obs import _surfacing_summary
     from ai_core.recommend import _adaptive_min_signal_lower, recommend
 
-    # Enable skill recommendations explicitly (opt-out env var must be unset/truthy).
-    monkeypatch.delenv("AI_SKILL_RECOMMENDATIONS", raising=False)
+    # Recommendation surfacing is opt-in; this test exercises the enabled path.
+    monkeypatch.setenv("AI_SKILL_RECOMMENDATIONS", "1")
+    monkeypatch.setenv("AI_SATISFACTION_SUMMARY", "1")
     monkeypatch.delenv("AI_AGENT_RECOMMENDATIONS", raising=False)
     monkeypatch.delenv("AI_PRECALL_RECOMMENDATIONS", raising=False)
     monkeypatch.delenv("AI_RECOMMEND_COMPACT", raising=False)
@@ -1393,10 +1395,10 @@ def test_e2e_autonomous_loop_full_cycle(tmp_root: Path, monkeypatch):
     # ---- PHASE 1: Cold start --------------------------------------------------
     _seed_decisions(tmp_root, "infra", 5)
     ctx = build_context("SessionStart", {"agent": "claude"}, root=tmp_root)
-    assert "Skill recommendations available" in ctx, (
+    assert "Skill candidates" in ctx, (
         f"expected skill recommendations header in SessionStart context, got:\n{ctx}"
     )
-    assert "Recommendation satisfaction:" in ctx, (
+    assert "recommend satisfaction" in ctx, (
         f"expected satisfaction summary after cold-start surfacing, got:\n{ctx}"
     )
     # At least one recommend_pending audit row written by the cold-start persist path.

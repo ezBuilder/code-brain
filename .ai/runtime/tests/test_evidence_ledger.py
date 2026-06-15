@@ -11,6 +11,7 @@ PYTHON = sys.executable
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
 from ai_core.evidence import append_candidate_results, evidence_path, list_evidence, record_evidence, set_evidence_status  # noqa: E402
+from ai_core import evidence as evidence_mod  # noqa: E402
 from ai_core.search import context_pack, query, rebuild  # noqa: E402
 
 
@@ -233,3 +234,23 @@ def test_mcp_lists_and_sets_evidence_status(tmp_path: Path) -> None:
     )
     assert listed is not None
     assert listed["result"]["structuredContent"]["count"] == 1
+
+
+def test_evidence_ledger_rotates_when_byte_cap_exceeded(tmp_path: Path, monkeypatch) -> None:
+    repo = _init_repo(tmp_path)
+    monkeypatch.setattr(evidence_mod, "EVIDENCE_MAX_BYTES", 1600)
+    monkeypatch.setattr(evidence_mod, "EVIDENCE_KEEP", 100)
+    for i in range(12):
+        created = record_evidence(
+            repo,
+            query="large evidence",
+            path=f"src/app{i}.py",
+            snippet=("needle" + str(i)) * 150,
+            source="test",
+        )
+        assert created["ok"] is True
+    path = evidence_path(repo)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) < 12
+    assert path.stat().st_size <= 1600
+    assert json.loads(lines[-1])["path"] == "src/app11.py"

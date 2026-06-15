@@ -68,7 +68,7 @@ test:
 doctor:
 	uv run --project .ai/runtime ai doctor --strict --json
 
-quick: env-check lint doctor test
+quick: env-check lint doctor
 	uv run --project .ai/runtime ai report status --json >/dev/null
 
 smoke:

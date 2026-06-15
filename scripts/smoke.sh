@@ -25,7 +25,7 @@ tar \
   -C "$ROOT" -cf - . | tar -C "$COPY" -xf -
 
 cd "$COPY"
-unset CI GITHUB_ACTIONS
+unset CI GITHUB_ACTIONS GITLAB_CI AI_CI
 
 # Release gate already runs the full suite in a git checkout. This detached copy
 # smoke intentionally exercises install/runtime commands without git metadata.

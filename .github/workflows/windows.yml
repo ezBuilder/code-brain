@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: windows-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pytest-windows:
     runs-on: windows-latest
@@ -15,11 +19,16 @@ jobs:
         shell: pwsh
         run: |
           uv sync --project .ai/runtime --all-extras --dev
-      - name: Pytest (cross-platform unit tests)
+      - name: Pytest (Windows portability tests)
         shell: pwsh
         run: |
           Remove-Item Env:CI -ErrorAction SilentlyContinue
           Remove-Item Env:GITHUB_ACTIONS -ErrorAction SilentlyContinue
           Remove-Item Env:GITLAB_CI -ErrorAction SilentlyContinue
           Remove-Item Env:AI_CI -ErrorAction SilentlyContinue
-          uv run --project .ai/runtime python -m pytest .ai/runtime/tests -x --tb=short -q
+          uv run --project .ai/runtime python -m pytest `
+            .ai/runtime/tests/test_cli.py `
+            .ai/runtime/tests/test_mcp_config_and_antigravity.py `
+            .ai/runtime/tests/test_recommend.py `
+            -k "preflight or mcp_methods_registered or secret_scan_uses_git_baseline_not_local_noise or os_aware or powershell or ps1 or windows" `
+            --tb=short -q

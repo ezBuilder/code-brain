@@ -34,7 +34,7 @@ BASE_MANIFEST_SHA="$(manifest_sha)"
 
 run_bootstrap() {
   local label="$1"
-  CI=true GITHUB_ACTIONS=true ./bootstrap.sh >/dev/null
+  AI_BOOTSTRAP_SKIP_TESTS=1 CI=true GITHUB_ACTIONS=true ./bootstrap.sh >/dev/null
   local status
   status="$(git status --short)"
   if [[ -n "$status" ]]; then

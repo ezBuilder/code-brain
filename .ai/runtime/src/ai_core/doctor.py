@@ -185,7 +185,6 @@ def check_layout(root: Path) -> Check:
         ".ai/bin/ai",
         ".ai/generated",
         ".ai/memory/audit",
-        ".ai/memory/audit-index.jsonl",
         ".ai/memory/queue/.tmp/.gitkeep",
         ".ai/memory/queue/processing/.gitkeep",
         ".ai/memory/queue/dead/.gitkeep",

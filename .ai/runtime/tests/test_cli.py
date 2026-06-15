@@ -577,8 +577,9 @@ def test_doctor_strict_passes_after_render(tmp_path: Path) -> None:
 
 def test_preflight_check_only_json(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
+    bash = usable_bash_or_skip()
     result = subprocess.run(
-        ["./scripts/preflight.sh", "--check-only", "--json"],
+        [bash, "scripts/preflight.sh", "--check-only", "--json"],
         cwd=repo,
         text=True,
         stdout=subprocess.PIPE,

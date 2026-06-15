@@ -43,6 +43,5 @@ if [[ -n "$POWERSHELL_BIN" ]]; then
 else
   echo "install check note: PowerShell not found; skipped ps1 shim execution" >&2
 fi
-uv run --project .ai/runtime python -m pytest .ai/runtime/tests >/dev/null
 
 echo "install check ok: $ARCHIVE"

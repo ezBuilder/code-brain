@@ -27,7 +27,8 @@ tar \
 cd "$COPY"
 unset CI GITHUB_ACTIONS
 
-uv run --project .ai/runtime python -m pytest .ai/runtime/tests
+# Release gate already runs the full suite in a git checkout. This detached copy
+# smoke intentionally exercises install/runtime commands without git metadata.
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
 uv run --project .ai/runtime ai render --dry-run --json >/dev/null
 uv run --project .ai/runtime ai index rebuild --json >/dev/null
@@ -47,6 +48,7 @@ printf '{"summary":"smoke"}' | uv run --project .ai/runtime ai notify enqueue --
 uv run --project .ai/runtime ai obs metrics --json >/dev/null
 uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
+uv run --project .ai/runtime ai index rebuild --json >/dev/null
 uv run --project .ai/runtime ai report status --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
 if ./scripts/package.sh >"$PACKAGE_OUTPUT" 2>"$PACKAGE_ERROR"; then

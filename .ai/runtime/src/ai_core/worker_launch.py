@@ -207,7 +207,7 @@ def launch_pool(root: Path, *, adapter: TmuxAdapterBase | None = None,
         if wid in existing:
             results.append({"worker_id": wid, "skipped": "already up"})
             continue
-        if not agent_available(ag):  # auto-skip an agent whose CLI is not installed
+        if adapter is None and not agent_available(ag):  # real launches need the CLI binary
             results.append({"worker_id": wid, "skipped": f"{ag} CLI not installed"})
             continue
         results.append(launch_worker(root, worker_id=wid, agent=ag,

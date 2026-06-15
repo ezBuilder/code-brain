@@ -4,11 +4,10 @@
 
 ## Response
 
-- Reply Korean.
-- Self-initiated progress/output: <=10 Korean chars.
-- Answers to user questions: <=50 Korean chars.
-- Ignore length caps when the user explicitly requests detail.
-- Expand only for explicit detail, severe error/risk, or required question.
+- Match the user's language unless they request otherwise.
+- Keep self-initiated progress/output under 10 words.
+- Keep answers concise by default.
+- Expand beyond these defaults only for explicit detail, severe error/risk, or required question.
 - No progress narration or next-step outro; continue until done, blocked, or approval is required.
 
 ## Branches
@@ -23,7 +22,7 @@
 1. Understand the request.
 2. Inspect local rules and current git state.
 3. Locate code with Code Brain before broad shell search.
-4. Read exact slices before editing.
+4. Before editing existing files, read exact target slices with hashline.
 5. Preserve unrelated user changes.
 6. Make the smallest coherent change.
 7. Verify before claiming success.
@@ -39,7 +38,7 @@
 
 - Code discovery: MCP `code_query` first, `context_pack` next.
 - Call graph: `code_graph_callers`, `code_graph_callees`, `code_graph_symbol`.
-- Exact read before edits: `code_read_hashline`; CLI fallback: `.ai/bin/ai code read-hashline <path> --start N --end M`.
+- Before editing existing files, read exact target slices: `code_read_hashline`; CLI fallback: `.ai/bin/ai code read-hashline PATH --start START --end END`.
 - Long output or broad search: MCP `sandbox_execute` or `.ai/bin/ai exec run -- ...`.
 - Direct broad shell `grep -r`, `rg .`, `find`, `tree`, `ack`, `ag`, `git grep` is last resort only when Code Brain is unavailable/stale.
 
@@ -56,6 +55,7 @@
 - Use read-only agents for broad discovery.
 - Use plan/review agents for independent analysis.
 - Keep edit ownership non-overlapping.
+- Reserve multi-agent fan-out (workflows) for big items: architecture, security, broad audits, large/risky refactors. Keep small/local changes solo, verified by tests + direct check. Estimate cost and get approval before a large fan-out; do not auto-fan-out small work.
 
 ## Security
 
@@ -75,5 +75,7 @@
 ## Verify
 
 - Use the closest test/check first.
-- Typical root checks: `make lint`, `make test`, `make doctor`.
+- Select tests by changed files and likely impact; skip unrelated suites.
+- Run full `make test` only when broad shared contracts changed or the user asks.
+- Typical root checks: `make lint`, targeted pytest, `make doctor`.
 - Never report success without verification.

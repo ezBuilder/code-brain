@@ -1,20 +1,52 @@
 # Code Brain
 
-[한국어](../../README.md) · [English](en.md) · [中文](zh-CN.md) · [日本語](ja.md) · Español · [Français](fr.md) · [Deutsch](de.md)
+[한국어](ko.md) · [English](../../README.md) · [中文](zh-CN.md) · [日本語](ja.md) · Español · [Français](fr.md) · [Deutsch](de.md)
 
-Si una IA solo lee este README, basta con ejecutar un comando para instalar Code Brain en el proyecto. Al terminar, las nuevas sesiones de Claude Code, Codex CLI y Antigravity cargan automaticamente la misma memoria `.ai/`, busqueda, hooks y MCP.
+Code Brain es infraestructura local al repositorio para agentes de codigo. Claude Code, Codex CLI y Google Antigravity comparten la misma memoria `.ai/`, busqueda BM25, politica de hooks, herramientas MCP, auditoria y ruta de actualizacion.
+
+## Por que destaca
+
+- Varios agentes comparten un mismo brain local al repo.
+- El perfil MCP `usage` expone solo las herramientas frecuentes y reduce presion de tokens.
+- BM25/FTS5 y `context_pack` ayudan a acotar codigo antes de leer demasiado.
+- `code_read_hashline` aporta anclas line+sha antes de editar.
+- Los hooks bloquean git destructivo, secretos, grep/find demasiado amplios y salidas enormes.
+- Los JSONL/log/evidence generados tienen limites y `doctor` los valida.
+- `/cb-upgrade` o `.ai/bin/ai upgrade latest --json` actualizan desde el repo publico de GitHub.
+
+## Instalacion
+
 ```bash
-# macOS / Linux
-git clone https://github.com/ezBuilder/code-brain.git && cd code-brain
+git clone https://github.com/ezBuilder/code-brain.git
+cd code-brain
 bash scripts/install.sh /path/to/project
+```
 
-# Windows PowerShell
-git clone https://github.com/ezBuilder/code-brain.git; cd code-brain
+Windows:
+
+```powershell
+git clone https://github.com/ezBuilder/code-brain.git
+cd code-brain
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\path\to\project
 ```
 
-Exito: la ultima linea debe decir `[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.`
+Despues, abre una nueva sesion de Claude/Codex/Antigravity.
 
-Code Brain es infraestructura local al repositorio para que Claude Code, Codex CLI y Google Antigravity compartan memoria, busqueda de codigo, politicas, hooks y auditoria en un mismo workspace.
+## Actualizacion
 
-Mantiene una busqueda lexical-first con BM25, comprobaciones hashline, herramientas MCP, hooks y memoria entre sesiones. Las rutas criticas son locales, offline y evitan llamadas de red.
+```bash
+.ai/bin/ai upgrade latest --json
+```
+
+Dentro del agente, ejecuta `/cb-upgrade`. Al terminar, abre una nueva sesion.
+
+## Pruebas reproducibles
+
+```bash
+make lint
+.ai/bin/ai upgrade latest --dry-run --json
+.ai/bin/ai doctor --strict --json
+.ai/bin/ai obs usage --json
+```
+
+License: Apache-2.0.

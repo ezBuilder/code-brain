@@ -137,12 +137,48 @@ def init_package_repo(repo: Path) -> None:
     subprocess.run(["git", "commit", "-qm", "package-test-baseline"], cwd=repo, check=True)
 
 
+def init_public_source_repo(repo: Path) -> None:
+    init_package_repo(repo)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+
+
 def test_version_json() -> None:
     result = run_ai("--json", "version")
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert payload["version"] == "0.1.0"
+    assert payload["version"] == "0.1.1"
     assert payload["protocol_version"] == 1
+
+
+def test_render_mirrors_agents_contract_to_claude(tmp_path: Path) -> None:
+    from ai_core.render import render
+
+    root = tmp_path
+    (root / ".ai").mkdir()
+    contract = "# Code Brain Agent Contract\n\n- Match the user's language unless they request otherwise.\n"
+    (root / ".ai" / "AGENTS.md").write_text(contract, encoding="utf-8")
+
+    payload = render(root)
+    assert payload["manifest"]["artifacts"][0]["action"] == "mirror"
+    assert (root / "AGENTS.md").read_text(encoding="utf-8") == contract
+    assert (root / "CLAUDE.md").read_text(encoding="utf-8") == contract
+
+
+def test_cb_upgrade_command_assets_exist() -> None:
+    from ai_core.doctor import REQUIRED_CODEX_PROMPT_FILES, REQUIRED_SLASH_COMMAND_FILES
+
+    claude = ROOT / ".claude" / "commands" / "cb-upgrade.md"
+    codex = ROOT / ".codex" / "prompts" / "cb-upgrade.md"
+    skill = ROOT / ".agents" / "skills" / "source-command-cb-upgrade" / "SKILL.md"
+    for path in (claude, codex, skill):
+        text = path.read_text(encoding="utf-8")
+        assert ".ai/bin/ai upgrade latest --json" in text
+        assert "새 세션" in text
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "/cb-upgrade" in readme
+    assert "SessionStart" in readme and "do not call the network" in readme
+    assert ".claude/commands/cb-upgrade.md" in REQUIRED_SLASH_COMMAND_FILES
+    assert ".codex/prompts/cb-upgrade.md" in REQUIRED_CODEX_PROMPT_FILES
 
 
 def test_release_gate_summary_schema_and_redaction(monkeypatch) -> None:
@@ -152,7 +188,7 @@ def test_release_gate_summary_schema_and_redaction(monkeypatch) -> None:
         "release_ready": True,
         "release_artifacts": {
             "all_current": True,
-            "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.0.release-notes.md"},
+            "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.1.release-notes.md"},
         },
         "doctor": {"checks": [{"name": "layout", "ok": True, "detail": "ok"}]},
     }
@@ -589,6 +625,19 @@ def test_secret_scan_uses_git_baseline_not_local_noise(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     secret_check = next(check for check in payload["checks"] if check["name"] == "secret_scan")
     assert secret_check["ok"] is True
+
+
+def test_doctor_rejects_oversized_generated_artifacts(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    events = repo / ".ai" / "memory" / "events" / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    events.write_text(('{"hook":"PreToolUse","blob":"' + ("x" * 5000) + '"}\n') * 1000, encoding="utf-8")
+    result = run_ai("doctor", "--strict", "--json", cwd=repo)
+    payload = json.loads(result.stdout)
+    check = next(check for check in payload["checks"] if check["name"] == "generated_artifacts_bounded")
+    assert result.returncode == 10
+    assert check["ok"] is False
+    assert "events.jsonl" in check["detail"]
 
 
 def test_code_index_uses_git_baseline_and_skips_dependencies(tmp_path: Path) -> None:
@@ -1610,7 +1659,7 @@ def test_obs_health_summary_release_artifacts_are_redacted_and_informational(tmp
                     "all_present": True,
                     "all_valid": True,
                     "all_current": False,
-                    "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.0.release-notes.md"},
+                    "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.1.1.release-notes.md"},
                 },
             },
             sort_keys=True,
@@ -2793,6 +2842,76 @@ def test_ci_migrate_upgrade_write_policy(tmp_path: Path) -> None:
     assert dry_upgrade.returncode == 0, dry_upgrade.stdout + dry_upgrade.stderr
     upgrade_write = run_ai("upgrade", "apply", "--target-version", "0.1.1", "--json", env={"CI": "true"}, cwd=repo)
     assert upgrade_write.returncode == 16
+    dry_latest = run_ai("upgrade", "latest", "--dry-run", "--json", env={"CI": "true"}, cwd=repo)
+    assert dry_latest.returncode == 0, dry_latest.stdout + dry_latest.stderr
+    latest_write = run_ai("upgrade", "latest", "--json", env={"CI": "true"}, cwd=repo)
+    assert latest_write.returncode == 16
+
+
+def test_upgrade_latest_dry_run_reports_public_repo_defaults() -> None:
+    result = run_ai("upgrade", "latest", "--dry-run", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["dry_run"] is True
+    assert payload["repo_url"] == "https://github.com/ezBuilder/code-brain.git"
+    assert payload["ref"] == "main"
+    assert payload["planned"]["doctor"] == ".ai/bin/ai doctor --strict --json"
+
+
+def test_upgrade_latest_from_local_repo_updates_install_manifest(tmp_path: Path) -> None:
+    source = copy_repo(tmp_path / "source")
+    init_public_source_repo(source)
+    target = copy_repo(tmp_path / "target")
+    init_package_repo(target)
+
+    result = run_ai("upgrade", "latest", "--repo-url", str(source), "--ref", "main", "--json", cwd=target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["channel"] == "github"
+    assert payload["repo_url"] == str(source)
+    assert payload["source_git_sha"]
+    manifest = json.loads((target / ".ai" / "generated" / "install-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
+    assert manifest["source_repo_url"] == str(source)
+    assert manifest["source_ref"] == "main"
+    assert manifest["upgrade_command"] == ".ai/bin/ai upgrade latest --json"
+    claude_text = (target / "CLAUDE.md").read_text(encoding="utf-8")
+    assert claude_text == (target / ".ai" / "AGENTS.md").read_text(encoding="utf-8")
+    assert "Match the user's language unless they request otherwise." in claude_text
+    assert "Keep self-initiated progress/output under 10 words." in claude_text
+    follow_up = run_ai("upgrade", "latest", "--dry-run", "--json", cwd=target)
+    assert follow_up.returncode == 0, follow_up.stdout + follow_up.stderr
+    follow_up_payload = json.loads(follow_up.stdout)
+    assert follow_up_payload["repo_url"] == str(source)
+    assert follow_up_payload["ref"] == "main"
+
+
+def test_upgrade_from_github_script_dry_run(tmp_path: Path) -> None:
+    bash = usable_bash_or_skip()
+    target = tmp_path / "target"
+    target.mkdir()
+    result = subprocess.run(
+        [
+            bash,
+            "scripts/upgrade-from-github.sh",
+            "--dry-run",
+            "--repo-url",
+            str(tmp_path / "source"),
+            "--ref",
+            "main",
+            str(target),
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "dry-run repo=" in result.stdout
+    assert "action=install" in result.stdout
 
 
 def test_report_status_and_release_notes(tmp_path: Path) -> None:
@@ -2800,7 +2919,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
     status_result = run_ai("report", "status", "--json", cwd=repo)
     assert status_result.returncode == 0, status_result.stdout + status_result.stderr
     payload = json.loads(status_result.stdout)
-    assert payload["runtime_version"] == "0.1.0"
+    assert payload["runtime_version"] == "0.1.1"
     assert payload["protocol_version"] == 1
     assert payload["doctor"]["ok"] is True
     assert isinstance(payload["release_ready"], bool)
@@ -2823,7 +2942,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
         assert artifacts["archive"]["archive_exists"] is False
     notes_result = run_ai("report", "release-notes", cwd=repo)
     assert notes_result.returncode == 0, notes_result.stdout + notes_result.stderr
-    assert "Code Brain 0.1.0 Release Notes" in notes_result.stdout
+    assert "Code Brain 0.1.1 Release Notes" in notes_result.stdout
     assert "SBOM" in notes_result.stdout
     assert "./scripts/docs-check.sh" in notes_result.stdout
     assert "./scripts/release-gate.sh" in notes_result.stdout
@@ -2831,7 +2950,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
 
 def test_report_status_rejects_release_notes_git_mismatch(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
-    notes_path = repo / "dist" / "code-brain-0.1.0.release-notes.md"
+    notes_path = repo / "dist" / "code-brain-0.1.1.release-notes.md"
     if not notes_path.exists():
         return
     text = notes_path.read_text(encoding="utf-8")
@@ -3564,7 +3683,7 @@ def test_session_start_hook_injects_prior_session_tail(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     ctx = json.loads(result.stdout)["additionalContext"]
-    assert "이전 세션 재개" in ctx
+    assert "resume session_id=old-session" in ctx
     assert "session tail:" in ctx
     assert "prior milestone 11" in ctx
     assert "prior milestone 3" not in ctx
@@ -3582,11 +3701,16 @@ def test_session_start_hook_surfaces_skill_recommendations(tmp_path: Path) -> No
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
         encoding="utf-8",
     )
-    result = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    result = run_ai_input(
+        "hook", "SessionStart", "--json",
+        stdin='{"agent":"claude"}',
+        env={"AI_SKILL_RECOMMENDATIONS": "1"},
+        cwd=repo,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
     ctx = response["additionalContext"]
-    assert "스킬 추천 있음" in ctx
+    assert "Skill candidates" in ctx
     assert "ai recommend skills accept" in ctx
     assert "recall-deploy-decisions" in ctx
     catalog = repo / ".ai" / "skills" / "catalog.jsonl"
@@ -3607,11 +3731,16 @@ def test_session_start_hook_satisfaction_summary_includes_surfaced_count(tmp_pat
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
         encoding="utf-8",
     )
-    result = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    result = run_ai_input(
+        "hook", "SessionStart", "--json",
+        stdin='{"agent":"claude"}',
+        env={"AI_SKILL_RECOMMENDATIONS": "1", "AI_SATISFACTION_SUMMARY": "1"},
+        cwd=repo,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
     ctx = response["additionalContext"]
-    assert "추천 만족도:" in ctx
+    assert "recommend satisfaction" in ctx
     assert "surfaced" in ctx
 
 
@@ -3629,11 +3758,16 @@ def test_session_start_hook_compact_mode_collapses_sections(tmp_path: Path, monk
         encoding="utf-8",
     )
     monkeypatch.setenv("AI_RECOMMEND_COMPACT", "1")
-    result = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    result = run_ai_input(
+        "hook", "SessionStart", "--json",
+        stdin='{"agent":"claude"}',
+        env={"AI_SKILL_RECOMMENDATIONS": "1", "AI_RECOMMEND_COMPACT": "1"},
+        cwd=repo,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
     ctx = json.loads(result.stdout)["additionalContext"]
     assert "cb-skill" in ctx, "compact mode must use 'cb-skill' prefix line"
-    assert "스킬 추천 있음" not in ctx, "verbose header must be omitted in compact mode"
+    assert "Skill candidates" not in ctx, "verbose header must be omitted in compact mode"
 
 
 def test_session_start_hook_cooldown_suppresses_repeat_surfacing(tmp_path: Path) -> None:
@@ -3648,16 +3782,17 @@ def test_session_start_hook_cooldown_suppresses_repeat_surfacing(tmp_path: Path)
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
         encoding="utf-8",
     )
-    first = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    env = {"AI_SKILL_RECOMMENDATIONS": "1", "AI_SATISFACTION_SUMMARY": "1"}
+    first = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', env=env, cwd=repo)
     assert first.returncode == 0
-    assert "스킬 추천 있음" in json.loads(first.stdout)["additionalContext"]
-    second = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', cwd=repo)
+    assert "Skill candidates" in json.loads(first.stdout)["additionalContext"]
+    second = run_ai_input("hook", "SessionStart", "--json", stdin='{"agent":"claude"}', env=env, cwd=repo)
     assert second.returncode == 0
     ctx2 = json.loads(second.stdout)["additionalContext"]
-    assert "스킬 추천 있음" not in ctx2, (
+    assert "Skill candidates" not in ctx2, (
         "cooldown should suppress identical surfacing on the next SessionStart"
     )
-    assert "추천 만족도:" in ctx2
+    assert "recommend satisfaction" in ctx2
 
 
 def test_post_tool_use_hook_skips_injection(tmp_path: Path) -> None:
@@ -3683,7 +3818,7 @@ def test_user_prompt_submit_hook_includes_routing_when_memory_empty(tmp_path: Pa
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
     ctx = response["additionalContext"]
-    assert "검색 라우팅" in ctx
+    assert "Search:" in ctx
     assert "code_read_hashline" in ctx
     assert "Recent decisions" not in ctx
 
@@ -3695,8 +3830,8 @@ def test_user_prompt_submit_harness_request_injects_directive(tmp_path: Path) ->
     result = run_ai_input("hook", "UserPromptSubmit", "--json", stdin=payload, cwd=repo)
     assert result.returncode == 0, result.stdout + result.stderr
     ctx = json.loads(result.stdout)["additionalContext"]
-    assert "Explicit harness request detected" in ctx
-    assert "Do not wait for a separate `ai harness` command" in ctx
+    assert "Harness requested" in ctx
+    assert "Scope, own paths" in ctx
     assert "target=95%" in ctx
 
 

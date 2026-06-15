@@ -90,7 +90,11 @@ function Get-ManagedFiles {
                 if (Test-Path $path) { $tracked += $path }
             }
         }
-        return $tracked | Where-Object { $_ -and -not $_.StartsWith(".ai/runtime/.venv") }
+        return $tracked | Where-Object {
+            $_ -and
+            -not $_.StartsWith(".ai/runtime/.venv") -and
+            (Test-Path -LiteralPath (Join-Path $SourceRoot $_) -PathType Leaf)
+        }
     }
     finally {
         Pop-Location
@@ -307,11 +311,15 @@ dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
 function Write-InstallManifest {
     $dst = Join-Path $TargetRoot ".ai/generated/install-manifest.json"
     $sourceSha = ""
+    $sourceRepoUrl = $env:CODE_BRAIN_REPO_URL
+    $sourceRef = $env:CODE_BRAIN_REF
     Push-Location $SourceRoot
     try {
         cmd /c "git rev-parse --is-inside-work-tree >NUL 2>NUL"
         if ($LASTEXITCODE -eq 0) {
             $sourceSha = (git rev-parse HEAD 2>$null).Trim()
+            if (-not $sourceRepoUrl) { $sourceRepoUrl = (git config --get remote.origin.url 2>$null).Trim() }
+            if (-not $sourceRef) { $sourceRef = (git rev-parse --abbrev-ref HEAD 2>$null).Trim() }
         }
     } catch {}
     Pop-Location
@@ -323,14 +331,56 @@ function Write-InstallManifest {
         installed_at         = $now
         merged_config_files  = @(".mcp.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json")
         project              = $project
-        schema_version       = 1
+        schema_version       = 2
         source_git_sha       = $sourceSha
+        source_ref           = $sourceRef
+        source_repo_url      = $sourceRepoUrl
         tool                 = "code-brain"
+        upgrade_channel      = $(if ($sourceRepoUrl) { "github" } else { "local" })
+        upgrade_command      = ".ai/bin/ai upgrade latest --json"
     }
     $json = $manifest | ConvertTo-Json -Depth 6
     $dstDir = Split-Path $dst -Parent
     if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
     Set-Content -LiteralPath $dst -Value $json -Encoding UTF8
+}
+
+function Get-AgentContractContent {
+    $source = Join-Path $SourceRoot ".ai/AGENTS.md"
+    if (Test-Path $source) {
+        $text = Get-Content -LiteralPath $source -Raw
+        if ($text.EndsWith("`n")) { return $text }
+        return $text + "`n"
+    }
+    return "# Code Brain Agent Contract`n`nRepo-local agent contract missing: ``.ai/AGENTS.md``.`n"
+}
+
+function Test-CodeBrainAgentStub {
+    param([string] $Path, [string] $Line)
+    if (-not (Test-Path $Path)) { return $false }
+    $existing = Get-Content -LiteralPath $Path -Raw
+    return $existing.Contains($Line)
+}
+
+function Seed-RootAgentFile {
+    param([string] $FileName)
+    $dst = Join-Path $TargetRoot $FileName
+    $write = $false
+    if (-not (Test-Path $dst)) {
+        $write = $true
+    }
+    elseif ($FileName -eq "AGENTS.md" -and (Test-CodeBrainAgentStub -Path $dst -Line "Canonical agent instructions live in `.ai/AGENTS.md`.")) {
+        $write = $true
+    }
+    elseif ($FileName -eq "CLAUDE.md" -and (
+        (Test-CodeBrainAgentStub -Path $dst -Line "Canonical Claude instructions live in `.ai/AGENTS.md`.") -or
+        (Test-CodeBrainAgentStub -Path $dst -Line "Full repo-local contract: `.ai/AGENTS.md`.")
+    )) {
+        $write = $true
+    }
+    if ($write) {
+        Set-Content -LiteralPath $dst -Value (Get-AgentContractContent) -Encoding UTF8
+    }
 }
 
 function Ensure-PersistentScaffold {
@@ -390,6 +440,8 @@ function Install-OrUpgrade {
     Merge-ClaudeSettings
     Merge-CodexHooksJson
     Ensure-PersistentScaffold
+    Seed-RootAgentFile -FileName "AGENTS.md"
+    Seed-RootAgentFile -FileName "CLAUDE.md"
     Write-InstallManifest
     Invoke-Bootstrap
     Write-Host "code-brain $Action`: $TargetRoot"

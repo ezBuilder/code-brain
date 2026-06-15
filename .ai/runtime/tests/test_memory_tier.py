@@ -186,3 +186,31 @@ def test_page_out_actually_folds_old_audit_entries(tmp_root: Path, monkeypatch):
     lines = [l.strip() for l in content.split("\n") if l.strip()]
     fold_records = [json.loads(l) for l in lines if json.loads(l).get("action") == "_folded"]
     assert len(fold_records) >= 1
+
+
+def test_page_out_rotates_volatile_logs(tmp_root: Path, monkeypatch):
+    from ai_core import evidence as evidence_mod
+    from ai_core import memory
+    from ai_core import prompt_growth as pg
+    from ai_core.memory_tier import page_out
+
+    monkeypatch.setattr(memory, "EVENTS_MAX_BYTES", 900)
+    monkeypatch.setattr(memory, "EVENTS_KEEP", 100)
+    monkeypatch.setattr(pg, "PROMPT_GROWTH_MAX_BYTES", 900)
+    monkeypatch.setattr(pg, "PROMPT_GROWTH_KEEP", 100)
+    monkeypatch.setattr(evidence_mod, "EVIDENCE_MAX_BYTES", 900)
+    monkeypatch.setattr(evidence_mod, "EVIDENCE_KEEP", 100)
+
+    events = memory.events_path(tmp_root)
+    prompt = pg.log_path(tmp_root)
+    evid = evidence_mod.evidence_path(tmp_root)
+    line = '{"i":0,"blob":"' + ("x" * 600) + '"}\n'
+    for path in (events, prompt, evid):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(line * 6, encoding="utf-8")
+
+    payload = page_out(tmp_root, dry_run=False)
+    assert payload["volatile_logs"]["events"]["rotated"] is True
+    assert events.stat().st_size <= 900
+    assert prompt.stat().st_size <= 900
+    assert evid.stat().st_size <= 900

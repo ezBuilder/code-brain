@@ -16,11 +16,20 @@ def test_default_is_full(monkeypatch) -> None:
 
 def test_compact_returns_core_plus_search(monkeypatch) -> None:
     monkeypatch.setenv("AI_MCP_COMPACT_TOOLS", "1")
+    monkeypatch.delenv("AI_CODE_BRAIN_PROFILE", raising=False)
     m._invalidate_tools_list_cache()
     names = {t["name"] for t in m._build_tools_list_payload()["tools"]}
     assert "code_query" in names and "tool_search" in names
     assert "autoresearch_ingest_stage" not in names  # deferred
-    assert len(names) < 20
+    assert len(names) <= 8
+    m._invalidate_tools_list_cache()
+
+
+def test_usage_profile_returns_five_hot_tools(monkeypatch) -> None:
+    monkeypatch.setenv("AI_CODE_BRAIN_PROFILE", "usage")
+    m._invalidate_tools_list_cache()
+    names = {t["name"] for t in m._build_tools_list_payload()["tools"]}
+    assert names == {"obs_usage", "code_query", "context_pack", "code_read_hashline", "tool_search"}
     m._invalidate_tools_list_cache()
 
 

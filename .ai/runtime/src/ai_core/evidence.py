@@ -6,7 +6,7 @@ import re
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .memory import append_audit, append_jsonl, now_iso, read_jsonl_all
+from .memory import append_audit, append_jsonl, now_iso, read_jsonl_all, rotate_jsonl_tail
 from .redact import redact_value
 
 STATUSES = ("candidate", "curated", "verified", "rejected")
@@ -14,6 +14,8 @@ MAX_QUERY_CHARS = 512
 MAX_SNIPPET_CHARS = 1200
 MAX_NOTE_CHARS = 512
 MAX_SYMBOL_CHARS = 240
+EVIDENCE_MAX_BYTES = 4_000_000
+EVIDENCE_KEEP = 5000
 
 _DENIED_NAMES = {
     ".env",
@@ -31,6 +33,15 @@ _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 
 def evidence_path(root: Path) -> Path:
     return root / ".ai" / "memory" / "evidence.jsonl"
+
+
+def rotate_ledger(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    return rotate_jsonl_tail(
+        evidence_path(root),
+        max_bytes=EVIDENCE_MAX_BYTES,
+        keep_lines=EVIDENCE_KEEP,
+        dry_run=dry_run,
+    )
 
 
 def _clean_text(value: Any, *, max_chars: int) -> str:
@@ -131,6 +142,8 @@ def append_candidate_results(
         existing_ids.add(record["id"])
         appended.append(record["id"])
     if appended:
+        rotate_ledger(root)
+    if appended:
         append_audit(
             root,
             action="evidence.candidates",
@@ -184,6 +197,7 @@ def record_evidence(
     if current is not None:
         return {"ok": True, "changed": False, "record": current}
     append_jsonl(evidence_path(root), record)
+    rotate_ledger(root)
     append_audit(root, action="evidence.record", category="evidence", payload={"id": record["id"], "status": status})
     return {"ok": True, "changed": True, "record": record}
 
@@ -269,5 +283,6 @@ def set_evidence_status(
     if note_clean:
         update["note"] = note_clean
     append_jsonl(evidence_path(root), update)
+    rotate_ledger(root)
     append_audit(root, action="evidence.set_status", category="evidence", payload={"id": eid, "status": status})
     return {"ok": True, "changed": True, "record": update}

@@ -1,20 +1,23 @@
 # Code Brain
 
-[한국어](../../README.md) · English · [中文](zh-CN.md) · [日本語](ja.md) · [Español](es.md) · [Français](fr.md) · [Deutsch](de.md)
+[한국어](ko.md) · [English](../../README.md) · [中文](zh-CN.md) · [日本語](ja.md) · [Español](es.md) · [Français](fr.md) · [Deutsch](de.md)
 
-If an AI only reads this README, run one command to attach Code Brain to a project. After installation, new Claude Code, Codex CLI, and Antigravity sessions automatically load the same `.ai/` memory, search, hooks, and MCP wiring.
+English is now the default root README: [../../README.md](../../README.md).
+
+This compatibility page is kept for old links. The root README contains the full install guide, public-repo upgrade flow, `/cb-upgrade`, proof points, security notes, and architecture map.
+
+Quick install:
+
 ```bash
-# macOS / Linux
-git clone https://github.com/ezBuilder/code-brain.git && cd code-brain
+git clone https://github.com/ezBuilder/code-brain.git
+cd code-brain
 bash scripts/install.sh /path/to/project
-
-# Windows PowerShell
-git clone https://github.com/ezBuilder/code-brain.git; cd code-brain
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\path\to\project
 ```
 
-Success means the final line says: `[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.`
+Upgrade an installed project:
 
-Code Brain is repo-local infrastructure that lets Claude Code, Codex CLI, and Google Antigravity share the same memory, code search, policy, hooks, and audit trail inside one workspace.
+```bash
+.ai/bin/ai upgrade latest --json
+```
 
-It keeps search lexical-first with BM25, hashline integrity checks, MCP tools, hooks, and cross-session memory. Hot paths are local, offline, and designed to avoid network calls.
+Inside an agent session, run `/cb-upgrade`, then open a new session.

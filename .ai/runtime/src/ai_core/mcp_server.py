@@ -30,7 +30,7 @@ MCP_SERVER_NAME = "code-brain"
 TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "memory_query",
-        "description": "BM25 search over indexed source. Returns top-K snippets with provenance.",
+        "description": "인덱싱된 소스를 BM25로 검색. 출처가 붙은 상위 K개 스니펫 반환.",
         "inputSchema": {
             "type": "object",
             "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 5}},
@@ -39,7 +39,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "code_query",
-        "description": "Alias of memory_query — BM25 code search.",
+        "description": "memory_query 별칭 — BM25 코드 검색.",
         "inputSchema": {
             "type": "object",
             "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 5}},
@@ -48,7 +48,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "context_pack",
-        "description": "BM25 query plus an additionalContext string suitable for hook injection.",
+        "description": "BM25 검색 결과에 훅 주입에 적합한 additionalContext 문자열을 더해 반환.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -65,7 +65,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "code_graph_callers",
-        "description": "Function-call graph reverse lookup: who calls this qualname? Read-only.",
+        "description": "호출 그래프 역방향 조회: 이 qualname을 누가 호출하나? 읽기전용.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -77,7 +77,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "code_graph_callees",
-        "description": "Function-call graph forward lookup: what does this qualname call? Read-only.",
+        "description": "호출 그래프 정방향 조회: 이 qualname이 무엇을 호출하나? 읽기전용.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -89,7 +89,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "code_graph_symbol",
-        "description": "Locate function/class definitions by qualname fragment. Read-only.",
+        "description": "qualname 일부로 함수/클래스 정의를 찾는다. 읽기전용.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -101,7 +101,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "code_read_hashline",
-        "description": "Read a repo file with line+hash anchors for stale-edit detection. Read-only; refuses credential-like paths.",
+        "description": "기존 파일을 편집하기 전 대상 줄 범위를 읽어 stale-edit를 막는 기본 읽기 도구. 줄+해시 앵커 반환; 자격증명류 경로는 거부한다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -114,7 +114,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "stream_guard_scan",
-        "description": "Scan text with Code Brain stream-guard rules. Read-only.",
+        "description": "Code Brain stream-guard 규칙으로 텍스트를 스캔. 읽기전용.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -126,12 +126,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "ai_request_rebuild",
-        "description": "Force-rebuild the SQLite FTS5 code index. Write-class.",
+        "description": "SQLite FTS5 코드 인덱스를 강제 재빌드. 쓰기성.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "obs_usage",
-        "description": "Token usage + Code Brain effect bytes. Read-only.",
+        "description": "토큰 사용량 + Code Brain 효과 바이트. 읽기전용.",
         "inputSchema": {
             "type": "object",
             "properties": {"include_sessions": {"type": "boolean", "default": False}},
@@ -139,12 +139,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "obs_health_summary",
-        "description": "Doctor + queue + worker + index roll-up. Read-only.",
+        "description": "doctor + 큐 + 워커 + 인덱스 종합 요약. 읽기전용.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "obs_search",
-        "description": "BM25 query with stale-detection report.",
+        "description": "stale 감지 리포트가 붙은 BM25 검색.",
         "inputSchema": {
             "type": "object",
             "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 5}},
@@ -153,17 +153,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "doctor_strict",
-        "description": "Run all doctor checks and return the full payload. Read-only.",
+        "description": "모든 doctor 체크를 실행하고 전체 페이로드를 반환. 읽기전용.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "sandbox_execute",
-        "description": (
-            "Run shell in sandbox; returns summary+exec_id, full output on disk. Write-class. "
-            "command accepts either an argv array (e.g. [\"git\", \"log\"]) or a single "
-            "shell string (run under `bash -lc`) so heredocs/pipes work without JSON escaping. "
-            "For small outputs (<=20 lines / <=1KB) the response replaces first_lines/last_lines with a single `output` field."
-        ),
+        "description": "샌드박스에서 셸을 실행; 요약+exec_id를 반환하고 전체 출력은 디스크에 저장. 쓰기성. command는 argv 배열(예: [\"git\", \"log\"]) 또는 단일 셸 문자열(`bash -lc`로 실행) 모두 허용해 heredoc/파이프를 JSON 이스케이프 없이 쓸 수 있다. 출력이 작으면(≤20줄/≤1KB) first_lines/last_lines 대신 단일 `output` 필드로 반환.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -181,13 +176,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "record_decision",
-        "description": (
-            "Persist a decision (or a re-testable failure) to .ai/memory/decisions.jsonl. "
-            "Auto-injected next session. For a failure/negative result set kind='failure' and "
-            "record observed_versions/environment/retest_after so it reads as a dated, re-testable "
-            "observation — NOT a permanent ban. A later success retires it: kind='failure', "
-            "status='refuted', supersedes_id=<original id>. Write-class."
-        ),
+        "description": "결정(또는 재검증 가능한 실패)을 .ai/memory/decisions.jsonl에 기록. 다음 세션에 자동 주입. 실패/부정 결과는 kind='failure'로 두고 observed_versions/environment/retest_after를 적어 '날짜가 있는 재검증 가능한 관측'으로 남긴다 — 영구 금지가 아님. 이후 성공하면 은퇴 처리: kind='failure', status='refuted', supersedes_id=<원래 id>. 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -207,14 +196,14 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "code_graph_trace",
-        "description": "Trace the shortest caller→callee chain between two symbols (multi-hop). Orientation aid; feed results into code_query.",
+        "description": "두 심볼 간 최단 caller→callee 사슬을 추적(멀티홉). 방향 잡기용; 결과는 code_query에 넘겨 쓴다.",
         "inputSchema": {"type": "object", "properties": {
             "src": {"type": "string"}, "dst": {"type": "string"}, "max_depth": {"type": "integer", "default": 6}},
             "required": ["src", "dst"]},
     },
     {
         "name": "code_graph_impact",
-        "description": "Blast radius of changing files/symbols: transitive callers impacted. Pass changed repo-relative paths to scope a review.",
+        "description": "파일/심볼 변경의 영향 범위: 전이적으로 영향받는 호출자들. 변경된 repo 상대경로를 넘기면 리뷰 범위를 좁힌다.",
         "inputSchema": {"type": "object", "properties": {
             "paths": {"type": "array", "items": {"type": "string"}},
             "symbols": {"type": "array", "items": {"type": "string"}},
@@ -222,16 +211,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "code_graph_architecture",
-        "description": "Whole-repo orientation: top modules by symbol count and call centrality. Cheap map for a supervisor.",
+        "description": "repo 전체 조망: 심볼 수와 호출 중심성 기준 상위 모듈. supervisor용 저비용 지도.",
         "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 8}}},
     },
     {
         "name": "ast_grep_search",
-        "description": (
-            "Structural (AST) code search: find code matching a syntactic pattern in a language "
-            "(e.g. pattern 'except: $$$' lang python, or 'fetch($URL)' lang ts). Precise refactor/"
-            "audit retrieval BM25 cannot do. Read-only, repo-scoped. Use code_query for intent/keyword search."
-        ),
+        "description": "구조적(AST) 코드 검색: 언어별 구문 패턴에 맞는 코드를 찾는다(예: 패턴 'except: $$$' lang python, 'fetch($URL)' lang ts). BM25가 못 하는 정밀 리팩터/감사 검색.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -245,16 +230,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "loopd_status",
-        "description": "Code Brain loopd status: queue counts and warm-worker states. Read-only; llm_idle_polls is always 0.",
+        "description": "Code Brain loopd 상태: 큐 카운트와 warm 워커 상태. 읽기전용; llm_idle_polls는 항상 0.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "loop_submit",
-        "description": (
-            "Queue a task for the multi-agent worker pool. The orchestrator later routes it to the "
-            "cheapest adequate worker/model. Use this when the user wants work delegated to "
-            "codex/claude/agy workers. Then call loopd_dispatch_once. Write-class."
-        ),
+        "description": "멀티에이전트 워커 풀에 작업을 큐잉. 오케스트레이터가 이후 가장 싸고 적합한 워커/모델로 라우팅한다. 사용자가 codex/claude/agy 워커에 작업을 위임하고 싶을 때 사용. 이어서 loopd_dispatch_once를 호출. 쓰기성.",
         "inputSchema": {"type": "object", "properties": {
             "instruction": {"type": "string", "description": "the full task to perform"},
             "goal": {"type": "string", "description": "one-line goal"},
@@ -265,11 +246,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "loopd_up",
-        "description": (
-            "Bring up the warm worker pool (one tmux worker per registered profile). dry_run shows "
-            "the plan. autonomous skips per-command prompts (safety = dispatch gate). tier sets the "
-            "model cost tier. Use when the user wants to start the codex/claude/agy pool. Write-class."
-        ),
+        "description": "warm 워커 풀을 띄운다(등록 프로필당 tmux 워커 1개). dry_run은 계획만 표시. autonomous는 명령별 프롬프트를 건너뛴다(안전장치=디스패치 게이트). tier로 모델 비용 등급을 설정. 풀을 시작할 때 사용.",
         "inputSchema": {"type": "object", "properties": {
             "autonomous": {"type": "boolean", "default": False},
             "tier": {"type": "string", "enum": ["cheap", "balanced", "best"]},
@@ -277,49 +254,34 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "loopd_recover",
-        "description": "loopd maintenance tick: free completed workers to idle, flag stale, nudge benign interrupts. No LLM.",
+        "description": "loopd 유지보수 틱: 완료 워커를 idle로 해제, stale 표시, 양성 인터럽트 넛지. LLM 없음.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "selfimprove_run",
-        "description": (
-            "Trigger one closed-loop self-improvement cycle: queue a self-review task for a cheap "
-            "non-self judge worker (then call loopd_dispatch_once). The judge proposes one prompt "
-            "rule; it passes the M_core safety gate and is kept only if real tokens do not regress "
-            "(auto-rollback). Background only — never blocks. Write-class."
-        ),
+        "description": "닫힌 루프 자가개선 1사이클 트리거: 저렴한 비자기 judge 워커에 자가검토 작업을 큐잉(이어서 loopd_dispatch_once 호출). judge가 프롬프트 규칙 하나를 제안하고, M_core 안전 게이트를 통과하면 래칫으로 검증해 적용/롤백된다.",
         "inputSchema": {"type": "object", "properties": {
             "tier": {"type": "string", "enum": ["cheap", "balanced", "best"], "default": "cheap"}}},
     },
     {
         "name": "loopd_agents",
-        "description": (
-            "Auto-detect which agent CLIs (codex/claude/agy) and tmux are installed here. Call this "
-            "FIRST before launching a pool — only available agents can run; the rest are skipped."
-        ),
+        "description": "여기에 어떤 에이전트 CLI(codex/claude/agy)와 tmux가 설치돼 있는지 자동 감지. 풀을 띄우기 전 가장 먼저 호출 — 사용 가능한 에이전트만 실행되고 나머지는 건너뛴다.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "loopd_dispatch_once",
-        "description": "Run one deterministic loopd dispatch tick (assign pending work to idle workers; park high-risk). No LLM. Write-class.",
+        "description": "결정론적 loopd 디스패치 틱 1회(대기 작업을 idle 워커에 배정; 고위험은 보류). LLM 없음. 쓰기성.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "tool_search",
-        "description": (
-            "Find Code Brain MCP tools by keyword and get their full schemas. Use this when the "
-            "default tool list is compact (AI_MCP_COMPACT_TOOLS) and the tool you need is not loaded."
-        ),
+        "description": "키워드로 Code Brain MCP 도구를 찾아 전체 스키마를 가져온다. 기본 도구 목록이 compact(AI_MCP_COMPACT_TOOLS)이고 필요한 도구가 로드되지 않았을 때 사용.",
         "inputSchema": {"type": "object", "properties": {
             "query": {"type": "string"}, "limit": {"type": "integer", "default": 8}}, "required": ["query"]},
     },
     {
         "name": "lessons_recall",
-        "description": (
-            "Recall distilled lessons relevant to a query (failure-prevention strategies mined "
-            "from past runs), ranked by confidence*relevance*recency. Read-only. Call before a "
-            "risky/repeated task to reuse prior experience."
-        ),
+        "description": "질의에 관련된 정제된 교훈(과거 실행에서 캐낸 실패예방 전략)을 confidence*relevance*recency 순으로 회상. 읽기전용. 위험/반복 작업 전에 호출해 과거 경험을 재활용.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -331,7 +293,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "record_todo",
-        "description": "Persist open todo to .ai/memory/todos.jsonl. Auto-injected next session. Write-class.",
+        "description": "열린 todo를 .ai/memory/todos.jsonl에 기록. 다음 세션에 자동 주입. 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -345,7 +307,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "close_todo",
-        "description": "Close a todo by id or title substring. Write-class.",
+        "description": "id 또는 제목 일부로 todo를 닫는다. 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -358,7 +320,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "append_session_note",
-        "description": "Append milestone line to .ai/memory/session-current.md. Write-class.",
+        "description": ".ai/memory/session-current.md에 마일스톤 한 줄을 추가. 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {"text": {"type": "string"}},
@@ -367,7 +329,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "evidence_list",
-        "description": "List latest repo-local evidence records from .ai/memory/evidence.jsonl. Read-only.",
+        "description": ".ai/memory/evidence.jsonl의 최신 repo-local 증거 레코드 목록. 읽기전용.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -378,7 +340,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "evidence_record",
-        "description": "Record an explicit repo-local evidence item. Write-class.",
+        "description": "명시적 repo-local 증거 항목을 기록. 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -394,7 +356,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "evidence_set_status",
-        "description": "Promote or reject an evidence record. Write-class.",
+        "description": "증거 레코드를 승격하거나 거부. 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -408,7 +370,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "security_finding_list",
-        "description": "List latest repo-local security findings from .ai/memory/security-findings.jsonl. Read-only.",
+        "description": ".ai/memory/security-findings.jsonl의 최신 repo-local 보안 발견 목록. 읽기전용.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -419,7 +381,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "security_finding_record",
-        "description": "Record a redacted security finding with summary/hash evidence. Write-class.",
+        "description": "요약/해시 증거가 붙은 redacted 보안 발견을 기록. 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -437,7 +399,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "security_finding_update",
-        "description": "Update a security finding status after verification. Write-class.",
+        "description": "검증 후 보안 발견 상태를 갱신. 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -451,12 +413,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "append_handoff",
-        "description": (
-            "Set/update the resume HANDOFF (goal/plan/next_step/open_questions/blockers) at a "
-            "stopping point. Git-tracked so it travels across machines (Mac↔VPS); the next session "
-            "— any agent, either machine — leads its SessionStart context with it. Partial update: "
-            "only provided fields change. Write-class. Call this before pausing work."
-        ),
+        "description": "정지 지점에서 resume HANDOFF(goal/plan/next_step/open_questions/blockers)를 설정/갱신. Git 추적이라 머신 간(Mac↔VPS) 이동 — 다음 세션은 어떤 에이전트·어느 머신이든 SessionStart 컨텍스트 맨 앞에 이걸 둔다. 부분 갱신: 준 필드만 변경. 쓰기성. 작업을 멈추기 전에 호출.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -474,7 +431,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     # ---- Innovation modules (PoC; safe — no hot-path mutation) ----
     {
         "name": "speculative_mine_patterns",
-        "description": "Mine 2-gram tool-call patterns from audit/2026.jsonl for speculative execution.",
+        "description": "audit/2026.jsonl에서 투기실행용 2-gram 도구호출 패턴을 캔다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -486,12 +443,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "speculative_hit_rate",
-        "description": "Speculative-execution hit/miss summary from .ai/cache/speculative.jsonl.",
+        "description": ".ai/cache/speculative.jsonl 기반 투기실행 적중/실패 요약.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "trajectory_summarize",
-        "description": "TRAJEVAL-style trajectory diagnosis (efficiency + failure mode) across recent sessions.",
+        "description": "최근 세션들에 대한 TRAJEVAL식 궤적 진단(효율성 + 실패모드).",
         "inputSchema": {
             "type": "object",
             "properties": {"limit": {"type": "integer", "default": 10}},
@@ -499,7 +456,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_search",
-        "description": "AutoResearch knowledge-wiki FTS5 BM25 search (Stage 0). Read-only.",
+        "description": "AutoResearch 지식위키 FTS5 BM25 검색(Stage 0). 읽기전용.",
         "inputSchema": {
             "type": "object",
             "properties": {"q": {"type": "string"}, "k": {"type": "integer", "default": 10}},
@@ -508,7 +465,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_ingest_stage",
-        "description": "AutoResearch ingest phase 1: persist immutable raw + manifest (idempotent on sha256), return nonce-wrapped data for the agent to summarize. Provide `content` (local) OR `url` (Stage 3, SSRF-guarded HTTPS fetch). Web content is untrusted (quarantined if flagged). Write-class.",
+        "description": "AutoResearch ingest 1단계: 불변 raw + manifest를 보존(sha256 멱등), 에이전트가 요약하도록 nonce로 감싼 데이터를 반환. `content`(로컬) 또는 `url`(Stage 3, SSRF 가드 HTTPS 페치) 제공. 웹 콘텐츠는 신뢰불가(플래그 시 격리). 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -522,7 +479,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_ingest_commit",
-        "description": "AutoResearch ingest phase 2: verify-det gate, then write agent-authored wiki pages + FTS + log. Failing citations are quarantined as status:draft. Write-class.",
+        "description": "AutoResearch ingest 2단계: verify-det 게이트 후 에이전트가 작성한 위키 페이지 + FTS + 로그를 쓴다. 인용 실패는 status:draft로 격리. 쓰기성.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -534,7 +491,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_lint",
-        "description": "AutoResearch wiki health lint (Stage 0): orphan / draft / taint / stale pages. Read-only, no auto-fix.",
+        "description": "AutoResearch 위키 건강 lint(Stage 0): orphan/draft/taint/stale 페이지. 읽기전용, 자동수정 없음.",
         "inputSchema": {
             "type": "object",
             "properties": {"stale_before": {"type": "string"}},
@@ -542,7 +499,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_query",
-        "description": "AutoResearch knowledge query (Stage 0): FTS5 retrieval with per-page trust signals. Draft/taint pages are quarantined out of candidates (laundering defense); the calling agent writes the cited answer.",
+        "description": "AutoResearch 지식 질의(Stage 0): 페이지별 신뢰 신호가 붙은 FTS5 검색. draft/taint 페이지는 후보에서 격리(세탁 방어); 인용된 답변은 호출 에이전트가 작성한다.",
         "inputSchema": {
             "type": "object",
             "properties": {"question": {"type": "string"}, "k": {"type": "integer", "default": 10}},
@@ -551,7 +508,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_verify",
-        "description": "AutoResearch deterministic citation verification (Stage 3): scores each claim's quote against its cited source texts (faithfulness in [0,1], no LLM). The agent uses the score to accept/hedge/reject; factuality judgment is the agent's job.",
+        "description": "AutoResearch 결정론적 인용 검증(Stage 3): 각 주장의 인용문을 출처 텍스트와 대조 채점(faithfulness 0~1, LLM 없음). 점수로 에이전트가 수용/완화/거부를 판단; 사실성 판단은 에이전트 몫.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -563,12 +520,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_deepresearch_start",
-        "description": "Stage 3: start a deep-research session. Runtime tracks state only; the agent does plan→fetch (autoresearch_ingest_stage with url)→synthesize→commit. Returns the session.",
+        "description": "Stage 3: 딥리서치 세션 시작. 런타임은 상태만 추적; 에이전트가 plan→fetch(autoresearch_ingest_stage url)→synthesize→commit. 세션 반환.",
         "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]},
     },
     {
         "name": "autoresearch_deepresearch_update",
-        "description": "Stage 3: update a deep-research session (subquestions / add_source / status). Size-capped.",
+        "description": "Stage 3: 딥리서치 세션 갱신(subquestions/add_source/status). 크기 제한.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -582,17 +539,17 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_deepresearch_status",
-        "description": "Stage 3: get a deep-research session state by session_id.",
+        "description": "Stage 3: session_id로 딥리서치 세션 상태 조회.",
         "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
     },
     {
         "name": "autoresearch_route",
-        "description": "Stage 4: suggest a model tier (local/frontier) for a query via a deterministic complexity heuristic (RouteLLM-style). The agent makes the final model choice. No LLM.",
+        "description": "Stage 4: 결정론적 복잡도 휴리스틱(RouteLLM식)으로 질의의 모델 티어(local/frontier)를 제안. 최종 모델 선택은 에이전트가. LLM 없음.",
         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
     },
     {
         "name": "autoresearch_survey_plan",
-        "description": "Stage 4: gate breadth-first multi-agent fan-out (orchestrator-worker). Returns single vs multi recommendation, a bounded worker list, and the ~15x cost warning. Deterministic policy, not an executor. No LLM.",
+        "description": "Stage 4: 너비우선 멀티에이전트 팬아웃(orchestrator-worker) 게이트. single/multi 권고, 제한된 워커 목록, ~15배 비용 경고를 반환. 결정론적 정책이며 실행기는 아님. LLM 없음.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -605,7 +562,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_loop_start",
-        "description": "Stage 2 (OFF by default; autoresearch.loop.enable): start a metric ratchet loop. Runtime tracks state + budget; the agent does git (worktree/commit/reset) and edits. metric_cmd must be a user-trusted command.",
+        "description": "Stage 2(기본 OFF; autoresearch.loop.enable): 메트릭 래칫 루프 시작. 런타임은 상태+예산 추적; git(worktree/commit/reset)과 편집은 에이전트가. metric_cmd는 사용자 신뢰 명령이어야 함.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -623,7 +580,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_loop_record",
-        "description": "Stage 2: run one ratchet evaluation (metric in the hardened sandbox — network+env isolated). Returns decision keep|discard|crash + best + should_continue. The agent git-resets on discard/crash.",
+        "description": "Stage 2: 래칫 평가 1회 실행(하드닝된 샌드박스—네트워크+env 격리—에서 메트릭). 결정 keep|discard|crash + best + should_continue 반환. discard/crash 시 에이전트가 git-reset.",
         "inputSchema": {
             "type": "object",
             "properties": {"session_id": {"type": "string"}, "cost_spent": {"type": "number"}},
@@ -632,12 +589,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "autoresearch_loop_status",
-        "description": "Stage 2: get a ratchet loop session state by session_id.",
+        "description": "Stage 2: session_id로 래칫 루프 세션 상태 조회.",
         "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
     },
     {
         "name": "autoresearch_loop_stop",
-        "description": "Stage 2: stop a ratchet loop (no auto-merge; a human reviews the best commit).",
+        "description": "Stage 2: 래칫 루프 정지(자동 머지 없음; 최선 커밋은 사람이 검토).",
         "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]},
     },
 )
@@ -661,14 +618,18 @@ _TOOLS_LIST_CACHE: dict[str, Any] | None = None
 # Hot tools surfaced by default in compact mode; the rest load on demand via tool_search.
 # Opt-in (AI_MCP_COMPACT_TOOLS=1) — cuts the fixed per-session tool-schema token cost for
 # clients without their own deferred-loading (landscape P1). Default OFF = no behavior change.
-_CORE_TOOLS = frozenset({
-    "code_query", "context_pack", "code_read_hashline",
-    "code_graph_callers", "code_graph_callees", "code_graph_symbol", "code_graph_architecture",
-    "ast_grep_search", "lessons_recall", "record_decision", "record_todo", "memory_query",
-    # measured hot tools (obs mcp_tool_breakdown top-5): used heavily, kept loaded so compact
-    # mode never forces a tool_search round-trip for them.
-    "doctor_strict", "ai_request_rebuild",
+_USAGE_TOOLS = frozenset({
+    "obs_usage",
+    "code_query",
+    "context_pack",
+    "code_read_hashline",
     "tool_search",
+})
+_CORE_TOOLS = frozenset({
+    *_USAGE_TOOLS,
+    "obs_health_summary",
+    "obs_search",
+    "doctor_strict",
 })
 
 
@@ -677,9 +638,20 @@ def _compact_tools_enabled() -> bool:
     return str(os.environ.get("AI_MCP_COMPACT_TOOLS", "")).strip() not in ("", "0", "false", "no")
 
 
+def _tool_profile() -> str:
+    import os
+    profile = str(os.environ.get("AI_CODE_BRAIN_PROFILE", "")).strip().lower()
+    if profile in {"usage", "core", "compact", "full"}:
+        return profile
+    return "compact" if _compact_tools_enabled() else "full"
+
+
 def _build_tools_list_payload() -> dict[str, Any]:
     """Build the tools/list result payload. Pure function over module constants."""
-    if _compact_tools_enabled():
+    profile = _tool_profile()
+    if profile == "usage":
+        return {"tools": [dict(t) for t in TOOLS if t["name"] in _USAGE_TOOLS]}
+    if profile in {"core", "compact"}:
         return {"tools": [dict(t) for t in TOOLS if t["name"] in _CORE_TOOLS]}
     return {"tools": [dict(tool) for tool in TOOLS]}
 

@@ -182,16 +182,11 @@ tmp_home="$(mktemp -d)"
 trap 'rm -rf "$tmp_home"' EXIT
 
 mkdir -p "$tmp_home/.claude" "$tmp_home/.codex"
-cat >"$tmp_home/.claude/CLAUDE.md" <<'MD'
-# Personal Claude Rules
-
-Keep this custom Claude instruction.
-MD
-cat >"$tmp_home/.codex/AGENTS.md" <<'MD'
-# Personal Codex Rules
-
-Keep this custom Codex instruction.
-MD
+# Seed a legacy markerless copy of the rule above genuine user content, mirroring
+# pre-marker installs. The installer must collapse it into one managed block
+# rather than appending beside it (which duplicated the whole ruleset).
+{ cat rules/CLAUDE.md; printf '\n\n# Personal Claude Rules\n\nKeep this custom Claude instruction.\n'; } >"$tmp_home/.claude/CLAUDE.md"
+{ cat rules/AGENTS.md; printf '\n\n# Personal Codex Rules\n\nKeep this custom Codex instruction.\n'; } >"$tmp_home/.codex/AGENTS.md"
 cat >"$tmp_home/.claude/settings.json" <<'JSON'
 {
   "autoMemoryEnabled": true,
@@ -231,6 +226,9 @@ grep -q "Keep this custom Claude instruction." "$tmp_home/.claude/CLAUDE.md"
 grep -q "Keep this custom Codex instruction." "$tmp_home/.codex/AGENTS.md"
 test "$(grep -c 'code-brain-global-kit:start' "$tmp_home/.claude/CLAUDE.md")" -eq 1
 test "$(grep -c 'code-brain-global-kit:start' "$tmp_home/.codex/AGENTS.md")" -eq 1
+# Rule body must survive exactly once: legacy markerless copy collapsed, not duplicated.
+test "$(grep -c 'If Code Brain is missing or stale, fall back and say so.' "$tmp_home/.claude/CLAUDE.md")" -eq 1
+test "$(grep -c 'If Code Brain is missing or stale, fall back and say so.' "$tmp_home/.codex/AGENTS.md")" -eq 1
 test -x "$tmp_home/.claude/hooks/block-dangerous.sh"
 test -x "$tmp_home/.claude/hooks/protect-secrets.sh"
 test -x "$tmp_home/.claude/hooks/session-context.sh"

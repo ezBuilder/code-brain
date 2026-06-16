@@ -110,22 +110,49 @@ if not target.exists():
     raise SystemExit(0)
 
 current = target.read_text(encoding="utf-8")
-if current.strip() == source_text.strip():
-    output.write_text(block, encoding="utf-8")
-    raise SystemExit(0)
 
 has_start = start in current
 has_end = end in current
 if has_start != has_end:
     raise SystemExit(f"managed block markers are incomplete in {target}")
 
+# Strip any existing managed block so it is re-rendered fresh from source,
+# instead of replacing it in place and leaving stale siblings behind.
 if has_start:
     before, rest = current.split(start, 1)
     _, after = rest.split(end, 1)
-    rendered = before.rstrip() + "\n\n" + block + after.lstrip("\n")
+    user_content = before + after
 else:
-    sep = "" if current.endswith("\n") else "\n"
-    rendered = current + sep + "\n" + block
+    user_content = current
+
+# Strip legacy markerless copies of this rule left by older installers. Without
+# this, an upgrade appends a fresh managed block beside the old copy and
+# duplicates the whole ruleset — a bloated, self-contradicting global prompt
+# that destabilises the agent (e.g. tool calls leaking into text output).
+rule_lines = source_text.strip().splitlines()
+head = rule_lines[0].strip()
+tail = rule_lines[-1].strip()
+if head and tail:
+    lines = user_content.splitlines()
+    cleaned = []
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == head:
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != tail:
+                j += 1
+            if j < len(lines):  # head..tail span = a legacy rule copy; drop it
+                i = j + 1
+                continue
+        cleaned.append(lines[i])
+        i += 1
+    user_content = "\n".join(cleaned)
+
+user_content = user_content.strip()
+if user_content:
+    rendered = user_content + "\n\n" + block
+else:
+    rendered = block
 
 output.write_text(rendered, encoding="utf-8")
 PY

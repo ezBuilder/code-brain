@@ -238,7 +238,7 @@ hooks_dir = "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook"
 events = ["PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop", "SubagentStop",
           "PreCompact", "SessionEnd", "Notification", "PostCompact", "CwdChanged", "ConfigChange",
           "PermissionDenied", "InstructionsLoaded"]
-matchers = {"PreToolUse": "Bash", "PostToolUse": "Edit|Write|MultiEdit|NotebookEdit"}
+matchers = {"PreToolUse": "Bash", "PostToolUse": "Edit|Write|MultiEdit|NotebookEdit", "SessionStart": "startup|resume|clear|compact"}
 managed = {}
 for ev in events:
     entry = {"hooks": [{"type": "command", "command": f"{hooks_dir} {ev}"}]}
@@ -279,7 +279,7 @@ def cb(ev, status):
 managed = {
     "PreToolUse": [{"matcher": "Bash", "hooks": [cb("PreToolUse", "Checking Code Brain command routing")]}],
     "PostToolUse": [{"matcher": "Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [cb("PostToolUse", "Recording Code Brain tool result")]}],
-    "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [cb("SessionStart", "Loading Code Brain session context")]}],
+    "SessionStart": [{"matcher": "startup|resume|clear|compact", "hooks": [cb("SessionStart", "Loading Code Brain session context")]}],
     "UserPromptSubmit": [{"hooks": [cb("UserPromptSubmit", "Loading Code Brain prompt context")]}],
     "Stop": [{"hooks": [cb("Stop", "Recording Code Brain stop event")]}],
     "SubagentStop": [{"hooks": [cb("SubagentStop", "Recording Code Brain subagent stop")]}],

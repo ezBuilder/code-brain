@@ -1,5 +1,14 @@
 # Code Brain
 
+[![Release](https://img.shields.io/github/v/release/ezBuilder/code-brain?sort=semver&style=flat-square&color=2962FF)](https://github.com/ezBuilder/code-brain/releases)
+[![License](https://img.shields.io/github/license/ezBuilder/code-brain?style=flat-square&color=4CAF50)](https://github.com/ezBuilder/code-brain/blob/main/LICENSE)
+[![Release Gate](https://img.shields.io/github/actions/workflow/status/ezBuilder/code-brain/release-gate.yml?branch=main&style=flat-square&label=release-gate)](https://github.com/ezBuilder/code-brain/actions/workflows/release-gate.yml)
+[![Stars](https://img.shields.io/github/stars/ezBuilder/code-brain?style=flat-square&color=FFC107)](https://github.com/ezBuilder/code-brain/stargazers)
+
+![Claude Code](https://img.shields.io/badge/Claude_Code-ready-8A2BE2?style=flat-square)
+![Codex CLI](https://img.shields.io/badge/Codex_CLI-ready-111111?style=flat-square)
+![Antigravity](https://img.shields.io/badge/Antigravity-ready-4285F4?style=flat-square)
+
 한국어 · [English](../../README.md) · [中文](zh-CN.md) · [日本語](ja.md) · [Español](es.md) · [Français](fr.md) · [Deutsch](de.md)
 
 Code Brain은 진지한 AI 코딩 에이전트를 위한 레포 로컬 인프라입니다. Claude Code, Codex CLI, Google Antigravity에 동일한 프로젝트 메모리, BM25 코드 검색, 훅 정책, MCP 도구, 감사 기록, 업그레이드 경로를 하나의 워크스페이스 안에서 제공합니다.

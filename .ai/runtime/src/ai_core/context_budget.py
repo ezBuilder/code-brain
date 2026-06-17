@@ -42,8 +42,21 @@ def _has_protected_signal(item: dict[str, Any]) -> bool:
     return any(signal in haystack for signal in PROTECTED_SIGNALS)
 
 
+def _canonical_sort_key(item: dict[str, Any]) -> tuple[int, str, str]:
+    # Deterministic, content-derived emission order: protected signals first
+    # (stable prefix, never dropped), then lexical (path, snippet). Independent of
+    # incoming relevance rank, so identical input sets yield a byte-stable prefix.
+    return (
+        0 if _has_protected_signal(item) else 1,
+        str(item.get("path", "")),
+        str(item.get("snippet", "")),
+    )
+
+
 def _line(item: dict[str, Any]) -> str:
-    return f"- {item['path']}: {item['snippet']}"
+    # Fail-soft: tolerate items missing path/snippet so a malformed result cannot
+    # raise into the hook-wrapped apply() path; defaults mirror _canonical_sort_key.
+    return f"- {item.get('path', '')}: {item.get('snippet', '')}"
 
 
 def _bytes(text: str) -> int:
@@ -91,7 +104,7 @@ def apply(
         if id(item) not in selected_ids:
             selected.append(item)
             selected_ids.add(id(item))
-    selected.sort(key=lambda item: results.index(item))
+    selected.sort(key=_canonical_sort_key)
     lines_with_flags = [(_line(item), _has_protected_signal(item)) for item in selected]
     lines, dropped_for_bytes, over_budget_to_preserve = _fit_lines(lines_with_flags, int(budget["max_bytes"]))
     additional = "\n".join(lines)

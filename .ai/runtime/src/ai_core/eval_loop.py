@@ -105,10 +105,15 @@ def _iter_cases(root: Path) -> list[dict[str, Any]]:
     return cases
 
 
+def _count(cases: list[dict[str, Any]]) -> tuple[int, int]:
+    """Shared pass/total math for the summary and the pure fitness helpers."""
+    passed = sum(1 for case in cases if _is_pass(str(case.get("outcome", ""))))
+    return passed, len(cases)
+
+
 def summarize_cases(root: Path, *, latest_limit: int = LATEST_FAILURE_LIMIT) -> dict[str, Any]:
     cases = _iter_cases(root)
-    passed = sum(1 for case in cases if _is_pass(str(case.get("outcome", ""))))
-    total = len(cases)
+    passed, total = _count(cases)
     failed = total - passed
     failures = [case for case in cases if not _is_pass(str(case.get("outcome", "")))]
     latest_failures = list(reversed(failures[-latest_limit:])) if latest_limit > 0 else []
@@ -123,3 +128,29 @@ def summarize_cases(root: Path, *, latest_limit: int = LATEST_FAILURE_LIMIT) -> 
             "path": str(_cases_path(root)),
         }
     )
+
+
+def pass_rate(root: Path) -> float:
+    """Pure: passed/total over .ai/eval/cases.jsonl (4dp), 0.0 when there are no cases.
+
+    Never raises on a missing file — mirrors _iter_cases, which returns [] when absent. This
+    is the correctness signal the self-improve ratchet consults alongside output tokens.
+    """
+    passed, total = _count(_iter_cases(root))
+    return round(passed / total, 4) if total else 0.0
+
+
+def eval_fitness(root: Path) -> dict[str, Any]:
+    """Pure read carrying the fail-soft eval signal the prompt_growth ratchet consumes.
+
+    Returns ``{"available", "total", "passed", "pass_rate"}``. ``available`` is True only when
+    ``total > 0``; when False the caller MUST NOT gate on eval (degrade to today's token-only
+    ratchet). Only counts/floats leave the module, so no redaction is required.
+    """
+    passed, total = _count(_iter_cases(root))
+    return {
+        "available": total > 0,
+        "total": total,
+        "passed": passed,
+        "pass_rate": round(passed / total, 4) if total else 0.0,
+    }

@@ -197,6 +197,63 @@ def test_spawn_sleep_time_jobs_subprocess_mock() -> None:
                 assert len(result["spawned"]) >= 1
 
 
+def test_spawn_sleep_time_jobs_includes_page_in_default_on() -> None:
+    """Job 5: a memory page-in job is spawned when AI_MEMORY_PAGE_IN is default-on."""
+    from ai_core.hooks import _spawn_sleep_time_jobs
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmproot = Path(tmpdir)
+        (tmproot / ".ai" / "cache").mkdir(parents=True, exist_ok=True)
+        ai_bin = tmproot / ".ai" / "bin" / "ai"
+        ai_bin.parent.mkdir(parents=True, exist_ok=True)
+        ai_bin.write_text("#!/bin/sh\necho mock\n")
+        ai_bin.chmod(0o755)
+
+        env = {"AI_SLEEP_TIME": "1"}
+        # ensure default-on: AI_MEMORY_PAGE_IN not disabled
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("AI_MEMORY_PAGE_IN", None)
+            with mock.patch("subprocess.Popen") as mock_popen:
+                mock_proc = mock.Mock()
+                mock_proc.pid = 4321
+                mock_popen.return_value = mock_proc
+
+                result = _spawn_sleep_time_jobs(tmproot)
+
+                cmds = [call_args[0][0] for call_args in mock_popen.call_args_list]
+                page_in_cmds = [c for c in cmds if "page-in" in c]
+                assert len(page_in_cmds) == 1
+                assert "memory" in page_in_cmds[0]
+                assert any("page_in" in s for s in result["spawned"])
+
+
+def test_spawn_sleep_time_jobs_page_in_opt_out() -> None:
+    """AI_MEMORY_PAGE_IN=0 → no page-in job is spawned."""
+    from ai_core.hooks import _spawn_sleep_time_jobs
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmproot = Path(tmpdir)
+        (tmproot / ".ai" / "cache").mkdir(parents=True, exist_ok=True)
+        ai_bin = tmproot / ".ai" / "bin" / "ai"
+        ai_bin.parent.mkdir(parents=True, exist_ok=True)
+        ai_bin.write_text("#!/bin/sh\necho mock\n")
+        ai_bin.chmod(0o755)
+
+        with mock.patch.dict(os.environ, {"AI_SLEEP_TIME": "1", "AI_MEMORY_PAGE_IN": "0"}):
+            with mock.patch("subprocess.Popen") as mock_popen:
+                mock_proc = mock.Mock()
+                mock_proc.pid = 4321
+                mock_popen.return_value = mock_proc
+
+                result = _spawn_sleep_time_jobs(tmproot)
+
+                cmds = [call_args[0][0] for call_args in mock_popen.call_args_list]
+                assert not any("page-in" in c for c in cmds)
+                assert not any("page_in" in s for s in result["spawned"])
+
+
 def test_stop_hook_with_sleep_time_enabled_mocked() -> None:
     """Test that Stop hook calls _spawn_sleep_time_jobs (mocked subprocess)."""
     from ai_core import hooks

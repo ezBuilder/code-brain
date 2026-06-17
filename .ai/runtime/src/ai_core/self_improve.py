@@ -82,4 +82,12 @@ def status(root: Path) -> dict[str, Any]:
         "closed_loop": "enqueue_review → cheap judge → propose_rule → M_core gate → ratchet",
         "checked_at": now_iso(),
     }
+    # Surface the eval fitness coupling so `ai selfimprove status` shows whether the ratchet has a
+    # correctness signal to gate on. Read-only and fail-soft: omit the block if eval_loop is missing.
+    try:
+        from . import eval_loop
+
+        base["self_improve"]["eval"] = eval_loop.eval_fitness(root)
+    except Exception:
+        pass
     return base

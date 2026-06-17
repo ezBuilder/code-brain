@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ai_core import hooks
 from ai_core import prompt_growth as pg
+from ai_core import self_improve as si
 
 
 def _seed(tmp_path: Path) -> Path:
@@ -116,3 +117,88 @@ def test_prompt_growth_prunes_version_snapshots(tmp_path: Path, monkeypatch) -> 
         "20260101000006.json",
         "20260101000007.json",
     ]
+
+
+# --- eval_loop <-> ratchet fitness coupling (GEPA) ---
+
+
+def _rule_by_text(root: Path, text: str) -> dict:
+    return [r for r in pg._active_rules(pg._read_state(root)).values()
+            if r.get("text") == text][0]
+
+
+def test_eval_gate_noop_without_cases(tmp_path: Path) -> None:
+    # With NO cases.jsonl, the eval gate must be a strict no-op: steady (non-regressing)
+    # output_chars graduate the brevity rule to "kept" — degrade-to-token-only is provable.
+    root = _seed(tmp_path)
+    for _ in range(60):
+        pg.tick(root, output_chars=1200, cooldown=5)
+    rule = [r for r in pg._active_rules(pg._read_state(root)).values()
+            if r.get("id") == "brevity-boost"][0]
+    assert rule["status"] == "kept"
+    # the baseline was captured but flagged unavailable, so the gate never fired
+    assert rule["baseline_eval_available"] is False
+    assert rule.get("regressed_eval") in (False, None)
+    assert not (root / ".ai" / "eval" / "cases.jsonl").exists()
+
+
+def test_eval_gate_rolls_back_on_pass_rate_drop(tmp_path: Path, monkeypatch) -> None:
+    from ai_core import eval_loop
+
+    root = _seed(tmp_path)
+    pg.tick(root, output_chars=40, cooldown=999)  # turns=1, flat low output
+
+    # Baseline at apply time: eval available and HIGH pass-rate.
+    monkeypatch.setattr(eval_loop, "eval_fitness",
+                        lambda r: {"available": True, "total": 3, "passed": 3, "pass_rate": 1.0})
+    out = si.propose_rule(root, text="가능하면 짧게 답한다")
+    assert out["status"] == "applied"
+    rule = _rule_by_text(root, "가능하면 짧게 답한다")
+    assert rule["baseline_eval_available"] is True
+    assert rule["baseline_eval_pass_rate"] == 1.0
+
+    # Judge time: eval still available but pass-rate DROPPED, while output_chars stay flat (the
+    # token signal alone would keep the rule). The correctness gate must roll it back.
+    monkeypatch.setattr(eval_loop, "eval_fitness",
+                        lambda r: {"available": True, "total": 3, "passed": 1, "pass_rate": 0.3333})
+    for _ in range(pg.RATCHET_WINDOW + 2):
+        pg.tick(root, output_chars=40, cooldown=1)
+
+    judged = _rule_by_text(root, "가능하면 짧게 답한다")
+    assert judged["status"] == "regressed"
+    assert judged["regressed_eval"] is True  # rolled back for correctness, not tokens
+
+
+def test_eval_gate_action_tag_marks_eval(tmp_path: Path, monkeypatch) -> None:
+    from ai_core import eval_loop
+
+    root = _seed(tmp_path)
+    pg.tick(root, output_chars=40, cooldown=999)
+    monkeypatch.setattr(eval_loop, "eval_fitness",
+                        lambda r: {"available": True, "total": 2, "passed": 2, "pass_rate": 1.0})
+    si.propose_rule(root, text="짧게 답한다")
+    monkeypatch.setattr(eval_loop, "eval_fitness",
+                        lambda r: {"available": True, "total": 2, "passed": 0, "pass_rate": 0.0})
+    # advance to the ratchet boundary without judging, then judge once and inspect the action tag
+    for _ in range(pg.RATCHET_WINDOW):
+        pg.tick(root, output_chars=40, cooldown=999)
+    result = pg.evaluate_and_grow(root)
+    assert any(a.startswith("rollback:") and a.endswith(":eval") for a in result["actions"])
+
+
+def test_eval_gate_keeps_when_pass_rate_holds_or_improves(tmp_path: Path, monkeypatch) -> None:
+    from ai_core import eval_loop
+
+    root = _seed(tmp_path)
+    pg.tick(root, output_chars=40, cooldown=999)
+    monkeypatch.setattr(eval_loop, "eval_fitness",
+                        lambda r: {"available": True, "total": 4, "passed": 2, "pass_rate": 0.5})
+    si.propose_rule(root, text="요점만 답한다")
+    # judge time: pass-rate IMPROVED; output flat → no regression on either signal → kept
+    monkeypatch.setattr(eval_loop, "eval_fitness",
+                        lambda r: {"available": True, "total": 4, "passed": 4, "pass_rate": 1.0})
+    for _ in range(pg.RATCHET_WINDOW + 2):
+        pg.tick(root, output_chars=40, cooldown=1)
+    judged = _rule_by_text(root, "요점만 답한다")
+    assert judged["status"] == "kept"
+    assert judged["regressed_eval"] is False

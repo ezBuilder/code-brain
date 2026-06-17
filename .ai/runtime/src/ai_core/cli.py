@@ -399,6 +399,10 @@ def build_parser() -> argparse.ArgumentParser:
     memory_pageout = memory_sub.add_parser("page-out", help="rotate session + archive old sessions (T30 step B)")
     memory_pageout.add_argument("--dry-run", action="store_true")
     memory_pageout.add_argument("--json", action="store_true", dest="command_json")
+    memory_pagein = memory_sub.add_parser("page-in", help="consolidate ranked HOT cache for SessionStart (T30 step C)")
+    memory_pagein.add_argument("--dry-run", action="store_true")
+    memory_pagein.add_argument("--limit", type=int, default=None)
+    memory_pagein.add_argument("--json", action="store_true", dest="command_json")
     memory_retention = memory_sub.add_parser("retention", help="retention scoring (decay+reinforcement) of durable memory")
     memory_retention.add_argument("--evict-limit", type=int, default=50)
     memory_retention.add_argument("--json", action="store_true", dest="command_json")
@@ -1274,6 +1278,11 @@ def main(argv: list[str] | None = None) -> int:
             from . import memory_tier as _mt
             emit(_mt.page_out(root, dry_run=bool(args.dry_run)), as_json=as_json)
             return OK
+        if args.command == "memory" and args.memory_command == "page-in":
+            from . import memory_tier as _mt
+            payload = _mt.page_in(root, dry_run=bool(args.dry_run), limit=args.limit)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "memory" and args.memory_command == "retention":
             from . import memory_tier as _mt
             emit(_mt.retention_report(root, evict_limit=int(args.evict_limit)), as_json=as_json)

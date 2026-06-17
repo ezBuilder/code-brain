@@ -74,6 +74,51 @@ def test_summary_counts_pass_rate_and_latest_failures(tmp_path: Path) -> None:
     assert [case["id"] for case in summary["latest_failures"]] == ["fail-2"]
 
 
+def test_pass_rate_no_cases_returns_zero(tmp_path: Path) -> None:
+    from ai_core.eval_loop import pass_rate
+
+    repo = _init_repo(tmp_path)
+    # fresh repo: no cases.jsonl on disk → 0.0, never raises on the missing file
+    assert pass_rate(repo) == 0.0
+
+
+def test_pass_rate_counts_outcomes(tmp_path: Path) -> None:
+    from ai_core.eval_loop import pass_rate, record_case
+
+    repo = _init_repo(tmp_path)
+    record_case(repo, case_id="p1", kind="swe", command="pytest a", outcome="pass", duration_ms=10)
+    record_case(repo, case_id="p2", kind="swe", command="pytest b", outcome="ok", duration_ms=10)
+    record_case(repo, case_id="f1", kind="swe", command="pytest c", outcome="fail", duration_ms=10)
+
+    assert pass_rate(repo) == 0.6667  # 2/3 rounded to 4dp
+
+
+def test_eval_fitness_unavailable_when_empty(tmp_path: Path) -> None:
+    from ai_core.eval_loop import eval_fitness
+
+    repo = _init_repo(tmp_path)
+    fit = eval_fitness(repo)
+    assert fit["available"] is False
+    assert fit["total"] == 0
+    assert fit["passed"] == 0
+    assert fit["pass_rate"] == 0.0
+
+
+def test_eval_fitness_available_with_cases(tmp_path: Path) -> None:
+    from ai_core.eval_loop import eval_fitness, record_case, summarize_cases
+
+    repo = _init_repo(tmp_path)
+    record_case(repo, case_id="p1", kind="swe", command="pytest a", outcome="pass", duration_ms=10)
+    record_case(repo, case_id="f1", kind="swe", command="pytest b", outcome="fail", duration_ms=10)
+
+    fit = eval_fitness(repo)
+    summary = summarize_cases(repo)
+    assert fit["available"] is True
+    assert fit["total"] == summary["total"] == 2
+    assert fit["passed"] == summary["passed"] == 1
+    assert fit["pass_rate"] == summary["pass_rate"] == 0.5
+
+
 def test_eval_cli_record_and_summary_json(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
 

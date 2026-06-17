@@ -430,6 +430,37 @@ def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
         except Exception:
             pass
 
+    # Job 5 (T30 step C): memory page-in — consolidate a compact, salience-ranked
+    # HOT cache so the next SessionStart injects a tighter, fewer-token context.
+    # Deterministic + offline; ordered AFTER page-out so tiers settle first.
+    # Opt-out via AI_MEMORY_PAGE_IN=0/off (default on). Detached, swallows errors.
+    if not _env_disabled("AI_MEMORY_PAGE_IN", default="1"):
+        try:
+            from .process_janitor import register_child
+
+            if IS_WINDOWS and ai_bin_ps.exists():
+                cmd = ["powershell", "-NoProfile", "-File", str(ai_bin_ps),
+                       "memory", "page-in", "--json"]
+            elif ai_bin_unix.exists():
+                cmd = [str(ai_bin_unix), "memory", "page-in", "--json"]
+            else:
+                cmd = None
+
+            if cmd is not None:
+                with open(os.devnull, "wb") as devnull:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=devnull,
+                        stderr=devnull,
+                        stdin=subprocess.DEVNULL,
+                        cwd=str(root),
+                        **detached_popen_kwargs(),
+                    )
+                register_child(root, pid=proc.pid, kind="sleep_time_page_in", command=cmd)
+                spawned.append(f"page_in(pid={proc.pid})")
+        except Exception:
+            pass
+
     return {"ok": True, "spawned": spawned, "skipped": False, "reason": None}
 
 
@@ -2416,12 +2447,54 @@ def _auto_milestone_on_stale(root: Path) -> bool:
         return False
 
 
+def _hot_cache_line(root: Path) -> str:
+    """Build a compact ranked HOT line from the precomputed page-in cache.
+
+    Read-only and fail-soft: returns "" when the cache is missing, stale, or
+    empty so SessionStart degrades to the live classify() histogram. Bounded by
+    the cache's own byte budget plus a hard cap here, so it never grows the
+    injection beyond the histogram it replaces.
+    """
+    # Opt-in (AI_MEMORY_HOT_LINE=1). The page-in cache is always built by the
+    # sleep-time path, but injecting its ranked line is OFF by default until the
+    # refs carry readable titles and the line measures smaller than the cb-mem
+    # histogram it would replace — otherwise it both grows tokens and loses info.
+    # cb-simplify: histogram-only by default; revisit when refs are human-readable
+    # and the ranked line is provably shorter than the histogram.
+    import os as _os
+    if _os.environ.get("AI_MEMORY_HOT_LINE", "").strip().lower() not in ("1", "true", "on", "yes"):
+        return ""
+    try:
+        from .memory_hot import read_hot_cache
+        from .memory_tier import _env_float as _ef
+
+        max_age = _ef("AI_MEMORY_HOT_CACHE_MAX_AGE", 1800.0)
+        cache = read_hot_cache(root, max_age_seconds=max_age if max_age > 0 else None)
+        if not cache:
+            return ""
+        items = cache.get("items") or []
+        if not items:
+            return ""
+        parts: list[str] = []
+        for it in items[:8]:
+            kind = str(it.get("kind") or "")[:12]
+            ref = str(it.get("ref") or "")[:48]
+            if ref:
+                parts.append(f"{kind}:{ref}")
+        if not parts:
+            return ""
+        return f"cb-hot({len(items)}): " + " · ".join(parts)
+    except Exception:
+        return ""
+
+
 def _memory_tier_summary_context(root: Path) -> str:
     deps = [
         root / ".ai" / "memory" / "audit-index.jsonl",
         root / ".ai" / "memory" / "todos.jsonl",
         root / ".ai" / "memory" / "decisions.jsonl",
         root / ".ai" / "memory" / "session-current.md",
+        root / ".ai" / "cache" / "memory-hot.json",
     ]
     deps.extend(all_audit_files(root))
 
@@ -2433,7 +2506,14 @@ def _memory_tier_summary_context(root: Path) -> str:
             hot = cls["tiers"]["hot"]["audit_events"]
             warm = cls["tiers"]["warm"]["audit_events"]
             cold = cls["tiers"]["cold"]["audit_events"]
-            sline = f"cb-mem: hot={hot} warm={warm} cold={cold} | session={int(pres['session_md_ratio']*100)}%"
+            # Opt-in ranked HOT line from the page-in cache (T30 step C);
+            # default keeps the cb-mem histogram. Read-only; "" when off/missing.
+            ranked = _hot_cache_line(root)
+            if ranked:
+                sline = ranked
+            else:
+                sline = f"cb-mem: hot={hot} warm={warm} cold={cold}"
+            sline += f" | session={int(pres['session_md_ratio']*100)}%"
             if pres.get("page_out_recommended"):
                 sline += " ⚠page-out"
             return sline

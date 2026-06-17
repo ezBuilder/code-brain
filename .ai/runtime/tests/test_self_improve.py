@@ -67,6 +67,16 @@ def test_status_describes_closed_loop(tmp_path: Path) -> None:
     assert "closed_loop" in s["self_improve"] and "ratchet" in s["self_improve"]["closed_loop"]
 
 
+def test_status_surfaces_eval_fitness(tmp_path: Path) -> None:
+    # The eval coupling is observable via status; on a repo with no cases it degrades cleanly.
+    root = _seed(tmp_path)
+    s = si.status(root)
+    eval_block = s["self_improve"]["eval"]
+    assert eval_block["available"] is False
+    assert eval_block["total"] == 0
+    assert eval_block["pass_rate"] == 0.0
+
+
 def test_domain_mention_rejected(tmp_path: Path) -> None:
     root = _seed(tmp_path)
     # a behavioural rule may not even MENTION a security domain (allow-by-domain defence)

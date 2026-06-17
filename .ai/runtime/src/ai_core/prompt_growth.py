@@ -58,6 +58,7 @@ MIN_SAMPLES = 20             # do not grow until enough signal
 VIOLATION_RATE = 0.5         # >=50% of recent reports verbose → warrant a brevity rule
 RATCHET_WINDOW = 30          # turns to measure a freshly applied rule before judging it
 RATCHET_REGRESS = 1.10       # post-rule avg output > 110% of baseline → rollback
+EVAL_REGRESS_TOL = 0.0       # eval pass-rate may drop at most this much before rollback (0.0 → any drop fails)
 PROMPT_GROWTH_MAX_BYTES = 512_000
 PROMPT_GROWTH_KEEP = 2000
 PROMPT_GROWTH_VERSION_KEEP = 30
@@ -176,6 +177,27 @@ def _output_tokens(root: Path) -> int:
         return 0
 
 
+def _eval_pass_rate(root: Path) -> tuple[bool, float]:
+    """Fail-soft eval fitness reader: ``(available, pass_rate)``; ``(False, 0.0)`` on any error.
+
+    Lazy import (matching ``_output_tokens``) keeps the eval_loop coupling isolated — an import
+    or IO failure degrades the ratchet to today's token-only behaviour rather than raising.
+    """
+    try:
+        from . import eval_loop
+
+        fit = eval_loop.eval_fitness(root)
+        return bool(fit.get("available", False)), float(fit.get("pass_rate", 0.0) or 0.0)
+    except Exception:
+        return False, 0.0
+
+
+def _baseline_eval(root: Path) -> dict[str, Any]:
+    """The two eval-baseline keys merged onto a rule dict at apply time (one place, two call sites)."""
+    available, rate = _eval_pass_rate(root)
+    return {"baseline_eval_available": available, "baseline_eval_pass_rate": rate}
+
+
 # --- 3. learned-prompt file (auto-applied, versioned, reversible) ---
 
 def _active_rules(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -264,6 +286,7 @@ def apply_external_rule(root: Path, *, rule_id: str, text: str, source: str = "s
             "applied_turns": int(state.get("turns", 0)),
             "baseline_tokens": _output_tokens(root),
             "baseline_obs_avg": _recent_output_avg(root, RATCHET_WINDOW),
+            **_baseline_eval(root),
             "rationale": str(rationale or "")[:300],
             "source": str(source or "self-improve")[:64],
         }
@@ -311,10 +334,24 @@ def _evaluate_and_grow(root: Path) -> dict[str, Any]:
         # since. A rule that genuinely worsened output (longer) over a fair window is rolled back.
         pre_avg = float(rule.get("baseline_obs_avg") or 0.0)
         post_avg = _recent_output_avg(root, min(window_turns, RATCHET_WINDOW))
-        if pre_avg > 0 and post_avg > pre_avg * RATCHET_REGRESS:
+        regressed_tokens = pre_avg > 0 and post_avg > pre_avg * RATCHET_REGRESS
+        # Second fitness signal (GEPA): eval pass-rate must not regress. STRICTER than tokens — a
+        # rule can be rolled back for correctness even if it shortened output. Strict no-op unless
+        # real eval cases existed both at apply time AND now (else degrade to the token-only ratchet).
+        base_eval_ok = bool(rule.get("baseline_eval_available"))
+        cur_eval_ok, cur_eval_rate = _eval_pass_rate(root)
+        regressed_eval = False
+        if base_eval_ok and cur_eval_ok:
+            base_eval_rate = float(rule.get("baseline_eval_pass_rate") or 0.0)
+            rule["cur_eval_pass_rate"] = cur_eval_rate
+            regressed_eval = cur_eval_rate < base_eval_rate - EVAL_REGRESS_TOL
+        rule["regressed_eval"] = regressed_eval
+        if regressed_tokens or regressed_eval:
             rule["status"] = "regressed"
             rule["rolled_back_at"] = now_iso()
-            actions.append(f"rollback:{rid}")
+            # surface the cause so audits/tests can distinguish a correctness rollback from a token one
+            cause = "eval" if regressed_eval else "tokens"
+            actions.append(f"rollback:{rid}:{cause}")
         else:
             rule["status"] = "kept"  # graduated: proven non-regressive, stays active-but-final
             rule["kept_at"] = now_iso()
@@ -356,6 +393,7 @@ def _evaluate_and_grow(root: Path) -> dict[str, Any]:
                     "applied_turns": state.get("turns", 0),
                     "baseline_tokens": cur_tokens,
                     "baseline_obs_avg": _recent_output_avg(root, RATCHET_WINDOW),
+                    **_baseline_eval(root),
                     "violation_rate": round(rate, 3),
                     "source": "prompt_growth.deterministic",
                 }

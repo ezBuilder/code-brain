@@ -19,6 +19,12 @@ def tmp_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def test_module_exposes_page_out_and_page_in():
+    """Guards the docstring promise: steps B/C (page_out + page_in) both exist."""
+    assert callable(getattr(mt, "page_out", None))
+    assert callable(getattr(mt, "page_in", None))
+
+
 def test_classify_empty_root_returns_zero_tiers(tmp_root: Path):
     payload = mt.classify(tmp_root)
     assert payload["ok"] is True

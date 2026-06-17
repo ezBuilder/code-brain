@@ -17,7 +17,10 @@ OS virtual-memory paging (MemGPT) + biological-memory consolidation:
          · closed todos
          · prior session resume snapshots
 
-This module is read-only. Page-in/page-out lands in steps B/C.
+Page-out (step B) is `page_out()`; page-in (step C) is `page_in()`, which
+consolidates a compact, salience-ranked HOT set into .ai/cache for the next
+SessionStart. Both are deterministic, offline, fail-soft. classify()/the
+retention scorers remain read-only.
 """
 from __future__ import annotations
 
@@ -59,6 +62,17 @@ def _env_float(name: str, default: float) -> float:
     if val != val:  # NaN
         return default
     return val
+
+
+def _env_int(name: str, default: int) -> int:
+    """Integer env helper mirroring _env_float (empty/invalid → default)."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 def hot_ttl_hours() -> float:
@@ -425,12 +439,12 @@ def _ts_of(rec: dict[str, Any]) -> datetime | None:
     return None
 
 
-def retention_report(root: Path, *, evict_limit: int = 50) -> dict[str, Any]:
-    """Score durable memory items (decisions, lessons, procedures) by retention.
+def scored_durable_items(root: Path) -> list[dict[str, Any]]:
+    """Retention-scored durable items (decisions, lessons, procedures).
 
-    Read-only: returns a tier histogram plus the lowest-scoring items as
-    eviction *candidates* (recommendation only — never deletes). Lessons fold
-    in their confidence/reinforcement signal from `lessons.score_lessons`.
+    Read-only, deterministic. Shared source of truth for both retention_report
+    (histogram + eviction candidates) and page-in HOT consolidation, so neither
+    duplicates the scoring nor bloats the other's public output.
     """
     from .memory import decisions_path, read_jsonl_all
     from .lessons import lessons_path, score_lessons
@@ -499,6 +513,18 @@ def retention_report(root: Path, *, evict_limit: int = 50) -> dict[str, Any]:
             "ref": str(rec.get("id") or rec.get("trigger", ""))[:80],
         })
 
+    return scored
+
+
+def retention_report(root: Path, *, evict_limit: int = 50) -> dict[str, Any]:
+    """Score durable memory items (decisions, lessons, procedures) by retention.
+
+    Read-only: returns a tier histogram plus the lowest-scoring items as
+    eviction *candidates* (recommendation only — never deletes). Lessons fold
+    in their confidence/reinforcement signal from `lessons.score_lessons`.
+    """
+    scored = scored_durable_items(root)
+
     hist = {"hot": 0, "warm": 0, "cold": 0, "evictable": 0}
     for item in scored:
         hist[item["tier"]] += 1
@@ -517,3 +543,111 @@ def retention_report(root: Path, *, evict_limit: int = 50) -> dict[str, Any]:
         "reinforce_sigma": _reinforce_sigma(),
         "evict_candidates": candidates,
     }
+
+
+# --- Page-in (step C): sleep-time HOT consolidation ---------------------------
+# Deterministic, offline, fail-soft. Runs in the EXISTING sleep-time path (never
+# a hot path, never inline LLM). Consolidates the top WARM/HOT durable items by
+# retention salience + recency into a small ranked cache that the next
+# SessionStart reads instead of recomputing — a tighter, fewer-token HOT context.
+
+
+def _maybe_enqueue_hot_summary(root: Path, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Opt-in (AI_MEMORY_HOT_SUMMARIZE=1): queue ONE cheap NON-SELF summary task.
+
+    Never calls an LLM inline. Routes only through the existing loopd cheap pool
+    via loop_engineering.submit (the same primitive self_improve uses), with a
+    self-contained read-cache/write-via-CLI instruction. Default OFF → page_in
+    stays fully deterministic and offline. Fail-soft: errors are swallowed.
+    """
+    if os.environ.get("AI_MEMORY_HOT_SUMMARIZE", "").strip().lower() not in ("1", "true", "on", "yes"):
+        return {"enqueued": False, "reason": "disabled"}
+    if not items:
+        return {"enqueued": False, "reason": "no_items"}
+    try:
+        from . import loop_engineering as le
+
+        instruction = (
+            "Sleep-time HOT consolidation summary (cheap, non-self, offline-friendly).\n"
+            "Read the precomputed ranked HOT items from .ai/cache/memory-hot.json. "
+            "Write ONE short (<=200 char) plain-text summary of the dominant themes via:\n"
+            "  ai memory session append --text \"<summary>\"\n"
+            "Do NOT modify the cache. Do NOT change rules/prompts. Then complete the loop request."
+        )
+        res = le.submit(
+            root,
+            instruction=instruction,
+            goal="Summarize consolidated HOT memory set",
+            role="memtier-hot-summary",
+            reviewer_required=False,
+            priority="P3",
+            dispatch={"model_tier": "cheap"},
+        )
+        return {"enqueued": bool(res.get("ok")), "request_id": (res.get("request") or {}).get("id")}
+    except Exception as exc:  # never raises out of page_in
+        return {"enqueued": False, "reason": str(exc)}
+
+
+def page_in(root: Path, *, dry_run: bool = False, limit: int | None = None) -> dict[str, Any]:
+    """Consolidate a compact, salience-ranked HOT set for the next SessionStart.
+
+    Deterministic + offline + fail-soft: fully wrapped — any failure returns
+    {"ok": False, "error": ...} and never raises into a hook. Reuses the
+    retention scorer (decay + reinforcement + per-type weight) as the single
+    ranking source; promotes the top-N WARM/HOT durable items, byte-bounds the
+    serialized set, and persists it atomically to .ai/cache/memory-hot.json.
+
+    dry_run=True computes + returns the items but writes NO cache file and emits
+    NO audit row. Any optional LLM summary is enqueued to the cheap non-self
+    loopd pool (opt-in AI_MEMORY_HOT_SUMMARIZE=1), never inline.
+    """
+    try:
+        from . import memory_hot
+
+        eff_limit = int(limit) if limit is not None else _env_int(
+            "AI_MEMORY_HOT_LIMIT", memory_hot.HOT_LIMIT_DEFAULT
+        )
+        eff_limit = max(0, eff_limit)
+        max_bytes = max(0, _env_int("AI_MEMORY_HOT_CACHE_BYTES", memory_hot.HOT_CACHE_BYTES_DEFAULT))
+
+        items = memory_hot.consolidate_hot_items(root, limit=eff_limit, max_bytes=max_bytes)
+        counts: dict[str, int] = {"hot": 0, "warm": 0}
+        for it in items:
+            tier = str(it.get("tier") or "")
+            if tier in counts:
+                counts[tier] += 1
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "dry_run": bool(dry_run),
+            "items": items,
+            "counts": counts,
+            "limit": eff_limit,
+            "max_bytes": max_bytes,
+            "written": False,
+        }
+
+        if dry_run:
+            return result
+
+        cache = memory_hot.write_hot_cache(root, items, counts=counts, limit=eff_limit)
+        result["written"] = True
+        result["generated_at"] = cache.get("generated_at")
+        result["cache_path"] = str(memory_hot.hot_cache_path(root))
+
+        # Audit only real, non-empty runs — mirrors memtier.auto_page_out and
+        # keeps idle cycles from bloating the audit log when there is nothing hot.
+        if items:
+            try:
+                from .memory import append_audit
+                append_audit(
+                    root, action="memtier.page_in", category="memory",
+                    payload={"items": len(items), "limit": eff_limit, "counts": counts},
+                )
+            except Exception:
+                pass
+
+        result["summary"] = _maybe_enqueue_hot_summary(root, items)
+        return result
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "dry_run": bool(dry_run)}

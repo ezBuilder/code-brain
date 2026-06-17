@@ -6,7 +6,7 @@ Code Brain은 진지한 AI 코딩 에이전트를 위한 레포 로컬 인프라
 
 이 도구는 한 가지 불편한 진실을 위해 만들어졌습니다. 에이전트는 강력하지만 컨텍스트를 잊고, 코드를 과도하게 읽고, 거대한 출력을 쏟아내며, 여러 도구를 넘나들며 표류합니다. Code Brain은 레포지토리를 에이전트가 바로 활용할 수 있는 운영 계층으로 바꿉니다.
 
-## Why It Stands Out
+## 차별점
 
 - **여러 에이전트를 위한 하나의 뇌.** Claude, Codex, Antigravity가 동일한 `.ai/` 계약, 메모리, 검색 인덱스, 훅, 명령 표면을 공유합니다.
 - **기본부터 토큰을 의식.** MCP는 가벼운 `usage` 프로필로 시작합니다. 처음에는 `obs_usage`, `code_query`, `context_pack`, `code_read_hashline`, `tool_search`만 노출됩니다.
@@ -18,7 +18,7 @@ Code Brain은 진지한 AI 코딩 에이전트를 위한 레포 로컬 인프라
 - **공개 레포 업그레이드 경로.** 설치된 프로젝트는 `/cb-upgrade` 또는 `.ai/bin/ai upgrade latest --json`을 실행하여 GitHub에서 가져와 다시 부트스트랩할 수 있습니다.
 - **공개 릴리스 위생.** 소스 메모리/상태는 대상 프로젝트로 전파되지 않으며, 시크릿 스캔, 감사 체인, 매니페스트, 생성 산출물 체크가 내장되어 있습니다.
 
-## Quick Install
+## 빠른 설치
 
 ```bash
 # macOS / Linux
@@ -44,7 +44,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\pat
 
 설치 후 새 Claude/Codex/Antigravity 세션을 여세요.
 
-## Upgrade From GitHub
+## GitHub에서 업그레이드
 
 설치된 프로젝트 내부에서:
 
@@ -82,7 +82,7 @@ CODE_BRAIN_REF=v0.2.0 bash scripts/upgrade-from-github.sh /path/to/project
 
 업그레이드는 명시적입니다. `SessionStart` 훅과 MCP 핫 패스는 네트워크를 호출하지 않습니다.
 
-## Agent Workflow
+## 에이전트 워크플로
 
 좁게 시작한 다음 앵커로 편집하세요:
 
@@ -116,7 +116,7 @@ tool_search             discover hidden MCP tool schemas
 /cb-upgrade  upgrade from the public repo
 ```
 
-## Proof Points
+## 증명 포인트
 
 합성 벤치마크 주장을 믿지 마세요. Code Brain은 여러분의 레포에서 직접 실행할 수 있는 체크를 함께 제공합니다:
 
@@ -140,7 +140,7 @@ uv run --project .ai/runtime python -m pytest .ai/runtime/tests/test_cli.py -k "
 
 공개 README에서는 이렇게 재현 가능한 체크를 앞세우세요. 벤치마크 수치는 `scripts/`나 CI의 반복 가능한 스크립트로 생성될 때만 추가하세요.
 
-## What Gets Installed
+## 설치되는 항목
 
 ```text
 .ai/                         runtime, memory structure, hooks, MCP shim
@@ -175,7 +175,7 @@ AI_INSTALL_GLOBAL_ANTIGRAVITY=1 bash scripts/setup-antigravity-global.sh
 
 macOS/Linux 최상위 설치 프로그램은 Claude/Codex 글로벌 킷을 설치할 수 있습니다. 기존 파일을 백업하고 관리되는 Code Brain 블록만 `~/.claude/CLAUDE.md`와 `~/.codex/AGENTS.md`에 병합합니다. Claude 설정, 훅, 명령, 에이전트, 스킬은 `~/.claude/` 아래에 병합되거나 복사됩니다. Antigravity 글로벌 설정은 명시적으로 요청한 경우에만 `code-brain` 항목을 갱신합니다.
 
-## Token And Disk Defaults
+## 토큰 및 디스크 기본값
 
 기본 MCP 프로필:
 
@@ -213,7 +213,7 @@ full:  all MCP tools
 
 상한이 적용된 파일이 한도를 넘어 커지면 `doctor --strict`가 `generated_artifacts_bounded`에서 실패합니다.
 
-## Security And Public Repo Hygiene
+## 보안 및 공개 레포 위생
 
 - 실제 시크릿을 읽거나, 출력하거나, 편집하거나, 커밋하지 마세요.
 - `.env`, 키, 토큰, 인증서, 비밀번호 저장소, 런타임 상태, 비공개 메모리는 공개 소스 레포 밖에 둡니다.
@@ -222,7 +222,7 @@ full:  all MCP tools
 - 글로벌 Antigravity 파일을 변경하기 전에 `AI_INSTALL_GLOBAL_ANTIGRAVITY=1`이 필요합니다.
 - CI 및 릴리스 후보는 `make lint`, 대상 테스트, `make doctor`, 락파일 체크, `make release-gate`를 통과해야 합니다.
 
-## Architecture Map
+## 아키텍처 맵
 
 ```text
 .ai/
@@ -247,6 +247,6 @@ full:  all MCP tools
 └── AGENTS.md                    canonical local agent contract
 ```
 
-## License
+## 라이선스
 
 Apache-2.0.

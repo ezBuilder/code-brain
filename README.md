@@ -14,6 +14,7 @@ It is built for one uncomfortable truth: agents are powerful, but they forget co
 - **Hashline-safe edits.** `code_read_hashline` gives line+sha anchors before edits, reducing stale or misplaced patches.
 - **Guardrails on the hot path.** Hooks block destructive git, broad grep/find dumps, secret leaks, and long output before they waste tokens or expose data.
 - **Bounded memory and artifacts.** Runtime-generated JSONL/log/evidence files have caps and doctor checks so a repo does not balloon silently.
+- **Offline memory consolidation.** Sleep-time `ai memory page-in` pre-warms a salience-ranked HOT cache so the next session loads a tighter, fewer-token context without any network call.
 - **Public-repo upgrade path.** Installed projects can run `/cb-upgrade` or `.ai/bin/ai upgrade latest --json` to pull from GitHub and re-bootstrap.
 - **Public-release hygiene.** Source memory/state is not propagated into target projects; secret scan, audit chain, manifest, and generated artifact checks are built in.
 
@@ -75,8 +76,8 @@ curl -fsSL https://raw.githubusercontent.com/ezBuilder/code-brain/main/scripts/u
 Pin a version or branch:
 
 ```bash
-.ai/bin/ai upgrade latest --ref v0.1.3 --json
-CODE_BRAIN_REF=v0.1.3 bash scripts/upgrade-from-github.sh /path/to/project
+.ai/bin/ai upgrade latest --ref v0.2.0 --json
+CODE_BRAIN_REF=v0.2.0 bash scripts/upgrade-from-github.sh /path/to/project
 ```
 
 Upgrades are explicit. `SessionStart` hooks and MCP hot paths do not call the network.
@@ -233,7 +234,8 @@ Manual cleanup:
 │   ├── mcp_server.py            MCP JSON-RPC stdio server
 │   ├── mcp_config.py            Claude/Codex/Antigravity config dialects
 │   ├── memory.py                decisions/todos/audit/events rotation
-│   ├── memory_tier.py           page-out / tiering
+│   ├── memory_tier.py           page-out / page-in / tiering
+│   ├── memory_hot.py            sleep-time salience-ranked HOT memory cache
 │   ├── evidence.py              bounded evidence ledger
 │   ├── doctor.py                release and safety checks
 │   ├── obs.py                   usage/health/search diagnostics

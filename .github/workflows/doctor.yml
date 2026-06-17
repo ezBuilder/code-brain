@@ -3,7 +3,7 @@ name: doctor
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, develop]
 
 concurrency:
   group: doctor-${{ github.ref }}

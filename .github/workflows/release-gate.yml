@@ -26,13 +26,13 @@ jobs:
       AI_CI: "true"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8.2.0
 
       - name: Release gate
         run: ./scripts/release-gate.sh
@@ -50,7 +50,7 @@ jobs:
           exit 1
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: code-brain-release-artifacts-${{ matrix.os }}
           path: |
@@ -65,7 +65,7 @@ jobs:
           retention-days: 30
 
       - name: Upload release gate summary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-gate-summary-${{ matrix.os }}
           path: dist/release-gate.summary.json
@@ -81,13 +81,13 @@ jobs:
       AI_CI: "true"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Download release gate summaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-gate-summary-*
           path: .ci-summaries

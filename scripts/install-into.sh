@@ -602,7 +602,8 @@ managed = {
          "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUse"}]}
     ],
     "SessionStart": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SessionStart"}]}
+        {"matcher": "startup|resume|clear|compact",
+         "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SessionStart"}]}
     ],
     "UserPromptSubmit": [
         {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook UserPromptSubmit"}]}
@@ -746,7 +747,7 @@ def H(event, matcher=None, msg=None):
 managed_codex_hooks = {
     "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|run_command", msg="Checking Code Brain command routing"),
     "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|run_command|replace_file_content|multi_replace_file_content|write_to_file|view_file|grep_search|list_dir", msg="Recording Code Brain tool result"),
-    "SessionStart": H("SessionStart", matcher="startup|resume|clear", msg="Loading Code Brain session context"),
+    "SessionStart": H("SessionStart", matcher="startup|resume|clear|compact", msg="Loading Code Brain session context"),
     "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
     "Stop": H("Stop", msg="Recording Code Brain stop event"),
     "SubagentStart": H("SubagentStart", msg="Loading Code Brain subagent context"),

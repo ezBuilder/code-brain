@@ -13,8 +13,8 @@ jobs:
   pytest-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
       - name: Sync runtime deps
         shell: pwsh
         run: |

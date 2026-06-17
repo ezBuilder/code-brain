@@ -3,7 +3,7 @@ SHELL := /usr/bin/env bash
 
 LATEST_ARCHIVE := $(shell ls -t dist/code-brain-*.tar.gz 2>/dev/null | head -n 1)
 
-.PHONY: help env-check preflight lockfile-check lock-check session-start install-into upgrade-in uninstall-from lint bootstrap test doctor quick smoke docs-check package verify-artifacts install-check reproducibility-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
+.PHONY: help env-check preflight lockfile-check lock-check session-start install-into upgrade-in uninstall-from lint bootstrap test doctor quick ci ci-full smoke docs-check package verify-artifacts install-check reproducibility-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
 
 help:
 	@printf '%s\n' \
@@ -70,6 +70,12 @@ doctor:
 
 quick: env-check lint doctor
 	uv run --project .ai/runtime ai report status --json >/dev/null
+
+ci:
+	./scripts/ci-local.sh
+
+ci-full:
+	./scripts/ci-local.sh --full
 
 smoke:
 	./scripts/smoke.sh

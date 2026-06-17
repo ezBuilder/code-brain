@@ -3,7 +3,7 @@ name: windows-runtime
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, develop]
 
 concurrency:
   group: windows-runtime-${{ github.ref }}

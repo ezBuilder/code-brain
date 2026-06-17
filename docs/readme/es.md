@@ -1,5 +1,14 @@
 # Code Brain
 
+[![Release](https://img.shields.io/github/v/release/ezBuilder/code-brain?sort=semver&style=flat-square&color=2962FF)](https://github.com/ezBuilder/code-brain/releases)
+[![License](https://img.shields.io/github/license/ezBuilder/code-brain?style=flat-square&color=4CAF50)](https://github.com/ezBuilder/code-brain/blob/main/LICENSE)
+[![Release Gate](https://img.shields.io/github/actions/workflow/status/ezBuilder/code-brain/release-gate.yml?branch=main&style=flat-square&label=release-gate)](https://github.com/ezBuilder/code-brain/actions/workflows/release-gate.yml)
+[![Stars](https://img.shields.io/github/stars/ezBuilder/code-brain?style=flat-square&color=FFC107)](https://github.com/ezBuilder/code-brain/stargazers)
+
+![Claude Code](https://img.shields.io/badge/Claude_Code-ready-8A2BE2?style=flat-square)
+![Codex CLI](https://img.shields.io/badge/Codex_CLI-ready-111111?style=flat-square)
+![Antigravity](https://img.shields.io/badge/Antigravity-ready-4285F4?style=flat-square)
+
 [한국어](ko.md) · [English](../../README.md) · [中文](zh-CN.md) · [日本語](ja.md) · Español · [Français](fr.md) · [Deutsch](de.md)
 
 Code Brain es infraestructura local del repositorio para agentes de codificación con IA serios. Proporciona a Claude Code, Codex CLI y Google Antigravity la misma memoria de proyecto, búsqueda de código BM25, política de hooks, herramientas MCP, registro de auditoría y ruta de actualización dentro de un mismo espacio de trabajo.

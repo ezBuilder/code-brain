@@ -104,7 +104,12 @@ cd /path/to/project
 .ai/bin/ai code read-hashline src/app.py --start 10 --end 80
 .ai/bin/ai doctor --strict --json
 .ai/bin/ai obs usage --json
+.ai/bin/ai memory recall --query "auth flow" --json
+.ai/bin/ai memory decision list --kind failure --json
+.ai/bin/ai memory conflicts --json
 ```
+
+召回将决策、失败、教训和流程整合为一个带排序与引用的答案；`memory conflicts` 离线标记相互矛盾的决策。
 
 默认 MCP 工具：
 

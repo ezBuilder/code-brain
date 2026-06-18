@@ -104,7 +104,12 @@ cd /path/to/project
 .ai/bin/ai code read-hashline src/app.py --start 10 --end 80
 .ai/bin/ai doctor --strict --json
 .ai/bin/ai obs usage --json
+.ai/bin/ai memory recall --query "auth flow" --json
+.ai/bin/ai memory decision list --kind failure --json
+.ai/bin/ai memory conflicts --json
 ```
+
+リコールは決定・失敗・教訓・手順を 1 つのランク付き・引用付き回答に統合し、`memory conflicts` は矛盾する決定をオフラインで検出します。
 
 デフォルトの MCP ツール:
 

@@ -292,6 +292,36 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "memory_recall",
+        "description": "질의에 관련된 durable 메모리(결정·실패·교훈·절차)를 confidence*relevance*recency로 통합 회상하고 인용 블록을 반환. 읽기전용·로컬·LLM합성 없음. lessons_recall의 상위호환(교훈만이 아니라 결정/실패/절차까지). 위험/반복 작업 전 '이 주제로 뭘 알고있나' 조회.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 8},
+                "types": {"type": "array", "items": {"type": "string", "enum": ["decision", "failure", "lesson", "procedure"]},
+                          "description": "optional subset of stores to search; default all"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "list_decisions",
+        "description": "기록된 결정/실패(decisions.jsonl)를 필터로 온디맨드 조회. 읽기전용. SessionStart 주입 tail 너머의 과거 결정을 미드세션에 질의할 때 사용. 필터: kind(decision|failure)/status/tag/source/text. 실패는 id로 fold되고 stale/refuted는 기본 제외.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["decision", "failure"]},
+                "status": {"type": "string", "enum": ["observed", "confirmed", "stale", "refuted"]},
+                "tag": {"type": "string", "description": "match any tag (substring)"},
+                "source": {"type": "string", "description": "substring match on source"},
+                "text": {"type": "string", "description": "substring match on decision text"},
+                "limit": {"type": "integer", "default": 20},
+                "include_retired": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
         "name": "record_todo",
         "description": "열린 todo를 .ai/memory/todos.jsonl에 기록. 다음 세션에 자동 주입. 쓰기성.",
         "inputSchema": {
@@ -930,6 +960,30 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         from .lessons import recall_lessons
 
         return recall_lessons(root, query=recall_query, limit=int(args.get("limit", 5) or 5))
+    if name == "memory_recall":
+        mr_query = args.get("query")
+        if not isinstance(mr_query, str) or not mr_query.strip():
+            raise ValueError("memory_recall requires non-empty query")
+        from .memory_recall import recall_memory
+        mr_types = args.get("types") if isinstance(args.get("types"), list) else None
+        return recall_memory(
+            root,
+            query=mr_query,
+            limit=int(args.get("limit", 8) or 8),
+            types=[str(t) for t in mr_types] if mr_types else None,
+        )
+    if name == "list_decisions":
+        from .memory import read_decisions_filtered
+        return read_decisions_filtered(
+            root,
+            kind=args.get("kind") if isinstance(args.get("kind"), str) else None,
+            status=args.get("status") if isinstance(args.get("status"), str) else None,
+            tag=args.get("tag") if isinstance(args.get("tag"), str) else None,
+            source=args.get("source") if isinstance(args.get("source"), str) else None,
+            text=args.get("text") if isinstance(args.get("text"), str) else None,
+            limit=int(args.get("limit", 20) or 20),
+            include_retired=bool(args.get("include_retired", False)),
+        )
     if name == "record_todo":
         title = args.get("title")
         if not isinstance(title, str) or not title.strip():

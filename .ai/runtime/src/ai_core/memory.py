@@ -168,6 +168,74 @@ def read_decisions_for_surface(root: Path, *, limit: int) -> tuple[list[dict[str
     return plain[-limit:], live
 
 
+def read_decisions_filtered(
+    root: Path,
+    *,
+    kind: str | None = None,
+    status: str | None = None,
+    tag: str | None = None,
+    source: str | None = None,
+    text: str | None = None,
+    limit: int = 20,
+    include_retired: bool = False,
+) -> dict[str, Any]:
+    """On-demand filtered read over decisions.jsonl (newest-first).
+
+    Unlike read_decisions_for_surface (which feeds the fixed SessionStart tail), this lets an
+    agent query past decisions mid-session. It reuses the same integrity rules so a query can
+    never surface a duplicate or retired row: failures fold by id (last write wins) and
+    stale/refuted ones drop unless include_retired. Filters are AND-combined — kind/status are
+    exact, tag/source/text are case-insensitive substring. Fail-soft → empty on error.
+    """
+    try:
+        rows = read_jsonl_all(decisions_path(root))
+    except Exception:
+        return {"ok": True, "count": 0, "items": []}
+
+    plain: list[dict[str, Any]] = []
+    failures: dict[str, dict[str, Any]] = {}
+    for rec in rows:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("kind") == "failure":
+            fid = str(rec.get("id") or "")
+            if fid:
+                failures[fid] = rec  # fold by id
+        else:
+            plain.append(rec)
+
+    items: list[dict[str, Any]] = list(plain)
+    for rec in failures.values():
+        if not include_retired and str(rec.get("status", "observed")) in _RETIRED_STATUSES:
+            continue
+        items.append(rec)
+
+    kind_f = (kind or "").strip().lower() or None
+    status_f = (status or "").strip().lower() or None
+    tag_f = (tag or "").strip().lower() or None
+    source_f = (source or "").strip().lower() or None
+    text_f = (text or "").strip().lower() or None
+
+    def _match(rec: dict[str, Any]) -> bool:
+        rkind = "failure" if rec.get("kind") == "failure" else "decision"
+        if kind_f and rkind != kind_f:
+            return False
+        if status_f and str(rec.get("status", "")).lower() != status_f:
+            return False
+        if source_f and source_f not in str(rec.get("source", "")).lower():
+            return False
+        if tag_f and not any(tag_f in str(t).lower() for t in (rec.get("tags") or [])):
+            return False
+        if text_f and text_f not in str(rec.get("decision", "")).lower():
+            return False
+        return True
+
+    matched = [r for r in items if _match(r)]
+    matched.sort(key=lambda r: str(r.get("observed_at") or r.get("decided_at") or ""), reverse=True)
+    n = max(0, int(limit))
+    return {"ok": True, "count": len(matched[:n]), "items": matched[:n]}
+
+
 def append_todo(
     root: Path,
     *,

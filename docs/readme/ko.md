@@ -104,7 +104,12 @@ cd /path/to/project
 .ai/bin/ai code read-hashline src/app.py --start 10 --end 80
 .ai/bin/ai doctor --strict --json
 .ai/bin/ai obs usage --json
+.ai/bin/ai memory recall --query "auth flow" --json
+.ai/bin/ai memory decision list --kind failure --json
+.ai/bin/ai memory conflicts --json
 ```
+
+회상은 결정·실패·교훈·절차를 하나의 순위·인용 답변으로 통합하며, `memory conflicts`는 모순되는 결정을 오프라인에서 탐지합니다.
 
 기본 MCP 도구:
 

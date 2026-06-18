@@ -338,6 +338,19 @@ def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                 "error": str(e),
             }
 
+    # Advisory conflict scan (dark by default; never blocks page_out). Deterministic,
+    # stdlib-only, writes only conflicts.jsonl (never decisions). Opt in with the env flag.
+    import os
+    if str(os.environ.get("AI_MEMORY_CONFLICT_SCAN", "")).strip() not in ("", "0", "false", "no"):
+        try:
+            from .memory_conflicts import scan_conflicts
+            result["conflict_scan"] = scan_conflicts(root, dry_run=dry_run)
+        except Exception as e:
+            result["conflict_scan"] = {"ok": False, "error": str(e)}
+    else:
+        result["conflict_scan"] = {"ok": True, "skipped": True,
+                                   "reason": "disabled (AI_MEMORY_CONFLICT_SCAN unset)"}
+
     return result
 
 

@@ -355,6 +355,26 @@ def build_parser() -> argparse.ArgumentParser:
     memory_decision_add.add_argument("--status", choices=["observed", "confirmed", "stale", "refuted"])
     memory_decision_add.add_argument("--supersedes-id", dest="supersedes_id")
     memory_decision_add.add_argument("--json", action="store_true", dest="command_json")
+    memory_decision_list = memory_decision_sub.add_parser("list", help="filtered on-demand read of decisions/failures")
+    memory_decision_list.add_argument("--kind", choices=["decision", "failure"])
+    memory_decision_list.add_argument("--status", choices=["observed", "confirmed", "stale", "refuted"])
+    memory_decision_list.add_argument("--tag", help="match any tag (substring)")
+    memory_decision_list.add_argument("--source", help="substring match on source")
+    memory_decision_list.add_argument("--text", help="substring match on decision text")
+    memory_decision_list.add_argument("--limit", type=int, default=20)
+    memory_decision_list.add_argument("--include-retired", action="store_true", dest="include_retired")
+    memory_decision_list.add_argument("--json", action="store_true", dest="command_json")
+    memory_recall = memory_sub.add_parser("recall", help="unified recall across decisions/failures/lessons/procedures")
+    memory_recall.add_argument("--query", required=True)
+    memory_recall.add_argument("--limit", type=int, default=8)
+    memory_recall.add_argument("--type", action="append", default=None, dest="recall_types",
+                               choices=["decision", "failure", "lesson", "procedure"], help="repeatable; default all")
+    memory_recall.add_argument("--json", action="store_true", dest="command_json")
+    memory_conflicts = memory_sub.add_parser("conflicts", help="advisory: scan/list contradicting decision pairs")
+    memory_conflicts.add_argument("--scan", action="store_true", help="run a fresh scan (writes conflicts.jsonl)")
+    memory_conflicts.add_argument("--dry-run", action="store_true", dest="dry_run", help="scan but do not write")
+    memory_conflicts.add_argument("--limit", type=int, default=20)
+    memory_conflicts.add_argument("--json", action="store_true", dest="command_json")
     memory_todo = memory_sub.add_parser("todo")
     memory_todo_sub = memory_todo.add_subparsers(dest="memory_todo_command", required=True)
     memory_todo_add = memory_todo_sub.add_parser("add")
@@ -1222,6 +1242,29 @@ def main(argv: list[str] | None = None) -> int:
                 status=getattr(args, "status", None),
                 supersedes_id=getattr(args, "supersedes_id", None),
             )
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "decision" and args.memory_decision_command == "list":
+            from .memory import read_decisions_filtered
+            payload = read_decisions_filtered(
+                root, kind=args.kind, status=args.status, tag=args.tag,
+                source=args.source, text=args.text, limit=args.limit,
+                include_retired=bool(args.include_retired),
+            )
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "recall":
+            from .memory_recall import recall_memory
+            payload = recall_memory(root, query=args.query, limit=args.limit, types=args.recall_types)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "conflicts":
+            from .memory_conflicts import list_conflicts, scan_conflicts
+            if args.scan or args.dry_run:
+                reject_ci_write("memory")
+                payload = scan_conflicts(root, dry_run=bool(args.dry_run))
+            else:
+                payload = list_conflicts(root, limit=args.limit)
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "memory" and args.memory_command == "todo" and args.memory_todo_command == "add":

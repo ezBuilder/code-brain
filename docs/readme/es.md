@@ -104,7 +104,12 @@ cd /path/to/project
 .ai/bin/ai code read-hashline src/app.py --start 10 --end 80
 .ai/bin/ai doctor --strict --json
 .ai/bin/ai obs usage --json
+.ai/bin/ai memory recall --query "auth flow" --json
+.ai/bin/ai memory decision list --kind failure --json
+.ai/bin/ai memory conflicts --json
 ```
+
+La recuperación abarca decisiones, fallos, lecciones y procedimientos en una sola respuesta clasificada y citada; `memory conflicts` detecta decisiones contradictorias sin conexión.
 
 Herramientas MCP por defecto:
 

@@ -168,13 +168,75 @@ def test_workspace_symbols_real_limit_capping(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_find_references_cache_hits_on_repeat(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """When available, identical (file,line,col) calls reuse the cached entry."""
+def _stub_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(lsp, "_MULTILSPY_AVAILABLE", True, raising=True)
     monkeypatch.setattr(lsp, "_detect_servers", lambda: ["pyright"], raising=True)
+
+
+def test_find_references_cache_hits_on_repeat(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """When available, identical (file,line,col) calls reuse the cached entry."""
+    _stub_available(monkeypatch)
+    monkeypatch.setattr(lsp, "_lsp_call", lambda *a, **k: [], raising=True)  # backend present, no refs
 
     out1 = lsp.find_references(tmp_path, "pkg/a.py", 1, 2)
     out2 = lsp.find_references(tmp_path, "pkg/a.py", 1, 2)
     assert out1["ok"] is True
     # Cached value must be the same object reference.
     assert out1 is out2
+
+
+# ---------------------------------------------------------------------------
+# G5: real backend wiring (per-call multilspy; stubbed via _lsp_call seam)
+# ---------------------------------------------------------------------------
+
+
+def test_map_location_pure(tmp_path: Path) -> None:
+    src = tmp_path / "pkg" / "m.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("a = 1\nb = 2\n", encoding="utf-8")
+    loc = {"relativePath": "pkg/m.py", "range": {"start": {"line": 1, "character": 4}}}
+    out = lsp._map_location(loc, tmp_path)
+    assert out == {"path": "pkg/m.py", "line": 1, "column": 4, "preview": "b = 2"}
+    assert lsp._map_location({}, tmp_path) is None
+
+
+def test_find_references_wired_maps_locations(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _stub_available(monkeypatch)
+    fake = [{"relativePath": "pkg/a.py", "range": {"start": {"line": 3, "character": 0}}}]
+    monkeypatch.setattr(lsp, "_lsp_call", lambda *a, **k: fake, raising=True)
+    out = lsp.find_references(tmp_path, "pkg/a.py", 3, 0)
+    assert out["ok"] is True and out["references"][0]["path"] == "pkg/a.py"
+    assert out["references"][0]["line"] == 3
+
+
+def test_goto_definition_wired_maps_first(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _stub_available(monkeypatch)
+    fake = [{"relativePath": "pkg/a.py", "range": {"start": {"line": 9, "character": 2}}}]
+    monkeypatch.setattr(lsp, "_lsp_call", lambda *a, **k: fake, raising=True)
+    out = lsp.goto_definition(tmp_path, "pkg/a.py", 1, 1)
+    assert out["ok"] is True and out["definition"]["line"] == 9
+
+
+def test_query_failure_returns_ok_false(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _stub_available(monkeypatch)
+    monkeypatch.setattr(lsp, "_lsp_call", lambda *a, **k: None, raising=True)  # backend threw
+    refs = lsp.find_references(tmp_path, "pkg/a.py", 1, 1)
+    assert refs["ok"] is False and refs["reason"] == "lsp_query_failed" and refs["references"] == []
+    gd = lsp.goto_definition(tmp_path, "pkg/a.py", 1, 1)
+    assert gd["ok"] is False and gd["definition"] is None
+
+
+def test_doctor_lsp_probe_never_fails(tmp_path: Path) -> None:
+    from ai_core.doctor import check_lsp_available
+    chk = check_lsp_available(tmp_path)
+    assert chk.ok is True  # INFO-only: optional backend absence must never fail the gate
+
+
+def test_real_lsp_smoke_if_installed(tmp_path: Path) -> None:
+    """Only runs when multilspy AND a python language server are actually installed."""
+    if not lsp._MULTILSPY_AVAILABLE or not shutil.which("pyright-langserver"):
+        pytest.skip("multilspy or pyright-langserver not installed")
+    src = tmp_path / "m.py"
+    src.write_text("def foo():\n    return 1\n\nfoo()\n", encoding="utf-8")
+    out = lsp.goto_definition(tmp_path, "m.py", 3, 0)
+    assert out["ok"] is True  # may or may not resolve, but must not error

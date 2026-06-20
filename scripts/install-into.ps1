@@ -287,11 +287,16 @@ managed = {
     "PostCompact": [{"hooks": [cb("PostCompact", "Recording Code Brain compact completion")]}],
     "PermissionRequest": [{"matcher": "Bash", "hooks": [cb("PermissionRequest", "Checking Code Brain approval policy")]}],
 }
-default_payload = {"_note": "Codex hook schema may differ across versions."}
-payload = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else default_payload
-if not isinstance(payload, dict):
+existing_payload = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
+if not isinstance(existing_payload, dict):
     raise SystemExit("hooks.json is not an object")
-hooks = payload.setdefault("hooks", {})
+existing_hooks = existing_payload.get("hooks", {})
+if not isinstance(existing_hooks, dict):
+    raise SystemExit("hooks.json .hooks must be an object")
+# Codex's hooks parser accepts ONLY a top-level `hooks` key; a `_note` annotation makes it
+# reject the file. Rebuild with hooks only, dropping any stale top-level keys.
+payload = {"hooks": existing_hooks}
+hooks = payload["hooks"]
 def has_cb(v):
     if not isinstance(v, dict):
         return False

@@ -170,6 +170,17 @@ def test_codex_hooks_registers_subagent_start(install_into_target: Path) -> None
     assert "SubagentStart" in hooks.get("hooks", {})
 
 
+def test_codex_hooks_only_top_level_hooks_key(install_into_target: Path) -> None:
+    """Codex's parser rejects any top-level key other than `hooks` (e.g. a `_note`
+    annotation → 'unknown field _note, expected hooks'). The generated file must carry
+    `hooks` and nothing else."""
+    payload = json.loads(
+        (install_into_target / ".codex" / "hooks.json").read_text(encoding="utf-8")
+    )
+    assert list(payload.keys()) == ["hooks"], payload.keys()
+    assert "_note" not in payload
+
+
 def test_antigravity_hooks_uses_native_events(install_into_target: Path) -> None:
     # Antigravity has no SubagentStart/SessionStart. Its command hooks live under a
     # top-level named-hook map whose spec exposes the five native event fields.

@@ -156,6 +156,9 @@ def select_worker(root: Path, request: dict[str, Any]) -> dict[str, Any] | None:
     req_cwd = str(request.get("cwd") or "")
     maker = str(request.get("source_agent") or "")
     is_review = plan["category"] == "review_verify"
+    # G4 per-task fallback: families already tried (and failed transiently) on THIS request are
+    # deranked so the next dispatch advances along the fallback chain to a fresh family.
+    tried_agents = {str(a) for a in (request.get("tried_agents") or []) if a}
 
     candidates: list[dict[str, Any]] = []
     for w in wr.list_workers(root):
@@ -182,7 +185,8 @@ def select_worker(root: Path, request: dict[str, Any]) -> dict[str, Any] | None:
         # so the right family's cheap tier wins and a simple task never burns the best model.
         thrift = -wtier if adequate else -99
         quota_ok = 1 if str((w.get("usage") or {}).get("quota_state")) != "quota_exhausted" else 0
-        return (adequate, fit, independent, quota_ok, thrift,
+        not_tried = 0 if agent in tried_agents else 1   # advance the per-task fallback chain
+        return (adequate, fit, independent, not_tried, quota_ok, thrift,
                 -int((w.get("usage") or {}).get("requests_today", 0) or 0))
 
     candidates.sort(key=score, reverse=True)

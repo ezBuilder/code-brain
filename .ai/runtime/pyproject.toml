@@ -1,6 +1,6 @@
 [project]
 name = "code-brain-runtime"
-version = "0.3.0"
+version = "0.4.0"
 description = "Repo-local AI agent infrastructure runtime"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,6 +16,11 @@ dense = [
   "tokenizers>=0.19",
   "numpy>=1.26",
 ]
+# NOTE: LSP-grade navigation (lsp.py: find_references / goto_definition) uses `multilspy`
+# (Microsoft, MIT) + a language server on PATH (e.g. pyright). It is deliberately NOT declared
+# here: keeping it out of uv.lock preserves the offline, certifi+pytest-only lock the release
+# gate checks. lsp.py imports it lazily and degrades gracefully when absent. Opt in by hand:
+#   pip install multilspy && pip install pyright   (or: npm i -g pyright)
 
 [project.scripts]
 ai = "ai_core.cli:main"

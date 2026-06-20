@@ -50,8 +50,23 @@ def run_checks(root: Path) -> list[Check]:
         check_skills_catalog(root),
         check_precall_rules(root),
         check_antigravity_artifacts(root),
+        check_lsp_available(root),
     ]
     return checks
+
+
+def check_lsp_available(root: Path) -> Check:
+    """INFO-only probe for optional LSP-grade navigation (G5). NEVER fails the gate — the backend
+    is an opt-in extra (multilspy + a language server on PATH); absence is the normal default."""
+    try:
+        from .lsp import lsp_available
+        info = lsp_available(root)
+    except Exception as exc:  # probing must never break doctor
+        return Check("lsp_available", True, f"probe skipped: {exc}")
+    if info.get("ok"):
+        servers = ", ".join(info.get("servers_detected") or []) or "?"
+        return Check("lsp_available", True, f"ready ({servers})")
+    return Check("lsp_available", True, f"optional, inactive: {info.get('reason', 'unknown')}")
 
 
 def check_antigravity_artifacts(root: Path) -> Check:

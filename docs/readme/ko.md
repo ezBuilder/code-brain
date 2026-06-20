@@ -107,9 +107,10 @@ cd /path/to/project
 .ai/bin/ai memory recall --query "auth flow" --json
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
+.ai/bin/ai plan init --id feat --step "do A" --step "do B"
 ```
 
-회상은 결정·실패·교훈·절차를 하나의 순위·인용 답변으로 통합하며, `memory conflicts`는 모순되는 결정을 오프라인에서 탐지합니다.
+회상은 결정·실패·교훈·절차를 하나의 순위·인용 답변으로 통합하며, `memory conflicts`는 모순되는 결정을 오프라인에서 탐지합니다. 내구 plan(`ai plan`)은 멀티스텝 작업을 끝까지 끌고 갑니다 — `AI_LOOP_CONTINUATION`이 켜지면 Stop 훅이 모든 스텝이 체크될 때까지 다시 프롬프트합니다. 언어 서버가 설치돼 있으면 `code_find_references`/`code_goto_definition`이 LSP급 탐색을 더합니다.
 
 기본 MCP 도구:
 

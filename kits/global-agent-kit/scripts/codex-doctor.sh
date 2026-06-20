@@ -287,6 +287,11 @@ def check_hooks_json(data):
     misplaced = sorted(key for key in data if key in HOOK_EVENTS)
     if misplaced:
         fail(f"hooks.json event keys must be nested under top-level 'hooks': {misplaced}")
+    # Codex's parser accepts ONLY a top-level `hooks` key; any extra (e.g. a `_note`
+    # annotation) makes it fail to load the whole file ("unknown field ...").
+    unknown = sorted(key for key in data if key != "hooks" and key not in HOOK_EVENTS)
+    if unknown:
+        fail(f"hooks.json: Codex rejects top-level keys other than 'hooks': {unknown}")
     if hooks is None:
         warn("hooks.json has no top-level 'hooks' object")
         return

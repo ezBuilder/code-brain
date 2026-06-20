@@ -142,6 +142,31 @@ def set_state(root: Path, *, worker_id: str, state: str, request_id: str | None 
     return res
 
 
+def release_for_request(root: Path, *, request_id: str, quota_exhausted: bool = False) -> dict[str, Any]:
+    """Free any worker still holding request_id back to idle (G4 transient re-queue).
+
+    On a transient re-queue the request goes back to inbox (not done/dead), so recovery_tick's
+    settled-check never frees the holder — do it here. Optionally stamp usage.quota_state so
+    select_worker's existing quota_ok signal deranks it next round. Fail-soft.
+    """
+    rid = str(request_id or "")
+    if not rid:
+        return {"ok": False, "reason": "no_request_id"}
+    released: list[str] = []
+    for w in list_workers(root):
+        if str(w.get("current_request_id") or "") != rid:
+            continue
+        wid = str(w.get("worker_id"))
+        fields: dict[str, Any] = {"state": "idle", "current_request_id": None}
+        if quota_exhausted:
+            usage = dict(w.get("usage") or {})
+            usage["quota_state"] = "quota_exhausted"
+            fields["usage"] = usage
+        if update_worker(root, worker_id=wid, **fields).get("ok"):
+            released.append(wid)
+    return {"ok": True, "released": released}
+
+
 def write_heartbeat(root: Path, *, worker_id: str, state: str, request_id: str | None = None,
                     pane_id: str = "", last_output_hash: str = "", last_error: str | None = None) -> dict[str, Any]:
     """Wrapper/process-driven heartbeat (no LLM). Updates both the beat file and folded state."""

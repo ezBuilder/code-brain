@@ -107,9 +107,10 @@ cd /path/to/project
 .ai/bin/ai memory recall --query "auth flow" --json
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
+.ai/bin/ai plan init --id feat --step "do A" --step "do B"
 ```
 
-La recuperación abarca decisiones, fallos, lecciones y procedimientos en una sola respuesta clasificada y citada; `memory conflicts` detecta decisiones contradictorias sin conexión.
+La recuperación abarca decisiones, fallos, lecciones y procedimientos en una sola respuesta clasificada y citada; `memory conflicts` detecta decisiones contradictorias sin conexión. Un plan duradero (`ai plan`) mantiene el trabajo multipaso hasta el final: con `AI_LOOP_CONTINUATION`, el hook Stop vuelve a indicar hasta que cada paso esté marcado. `code_find_references` / `code_goto_definition` añaden navegación de nivel LSP cuando hay un servidor de lenguaje instalado.
 
 Herramientas MCP por defecto:
 

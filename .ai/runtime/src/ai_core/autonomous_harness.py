@@ -84,12 +84,28 @@ def analyze(root: Path) -> dict[str, Any]:
 def context_line(root: Path) -> str:
     payload = analyze(root)
     signals = payload["signals"]
-    return (
+    base = (
         "cb-harness: "
         f"mode={payload['mode']}, target={int(COMPLETION_TARGET * 100)}%, "
         f"src={signals['source_files']}, tests={signals['test_files']}, dirty={signals['dirty_files']}. "
         "For build/harden: scope, own paths, verify, iterate until done/blocker."
     )
+    return base + _plan_progress_suffix(root)
+
+
+def _plan_progress_suffix(root: Path) -> str:
+    """One-line active-plan progress (G2). Read-only, fail-soft → empty when no active plan."""
+    try:
+        from . import plan_state
+        active = plan_state.active_summary(root)
+    except Exception:
+        return ""
+    if not active:
+        return ""
+    nxt = active.get("next_label")
+    tail = f" next: {str(nxt)[:80]}" if nxt else ""
+    return (f" | plan {active['plan_id']}: {active['completed']}/{active['total']} done,"
+            f" {active['remaining']} left.{tail}")
 
 
 def requested(payload: dict[str, Any]) -> bool:
@@ -97,14 +113,43 @@ def requested(payload: dict[str, Any]) -> bool:
     return any(pattern.lower() in text for pattern in REQUEST_PATTERNS)
 
 
-def directive(root: Path, *, explicit: bool = False) -> str:
+def directive(root: Path, *, explicit: bool = False, request: dict[str, Any] | None = None) -> str:
     payload = analyze(root)
     prefix = "Harness requested." if explicit else "Harness ready."
-    return (
+    base = (
         f"{prefix} "
         f"mode={payload['mode']}, target={int(COMPLETION_TARGET * 100)}%. "
         "Scope, own paths, enforce gates, verify, iterate until done/blocker."
     )
+    return base + _evidence_tier_close(evidence_tier(request)) if request is not None else base
+
+
+def evidence_tier(request: dict[str, Any] | None) -> str:
+    """LIGHT vs HEAVY work triage (G12), reusing loopd's existing risk/tier classifiers — no new
+    regex. HEAVY ⇐ high risk OR best-tier (refactor/security/migration/complex). Advisory only:
+    it names a stronger evidence bar in the directive; it does not enforce (that is G1's job)."""
+    if not isinstance(request, dict):
+        return "light"
+    # Normalize a hook payload (free-text prompt) into a request shape loopd's classifiers read.
+    text = _payload_text(request)
+    synth: dict[str, Any] = {"goal": text[:2000], "instruction": text}
+    for k in ("dispatch", "checklist", "role"):
+        if k in request:
+            synth[k] = request[k]
+    try:
+        from .loopd import assess_tier, infer_risk
+        if infer_risk(synth) == "high" or assess_tier(synth) == "best":
+            return "heavy"
+    except Exception:
+        return "light"
+    return "light"
+
+
+def _evidence_tier_close(tier: str) -> str:
+    if tier == "heavy":
+        return (" This is HEAVY work (high-risk or complex): for each claim record reproducible"
+                " evidence (command + observed result) before declaring done; a bare status is not done.")
+    return " This is LIGHT work: a single focused test or check is sufficient evidence."
 
 
 def _payload_text(payload: dict[str, Any]) -> str:

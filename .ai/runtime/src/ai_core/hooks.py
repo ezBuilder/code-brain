@@ -1780,6 +1780,37 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                     existing = {"hookEventName": effective_hook}
                 existing["updatedToolOutput"] = cleaned
                 response["hookSpecificOutput"] = existing
+    # G9: Read-triggered walk-up directory context (opt-in via AI_DIR_CONTEXT). Surfaces nested
+    # AGENTS.md/CLAUDE.md next to the file just read, once per session. Separate branch — does not
+    # widen CONTEXT_INJECTION_HOOKS (those inject unconditionally; this is demand-driven on Read).
+    if effective_hook == "PostToolUse":
+        try:
+            from .dir_context import directory_context_for_read
+            dir_block = directory_context_for_read(root, payload)
+        except Exception:
+            dir_block = ""
+        if dir_block:
+            existing = response.get("hookSpecificOutput")
+            if not isinstance(existing, dict):
+                existing = {"hookEventName": effective_hook}
+            prior_ctx = str(existing.get("additionalContext") or "")
+            merged = f"{prior_ctx}\n\n{dir_block}".strip() if prior_ctx else dir_block
+            existing["additionalContext"] = merged
+            response["hookSpecificOutput"] = existing
+            response["additionalContext"] = merged
+            response["dir_context"] = True
+    # G3: Stop-hook plan continuation (opt-in via AI_LOOP_CONTINUATION, bounded). Only when NOT
+    # already blocking for security — a security block must never be downgraded to a continuation.
+    if effective_hook == "Stop" and response.get("decision") != "block":
+        try:
+            from .loop_continuation import continuation_directive
+            cont = continuation_directive(payload, root)
+            if cont:
+                response["decision"] = "block"
+                response["reason"] = cont
+                response["continuation"] = True
+        except Exception:
+            pass
     return redact_value(response)
 
 
@@ -2173,7 +2204,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         try:
             from .autonomous_harness import directive as _harness_directive, requested as _harness_requested
             if _harness_requested(payload):
-                sections.append(_harness_directive(root, explicit=True))
+                sections.append(_harness_directive(root, explicit=True, request=payload))
         except Exception:
             pass
         scope_line = _session_scope_summary(root)

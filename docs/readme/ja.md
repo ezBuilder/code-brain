@@ -107,9 +107,10 @@ cd /path/to/project
 .ai/bin/ai memory recall --query "auth flow" --json
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
+.ai/bin/ai plan init --id feat --step "do A" --step "do B"
 ```
 
-リコールは決定・失敗・教訓・手順を 1 つのランク付き・引用付き回答に統合し、`memory conflicts` は矛盾する決定をオフラインで検出します。
+リコールは決定・失敗・教訓・手順を 1 つのランク付き・引用付き回答に統合し、`memory conflicts` は矛盾する決定をオフラインで検出します。永続的なプラン(`ai plan`)はマルチステップ作業を最後までやり切らせます — `AI_LOOP_CONTINUATION` が有効なら Stop フックが全ステップにチェックが付くまで再プロンプトします。言語サーバーが入っていれば `code_find_references`/`code_goto_definition` が LSP 級のナビゲーションを追加します。
 
 デフォルトの MCP ツール:
 

@@ -107,9 +107,10 @@ cd /path/to/project
 .ai/bin/ai memory recall --query "auth flow" --json
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
+.ai/bin/ai plan init --id feat --step "do A" --step "do B"
 ```
 
-Recall fasst Entscheidungen, Fehler, Lektionen und Prozeduren in einer einzigen gerankten, zitierten Antwort zusammen; `memory conflicts` meldet widersprüchliche Entscheidungen offline.
+Recall fasst Entscheidungen, Fehler, Lektionen und Prozeduren in einer einzigen gerankten, zitierten Antwort zusammen; `memory conflicts` meldet widersprüchliche Entscheidungen offline. Ein dauerhafter Plan (`ai plan`) hält mehrstufige Arbeit bis zum Ende durch — mit `AI_LOOP_CONTINUATION` fordert der Stop-Hook erneut auf, bis jeder Schritt abgehakt ist. `code_find_references` / `code_goto_definition` ergänzen LSP-Navigation, wenn ein Language-Server installiert ist.
 
 Standard-MCP-Tools:
 

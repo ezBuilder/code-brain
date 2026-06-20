@@ -100,6 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
     loop_submit.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P1")
     loop_submit.add_argument("--interval-seconds", type=int, default=300)
     loop_submit.add_argument("--no-review", action="store_true")
+    loop_submit.add_argument("--require-acceptance", action="store_true", dest="require_acceptance",
+                             help="gate complete on a passing deterministic acceptance re-run (G1)")
     loop_submit.add_argument("--json", action="store_true", dest="command_json")
     loop_claim = loop_sub.add_parser("claim")
     loop_claim.add_argument("--orchestrator-id", required=True)
@@ -128,7 +130,16 @@ def build_parser() -> argparse.ArgumentParser:
     loop_verdict.add_argument("--summary", required=True)
     loop_verdict.add_argument("--rubric-result")
     loop_verdict.add_argument("--rubric-result-file")
+    loop_verdict.add_argument("--evidence-json", dest="evidence_json",
+                              help="JSON array of {command,observed,artifact_path} typed evidence (G1)")
     loop_verdict.add_argument("--json", action="store_true", dest="command_json")
+    loop_acceptance = loop_sub.add_parser("acceptance", help="deterministically re-run acceptance commands (G1)")
+    loop_acceptance.add_argument("--request-id", required=True)
+    loop_acceptance.add_argument("--lease-id", required=True)
+    loop_acceptance.add_argument("--command", action="append", default=[], dest="acceptance_commands",
+                                 help="acceptance command; repeatable (must exit 0)")
+    loop_acceptance.add_argument("--timeout", type=int, default=60)
+    loop_acceptance.add_argument("--json", action="store_true", dest="command_json")
     loop_distill = loop_sub.add_parser("distill")
     loop_distill.add_argument("--request-id", required=True)
     loop_distill.add_argument("--text")
@@ -140,6 +151,25 @@ def build_parser() -> argparse.ArgumentParser:
     loop_recover.add_argument("--json", action="store_true", dest="command_json")
     loop_status = loop_sub.add_parser("status")
     loop_status.add_argument("--json", action="store_true", dest="command_json")
+    plan = sub.add_parser("plan", help="durable per-plan step progress (checkbox = state)")
+    plan_sub = plan.add_subparsers(dest="plan_command", required=True)
+    plan_init = plan_sub.add_parser("init")
+    plan_init.add_argument("--id", required=True, dest="plan_id")
+    plan_init.add_argument("--title", default="")
+    plan_init.add_argument("--step", action="append", default=[], dest="plan_steps", help="step label; repeatable")
+    plan_init.add_argument("--force", action="store_true")
+    plan_init.add_argument("--json", action="store_true", dest="command_json")
+    plan_show = plan_sub.add_parser("show")
+    plan_show.add_argument("--id", required=True, dest="plan_id")
+    plan_show.add_argument("--json", action="store_true", dest="command_json")
+    plan_check = plan_sub.add_parser("check")
+    plan_check.add_argument("--id", required=True, dest="plan_id")
+    plan_check.add_argument("--match", help="label substring")
+    plan_check.add_argument("--index", type=int)
+    plan_check.add_argument("--undo", action="store_true", help="mark not done")
+    plan_check.add_argument("--json", action="store_true", dest="command_json")
+    plan_list = plan_sub.add_parser("list")
+    plan_list.add_argument("--json", action="store_true", dest="command_json")
     trust = sub.add_parser("trust")
     trust_sub = trust.add_subparsers(dest="trust_command", required=True)
     trust_init = trust_sub.add_parser("init")
@@ -880,6 +910,7 @@ def main(argv: list[str] | None = None) -> int:
                     reviewer_required=not args.no_review,
                     rubric=rubric,
                     checklist=args.checklist,
+                    acceptance_required=bool(getattr(args, "require_acceptance", False)),
                 )
                 emit(payload, as_json=as_json)
                 return OK
@@ -923,6 +954,15 @@ def main(argv: list[str] | None = None) -> int:
                     if args.rubric_result is not None or args.rubric_result_file
                     else ""
                 )
+                evidence = None
+                if getattr(args, "evidence_json", None):
+                    try:
+                        parsed = json.loads(args.evidence_json)
+                        if isinstance(parsed, list):
+                            evidence = [e for e in parsed if isinstance(e, dict)]
+                    except (ValueError, TypeError):
+                        emit({"ok": False, "reason": "invalid_evidence_json"}, as_json=as_json)
+                        return GENERIC_ERROR
                 payload = loop_eng.record_verdict(
                     root,
                     request_id=args.request_id,
@@ -931,9 +971,21 @@ def main(argv: list[str] | None = None) -> int:
                     verdict=args.verdict,
                     summary=args.summary,
                     rubric_result=rubric_result,
+                    evidence=evidence,
                 )
                 emit(payload, as_json=as_json)
                 return OK
+            if args.loop_command == "acceptance":
+                reject_ci_write("loop")
+                payload = loop_eng.record_acceptance(
+                    root,
+                    request_id=args.request_id,
+                    lease_id=args.lease_id,
+                    commands=args.acceptance_commands,
+                    timeout=args.timeout,
+                )
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
             if args.loop_command == "distill":
                 reject_ci_write("loop")
                 text = _read_loop_text(root, text=args.text, file_path=args.file)
@@ -947,6 +999,28 @@ def main(argv: list[str] | None = None) -> int:
                 return OK
             if args.loop_command == "status":
                 payload = loop_eng.status(root)
+                emit(payload, as_json=as_json)
+                return OK
+        if args.command == "plan":
+            from . import plan_state as _ps
+            if args.plan_command == "init":
+                reject_ci_write("plan")
+                payload = _ps.init_plan(root, plan_id=args.plan_id, steps=args.plan_steps,
+                                        title=args.title, force=bool(args.force))
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.plan_command == "show":
+                payload = _ps.read_plan(root, args.plan_id)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.plan_command == "check":
+                reject_ci_write("plan")
+                payload = _ps.mark_step(root, plan_id=args.plan_id, match=args.match,
+                                        index=args.index, done=not args.undo)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else GENERIC_ERROR
+            if args.plan_command == "list":
+                payload = _ps.list_plans(root)
                 emit(payload, as_json=as_json)
                 return OK
         if args.command == "prompt-growth" and args.prompt_growth_command == "status":

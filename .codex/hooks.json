@@ -1,5 +1,4 @@
 {
-  "_note": "Code Brain Codex hooks. Keep this in the current Codex matcher-group schema: event -> matcher -> hooks[].",
   "hooks": {
     "PermissionRequest": [
       {

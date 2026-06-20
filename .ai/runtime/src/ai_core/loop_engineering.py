@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .error_classifier import is_transient_fault
 from .memory import append_audit, append_decision
 from .session_resume import write_handoff
 from .worker.lock import queue_lock
@@ -69,6 +70,7 @@ def submit(
     rubric: str = "",
     checklist: list[str] | None = None,
     dispatch: dict[str, Any] | None = None,
+    acceptance_required: bool = False,
 ) -> dict[str, Any]:
     if priority not in {"P0", "P1", "P2", "P3"}:
         raise ValueError(f"invalid priority: {priority}")
@@ -102,6 +104,7 @@ def submit(
         "checklist": checklist_items,
         "loop_interval_seconds": interval_seconds,
         "reviewer_required": bool(reviewer_required),
+        "acceptance_required": bool(acceptance_required),
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "attempts": 0,
@@ -221,6 +224,7 @@ def record_verdict(
     verdict: str,
     summary: str,
     rubric_result: str = "",
+    evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     _validate_request_id(request_id)
     if verdict not in VALID_VERDICTS:
@@ -242,12 +246,72 @@ def record_verdict(
             "verdict": verdict,
             "summary": summary[:4000],
             "rubric_result": rubric_result.strip()[:MAX_RUBRIC_BYTES],
+            "evidence": _clean_evidence(evidence),
             "recorded_at": now_iso(),
         }
         request["updated_at"] = now_iso()
         _write_json(source, request)
     append_audit(root, action="loop.verdict", category="loop", payload={"request_id": request_id, "verdict": verdict})
     return {"ok": True, "request": _public_request(request, source, root)}
+
+
+def _clean_evidence(evidence: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Bound + redact opt-in typed evidence on a verdict ({command, observed, artifact_path}).
+
+    Evidence alone is just a self-report (G1 caveat): the binding completion gate is the
+    deterministic acceptance re-run (record_acceptance), not this list. We still store it as a
+    human/audit trail and as the 'non-empty evidence' signal the acceptance gate checks.
+    """
+    from .redact import redact_value
+    out: list[dict[str, Any]] = []
+    for item in (evidence or [])[:20]:
+        if not isinstance(item, dict):
+            continue
+        row = {
+            "command": str(redact_value(str(item.get("command", ""))))[:200],
+            "observed": str(redact_value(str(item.get("observed", ""))))[:500],
+            "artifact_path": str(redact_value(str(item.get("artifact_path", ""))))[:300],
+        }
+        if row["command"] or row["observed"] or row["artifact_path"]:
+            out.append(row)
+    return out
+
+
+def record_acceptance(
+    root: Path,
+    *,
+    request_id: str,
+    lease_id: str,
+    commands: list[str],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Deterministically re-run acceptance commands and stamp the result on the request (G1).
+
+    This is the machine-verification a reviewer 'pass' must be corroborated by when the request
+    is acceptance_required. Lease-guarded, processing-only; never raises into the loop.
+    """
+    _validate_request_id(request_id)
+    from .acceptance import run_acceptance
+    result = run_acceptance(root, commands=commands, timeout=timeout, cwd=str(root))
+    with queue_lock(root):
+        ensure_loop_dirs(root)
+        source = loop_root(root) / "processing" / f"{request_id}.json"
+        if not source.exists():
+            raise ValueError(f"loop request is not processing: {request_id}")
+        request = _read_json(source)
+        if request.get("lease_id") != lease_id:
+            raise ValueError("lease_id mismatch")
+        request["acceptance_result"] = {
+            "all_passed": bool(result.get("all_passed")),
+            "count": int(result.get("count", 0) or 0),
+            "results": result.get("results", [])[:20],
+            "recorded_at": now_iso(),
+        }
+        request["updated_at"] = now_iso()
+        _write_json(source, request)
+    append_audit(root, action="loop.acceptance", category="loop",
+                 payload={"request_id": request_id, "all_passed": bool(result.get("all_passed"))})
+    return {"ok": True, "request": _public_request(request, source, root), "acceptance": result}
 
 
 def distill(
@@ -353,6 +417,7 @@ def _finish(root: Path, *, request_id: str, lease_id: str, status: str, summary:
     if status not in {"done", "dead"}:
         raise ValueError("invalid status")
     _validate_request_id(request_id)
+    requeued = False
     with queue_lock(root):
         ensure_loop_dirs(root)
         source = loop_root(root) / "processing" / f"{request_id}.json"
@@ -361,21 +426,65 @@ def _finish(root: Path, *, request_id: str, lease_id: str, status: str, summary:
         request = _read_json(source)
         if request.get("lease_id") != lease_id:
             raise ValueError("lease_id mismatch")
-        if status == "done" and bool(request.get("reviewer_required", True)) and not _verdict_passed(request):
-            guard = _phase_guard(request, completion_attempt=True)
-            raise LoopPhaseError("reviewer verdict pass required before complete", guard)
-        request.update(
-            {
-                "status": status,
-                "summary": summary.strip()[:4000],
-                "result": result.strip()[:MAX_INSTRUCTION_BYTES],
-                "finished_at": now_iso(),
+        # Per-task model/agent fallback (G4): a transient fault (rate-limit/quota/overload) is not
+        # the task's fault — re-queue this exact request so a DIFFERENT family/tier can pick it up,
+        # bounded by MAX_ATTEMPTS (attempts is incremented per claim). Fatal faults and an exhausted
+        # budget still dead-letter. record_outcome is skipped on re-queue (the task is not settled).
+        attempts = int(request.get("attempts", 0) or 0)
+        if status == "dead" and is_transient_fault(summary) and attempts < MAX_ATTEMPTS:
+            tried_agent = str(request.get("routed_agent") or request.get("claimed_by_agent") or "").strip()
+            tried_tier = str(request.get("routed_tier") or "").strip()
+            tried_agents = [a for a in (request.get("tried_agents") or []) if a]
+            tried_tiers = [t for t in (request.get("tried_tiers") or []) if t]
+            if tried_agent and tried_agent not in tried_agents:
+                tried_agents.append(tried_agent)
+            if tried_tier and tried_tier not in tried_tiers:
+                tried_tiers.append(tried_tier)
+            for key in ("lease_id", "orchestrator_id", "claimed_by_agent", "claimed_at",
+                        "lease_expires_at", "routed_tier", "routed_agent"):
+                request.pop(key, None)
+            request.update({
+                "status": "pending",
+                "tried_agents": tried_agents[:8],
+                "tried_tiers": tried_tiers[:4],
+                "last_transient_reason": summary.strip()[:240],
+                "requeued_at": now_iso(),
                 "updated_at": now_iso(),
-            }
-        )
-        target = loop_root(root) / status / source.name
-        _write_json(target, request)
-        source.unlink()
+            })
+            target = loop_root(root) / "inbox" / source.name
+            _write_json(target, request)
+            source.unlink()
+            requeued = True
+        else:
+            if status == "done" and bool(request.get("reviewer_required", True)) and not _verdict_passed(request):
+                guard = _phase_guard(request, completion_attempt=True)
+                raise LoopPhaseError("reviewer verdict pass required before complete", guard)
+            if status == "done" and bool(request.get("acceptance_required", False)) and not _acceptance_passed(request):
+                guard = _phase_guard(request, completion_attempt=True)
+                raise LoopPhaseError("acceptance re-run must pass before complete", guard)
+            request.update(
+                {
+                    "status": status,
+                    "summary": summary.strip()[:4000],
+                    "result": result.strip()[:MAX_INSTRUCTION_BYTES],
+                    "finished_at": now_iso(),
+                    "updated_at": now_iso(),
+                }
+            )
+            target = loop_root(root) / status / source.name
+            _write_json(target, request)
+            source.unlink()
+    if requeued:
+        append_audit(root, action="loop.requeue", category="loop",
+                     payload={"request_id": request_id, "reason": "transient_fault", "attempts": attempts})
+        # Free the worker that hit the limit back to idle and soft-derank it (quota_state) so the
+        # next dispatch prefers a different family. Fail-soft: bookkeeping never breaks the re-queue.
+        try:
+            from . import worker_registry as _wr
+            _wr.release_for_request(root, request_id=request_id, quota_exhausted=True)
+        except Exception:
+            pass
+        return {"ok": True, "requeued": True, "request": _public_request(request, target, root)}
     append_audit(root, action=f"loop.{status}", category="loop", payload={"request_id": request_id})
     # feed the adaptive minimum-tier floor (axis 2). Fail-soft: routing bookkeeping must never break
     # the loop finish, and it only ever writes a bounded per-category tier int (never a gate).
@@ -476,10 +585,21 @@ def _verdict_passed(request: dict[str, Any]) -> bool:
     return isinstance(verdict, dict) and verdict.get("verdict") == "pass"
 
 
+def _acceptance_passed(request: dict[str, Any]) -> bool:
+    ar = request.get("acceptance_result")
+    return isinstance(ar, dict) and bool(ar.get("all_passed"))
+
+
+def _verdict_has_evidence(request: dict[str, Any]) -> bool:
+    verdict = request.get("reviewer_verdict")
+    return isinstance(verdict, dict) and bool(verdict.get("evidence"))
+
+
 def _phase_guard(request: dict[str, Any], *, completion_attempt: bool = False) -> dict[str, Any]:
     expected_phase = _expected_phase(request)
     issues = _phase_issues(request)
-    out_of_plan_codes = {"missing_rubric", "missing_checklist", "reviewer_verdict_failed", "reviewer_verdict_blocked"}
+    out_of_plan_codes = {"missing_rubric", "missing_checklist", "reviewer_verdict_failed",
+                         "reviewer_verdict_blocked", "acceptance_not_passed"}
     if completion_attempt:
         out_of_plan_codes.add("missing_reviewer_verdict")
     out_of_plan = any(issue.get("code") in out_of_plan_codes for issue in issues)
@@ -516,6 +636,17 @@ def _expected_phase(request: dict[str, Any]) -> str:
 
 def _phase_issues(request: dict[str, Any]) -> list[dict[str, str]]:
     issues: list[dict[str, str]] = []
+    # Acceptance gate is independent of reviewer_required, so surface it before the early return.
+    if (bool(request.get("acceptance_required", False))
+            and str(request.get("status") or "") == "processing"
+            and not _acceptance_passed(request)):
+        issues.append(
+            _phase_issue(
+                "acceptance_not_passed",
+                "acceptance re-run has not passed",
+                "run `ai loop acceptance` with the rubric commands until they exit 0, then complete",
+            )
+        )
     if not bool(request.get("reviewer_required", True)):
         return issues
     if not str(request.get("rubric") or "").strip():

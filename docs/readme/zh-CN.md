@@ -107,9 +107,10 @@ cd /path/to/project
 .ai/bin/ai memory recall --query "auth flow" --json
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
+.ai/bin/ai plan init --id feat --step "do A" --step "do B"
 ```
 
-召回将决策、失败、教训和流程整合为一个带排序与引用的答案；`memory conflicts` 离线标记相互矛盾的决策。
+召回将决策、失败、教训和流程整合为一个带排序与引用的答案；`memory conflicts` 离线标记相互矛盾的决策。持久化计划(`ai plan`)让多步骤工作坚持到底 —— 启用 `AI_LOOP_CONTINUATION` 后，Stop 钩子会持续重新提示直到每个步骤都被勾选。安装语言服务器后，`code_find_references`/`code_goto_definition` 提供 LSP 级导航。
 
 默认 MCP 工具：
 

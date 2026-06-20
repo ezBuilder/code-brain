@@ -758,16 +758,21 @@ managed_codex_hooks = {
 }
 if dst.exists():
     try:
-        payload = json.loads(dst.read_text(encoding="utf-8"))
+        existing_payload = json.loads(dst.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         raise SystemExit(f"install-into failed: existing {dst} is not valid JSON")
-    if not isinstance(payload, dict):
+    if not isinstance(existing_payload, dict):
         raise SystemExit(f"install-into failed: existing {dst} is not a JSON object")
 else:
-    payload = {"_note": "Codex hook schema may differ across versions. Verify with your codex CLI release. PreToolUse currently supports deny rules only — input rewriting awaits upstream updatedInput support."}
-hooks = payload.setdefault("hooks", {})
-if not isinstance(hooks, dict):
+    existing_payload = {}
+existing_hooks = existing_payload.get("hooks", {})
+if not isinstance(existing_hooks, dict):
     raise SystemExit(f"install-into failed: existing {dst}.hooks must be a JSON object")
+# Codex's hooks parser accepts ONLY a top-level `hooks` key — any extra key (e.g. an
+# annotation `_note`) makes it reject the whole file ("unknown field `_note`, expected
+# `hooks`"). Rebuild with hooks only, dropping any stale top-level keys older installs wrote.
+payload = {"hooks": existing_hooks}
+hooks = payload["hooks"]
 
 def _has_code_brain_command(hook_value):
     if isinstance(hook_value, dict):

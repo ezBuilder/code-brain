@@ -107,9 +107,10 @@ cd /path/to/project
 .ai/bin/ai memory recall --query "auth flow" --json
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
+.ai/bin/ai plan init --id feat --step "do A" --step "do B"
 ```
 
-Le rappel couvre décisions, échecs, leçons et procédures en une seule réponse classée et citée ; `memory conflicts` signale les décisions contradictoires hors ligne.
+Le rappel couvre décisions, échecs, leçons et procédures en une seule réponse classée et citée ; `memory conflicts` signale les décisions contradictoires hors ligne. Un plan durable (`ai plan`) tient le travail multi-étapes jusqu'au bout — avec `AI_LOOP_CONTINUATION`, le hook Stop relance jusqu'à ce que chaque étape soit cochée. `code_find_references` / `code_goto_definition` ajoutent une navigation de niveau LSP quand un serveur de langage est installé.
 
 Outils MCP par défaut :
 

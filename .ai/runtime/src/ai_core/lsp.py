@@ -110,6 +110,65 @@ def _normalise_root(root: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Real backend (multilspy, per-call, Python only). Wired behind lsp_available so
+# the unavailable contract is unchanged. No daemon, no hooks — explicit calls only.
+# OmO ships a TS unix-socket LSP daemon; that design is reimplemented here per-call,
+# not ported. A warm daemon is intentionally out of scope (cold-start would flake the
+# hot-path SLO if ever wired into a hook).
+# ---------------------------------------------------------------------------
+
+
+def _line_preview(root: Path, rel_or_abs_path: str, line: int) -> str:
+    """Best-effort source line at `line` (0-indexed) for a result location. Never raises."""
+    try:
+        p = Path(rel_or_abs_path)
+        if not p.is_absolute():
+            p = Path(root) / p
+        text = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        if 0 <= line < len(text):
+            return text[line].strip()[:200]
+    except OSError:
+        pass
+    return ""
+
+
+def _map_location(loc: dict[str, Any], root: Path) -> dict[str, Any] | None:
+    """Map a multilspy Location dict → {path, line, column, preview}. Pure; None if unusable."""
+    if not isinstance(loc, dict):
+        return None
+    path = loc.get("relativePath") or loc.get("absolutePath") or ""
+    if not path and isinstance(loc.get("uri"), str):
+        path = loc["uri"].removeprefix("file://")
+    rng = loc.get("range") if isinstance(loc.get("range"), dict) else {}
+    start = rng.get("start") if isinstance(rng.get("start"), dict) else {}
+    line = int(start.get("line", 0) or 0)
+    column = int(start.get("character", 0) or 0)
+    if not path:
+        return None
+    return {"path": str(path), "line": line, "column": column,
+            "preview": _line_preview(root, str(path), line)}
+
+
+def _lsp_call(root: Path, file_path: str, line: int, column: int, *, kind: str) -> list[dict[str, Any]] | None:
+    """Per-call multilspy query (Python/pyright). Returns raw locations, or None on any failure."""
+    try:
+        from multilspy import SyncLanguageServer
+        from multilspy.multilspy_config import MultilspyConfig
+        from multilspy.multilspy_logger import MultilspyLogger
+
+        config = MultilspyConfig.from_dict({"code_language": "python"})
+        server = SyncLanguageServer.create(config, MultilspyLogger(), str(_normalise_root(root)))
+        with server.start_server():
+            if kind == "references":
+                raw = server.request_references(file_path, line, column)
+            else:
+                raw = server.request_definition(file_path, line, column)
+        return list(raw) if raw else []
+    except Exception:  # noqa: BLE001 — any backend failure degrades to fallback, never raises
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -183,14 +242,11 @@ def find_references(
     if cached is not None:
         return cached
 
-    # PoC: wiring to multilspy.SyncLanguageServer is intentionally deferred.
-    # We return a shape-stable, empty success so the upstream tools can
-    # already integrate without depending on the real backend.
-    result: dict[str, Any] = {
-        "ok": True,
-        "references": [],
-        "reason": "lsp_backend_not_wired",
-    }
+    raw = _lsp_call(root, file_path, int(line), int(column), kind="references")
+    if raw is None:
+        return {"ok": False, "reason": "lsp_query_failed", "references": []}
+    refs = [m for loc in raw if (m := _map_location(loc, root)) is not None]
+    result: dict[str, Any] = {"ok": True, "references": refs}
     _cache_put(cache_key, result)
     return result
 
@@ -217,12 +273,15 @@ def goto_definition(
             "reason": avail["reason"],
             "definition": None,
         }
-    # PoC: backend not wired yet.
-    return {
-        "ok": True,
-        "definition": None,
-        "reason": "lsp_backend_not_wired",
-    }
+    raw = _lsp_call(root, file_path, int(line), int(column), kind="definition")
+    if raw is None:
+        return {"ok": False, "reason": "lsp_query_failed", "definition": None}
+    definition: dict[str, Any] | None = None
+    for loc in raw:
+        definition = _map_location(loc, root)
+        if definition is not None:
+            break
+    return {"ok": True, "definition": definition}
 
 
 def workspace_symbols(

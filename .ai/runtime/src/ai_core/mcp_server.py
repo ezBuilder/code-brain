@@ -100,6 +100,32 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "code_find_references",
+        "description": "심볼 정의 위치(파일+0-indexed line/column)에 대한 정확한 LSP 참조를 찾는다. multilspy+언어서버(현재 Python/pyright)가 설치돼 있을 때만 동작하고, 없으면 ok=false+reason으로 graceful. 읽기전용·per-call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "line": {"type": "integer", "description": "0-indexed"},
+                "column": {"type": "integer", "description": "0-indexed"},
+            },
+            "required": ["file_path", "line", "column"],
+        },
+    },
+    {
+        "name": "code_goto_definition",
+        "description": "심볼 사용 위치(파일+0-indexed line/column)에서 정의로 점프. LSP 기반(multilspy, Python/pyright); 미설치 시 ok=false+reason. 읽기전용·per-call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "line": {"type": "integer", "description": "0-indexed"},
+                "column": {"type": "integer", "description": "0-indexed"},
+            },
+            "required": ["file_path", "line", "column"],
+        },
+    },
+    {
         "name": "code_read_hashline",
         "description": "기존 파일을 편집하기 전 대상 줄 범위를 읽어 stale-edit를 막는 기본 읽기 도구. 줄+해시 앵커 반환; 자격증명류 경로는 거부한다.",
         "inputSchema": {
@@ -828,6 +854,14 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "code_graph_symbol":
         from .codegraph import find_symbol
         return find_symbol(root, str(args.get("name", "")), limit=int(args.get("limit", 20) or 20))
+    if name == "code_find_references":
+        from .lsp import find_references
+        return find_references(root, str(args.get("file_path", "")),
+                               int(args.get("line", 0) or 0), int(args.get("column", 0) or 0))
+    if name == "code_goto_definition":
+        from .lsp import goto_definition
+        return goto_definition(root, str(args.get("file_path", "")),
+                               int(args.get("line", 0) or 0), int(args.get("column", 0) or 0))
     if name == "code_graph_trace":
         from .codegraph import trace_call_path
         return trace_call_path(root, src=str(args.get("src", "")), dst=str(args.get("dst", "")),

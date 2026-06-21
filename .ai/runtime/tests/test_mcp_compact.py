@@ -8,10 +8,14 @@ from ai_core import mcp_server as m
 
 def test_default_is_full(monkeypatch) -> None:
     monkeypatch.delenv("AI_MCP_COMPACT_TOOLS", raising=False)
+    monkeypatch.delenv("AI_CODE_BRAIN_PROFILE", raising=False)
     m._invalidate_tools_list_cache()
-    tools = m._build_tools_list_payload()["tools"]
-    # full catalog by default — every non-removed tool, and far more than the compact core.
-    assert len(tools) == len(m.TOOLS) > len(m._CORE_TOOLS)
+    names = {t["name"] for t in m._build_tools_list_payload()["tools"]}
+    # full catalog by default — every tool EXCEPT the hidden worker-pool surface, and far more
+    # than the compact core. (full-all re-surfaces the hidden ones; see test_mcp_server.)
+    assert len(names) == len(m.TOOLS) - len(m._HIDDEN_TOOLS) > len(m._CORE_TOOLS)
+    assert not (names & m._HIDDEN_TOOLS)
+    m._invalidate_tools_list_cache()
 
 
 def test_compact_returns_core_plus_search(monkeypatch) -> None:

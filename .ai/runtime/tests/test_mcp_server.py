@@ -92,3 +92,34 @@ def test_invalidate_tools_list_cache_forces_rebuild(tmp_path: Path, monkeypatch)
     mcp_server._invalidate_tools_list_cache()
     mcp_server.handle_request(tmp_path, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
     assert call_count["n"] == 2
+
+
+def test_worker_pool_tools_hidden_from_default_but_callable(tmp_path: Path, monkeypatch) -> None:
+    """C: worker-pool MCP tools are hidden from the default tools/list, yet still discoverable
+    via tool_search and dispatchable directly (functionality intact)."""
+    monkeypatch.delenv("AI_CODE_BRAIN_PROFILE", raising=False)
+    monkeypatch.delenv("AI_MCP_COMPACT_TOOLS", raising=False)
+    mcp_server._invalidate_tools_list_cache()
+    resp = mcp_server.handle_request(tmp_path, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    names = {t["name"] for t in resp["result"]["tools"]}
+    assert "loopd_status" not in names and "loop_submit" not in names  # hidden
+    assert "code_query" in names                                        # normal tools still shown
+    # still dispatchable directly
+    call = mcp_server.handle_request(tmp_path, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "loopd_status", "arguments": {}}})
+    assert "result" in call and call["result"].get("structuredContent", {}).get("ok") is not None
+    # still findable via tool_search
+    ts = mcp_server.handle_request(tmp_path, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "tool_search", "arguments": {"query": "loopd worker pool"}}})
+    found = {t["name"] for t in ts["result"]["structuredContent"]["tools"]}
+    assert "loopd_status" in found
+    mcp_server._invalidate_tools_list_cache()
+
+
+def test_full_all_profile_resurfaces_hidden(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_CODE_BRAIN_PROFILE", "full-all")
+    mcp_server._invalidate_tools_list_cache()
+    resp = mcp_server.handle_request(tmp_path, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    names = {t["name"] for t in resp["result"]["tools"]}
+    assert "loopd_status" in names
+    mcp_server._invalidate_tools_list_cache()

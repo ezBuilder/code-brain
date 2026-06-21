@@ -108,9 +108,10 @@ cd /path/to/project
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
 .ai/bin/ai plan init --id feat --step "do A" --step "do B"
+.ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
 ```
 
-Recall spans decisions, failures, lessons, and procedures in one ranked, cited answer; `memory conflicts` flags contradicting decisions offline. A durable plan (`ai plan`) keeps multi-step work honest — with `AI_LOOP_CONTINUATION` the Stop hook re-prompts until every step is checked. `code_find_references` / `code_goto_definition` add LSP-grade navigation when a language server is installed.
+Recall spans decisions, failures, lessons, and procedures in one ranked, cited answer; `memory conflicts` flags contradicting decisions offline. A durable plan (`ai plan`) keeps multi-step work honest — with `AI_LOOP_CONTINUATION` the Stop hook re-prompts until every step is checked. `code_find_references` / `code_goto_definition` add LSP-grade navigation when a language server is installed. Opt-in extras: decisions can carry `contradicts`/`derives_from`/`expires_at` relations (expired ones drop from recall); `AI_MCP_RESOURCES` exposes plans/reports/handoff as read-only `codebrain://` MCP resources; `AI_AST_CHUNK` switches Python indexing to AST-aware (cAST) chunking.
 
 Default MCP tools:
 

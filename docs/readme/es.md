@@ -108,9 +108,10 @@ cd /path/to/project
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
 .ai/bin/ai plan init --id feat --step "do A" --step "do B"
+.ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
 ```
 
-La recuperación abarca decisiones, fallos, lecciones y procedimientos en una sola respuesta clasificada y citada; `memory conflicts` detecta decisiones contradictorias sin conexión. Un plan duradero (`ai plan`) mantiene el trabajo multipaso hasta el final: con `AI_LOOP_CONTINUATION`, el hook Stop vuelve a indicar hasta que cada paso esté marcado. `code_find_references` / `code_goto_definition` añaden navegación de nivel LSP cuando hay un servidor de lenguaje instalado.
+La recuperación abarca decisiones, fallos, lecciones y procedimientos en una sola respuesta clasificada y citada; `memory conflicts` detecta decisiones contradictorias sin conexión. Un plan duradero (`ai plan`) mantiene el trabajo multipaso hasta el final: con `AI_LOOP_CONTINUATION`, el hook Stop vuelve a indicar hasta que cada paso esté marcado. `code_find_references` / `code_goto_definition` añaden navegación de nivel LSP cuando hay un servidor de lenguaje instalado. Extras opcionales: las decisiones pueden llevar relaciones `contradicts`/`derives_from`/`expires_at` (las caducadas se excluyen del recall); `AI_MCP_RESOURCES` expone plans/reports/handoff como recursos MCP de solo lectura `codebrain://`; `AI_AST_CHUNK` cambia la indexación de Python a fragmentación consciente del AST (cAST).
 
 Herramientas MCP por defecto:
 

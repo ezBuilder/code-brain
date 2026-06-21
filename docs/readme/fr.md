@@ -108,9 +108,10 @@ cd /path/to/project
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
 .ai/bin/ai plan init --id feat --step "do A" --step "do B"
+.ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
 ```
 
-Le rappel couvre décisions, échecs, leçons et procédures en une seule réponse classée et citée ; `memory conflicts` signale les décisions contradictoires hors ligne. Un plan durable (`ai plan`) tient le travail multi-étapes jusqu'au bout — avec `AI_LOOP_CONTINUATION`, le hook Stop relance jusqu'à ce que chaque étape soit cochée. `code_find_references` / `code_goto_definition` ajoutent une navigation de niveau LSP quand un serveur de langage est installé.
+Le rappel couvre décisions, échecs, leçons et procédures en une seule réponse classée et citée ; `memory conflicts` signale les décisions contradictoires hors ligne. Un plan durable (`ai plan`) tient le travail multi-étapes jusqu'au bout — avec `AI_LOOP_CONTINUATION`, le hook Stop relance jusqu'à ce que chaque étape soit cochée. `code_find_references` / `code_goto_definition` ajoutent une navigation de niveau LSP quand un serveur de langage est installé. Extras optionnels : les décisions peuvent porter des relations `contradicts`/`derives_from`/`expires_at` (les expirées sont exclues du rappel) ; `AI_MCP_RESOURCES` expose plans/rapports/handoff comme ressources MCP `codebrain://` en lecture seule ; `AI_AST_CHUNK` bascule l'indexation Python vers un découpage conscient de l'AST (cAST).
 
 Outils MCP par défaut :
 

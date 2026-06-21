@@ -108,9 +108,10 @@ cd /path/to/project
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
 .ai/bin/ai plan init --id feat --step "do A" --step "do B"
+.ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
 ```
 
-召回将决策、失败、教训和流程整合为一个带排序与引用的答案；`memory conflicts` 离线标记相互矛盾的决策。持久化计划(`ai plan`)让多步骤工作坚持到底 —— 启用 `AI_LOOP_CONTINUATION` 后，Stop 钩子会持续重新提示直到每个步骤都被勾选。安装语言服务器后，`code_find_references`/`code_goto_definition` 提供 LSP 级导航。
+召回将决策、失败、教训和流程整合为一个带排序与引用的答案；`memory conflicts` 离线标记相互矛盾的决策。持久化计划(`ai plan`)让多步骤工作坚持到底 —— 启用 `AI_LOOP_CONTINUATION` 后，Stop 钩子会持续重新提示直到每个步骤都被勾选。安装语言服务器后，`code_find_references`/`code_goto_definition` 提供 LSP 级导航。可选扩展：决策可携带 `contradicts`/`derives_from`/`expires_at` 关系（过期决策从召回中剔除）；`AI_MCP_RESOURCES` 将 plan/report/handoff 暴露为 `codebrain://` 只读 MCP 资源；`AI_AST_CHUNK` 将 Python 索引切换为 AST 感知（cAST）分块。
 
 默认 MCP 工具：
 

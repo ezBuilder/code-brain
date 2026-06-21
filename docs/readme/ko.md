@@ -108,9 +108,10 @@ cd /path/to/project
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
 .ai/bin/ai plan init --id feat --step "do A" --step "do B"
+.ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
 ```
 
-회상은 결정·실패·교훈·절차를 하나의 순위·인용 답변으로 통합하며, `memory conflicts`는 모순되는 결정을 오프라인에서 탐지합니다. 내구 plan(`ai plan`)은 멀티스텝 작업을 끝까지 끌고 갑니다 — `AI_LOOP_CONTINUATION`이 켜지면 Stop 훅이 모든 스텝이 체크될 때까지 다시 프롬프트합니다. 언어 서버가 설치돼 있으면 `code_find_references`/`code_goto_definition`이 LSP급 탐색을 더합니다.
+회상은 결정·실패·교훈·절차를 하나의 순위·인용 답변으로 통합하며, `memory conflicts`는 모순되는 결정을 오프라인에서 탐지합니다. 내구 plan(`ai plan`)은 멀티스텝 작업을 끝까지 끌고 갑니다 — `AI_LOOP_CONTINUATION`이 켜지면 Stop 훅이 모든 스텝이 체크될 때까지 다시 프롬프트합니다. 언어 서버가 설치돼 있으면 `code_find_references`/`code_goto_definition`이 LSP급 탐색을 더합니다. 옵트인 추가: 결정에 `contradicts`/`derives_from`/`expires_at` 관계를 달 수 있고(만료된 결정은 회상에서 제외), `AI_MCP_RESOURCES`는 plan/report/handoff를 `codebrain://` 읽기전용 MCP 리소스로 노출하며, `AI_AST_CHUNK`는 Python 인덱싱을 AST 인지(cAST) 청킹으로 전환합니다.
 
 기본 MCP 도구:
 

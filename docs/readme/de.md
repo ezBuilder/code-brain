@@ -108,9 +108,10 @@ cd /path/to/project
 .ai/bin/ai memory decision list --kind failure --json
 .ai/bin/ai memory conflicts --json
 .ai/bin/ai plan init --id feat --step "do A" --step "do B"
+.ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
 ```
 
-Recall fasst Entscheidungen, Fehler, Lektionen und Prozeduren in einer einzigen gerankten, zitierten Antwort zusammen; `memory conflicts` meldet widersprüchliche Entscheidungen offline. Ein dauerhafter Plan (`ai plan`) hält mehrstufige Arbeit bis zum Ende durch — mit `AI_LOOP_CONTINUATION` fordert der Stop-Hook erneut auf, bis jeder Schritt abgehakt ist. `code_find_references` / `code_goto_definition` ergänzen LSP-Navigation, wenn ein Language-Server installiert ist.
+Recall fasst Entscheidungen, Fehler, Lektionen und Prozeduren in einer einzigen gerankten, zitierten Antwort zusammen; `memory conflicts` meldet widersprüchliche Entscheidungen offline. Ein dauerhafter Plan (`ai plan`) hält mehrstufige Arbeit bis zum Ende durch — mit `AI_LOOP_CONTINUATION` fordert der Stop-Hook erneut auf, bis jeder Schritt abgehakt ist. `code_find_references` / `code_goto_definition` ergänzen LSP-Navigation, wenn ein Language-Server installiert ist. Opt-in-Extras: Entscheidungen können `contradicts`/`derives_from`/`expires_at`-Relationen tragen (abgelaufene fallen aus dem Recall); `AI_MCP_RESOURCES` stellt Pläne/Reports/Handoff als schreibgeschützte `codebrain://`-MCP-Ressourcen bereit; `AI_AST_CHUNK` schaltet die Python-Indizierung auf AST-bewusstes (cAST) Chunking um.
 
 Standard-MCP-Tools:
 

@@ -481,7 +481,21 @@ def _insert_function_chunks(
     else:
         return
 
-    func_chunks = _function_chunks_for_lang(path, source_text, lang)
+    # Opt-in cAST AST-aware chunking (Python pilot). Default OFF: when
+    # AI_AST_CHUNK is unset/falsy this returns None and the existing path runs
+    # byte-identically. When enabled for a .py file it yields size-balanced,
+    # syntactically-coherent chunks; an empty list (parse failure) falls back.
+    func_chunks: list[dict[str, Any]] | None = None
+    try:
+        from .ast_chunker import maybe_ast_chunks
+
+        ast_chunks = maybe_ast_chunks(path, source_text)
+    except Exception:
+        ast_chunks = None
+    if ast_chunks is not None:
+        func_chunks = _adapt_ast_chunks(path, ast_chunks)
+    if not func_chunks:
+        func_chunks = _function_chunks_for_lang(path, source_text, lang)
     if not func_chunks:
         return
 
@@ -734,6 +748,34 @@ def _function_chunks_for_python(path: str, source_text: str) -> list[dict[str, A
         })
 
     return chunks
+
+
+def _adapt_ast_chunks(path: str, ast_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Adapt cAST chunker output to the function-chunk shape used by the indexer.
+
+    The ast_chunker yields ``{text, start_line, end_line}``; the indexer's
+    insert path expects ``{qualname, text, start_line, end_line, kind}``. A
+    synthetic, deterministic qualname (``file::cast:<start>-<end>``) keeps the
+    function-chunk path unique per file without colliding with symbol-derived
+    chunks. Opt-in only; never reached when AI_AST_CHUNK is unset.
+    """
+    adapted: list[dict[str, Any]] = []
+    for ch in ast_chunks:
+        start_line = ch.get("start_line")
+        end_line = ch.get("end_line")
+        text = ch.get("text")
+        if not isinstance(start_line, int) or not isinstance(end_line, int) or not isinstance(text, str):
+            continue
+        qualname = f"cast:{start_line}-{end_line}"
+        adapted.append({
+            "symbol_name": qualname,
+            "qualname": qualname,
+            "start_line": start_line,
+            "end_line": end_line,
+            "text": text,
+            "kind": "cast_chunk",
+        })
+    return adapted
 
 
 def _function_chunks_for_lang(path: str, source_text: str, lang: str) -> list[dict[str, Any]]:

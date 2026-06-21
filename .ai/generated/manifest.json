@@ -22,7 +22,7 @@
   },
   "generator": {
     "name": "code-brain-runtime",
-    "version": "0.4.0"
+    "version": "0.5.0"
   },
   "git": {
     "attributes_hash": "ac10ed2ddfd8800eddbbdec84d3a525752497f206a2c8c812b415a6e088ed6de",
@@ -32,7 +32,7 @@
   },
   "processor": {
     "versions": {
-      "runtime": "0.4.0"
+      "runtime": "0.5.0"
     }
   },
   "schema_version": 1,

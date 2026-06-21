@@ -384,6 +384,12 @@ def build_parser() -> argparse.ArgumentParser:
     memory_decision_add.add_argument("--retest-after", dest="retest_after")
     memory_decision_add.add_argument("--status", choices=["observed", "confirmed", "stale", "refuted"])
     memory_decision_add.add_argument("--supersedes-id", dest="supersedes_id")
+    memory_decision_add.add_argument("--contradicts", dest="contradicts",
+                                     help="id of a decision this one contradicts (dec-...)")
+    memory_decision_add.add_argument("--derives-from", dest="derives_from",
+                                     help="id of a decision this one derives from (dec-...)")
+    memory_decision_add.add_argument("--expires-at", dest="expires_at",
+                                     help="ISO date/time after which this decision is retired")
     memory_decision_add.add_argument("--json", action="store_true", dest="command_json")
     memory_decision_list = memory_decision_sub.add_parser("list", help="filtered on-demand read of decisions/failures")
     memory_decision_list.add_argument("--kind", choices=["decision", "failure"])
@@ -1315,6 +1321,9 @@ def main(argv: list[str] | None = None) -> int:
                 retest_after=getattr(args, "retest_after", None),
                 status=getattr(args, "status", None),
                 supersedes_id=getattr(args, "supersedes_id", None),
+                contradicts=getattr(args, "contradicts", None),
+                derives_from=getattr(args, "derives_from", None),
+                expires_at=getattr(args, "expires_at", None),
             )
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR

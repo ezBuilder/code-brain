@@ -31,14 +31,15 @@ def _seed(root: Path) -> None:
 
 
 def test_resources_list_empty_when_disabled(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.delenv("AI_MCP_RESOURCES", raising=False)
+    # default is now ON; explicit AI_MCP_RESOURCES=0 disables.
+    monkeypatch.setenv("AI_MCP_RESOURCES", "0")
     _seed(tmp_path)
     resp = _req(tmp_path, "resources/list")
     assert resp["result"]["resources"] == []
 
 
 def test_resources_read_rejected_when_disabled(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.delenv("AI_MCP_RESOURCES", raising=False)
+    monkeypatch.setenv("AI_MCP_RESOURCES", "0")
     _seed(tmp_path)
     resp = _req(tmp_path, "resources/read", {"uri": "codebrain://plan/alpha"})
     assert resp["error"]["code"] == -32602

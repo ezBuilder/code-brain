@@ -7,7 +7,8 @@ the file and the repo root, and surfaces any not seen yet this session.
 
 Language-agnostic, offline, demand-driven, realpath-sealed (never escapes the repo root), and
 deduped per session so the same directory is injected once. skipRoot=True because the root file is
-already surfaced at SessionStart. stdlib only; no LLM, no network. OFF unless AI_DIR_CONTEXT is set.
+already surfaced at SessionStart. stdlib only; no LLM, no network. Default ON (read-only/advisory;
+disable with AI_DIR_CONTEXT=0).
 
 Caveat (pilot): this relies on the host actually consuming PostToolUse `additionalContext`. Verify
 empirically per host before trusting it as load-bearing.
@@ -28,7 +29,9 @@ _SID_RE = re.compile(r"[^A-Za-z0-9_-]")
 
 
 def enabled() -> bool:
-    return str(os.environ.get("AI_DIR_CONTEXT", "")).strip() not in ("", "0", "false", "no")
+    """Read-triggered directory-context gate. Default ON (read-only/advisory); disable
+    with AI_DIR_CONTEXT=0. UNSET/empty = ON; only an explicit 0/false/no turns it off."""
+    return str(os.environ.get("AI_DIR_CONTEXT", "")).strip().lower() not in ("0", "false", "no")
 
 
 def _realpath(p: Path) -> Path:

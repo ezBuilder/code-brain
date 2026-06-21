@@ -352,7 +352,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             _insert_chunk_embedding(conn, chunk_id, redacted, root)
             _insert_codegraph_for_path(conn, rel, redacted, path)
             # For supported languages, also insert function/class level chunks (hybrid chunking)
-            _insert_function_chunks(conn, rel, content, chunk_id)
+            _insert_function_chunks(conn, rel, content, chunk_id, root=root)
             if existing_pair is not None:
                 changed += 1
             else:
@@ -439,7 +439,7 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
             _insert_chunk_embedding(conn, chunk_id, redacted, root)
             _insert_codegraph_for_path(conn, rel, redacted, path)
             # For supported languages, also insert function/class level chunks (hybrid chunking)
-            _insert_function_chunks(conn, rel, content, chunk_id)
+            _insert_function_chunks(conn, rel, content, chunk_id, root=root)
             indexed += 1
         conn.commit()
         conn.execute("vacuum")
@@ -451,8 +451,35 @@ def _codegraph_enabled() -> bool:
     return str(raw).strip().lower() not in {"0", "off", "false", "no"}
 
 
+def _cast_chunk_active(path: str, root: Path | None) -> bool:
+    """Whether cAST chunking should run for ``path``.
+
+    True when EITHER the opt-in env flag (``AI_AST_CHUNK``) is truthy OR a
+    persisted self-validation verdict (cast_eval) enabled cAST for this repo —
+    so a passing eval auto-enables cAST without the env flag. Both checks are
+    fail-soft; with env unset and no verdict this returns False and the existing
+    chunking path stays byte-identical.
+    """
+    try:
+        from .ast_chunker import ast_chunk_enabled
+
+        if ast_chunk_enabled():
+            return True
+    except Exception:
+        pass
+    if root is None:
+        return False
+    try:
+        from . import cast_eval
+
+        return bool(cast_eval.verdict(root))
+    except Exception:
+        return False
+
+
 def _insert_function_chunks(
-    conn: sqlite3.Connection, path: str, source_text: str, file_chunk_id: int
+    conn: sqlite3.Connection, path: str, source_text: str, file_chunk_id: int,
+    *, root: Path | None = None,
 ) -> None:
     """Insert function/class level chunks for a source file (hybrid chunking).
 
@@ -481,17 +508,20 @@ def _insert_function_chunks(
     else:
         return
 
-    # Opt-in cAST AST-aware chunking (Python pilot). Default OFF: when
-    # AI_AST_CHUNK is unset/falsy this returns None and the existing path runs
-    # byte-identically. When enabled for a .py file it yields size-balanced,
-    # syntactically-coherent chunks; an empty list (parse failure) falls back.
+    # cAST AST-aware chunking (Python pilot). Default OFF: when AI_AST_CHUNK is
+    # unset/falsy AND no cast_eval verdict has enabled it, ast_chunks stays None
+    # and the existing path runs byte-identically. A truthy env flag OR a passing
+    # self-validation verdict (cast_eval.verdict) enables it for .py files; an
+    # empty list (parse failure) falls back to the default chunker.
     func_chunks: list[dict[str, Any]] | None = None
-    try:
-        from .ast_chunker import maybe_ast_chunks
+    ast_chunks: list[dict[str, Any]] | None = None
+    if lang == "py" and _cast_chunk_active(path, root):
+        try:
+            from .ast_chunker import chunk_python
 
-        ast_chunks = maybe_ast_chunks(path, source_text)
-    except Exception:
-        ast_chunks = None
+            ast_chunks = chunk_python(source_text)
+        except Exception:
+            ast_chunks = None
     if ast_chunks is not None:
         func_chunks = _adapt_ast_chunks(path, ast_chunks)
     if not func_chunks:

@@ -111,7 +111,7 @@ cd /path/to/project
 .ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
 ```
 
-リコールは決定・失敗・教訓・手順を 1 つのランク付き・引用付き回答に統合し、`memory conflicts` は矛盾する決定をオフラインで検出します。永続的なプラン(`ai plan`)はマルチステップ作業を最後までやり切らせます — `AI_LOOP_CONTINUATION` が有効なら Stop フックが全ステップにチェックが付くまで再プロンプトします。言語サーバーが入っていれば `code_find_references`/`code_goto_definition` が LSP 級のナビゲーションを追加します。オプトイン拡張: 決定に `contradicts`/`derives_from`/`expires_at` 関係を付与でき(期限切れはリコールから除外)、`AI_MCP_RESOURCES` は plan/report/handoff を `codebrain://` 読み取り専用 MCP リソースとして公開し、`AI_AST_CHUNK` は Python のインデックスを AST 認識(cAST)チャンキングに切り替えます。
+リコールは決定・失敗・教訓・手順を 1 つのランク付き・引用付き回答に統合し、`memory conflicts` は矛盾する決定をオフラインで検出します。永続的なプラン(`ai plan`)はマルチステップ作業を最後までやり切らせます — `AI_LOOP_CONTINUATION` が有効なら Stop フックが全ステップにチェックが付くまで再プロンプトします。言語サーバーが入っていれば `code_find_references`/`code_goto_definition` が LSP 級のナビゲーションを追加します。オプトイン拡張: 決定に `contradicts`/`derives_from`/`expires_at` 関係を付与でき(期限切れはリコールから除外)、`AI_MCP_RESOURCES` は plan/report/handoff を `codebrain://` 読み取り専用 MCP リソースとして公開し、`AI_AST_CHUNK` は Python のインデックスを AST 認識(cAST)チャンキングに切り替えます。v0.6.0 から安全な pilot(MCP resources・ディレクトリコンテキスト・競合検出)はデフォルト ON で、`ai config pilots` で管理します。cAST は `ai cast eval` で自己検証され、自分の repo でデフォルトチャンカーに勝ったときだけ recall ラチェットが有効化します(無計測の変更なし)。
 
 デフォルトの MCP ツール:
 

@@ -900,7 +900,50 @@ ensure_persistent_scaffold() {
   [[ -e "$TARGET_ROOT/.ai/memory/queue/dead/.gitkeep" ]] || : >"$TARGET_ROOT/.ai/memory/queue/dead/.gitkeep"
 }
 
+prune_orphans() {
+  # Remove CB-managed command/prompt/skill files that a PRIOR install recorded but the current
+  # version no longer ships (e.g. retired cb-loop*/cb-pool prompts). Manifest-gated: only files
+  # the previous install-manifest listed are eligible, so user-authored files (never in the
+  # manifest) are never touched. Runs before the copy/manifest rewrite. Fail-soft.
+  local manifest; manifest="$(manifest_path)"
+  [[ -f "$manifest" ]] || return 0
+  local newlist; newlist="$(mktemp)" || return 0
+  managed_files >"$newlist" 2>/dev/null
+  py - "$TARGET_ROOT" "$manifest" "$newlist" <<'PY'
+import json, sys
+from pathlib import Path
+target = Path(sys.argv[1]); manifest = Path(sys.argv[2]); newlist = Path(sys.argv[3])
+new_managed = {ln.strip() for ln in newlist.read_text(encoding="utf-8").splitlines() if ln.strip()}
+# Safety: if the source list came back empty (git/listing failure), prune NOTHING — never
+# let an empty "currently shipped" set delete every managed file.
+if not new_managed:
+    raise SystemExit(0)
+try:
+    prev = json.loads(manifest.read_text(encoding="utf-8")).get("files", [])
+except Exception:
+    raise SystemExit(0)
+PRUNE_DIRS = (".claude/commands/", ".codex/prompts/", ".agents/skills/")
+removed = []
+for rel in prev:
+    if not isinstance(rel, str) or not any(rel.startswith(d) for d in PRUNE_DIRS):
+        continue
+    if rel in new_managed:
+        continue
+    p = target / rel
+    if p.is_file():
+        try:
+            p.unlink()
+            removed.append(rel)
+        except OSError:
+            pass
+if removed:
+    print("pruned " + str(len(removed)) + " orphan command(s): " + ", ".join(sorted(removed)), file=sys.stderr)
+PY
+  rm -f "$newlist"
+}
+
 install_or_upgrade() {
+  prune_orphans
   while IFS= read -r rel; do
     copy_file "$rel"
   done < <(managed_files)

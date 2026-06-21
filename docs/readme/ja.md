@@ -207,7 +207,8 @@ AI_MCP_COMPACT_TOOLS=1
 ```text
 usage: obs_usage, code_query, context_pack, code_read_hashline, tool_search
 core:  usage + obs_health_summary, obs_search, doctor_strict
-full:  all MCP tools
+full:     all MCP tools except the hidden worker-pool surface (loopd_*, loop_submit)
+full-all: all MCP tools including the worker-pool surface
 ```
 
 生成アーティファクトの上限:

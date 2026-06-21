@@ -689,6 +689,14 @@ _CORE_TOOLS = frozenset({
     "doctor_strict",
 })
 
+# tmux worker-pool / loop-dispatch surface: kept functional + dispatchable, but hidden from the
+# default tools/list so it does not clutter the agent's tool palette (most users never spawn
+# background workers). Still discoverable on demand via tool_search and callable directly.
+# Re-surface with AI_CODE_BRAIN_PROFILE=full-all.
+_HIDDEN_TOOLS = frozenset({
+    "loopd_status", "loopd_up", "loopd_recover", "loopd_agents", "loopd_dispatch_once", "loop_submit",
+})
+
 
 def _compact_tools_enabled() -> bool:
     import os
@@ -698,7 +706,7 @@ def _compact_tools_enabled() -> bool:
 def _tool_profile() -> str:
     import os
     profile = str(os.environ.get("AI_CODE_BRAIN_PROFILE", "")).strip().lower()
-    if profile in {"usage", "core", "compact", "full"}:
+    if profile in {"usage", "core", "compact", "full", "full-all"}:
         return profile
     return "compact" if _compact_tools_enabled() else "full"
 
@@ -710,7 +718,10 @@ def _build_tools_list_payload() -> dict[str, Any]:
         return {"tools": [dict(t) for t in TOOLS if t["name"] in _USAGE_TOOLS]}
     if profile in {"core", "compact"}:
         return {"tools": [dict(t) for t in TOOLS if t["name"] in _CORE_TOOLS]}
-    return {"tools": [dict(tool) for tool in TOOLS]}
+    if profile == "full-all":  # escape hatch: surface even the hidden worker-pool tools
+        return {"tools": [dict(tool) for tool in TOOLS]}
+    # default "full": everything EXCEPT the hidden worker-pool/loop-dispatch surface
+    return {"tools": [dict(tool) for tool in TOOLS if tool["name"] not in _HIDDEN_TOOLS]}
 
 
 def _get_tools_list_payload() -> dict[str, Any]:

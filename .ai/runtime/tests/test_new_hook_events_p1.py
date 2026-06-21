@@ -148,6 +148,32 @@ def install_into_target(tmp_path: Path) -> Path:
     return target
 
 
+def test_upgrade_prunes_orphan_commands(install_into_target: Path) -> None:
+    """ai upgrade removes CB-managed commands no longer shipped (manifest-gated), while keeping
+    currently-shipped commands AND user-authored files (never recorded in the manifest)."""
+    target = install_into_target
+    prompts = target / ".codex" / "prompts"
+    orphan = prompts / "cb-loop.md"
+    orphan.write_text("retired loop junk\n", encoding="utf-8")        # CB-managed, now retired
+    user_cmd = prompts / "my-custom.md"
+    user_cmd.write_text("user command\n", encoding="utf-8")           # user file, NOT in manifest
+    manifest = target / ".ai" / "generated" / "install-manifest.json"
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["files"] = sorted(set(data.get("files", [])) | {".codex/prompts/cb-loop.md"})
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    shipped = prompts / "cb-doctor.md"
+    assert shipped.is_file(), "precondition: cb-doctor is a shipped command"
+    res = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "install-into.sh"), "upgrade", str(target)],
+        cwd=ROOT, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True, text=True, timeout=300,
+    )
+    assert res.returncode == 0, res.stderr[-400:]
+    assert not orphan.exists(), "retired CB command should be pruned"
+    assert shipped.is_file(), "shipped command must survive prune"
+    assert user_cmd.is_file(), "user-authored file must never be pruned"
+
+
 def test_claude_settings_registers_p1_events(install_into_target: Path) -> None:
     settings = json.loads(
         (install_into_target / ".claude" / "settings.json").read_text(encoding="utf-8")

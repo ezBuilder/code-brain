@@ -921,13 +921,41 @@ if not new_managed:
 try:
     prev = json.loads(manifest.read_text(encoding="utf-8")).get("files", [])
 except Exception:
-    raise SystemExit(0)
-PRUNE_DIRS = (".claude/commands/", ".codex/prompts/", ".agents/skills/")
-removed = []
-for rel in prev:
-    if not isinstance(rel, str) or not any(rel.startswith(d) for d in PRUNE_DIRS):
-        continue
+    prev = []
+PRUNE_DIRS = (".claude/commands", ".codex/prompts", ".agents/skills")
+# Known legacy command basenames CB used to ship and has retired (they don't carry the cb- prefix,
+# so the namespace rule below can't catch them). Manifest rewrites long ago dropped these, so
+# manifest-gating alone misses them — list them explicitly.
+RETIRED = {"ai-runbook.md", "automation-hook-slow.md", "git-runbook.md"}
+
+
+def is_cb_orphan(rel: str, name: str) -> bool:
+    """A CB-managed file the current version no longer ships. Conservative discriminators only:
+    (1) recorded in the PREVIOUS manifest, or (2) the cb- namespace (CB's reserved prefix), or
+    (3) an explicitly retired legacy basename. User files (no cb- prefix, not in manifest/list)
+    are never matched."""
     if rel in new_managed:
+        return False
+    return rel in prev_set or name.startswith("cb-") or name in RETIRED
+
+
+prev_set = {r for r in prev if isinstance(r, str)}
+candidates: list[str] = []
+# prev-manifest entries under the managed dirs (recently retired)
+for rel in prev_set:
+    if any(rel.startswith(d + "/") for d in PRUNE_DIRS):
+        candidates.append(rel)
+# plus a live scan of the target dirs (catches orphans already dropped from the manifest)
+for d in PRUNE_DIRS:
+    base = target / d
+    if base.is_dir():
+        for p in base.rglob("*"):
+            if p.is_file():
+                candidates.append(p.relative_to(target).as_posix())
+removed = []
+for rel in sorted(set(candidates)):
+    name = rel.rsplit("/", 1)[-1]
+    if not is_cb_orphan(rel, name):
         continue
     p = target / rel
     if p.is_file():

@@ -153,14 +153,14 @@ def test_upgrade_prunes_orphan_commands(install_into_target: Path) -> None:
     currently-shipped commands AND user-authored files (never recorded in the manifest)."""
     target = install_into_target
     prompts = target / ".codex" / "prompts"
+    # Realistic state: orphans are NOT in the manifest (earlier upgrades rewrote it to current
+    # source only). Prune must still catch them via the cb- namespace + retired-legacy list.
     orphan = prompts / "cb-loop.md"
-    orphan.write_text("retired loop junk\n", encoding="utf-8")        # CB-managed, now retired
+    orphan.write_text("retired loop junk\n", encoding="utf-8")        # cb- namespace orphan
+    legacy = prompts / "git-runbook.md"
+    legacy.write_text("retired legacy\n", encoding="utf-8")           # retired non-cb basename
     user_cmd = prompts / "my-custom.md"
-    user_cmd.write_text("user command\n", encoding="utf-8")           # user file, NOT in manifest
-    manifest = target / ".ai" / "generated" / "install-manifest.json"
-    data = json.loads(manifest.read_text(encoding="utf-8"))
-    data["files"] = sorted(set(data.get("files", [])) | {".codex/prompts/cb-loop.md"})
-    manifest.write_text(json.dumps(data), encoding="utf-8")
+    user_cmd.write_text("user command\n", encoding="utf-8")           # user file, NOT pruned
     shipped = prompts / "cb-doctor.md"
     assert shipped.is_file(), "precondition: cb-doctor is a shipped command"
     res = subprocess.run(
@@ -169,7 +169,8 @@ def test_upgrade_prunes_orphan_commands(install_into_target: Path) -> None:
         capture_output=True, text=True, timeout=300,
     )
     assert res.returncode == 0, res.stderr[-400:]
-    assert not orphan.exists(), "retired CB command should be pruned"
+    assert not orphan.exists(), "cb- namespace orphan should be pruned"
+    assert not legacy.exists(), "retired legacy command should be pruned"
     assert shipped.is_file(), "shipped command must survive prune"
     assert user_cmd.is_file(), "user-authored file must never be pruned"
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -1223,6 +1224,131 @@ def _get_prompt(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, A
     }
 
 
+# ---- MCP resources (read-only; opt-in via AI_MCP_RESOURCES, default OFF) ----
+#
+# Resources expose plans/report/handoff/session as first-class read-only MCP objects
+# (per spec, additive). Default behavior is unchanged: with the env flag OFF,
+# resources/list returns [] and resources/read rejects every uri. New behavior must
+# be opt-in, so the whole surface hides behind _resources_enabled().
+#
+# Hard read-only invariants:
+#  - URIs are validated against a strict scheme + safe id regex.
+#  - Bodies are read ONLY from .ai/memory or .ai/generated; nothing else is reachable.
+#  - Plan ids reuse plan_state._safe_plan_id (no path separators / traversal).
+#  - All text bodies pass through redact_value before leaving the process.
+_RESOURCE_SCHEME = "codebrain://"
+# Conservative id charset for the plan path segment: letters/digits/_/-, mirrors
+# plan_state._PLAN_ID_RE so traversal (`..`, `/`) can never reach the filesystem.
+_RESOURCE_PLAN_RE = re.compile(r"^codebrain://plan/([A-Za-z0-9][A-Za-z0-9_-]{0,63})$")
+
+
+def _resources_enabled() -> bool:
+    import os
+    return str(os.environ.get("AI_MCP_RESOURCES", "")).strip() not in ("", "0", "false", "no")
+
+
+def _list_resources(root: Path) -> list[dict[str, Any]]:
+    """Enumerate available read-only resources. Pure listing; reads no bodies except
+    cheap existence checks. Returns [] when nothing is present."""
+    from . import plan_state
+
+    resources: list[dict[str, Any]] = []
+    try:
+        plans = plan_state.list_plans(root).get("plans", [])
+    except Exception:
+        plans = []
+    for p in plans:
+        pid = str(p.get("plan_id", ""))
+        if not pid:
+            continue
+        resources.append(
+            {
+                "uri": f"codebrain://plan/{pid}",
+                "name": f"plan: {pid}",
+                "description": f"Plan step state ({p.get('completed', 0)}/{p.get('total', 0)} done).",
+                "mimeType": "text/markdown",
+            }
+        )
+    # Report/release status is always derivable (status_report never needs a file on disk).
+    resources.append(
+        {
+            "uri": "codebrain://report/status",
+            "name": "report: status",
+            "description": "Latest doctor + release-readiness status report.",
+            "mimeType": "application/json",
+        }
+    )
+    handoff = root / ".ai" / "memory" / "handoff.json"
+    if handoff.is_file():
+        resources.append(
+            {
+                "uri": "codebrain://handoff/current",
+                "name": "handoff: current",
+                "description": "Current resume handoff (goal/plan/next_step/blockers).",
+                "mimeType": "application/json",
+            }
+        )
+    session = root / ".ai" / "memory" / "session-current.md"
+    if session.is_file():
+        resources.append(
+            {
+                "uri": "codebrain://session/current",
+                "name": "session: current",
+                "description": "Current session notes.",
+                "mimeType": "text/markdown",
+            }
+        )
+    return resources
+
+
+def _read_resource(root: Path, uri: str) -> dict[str, Any]:
+    """Resolve a resource uri to {uri, mimeType, text}. Raises ValueError on an
+    unknown / malformed uri so the caller can return -32602. Read-only; never reads
+    outside .ai/memory or .ai/generated; all text passes through redact_value."""
+    if not isinstance(uri, str) or not uri.startswith(_RESOURCE_SCHEME):
+        raise ValueError(f"unknown resource uri: {uri!r}")
+
+    plan_match = _RESOURCE_PLAN_RE.fullmatch(uri)
+    if plan_match is not None:
+        from . import plan_state
+
+        # _safe_plan_id re-validates; combined with the regex this rejects traversal.
+        pid = plan_state._safe_plan_id(plan_match.group(1))
+        path = plan_state.plan_path(root, pid)
+        if not path.is_file():
+            raise ValueError(f"unknown resource uri: {uri!r}")
+        text = path.read_text(encoding="utf-8")
+        return {"uri": uri, "mimeType": "text/markdown", "text": str(redact_value(text))}
+
+    if uri == "codebrain://report/status":
+        from .report import status_report
+
+        try:
+            payload: Any = status_report(root)
+        except Exception as exc:
+            # The resource is valid; status generation itself failed (e.g. uninitialized
+            # repo). Surface a graceful body rather than masquerade as a bad-uri error.
+            payload = {"ok": False, "error": str(exc)}
+        text = json.dumps(redact_value(payload), ensure_ascii=False, sort_keys=True, indent=2)
+        return {"uri": uri, "mimeType": "application/json", "text": text}
+
+    if uri == "codebrain://handoff/current":
+        path = root / ".ai" / "memory" / "handoff.json"
+        if not path.is_file():
+            raise ValueError(f"unknown resource uri: {uri!r}")
+        text = path.read_text(encoding="utf-8")
+        return {"uri": uri, "mimeType": "application/json", "text": str(redact_value(text))}
+
+    if uri == "codebrain://session/current":
+        path = root / ".ai" / "memory" / "session-current.md"
+        if not path.is_file():
+            raise ValueError(f"unknown resource uri: {uri!r}")
+        text = path.read_text(encoding="utf-8")
+        return {"uri": uri, "mimeType": "text/markdown", "text": str(redact_value(text))}
+
+    raise ValueError(f"unknown resource uri: {uri!r}")
+
+
 def _ok(request_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
@@ -1297,7 +1423,21 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
         elif method == "prompts/get":
             response = _err(request_id, -32601, "prompts disabled — use local .claude/commands or .codex/prompts directly")
         elif method == "resources/list":
-            response = _ok(request_id, {"resources": []})
+            # Opt-in (AI_MCP_RESOURCES): default OFF keeps the original empty list.
+            resources = _list_resources(root) if _resources_enabled() else []
+            response = _ok(request_id, {"resources": resources})
+        elif method == "resources/read":
+            uri = params.get("uri")
+            if not _resources_enabled():
+                response = _err(request_id, -32602, "resources disabled (set AI_MCP_RESOURCES=1)")
+            elif not isinstance(uri, str) or not uri:
+                response = _err(request_id, -32602, "resources/read requires uri string")
+            else:
+                try:
+                    contents = _read_resource(root, uri)
+                    response = _ok(request_id, {"contents": [contents]})
+                except ValueError as exc:
+                    response = _err(request_id, -32602, str(exc))
         elif method == "resources/templates/list":
             response = _ok(request_id, {"resourceTemplates": []})
         elif isinstance(method, str) and method in TOOL_NAMES:

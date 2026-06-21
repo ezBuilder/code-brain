@@ -92,6 +92,34 @@ def _decision_id_exists(root: Path, dec_id: str) -> bool:
     return False
 
 
+def _valid_edge_id(value: str | None) -> str | None:
+    """Return a decision id only if it looks like one (dec-<hex>); else None (fail-soft).
+
+    Edge ids name other decision records; _short_id mints them as 'dec-' + 8 hex chars.
+    Malformed/empty input is ignored silently so a bad edge can never raise or pollute a record.
+    """
+    s = str(value or "").strip()
+    if not s.startswith("dec-"):
+        return None
+    suffix = s[4:]
+    if not suffix or not all(c in "0123456789abcdef" for c in suffix.lower()):
+        return None
+    return s
+
+
+def _is_expired(rec: dict[str, Any], *, now: str | None = None) -> bool:
+    """True when rec carries an expires_at strictly before now (ISO compare). Fail-soft.
+
+    expires_at is an opt-in field; records without it never expire. Comparison is lexical
+    on normalized ISO strings (now_iso emits a trailing 'Z'), which orders correctly for
+    UTC timestamps; a malformed/empty bound is treated as non-expiring.
+    """
+    exp = str(rec.get("expires_at") or "").strip()
+    if not exp:
+        return False
+    return exp < (now or now_iso())
+
+
 def append_decision(
     root: Path,
     *,
@@ -105,6 +133,9 @@ def append_decision(
     retest_after: str | None = None,
     status: str | None = None,
     supersedes_id: str | None = None,
+    contradicts: str | None = None,
+    derives_from: str | None = None,
+    expires_at: str | None = None,
 ) -> dict[str, Any]:
     from .redact import redact_value
     text_clean = redact_value(str(text)).strip()
@@ -135,18 +166,34 @@ def append_decision(
         # supersession: reuse the target id so the fold-by-id retires the original
         if supersedes_id and _decision_id_exists(root, str(supersedes_id)):
             record["id"] = str(supersedes_id)
+    # optional DAG edges (kind-agnostic): stored ONLY when provided so legacy/plain
+    # decisions stay byte-identical. Edge ids are validated (fail-soft); expires_at is a date.
+    contradicts_id = _valid_edge_id(contradicts)
+    if contradicts_id:
+        record["contradicts"] = contradicts_id
+    derives_id = _valid_edge_id(derives_from)
+    if derives_id:
+        record["derives_from"] = derives_id
+    if expires_at:
+        exp_clean = str(redact_value(str(expires_at))).strip()[:32]
+        if exp_clean:
+            record["expires_at"] = exp_clean
     append_jsonl(decisions_path(root), record)
     append_audit(root, action="memory.decision_add", category="memory",
                  payload={"id": record["id"], "kind": record.get("kind", "decision")})
     return {"ok": True, "record": record}
 
 
-def read_decisions_for_surface(root: Path, *, limit: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def read_decisions_for_surface(
+    root: Path, *, limit: int, include_expired: bool = False
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """One full-file pass → (recent plain decisions, live folded failures newest-first).
 
     Failures fold by id (last write wins) so a later 'stale'/'refuted' reappend retires the
     original; retired failures are dropped. Plain decisions and failures are partitioned so
-    failures never consume the plain tail window and retired rows never leak. Fail-soft.
+    failures never consume the plain tail window and retired rows never leak. Decisions whose
+    optional expires_at is in the past are treated as retired and dropped unless include_expired.
+    Fail-soft.
     """
     plain: list[dict[str, Any]] = []
     failures: dict[str, dict[str, Any]] = {}
@@ -154,6 +201,7 @@ def read_decisions_for_surface(root: Path, *, limit: int) -> tuple[list[dict[str
         rows = read_jsonl_all(decisions_path(root))
     except Exception:
         return [], []
+    now = now_iso()
     for rec in rows:
         if not isinstance(rec, dict):
             continue
@@ -163,7 +211,13 @@ def read_decisions_for_surface(root: Path, *, limit: int) -> tuple[list[dict[str
                 failures[fid] = rec  # fold
         else:
             plain.append(rec)
-    live = [r for r in failures.values() if str(r.get("status", "observed")) not in _RETIRED_STATUSES]
+    if not include_expired:
+        plain = [r for r in plain if not _is_expired(r, now=now)]
+    live = [
+        r for r in failures.values()
+        if str(r.get("status", "observed")) not in _RETIRED_STATUSES
+        and (include_expired or not _is_expired(r, now=now))
+    ]
     live.sort(key=lambda r: str(r.get("observed_at") or r.get("decided_at") or ""), reverse=True)
     return plain[-limit:], live
 
@@ -178,20 +232,23 @@ def read_decisions_filtered(
     text: str | None = None,
     limit: int = 20,
     include_retired: bool = False,
+    include_expired: bool = False,
 ) -> dict[str, Any]:
     """On-demand filtered read over decisions.jsonl (newest-first).
 
     Unlike read_decisions_for_surface (which feeds the fixed SessionStart tail), this lets an
     agent query past decisions mid-session. It reuses the same integrity rules so a query can
     never surface a duplicate or retired row: failures fold by id (last write wins) and
-    stale/refuted ones drop unless include_retired. Filters are AND-combined — kind/status are
-    exact, tag/source/text are case-insensitive substring. Fail-soft → empty on error.
+    stale/refuted ones drop unless include_retired. Records whose optional expires_at is in the
+    past are dropped unless include_expired. Filters are AND-combined — kind/status are exact,
+    tag/source/text are case-insensitive substring. Fail-soft → empty on error.
     """
     try:
         rows = read_jsonl_all(decisions_path(root))
     except Exception:
         return {"ok": True, "count": 0, "items": []}
 
+    now = now_iso()
     plain: list[dict[str, Any]] = []
     failures: dict[str, dict[str, Any]] = {}
     for rec in rows:
@@ -204,9 +261,13 @@ def read_decisions_filtered(
         else:
             plain.append(rec)
 
-    items: list[dict[str, Any]] = list(plain)
+    items: list[dict[str, Any]] = [
+        r for r in plain if include_expired or not _is_expired(r, now=now)
+    ]
     for rec in failures.values():
         if not include_retired and str(rec.get("status", "observed")) in _RETIRED_STATUSES:
+            continue
+        if not include_expired and _is_expired(rec, now=now):
             continue
         items.append(rec)
 

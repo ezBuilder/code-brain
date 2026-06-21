@@ -111,7 +111,7 @@ cd /path/to/project
 .ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
 ```
 
-召回将决策、失败、教训和流程整合为一个带排序与引用的答案；`memory conflicts` 离线标记相互矛盾的决策。持久化计划(`ai plan`)让多步骤工作坚持到底 —— 启用 `AI_LOOP_CONTINUATION` 后，Stop 钩子会持续重新提示直到每个步骤都被勾选。安装语言服务器后，`code_find_references`/`code_goto_definition` 提供 LSP 级导航。可选扩展：决策可携带 `contradicts`/`derives_from`/`expires_at` 关系（过期决策从召回中剔除）；`AI_MCP_RESOURCES` 将 plan/report/handoff 暴露为 `codebrain://` 只读 MCP 资源；`AI_AST_CHUNK` 将 Python 索引切换为 AST 感知（cAST）分块。
+召回将决策、失败、教训和流程整合为一个带排序与引用的答案；`memory conflicts` 离线标记相互矛盾的决策。持久化计划(`ai plan`)让多步骤工作坚持到底 —— 启用 `AI_LOOP_CONTINUATION` 后，Stop 钩子会持续重新提示直到每个步骤都被勾选。安装语言服务器后，`code_find_references`/`code_goto_definition` 提供 LSP 级导航。可选扩展：决策可携带 `contradicts`/`derives_from`/`expires_at` 关系（过期决策从召回中剔除）；`AI_MCP_RESOURCES` 将 plan/report/handoff 暴露为 `codebrain://` 只读 MCP 资源；`AI_AST_CHUNK` 将 Python 索引切换为 AST 感知（cAST）分块。自 v0.6.0 起，安全 pilot（MCP 资源、目录上下文、冲突检测）默认开启，用 `ai config pilots` 管理；cAST 通过 `ai cast eval` 自我验证，仅当在你的 repo 上胜过默认分块器时由 recall ratchet 启用（不做无度量更改）。
 
 默认 MCP 工具：
 

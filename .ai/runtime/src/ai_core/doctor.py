@@ -51,8 +51,29 @@ def run_checks(root: Path) -> list[Check]:
         check_precall_rules(root),
         check_antigravity_artifacts(root),
         check_lsp_available(root),
+        check_pilots(root),
     ]
     return checks
+
+
+def check_pilots(root: Path) -> Check:
+    """INFO-only surfacing of pilot/optional features. ALWAYS ok=True — this never
+    fails the gate; it just makes the opt-in switches discoverable in doctor output."""
+    try:
+        from .pilots import status as pilot_status
+        states = pilot_status(root)
+    except Exception as exc:  # probing must never break doctor
+        return Check("pilots", True, f"probe skipped: {exc}")
+    total = len(states)
+    on = [info["env"] for info in states.values() if info.get("effective_on")]
+    off = [info["env"] for info in states.values() if not info.get("effective_on")]
+    parts = [f"{len(on)}/{total} on"]
+    if on:
+        parts.append("on=" + ",".join(on))
+    if off:
+        parts.append("off=" + ",".join(off))
+    detail = str(redact_value("; ".join(parts)))
+    return Check("pilots", True, detail)
 
 
 def check_lsp_available(root: Path) -> Check:

@@ -35,6 +35,21 @@ def build_parser() -> argparse.ArgumentParser:
     config = sub.add_parser("config")
     config_sub = config.add_subparsers(dest="config_command", required=True)
     config_sub.add_parser("show")
+    config_pilots = config_sub.add_parser("pilots", help="show/enable/disable optional pilot features")
+    config_pilots.add_argument("--enable-all", action="store_true", dest="pilots_enable")
+    config_pilots.add_argument("--disable-all", action="store_true", dest="pilots_disable")
+    config_pilots.add_argument("--include-unsafe", action="store_true", dest="pilots_unsafe",
+                               help="also (en/dis)able eval-gated/opt-in-risky pilots like AI_AST_CHUNK")
+    config_pilots.add_argument("--json", action="store_true", dest="command_json")
+    cast = sub.add_parser("cast", help="cAST structure-aware chunking self-validation")
+    cast_sub = cast.add_subparsers(dest="cast_command", required=True)
+    cast_eval_p = cast_sub.add_parser("eval", help="measure cAST vs default recall on this repo; ratchet auto-enables on win")
+    cast_eval_p.add_argument("--k", type=int, default=5)
+    cast_eval_p.add_argument("--margin", type=float, default=0.02)
+    cast_eval_p.add_argument("--min-queries", type=int, default=10, dest="min_queries")
+    cast_eval_p.add_argument("--json", action="store_true", dest="command_json")
+    cast_status_p = cast_sub.add_parser("status", help="show the persisted cAST verdict")
+    cast_status_p.add_argument("--json", action="store_true", dest="command_json")
     render_parser = sub.add_parser("render")
     render_parser.add_argument("--json", action="store_true", dest="command_json")
     render_parser.add_argument("--dry-run", action="store_true")
@@ -809,6 +824,27 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "config" and args.config_command == "show":
             emit(load_config(root), as_json=as_json)
+            return OK
+        if args.command == "config" and args.config_command == "pilots":
+            from . import pilots as _pilots
+            if args.pilots_enable or args.pilots_disable:
+                mapping = (_pilots.enable_all if args.pilots_enable else _pilots.disable_all)(
+                    include_unsafe=bool(args.pilots_unsafe))
+                emit({"ok": True, "apply": mapping, "export_lines": _pilots.export_lines(mapping),
+                      "note": "env vars cannot be set in your shell from here — eval/source the export_lines, or set them in your shell/settings."},
+                     as_json=as_json)
+            else:
+                emit({"ok": True, "pilots": _pilots.status(root)}, as_json=as_json)
+            return OK
+        if args.command == "cast" and args.cast_command == "eval":
+            reject_ci_write("cast")
+            from . import cast_eval as _ce
+            payload = _ce.evaluate(root, k=args.k, margin=args.margin, min_queries=args.min_queries)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok", True) else GENERIC_ERROR
+        if args.command == "cast" and args.cast_command == "status":
+            from . import cast_eval as _ce
+            emit({"ok": True, "enabled": _ce.verdict(root)}, as_json=as_json)
             return OK
         if args.command == "render":
             reject_ci_write("render", dry_run=args.dry_run)

@@ -30,9 +30,10 @@ def test_sealed_to_root(tmp_path: Path) -> None:
     assert dc.find_context_files(root, str(root / "AGENTS.md")) == []
 
 
-def test_block_disabled_by_default(tmp_path: Path, monkeypatch) -> None:
+def test_block_disabled_when_off(tmp_path: Path, monkeypatch) -> None:
+    # default is now ON; explicit AI_DIR_CONTEXT=0 disables.
     root = _seed(tmp_path)
-    monkeypatch.delenv("AI_DIR_CONTEXT", raising=False)
+    monkeypatch.setenv("AI_DIR_CONTEXT", "0")
     payload = {"tool_name": "Read", "tool_input": {"file_path": str(root / "pkg" / "auth" / "login.py")},
                "session_id": "s1"}
     assert dc.directory_context_for_read(root, payload) == ""
@@ -73,7 +74,7 @@ def test_hook_postooluse_read_injects_when_enabled(tmp_path: Path, monkeypatch) 
     from ai_core import hooks
     payload = {"agent": "claude", "session_id": "s3", "dry": True, "tool_name": "Read",
                "tool_input": {"file_path": str(root / "pkg" / "auth" / "login.py")}}
-    monkeypatch.delenv("AI_DIR_CONTEXT", raising=False)
+    monkeypatch.setenv("AI_DIR_CONTEXT", "0")
     off = hooks.handle_hook(root, "PostToolUse", dict(payload))
     assert not off.get("dir_context")
     monkeypatch.setenv("AI_DIR_CONTEXT", "1")

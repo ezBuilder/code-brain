@@ -1224,12 +1224,12 @@ def _get_prompt(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, A
     }
 
 
-# ---- MCP resources (read-only; opt-in via AI_MCP_RESOURCES, default OFF) ----
+# ---- MCP resources (read-only; default ON, disable with AI_MCP_RESOURCES=0) ----
 #
 # Resources expose plans/report/handoff/session as first-class read-only MCP objects
-# (per spec, additive). Default behavior is unchanged: with the env flag OFF,
-# resources/list returns [] and resources/read rejects every uri. New behavior must
-# be opt-in, so the whole surface hides behind _resources_enabled().
+# (per spec, additive). Read-only and bounded, so on by default: with the gate ON
+# resources/list returns entries and resources/read serves redacted bodies. Only an
+# explicit AI_MCP_RESOURCES in (0,false,no) disables the surface; UNSET/empty = ON.
 #
 # Hard read-only invariants:
 #  - URIs are validated against a strict scheme + safe id regex.
@@ -1243,8 +1243,10 @@ _RESOURCE_PLAN_RE = re.compile(r"^codebrain://plan/([A-Za-z0-9][A-Za-z0-9_-]{0,6
 
 
 def _resources_enabled() -> bool:
+    """MCP read-only resources gate. Default ON (read-only, bounded); disable with
+    AI_MCP_RESOURCES=0. UNSET/empty = ON; only an explicit 0/false/no turns it off."""
     import os
-    return str(os.environ.get("AI_MCP_RESOURCES", "")).strip() not in ("", "0", "false", "no")
+    return str(os.environ.get("AI_MCP_RESOURCES", "")).strip().lower() not in ("0", "false", "no")
 
 
 def _list_resources(root: Path) -> list[dict[str, Any]]:
@@ -1423,13 +1425,13 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
         elif method == "prompts/get":
             response = _err(request_id, -32601, "prompts disabled — use local .claude/commands or .codex/prompts directly")
         elif method == "resources/list":
-            # Opt-in (AI_MCP_RESOURCES): default OFF keeps the original empty list.
+            # Default ON (AI_MCP_RESOURCES): only AI_MCP_RESOURCES=0 returns empty.
             resources = _list_resources(root) if _resources_enabled() else []
             response = _ok(request_id, {"resources": resources})
         elif method == "resources/read":
             uri = params.get("uri")
             if not _resources_enabled():
-                response = _err(request_id, -32602, "resources disabled (set AI_MCP_RESOURCES=1)")
+                response = _err(request_id, -32602, "resources disabled (set AI_MCP_RESOURCES=0 to disable; default ON)")
             elif not isinstance(uri, str) or not uri:
                 response = _err(request_id, -32602, "resources/read requires uri string")
             else:

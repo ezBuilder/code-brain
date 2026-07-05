@@ -4,30 +4,28 @@
     "AI_LOOP_CONTINUATION": "1"
   },
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "deny": [
       "Read(./.env)",
       "Read(./secrets/**)",
       "Read(./config/credentials.json)",
       "Bash(rm -rf *)",
+      "Bash(rm -fr *)",
       "Bash(git reset --hard *)",
       "Bash(git clean -fd *)",
+      "Bash(git clean -fdx *)",
+      "Bash(git branch -D *)",
+      "Bash(git push * --force*)",
+      "Bash(git push --force*)",
+      "Bash(git push * --delete *)",
+      "Bash(git filter-branch *)",
+      "Bash(git filter-repo *)",
+      "Bash(git update-ref -d *)",
+      "Bash(git reflog expire *)",
       "Bash(dropdb *)",
       "Bash(kubectl delete *)",
-      "Bash(terraform destroy *)"
-    ],
-    "ask": [
-      "Bash(git commit *)",
-      "Bash(git push *)",
-      "Bash(git merge *)",
-      "Bash(git rebase *)",
-      "Bash(gh repo create *)",
-      "Bash(gh workflow run *)",
-      "Bash(npm install *)",
-      "Bash(pnpm add *)",
-      "Bash(yarn add *)",
-      "Bash(pip install *)",
-      "Bash(uv add *)",
-      "Bash(npm publish *)"
+      "Bash(terraform destroy *)",
+      "Bash(pulumi destroy *)"
     ]
   },
   "hooks": {

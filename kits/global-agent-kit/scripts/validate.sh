@@ -252,9 +252,17 @@ hook_dir = Path(sys.argv[2])
 if settings.get("autoMemoryEnabled") is not True:
     raise SystemExit("installer did not preserve existing top-level settings")
 
-ask = settings.get("permissions", {}).get("ask", [])
-if "Bash(custom deploy *)" not in ask or "Bash(git push *)" not in ask:
-    raise SystemExit("installer did not merge permission ask rules")
+perms = settings.get("permissions", {})
+ask = perms.get("ask", [])
+if "Bash(custom deploy *)" not in ask:
+    raise SystemExit("installer did not preserve existing permission ask rules")
+
+deny = perms.get("deny", [])
+if "Bash(git branch -D *)" not in deny or "Bash(git push * --force*)" not in deny:
+    raise SystemExit("installer did not merge permission deny rules")
+
+if perms.get("defaultMode") != "bypassPermissions":
+    raise SystemExit("installer did not carry the bypassPermissions default mode")
 
 notification = settings.get("hooks", {}).get("Notification", [])
 if not notification:

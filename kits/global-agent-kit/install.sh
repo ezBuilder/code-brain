@@ -463,6 +463,9 @@ fi
 
 if [[ "$INSTALL_CODEX" -eq 1 ]]; then
   install_rule "$ROOT_DIR/rules/AGENTS.md" "$HOME/.codex/AGENTS.md"
+  # Codex's block-dangerous hook reads ~/.codex/policies/hook-policy.json; install it so the
+  # destructive-command guard uses the full policy (not the script's weaker fallback list).
+  install_dir "$ROOT_DIR/policies" "$HOME/.codex/policies"
 fi
 
 verify_install

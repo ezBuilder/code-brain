@@ -27,6 +27,14 @@ except Exception:
         r"\bsequelize\s+db:drop\b",
         r"\bkubectl\s+delete\b",
         r"\bterraform\s+destroy\b",
+        r"\bpulumi\s+destroy\b",
+        r"\bgit\s+branch\s+(-D|--delete\s+--force)\b",
+        r"\bgit\s+push\b.*(--force\b|--force-with-lease|\s-f\b)",
+        r"\bgit\s+push\b.*--delete\b",
+        r"\bgit\s+filter-branch\b",
+        r"\bgit\s+filter-repo\b",
+        r"\bgit\s+update-ref\s+-d\b",
+        r"\bgit\s+reflog\s+expire\b",
     ]
 
 for pattern in blocked:

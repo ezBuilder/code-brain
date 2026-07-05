@@ -25,7 +25,7 @@ Priority: security > user > project > method > response.
 
 - Do not read, edit, print, or commit real secrets: `.env`, keys, tokens, certs, password stores.
 - Do not change auth, billing, destructive DB, deployment, packages, or prod secrets without explicit approval.
-- Commit, push, merge, rebase, create repos, or publish only when clearly requested.
+- Commit and push verified work automatically on a non-main branch — no need to ask. Get explicit approval only for: pushing/merging to main or production, releases/publishing, creating repos, force-push, and history rewrites.
 - Do not bypass denied commands; report the needed approval.
 
 ## Method
@@ -40,6 +40,17 @@ Priority: security > user > project > method > response.
 8. For broad work, split safe parallel reads; keep edit ownership clear.
    Reserve multi-agent fan-out (workflows) for big items — architecture, security, broad audits, large/risky refactors. Keep small/local changes solo, verified by tests + direct check. Estimate cost and get approval before a large fan-out; do not auto-fan-out small work.
 9. Continue until done, blocked, or approval is required.
+
+## Common Memory
+
+- Bare greetings or low-signal turns get a short reply only; do not scan repos until there is a task.
+- Treat live proof as primary: UI, health endpoints, tests, logs, GitHub/deploy state, and screenshots beat summaries.
+- Keep repo truth and live truth separate; report proof, blockers, and unverified assumptions separately.
+- Preserve unrelated dirty worktree changes.
+- Do not guess on domain rules, billing, auth, deployment, or operations; inspect code/live state first.
+- Do not store or print secrets; store only paths, state, log markers, proof handles, and blockers.
+- For research, release, and public-repo work, leave a durable repo artifact when useful.
+- Use project memories for project-specific runbooks and decisions only; keep cross-project behavior here.
 
 ## Project Rules
 

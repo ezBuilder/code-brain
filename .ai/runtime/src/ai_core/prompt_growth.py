@@ -159,6 +159,23 @@ def _recent_output_avg(root: Path, n: int) -> float:
     return (sum(vals) / len(vals)) if vals else 0.0
 
 
+def violation_signals(root: Path, *, window: int = WINDOW) -> dict[str, Any]:
+    """Recent verbosity signal for the self-review instruction (fail-soft, stdlib-only).
+
+    Counts how many of the last ``window`` turn-observations were over-long — the ``verbose``
+    flag ``record_turn`` sets when output exceeds ``BREVITY_LIMIT``. Returns
+    ``{"long_reports": <int>}`` so the cheap judge's prompt reflects real signal instead of a
+    silently-zero placeholder. Never raises — degrades to ``{"long_reports": 0}``."""
+    try:
+        obs = _recent(root, max(1, int(window)))
+        long_reports = sum(
+            1 for o in obs if isinstance(o, dict) and int(o.get("verbose", 0) or 0)
+        )
+        return {"long_reports": long_reports}
+    except Exception:
+        return {"long_reports": 0}
+
+
 # --- 2. measurement (real tokens only, no estimates) ---
 
 def _output_tokens(root: Path) -> int:

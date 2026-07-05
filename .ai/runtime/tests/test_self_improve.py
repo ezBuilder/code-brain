@@ -114,6 +114,20 @@ def test_ratchet_rolls_back_when_output_worsens(tmp_path: Path) -> None:
     assert any(s == "regressed" for s in statuses.values())
 
 
+def test_violation_signals_counts_verbose_reports(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    # no observations yet → zero signal
+    assert pg.violation_signals(root)["long_reports"] == 0
+    # sustained over-long turns set the verbose flag (output_chars > BREVITY_LIMIT)
+    for _ in range(pg.MIN_SAMPLES):
+        pg.tick(root, output_chars=pg.BREVITY_LIMIT + 100, cooldown=999)
+    sig = pg.violation_signals(root)
+    assert sig["long_reports"] >= pg.MIN_SAMPLES
+    # and the self-review instruction now reflects the real count (was silently always 0)
+    instr = si._review_instruction(root)
+    assert f"{sig['long_reports']} over-long reports" in instr
+
+
 def test_homoglyph_domain_bypass_blocked(tmp_path: Path) -> None:
     root = _seed(tmp_path)
     # Cyrillic 'а' in "аuth", fullwidth — must still be caught after NFKD/ascii fold

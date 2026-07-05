@@ -291,6 +291,11 @@ for key in ("deny", "ask", "allow"):
             values.append(item)
     if values:
         permissions[key] = values
+# Carry scalar permission settings (e.g. defaultMode) from the kit, but never override a
+# choice the user already made in their own settings.
+for key in ("defaultMode",):
+    if key in incoming_permissions and key not in permissions:
+        permissions[key] = incoming_permissions[key]
 if permissions:
     merged["permissions"] = permissions
 

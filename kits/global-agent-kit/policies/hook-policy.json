@@ -10,7 +10,15 @@
       "\\bprisma\\s+migrate\\s+reset\\b",
       "\\bsequelize\\s+db:drop\\b",
       "\\bkubectl\\s+delete\\b",
-      "\\bterraform\\s+destroy\\b"
+      "\\bterraform\\s+destroy\\b",
+      "\\bpulumi\\s+destroy\\b",
+      "\\bgit\\s+branch\\s+(-D|--delete\\s+--force)\\b",
+      "\\bgit\\s+push\\b.*(--force\\b|--force-with-lease|\\s-f\\b)",
+      "\\bgit\\s+push\\b.*--delete\\b",
+      "\\bgit\\s+filter-branch\\b",
+      "\\bgit\\s+filter-repo\\b",
+      "\\bgit\\s+update-ref\\s+-d\\b",
+      "\\bgit\\s+reflog\\s+expire\\b"
     ],
     "paths": [
       "(^|/)\\.env($|\\.)",

@@ -67,16 +67,35 @@ def enumerate_claude_sessions(home: Path | None = None) -> Iterator[Path]:
     yield from sorted(projects.glob("*/*.jsonl"))
 
 
+def _iter_jsonl_records(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield JSON objects from a .jsonl transcript one line at a time.
+
+    A whole-file ``read_text().splitlines()`` materialises the entire transcript
+    (plus a list of every line) in RAM. For multi-GB agent logs that spikes RSS to
+    several times the file size, and because CPython/malloc retain freed arenas the
+    high-water mark accumulates across files — a status scan over many large Codex
+    rollouts drove a single process past 20 GB. Streaming bounds memory to one line.
+    """
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                yield record
+
+
 def parse_claude_session(path: Path, *, display_path: str | None = None) -> SessionUsage | None:
     usage: SessionUsage | None = None
     seen_requests: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for record in _iter_jsonl_records(path):
         message = record.get("message")
         if not isinstance(message, dict):
             continue
@@ -202,19 +221,7 @@ def parse_codex_session(path: Path, *, display_path: str | None = None) -> Codex
     seen_meta = False
     last_total: dict[str, int] | None = None
     last_total_ts: str | None = None
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
+    for record in _iter_jsonl_records(path):
         ts = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
         if ts:
             if usage.first_timestamp is None:

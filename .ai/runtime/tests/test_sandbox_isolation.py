@@ -58,6 +58,8 @@ def test_isolate_env_drops_unlisted_var(tmp_path, monkeypatch):
     out = _out(r)
     assert "got=NONE" in out
     assert "CANARY_SHOULD_NOT_LEAK" not in out
+    assert r["isolate_env"] is True
+    assert r["isolate_network"] is False
 
 
 def test_isolate_env_keeps_path(tmp_path):

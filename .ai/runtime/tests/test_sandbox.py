@@ -60,6 +60,34 @@ def test_execute_handles_command_not_found(tmp_path: Path) -> None:
     assert result["reason"] == "command_not_found"
 
 
+def test_execute_rejects_cwd_outside_repo(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    result = sandbox.execute(tmp_path, command=["pwd"], cwd=str(outside))
+    assert result == {"ok": False, "reason": "cwd_outside_root"}
+
+
+def test_execute_rejects_symlink_cwd_escape(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (tmp_path / "escape").symlink_to(outside, target_is_directory=True)
+    result = sandbox.execute(tmp_path, command=["pwd"], cwd="escape")
+    assert result == {"ok": False, "reason": "cwd_outside_root"}
+
+
+def test_execute_allows_relative_cwd_inside_repo(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    result = sandbox.execute(tmp_path, command=["pwd"], cwd="work")
+    assert result["ok"] is True
+    assert str(work) in result["output"]
+
+
+def test_execute_rejects_invalid_timeout(tmp_path: Path) -> None:
+    assert sandbox.execute(tmp_path, command=["echo", "x"], timeout=0)["reason"] == "invalid_timeout"
+    assert sandbox.execute(tmp_path, command=["echo", "x"], timeout=901)["reason"] == "invalid_timeout"
+
+
 def test_execute_redacts_secrets_in_summary(tmp_path: Path) -> None:
     secret = "AKIA" + "A" * 16
     result = sandbox.execute(tmp_path, command=["echo", secret])
@@ -107,6 +135,35 @@ def test_fetch_missing_id_returns_not_found(tmp_path: Path) -> None:
     assert result["reason"] == "not_found"
 
 
+def test_fetch_rejects_path_traversal_exec_id(tmp_path: Path) -> None:
+    result = sandbox.fetch(tmp_path, exec_id="../../../victim")
+    assert result == {"ok": False, "reason": "invalid_exec_id"}
+
+
+def test_fetch_and_read_output_reject_symlink_artifact(tmp_path: Path) -> None:
+    sandbox_dir = tmp_path / ".ai" / "cache" / "sandbox"
+    sandbox_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    exec_id = "deadbeefdeadbeef"
+    (sandbox_dir / f"{exec_id}.txt").symlink_to(outside)
+
+    fetched = sandbox.fetch(tmp_path, exec_id=exec_id)
+    assert fetched["ok"] is False
+    assert fetched["reason"] == "invalid_artifact"
+    assert sandbox.read_output(tmp_path, exec_id) is None
+
+
+def test_fetch_caps_large_artifact_reads(tmp_path: Path) -> None:
+    sandbox_dir = tmp_path / ".ai" / "cache" / "sandbox"
+    sandbox_dir.mkdir(parents=True)
+    exec_id = "0123456789abcdef"
+    (sandbox_dir / f"{exec_id}.txt").write_bytes(b"x" * (sandbox._READ_OUTPUT_CAP_BYTES + 100))
+    fetched = sandbox.fetch(tmp_path, exec_id=exec_id)
+    assert fetched["ok"] is True
+    assert fetched["truncated"] is True
+
+
 def test_list_executions_orders_newest_first(tmp_path: Path) -> None:
     ids = []
     for i in range(3):
@@ -150,6 +207,22 @@ def test_prune_removes_old_executions(tmp_path: Path) -> None:
     assert pruned["removed_count"] == 1
     assert not meta_path.exists()
     assert not txt_path.exists()
+
+
+def test_prune_ignores_malicious_metadata_exec_id(tmp_path: Path) -> None:
+    sandbox_dir = tmp_path / ".ai" / "cache" / "sandbox"
+    sandbox_dir.mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep", encoding="utf-8")
+    meta_path = sandbox_dir / "deadbeefdeadbeef.meta.json"
+    meta_path.write_text(
+        json.dumps({"exec_id": "../../../victim", "created_at": "2020-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    pruned = sandbox.prune(tmp_path, older_than_seconds=1)
+    assert pruned["removed_count"] == 0
+    assert pruned["kept_count"] == 1
+    assert victim.read_text(encoding="utf-8") == "keep"
 
 def test_execute_accepts_string_command(tmp_path: Path) -> None:
     # When command is a string, sandbox runs it via `bash -lc` so heredocs/pipes work.

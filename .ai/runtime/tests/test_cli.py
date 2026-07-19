@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tarfile
@@ -18,6 +19,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 PYTHON = sys.executable
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
+
+from ai_core import __version__  # noqa: E402
 
 
 def run_ai(*args: str, env: dict[str, str] | None = None, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
@@ -146,7 +149,7 @@ def test_version_json() -> None:
     result = run_ai("--json", "version")
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert payload["version"] == "0.6.3"
+    assert payload["version"] == __version__
     assert payload["protocol_version"] == 1
 
 
@@ -595,6 +598,36 @@ def test_preflight_check_only_json(tmp_path: Path) -> None:
     assert payload["checks"]["age"]["required"] is False
 
 
+def test_preflight_writes_confined_short_lived_proof(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    bash = usable_bash_or_skip()
+    result = subprocess.run(
+        [
+            bash,
+            "scripts/preflight.sh",
+            "--check-only",
+            "--json",
+            "--proof-file",
+            ".ai/cache/preflight-proof.json",
+        ],
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    proof_path = repo / ".ai" / "cache" / "preflight-proof.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    assert proof["schema"] == 2
+    assert proof["ok"] is True
+    assert len(proof["preflight_sha256"]) == 64
+    assert len(proof["root_fingerprint"]) == 64
+    assert len(proof["environment_fingerprint"]) == 64
+    if os.name != "nt":
+        assert stat.S_IMODE(proof_path.stat().st_mode) == 0o600
+
+
 def test_preflight_accepts_namespaced_code_brain_bootstrap(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     (repo / "bootstrap-code-brain.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
@@ -627,6 +660,61 @@ def test_secret_scan_uses_git_baseline_not_local_noise(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     secret_check = next(check for check in payload["checks"] if check["name"] == "secret_scan")
     assert secret_check["ok"] is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="executable fake Git fixture")
+def test_git_baseline_failure_is_structured_for_doctor_and_nonfatal_for_normal_session(
+    tmp_path: Path,
+) -> None:
+    repo = copy_repo(tmp_path)
+    (repo / ".git").mkdir()
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('git version 2.42.0')\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    env = {"PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", "")}
+
+    doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo, env=env)
+    doctor_payload = json.loads(doctor_result.stdout)
+    secret_check = next(
+        check for check in doctor_payload["checks"] if check["name"] == "secret_scan"
+    )
+
+    assert doctor_result.returncode == 10
+    assert secret_check["ok"] is False
+    assert "Git tracked-file baseline unavailable" in secret_check["detail"]
+    assert "Traceback" not in doctor_result.stderr
+
+    session_result = run_ai(
+        "session",
+        "start",
+        "--agent",
+        "operator",
+        "--rebuild",
+        "never",
+        "--json",
+        cwd=repo,
+        env=env,
+    )
+    session_payload = json.loads(session_result.stdout)
+    session_secret_check = next(
+        check for check in session_payload["doctor"]["checks"] if check["name"] == "secret_scan"
+    )
+
+    assert session_result.returncode == 0
+    assert session_payload["ok"] is True
+    assert session_secret_check["ok"] is False
+    assert "Git tracked-file baseline unavailable" in session_secret_check["detail"]
+    assert "Traceback" not in session_result.stderr
 
 
 def test_doctor_rejects_oversized_generated_artifacts(tmp_path: Path) -> None:
@@ -2921,7 +3009,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
     status_result = run_ai("report", "status", "--json", cwd=repo)
     assert status_result.returncode == 0, status_result.stdout + status_result.stderr
     payload = json.loads(status_result.stdout)
-    assert payload["runtime_version"] == "0.6.3"
+    assert payload["runtime_version"] == __version__
     assert payload["protocol_version"] == 1
     assert payload["doctor"]["ok"] is True
     assert isinstance(payload["release_ready"], bool)
@@ -2944,7 +3032,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
         assert artifacts["archive"]["archive_exists"] is False
     notes_result = run_ai("report", "release-notes", cwd=repo)
     assert notes_result.returncode == 0, notes_result.stdout + notes_result.stderr
-    assert "Code Brain 0.6.3 Release Notes" in notes_result.stdout
+    assert f"Code Brain {__version__} Release Notes" in notes_result.stdout
     assert "SBOM" in notes_result.stdout
     assert "./scripts/docs-check.sh" in notes_result.stdout
     assert "./scripts/release-gate.sh" in notes_result.stdout
@@ -2952,7 +3040,7 @@ def test_report_status_and_release_notes(tmp_path: Path) -> None:
 
 def test_report_status_rejects_release_notes_git_mismatch(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
-    notes_path = repo / "dist" / "code-brain-0.6.3.release-notes.md"
+    notes_path = repo / "dist" / f"code-brain-{__version__}.release-notes.md"
     if not notes_path.exists():
         return
     text = notes_path.read_text(encoding="utf-8")
@@ -3254,6 +3342,65 @@ def test_mcp_record_decision_via_tools_call(tmp_path: Path) -> None:
     assert "Use sandbox for grep" in structured["record"]["decision"]
 
 
+def test_exec_run_cli_exposes_environment_isolation(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".ai").mkdir()
+    (repo / ".ai" / "config.yaml").write_text("project_name: sandbox-cli-test\n", encoding="utf-8")
+    result = run_ai(
+        "exec",
+        "run",
+        "--isolate-env",
+        "--extra-env",
+        "NODE_ENV",
+        "--json",
+        "--",
+        PYTHON,
+        "-c",
+        (
+            "import os; "
+            "print('secret=' + os.getenv('CANARY_RUNTIME_TOKEN', 'NONE')); "
+            "print('node=' + os.getenv('NODE_ENV', 'NONE'))"
+        ),
+        cwd=repo,
+        env={"CANARY_RUNTIME_TOKEN": "must_not_leak", "NODE_ENV": "testing"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["isolate_env"] is True
+    assert payload["isolate_network"] is False
+    assert "secret=NONE" in payload["output"]
+    assert "must_not_leak" not in payload["output"]
+    assert "node=testing" in payload["output"]
+
+
+def test_exec_run_cli_returns_nonzero_for_fail_closed_isolation_error(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".ai").mkdir()
+    (repo / ".ai" / "config.yaml").write_text("project_name: sandbox-cli-error-test\n", encoding="utf-8")
+    result = run_ai(
+        "exec",
+        "run",
+        "--isolate-env",
+        "--extra-env",
+        "OPENAI_API_KEY",
+        "--json",
+        "--",
+        PYTHON,
+        "-c",
+        "print('must not execute')",
+        cwd=repo,
+        env={"OPENAI_API_KEY": "must_not_leak"},
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["reason"] == "invalid_extra_env_vars"
+    assert "must_not_leak" not in result.stdout
+
+
 def test_iter_text_files_skips_memory_and_cache(tmp_path: Path) -> None:
     sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
     from ai_core.search import iter_text_files
@@ -3272,6 +3419,8 @@ def test_iter_text_files_skips_memory_and_cache(tmp_path: Path) -> None:
     (repo / ".ai" / "memory" / "decisions.jsonl").write_text('{"d":"x"}\n', encoding="utf-8")
     (repo / ".ai" / "memory" / "session-current.md").write_text('# session\n', encoding="utf-8")
     (repo / ".ai" / "cache" / "code.sqlite").write_bytes(b"sqlite-stub")
+    (repo / ".chatgpt2codex").mkdir()
+    (repo / ".chatgpt2codex" / "session.json").write_text('{"internal":true}\n', encoding="utf-8")
     # Files that MUST be indexed
     (repo / "README.md").write_text("# project\n", encoding="utf-8")
     (repo / "src" / "main.py").write_text("def main(): pass\n", encoding="utf-8")
@@ -3279,7 +3428,7 @@ def test_iter_text_files_skips_memory_and_cache(tmp_path: Path) -> None:
     # Must contain README.md and src/main.py only.
     assert "README.md" in yielded
     assert "src/main.py" in yielded
-    forbidden_prefixes = (".ai/memory/", ".ai/cache/")
+    forbidden_prefixes = (".ai/memory/", ".ai/cache/", ".chatgpt2codex/")
     for path in yielded:
         for prefix in forbidden_prefixes:
             assert not path.startswith(prefix), f"{path} should be skipped (matches {prefix})"

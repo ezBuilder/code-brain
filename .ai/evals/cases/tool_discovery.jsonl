@@ -1,0 +1,8 @@
+{"id":"stale-index-rebuild","query":"rebuild stale code index","limit":5,"expect":[{"kind":"assert_list_item_rank_at_most","path":"tools","field":"name","value":"ai_request_rebuild","rank":1}]}
+{"id":"resume-handoff","query":"resume interrupted work handoff","limit":5,"expect":[{"kind":"assert_list_item_rank_at_most","path":"tools","field":"name","value":"append_handoff","rank":1}]}
+{"id":"call-graph-callers","query":"find function callers","limit":5,"expect":[{"kind":"assert_list_item_rank_at_most","path":"tools","field":"name","value":"code_graph_callers","rank":1}]}
+{"id":"deep-research-session","query":"start deep research session","limit":5,"expect":[{"kind":"assert_list_item_rank_at_most","path":"tools","field":"name","value":"autoresearch_deepresearch_start","rank":1}]}
+{"id":"durable-memory-recall","query":"remember past failures decisions lessons","limit":5,"expect":[{"kind":"assert_list_item_rank_at_most","path":"tools","field":"name","value":"memory_recall","rank":3}]}
+{"id":"security-finding-record","query":"record a security vulnerability finding","limit":5,"expect":[{"kind":"assert_list_item_rank_at_most","path":"tools","field":"name","value":"security_finding_record","rank":1}]}
+{"id":"sandbox-compact-output","query":"run shell command with compact output","limit":5,"expect":[{"kind":"assert_list_item_rank_at_most","path":"tools","field":"name","value":"sandbox_execute","rank":1}]}
+{"id":"korean-impact-analysis","query":"영향 범위 호출자 분석","limit":5,"expect":[{"kind":"assert_list_item_rank_at_most","path":"tools","field":"name","value":"code_graph_impact","rank":1}]}

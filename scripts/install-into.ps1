@@ -177,7 +177,8 @@ from pathlib import Path
 dst = Path(sys.argv[1])
 block = ('[mcp_servers.code-brain]\n'
          'command = "powershell"\n'
-         'args = ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"]\n')
+         'args = ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"]\n'
+         'env = { AI_CODE_BRAIN_PROFILE = "usage", AI_MCP_COMPACT_TOOLS = "1" }\n')
 text = dst.read_text(encoding="utf-8") if dst.exists() else ""
 def strip_section(t, header):
     lines = t.splitlines(); out = []; i = 0
@@ -222,6 +223,8 @@ def ensure_features(t):
         return (joined + "\n\n[features]\nhooks = true\n") if joined else "[features]\nhooks = true\n"
     return "\n".join(out).rstrip() + "\n"
 new_text = ensure_features(new_text)
+without_managed = strip_section(new_text, "[mcp_servers.code-brain]").rstrip()
+new_text = without_managed + "\n\n" + block if without_managed else block
 dst.parent.mkdir(parents=True, exist_ok=True)
 dst.write_text(new_text, encoding="utf-8")
 '@
@@ -448,7 +451,12 @@ function Install-OrUpgrade {
     Seed-RootAgentFile -FileName "AGENTS.md"
     Seed-RootAgentFile -FileName "CLAUDE.md"
     Write-InstallManifest
-    Invoke-Bootstrap
+    if ($env:AI_INSTALL_DEFER_RUNTIME -match '^(1|true|yes|on)$') {
+        Write-Host "install-into: runtime activation deferred; run bootstrap-code-brain.sh and session start in the target"
+    }
+    else {
+        Invoke-Bootstrap
+    }
     Write-Host "code-brain $Action`: $TargetRoot"
 }
 

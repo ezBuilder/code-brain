@@ -23,29 +23,45 @@ fi
 
 CHECK_ONLY=false
 JSON=false
-for arg in "$@"; do
-  case "$arg" in
+PROOF_FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --check-only) CHECK_ONLY=true ;;
     --json) JSON=true ;;
+    --proof-file)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "--proof-file requires a project-relative path" >&2
+        exit 2
+      fi
+      PROOF_FILE="$1"
+      ;;
     *)
-      echo "unknown argument: $arg" >&2
+      echo "unknown argument: $1" >&2
       exit 2
       ;;
   esac
+  shift
 done
 
-"${PYTHON_CMD[@]}" - "$ROOT" "$CHECK_ONLY" "$JSON" <<'PY'
+"${PYTHON_CMD[@]}" - "$ROOT" "$CHECK_ONLY" "$JSON" "$PROOF_FILE" <<'PY'
+import hashlib
 import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
-root = Path(sys.argv[1])
+root = Path(sys.argv[1]).resolve()
 check_only = sys.argv[2] == "true"
 as_json = sys.argv[3] == "true"
+proof_arg = sys.argv[4]
+sys.path.insert(0, str(root / ".ai" / "runtime" / "src"))
+from ai_core.preflight_proof import PROOF_SCHEMA, environment_fingerprint
 
 
 def command_env() -> dict[str, str]:
@@ -207,6 +223,55 @@ payload = {
     "warnings": warnings,
     "checks": checks,
 }
+
+
+def write_proof() -> None:
+    if not proof_arg:
+        return
+    requested = Path(proof_arg)
+    if requested.is_absolute() or ".." in requested.parts:
+        raise SystemExit("preflight failed: proof path must be project-relative and confined")
+    proof_path = root / requested
+    proof_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_parent = proof_path.parent.resolve()
+    try:
+        resolved_parent.relative_to(root)
+    except ValueError:
+        raise SystemExit("preflight failed: proof path escapes project root")
+    if proof_path.is_symlink():
+        raise SystemExit("preflight failed: proof path must not be a symlink")
+    if not ok:
+        proof_path.unlink(missing_ok=True)
+        return
+    script_path = root / "scripts" / "preflight.sh"
+    proof = {
+        "schema": PROOF_SCHEMA,
+        "ok": True,
+        "created_at_unix": time.time(),
+        "preflight_sha256": hashlib.sha256(script_path.read_bytes()).hexdigest(),
+        "root_fingerprint": hashlib.sha256(str(root).encode("utf-8")).hexdigest(),
+        "environment_fingerprint": environment_fingerprint(root),
+    }
+    fd, temporary = tempfile.mkstemp(prefix=".preflight-proof-", dir=resolved_parent)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(proof, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, proof_path)
+        if os.name != "nt":
+            proof_path.chmod(0o600)
+    finally:
+        try:
+            Path(temporary).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+write_proof()
 if as_json:
     print(json.dumps(payload, indent=2, sort_keys=True))
 else:

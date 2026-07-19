@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .memory import read_jsonl_all, read_jsonl_tail
+from .private_write import atomic_write_private_text, read_root_confined_text
 
 
 _FEDERATED_CACHE_TTL_SECONDS = 300
@@ -151,13 +152,20 @@ def _compute_cross_project_summary(self_root: Path, *, home: Path | None = None)
     }
 
 
-def _write_federated_cache(cache_path: Path, payload: dict[str, Any]) -> None:
+def _write_federated_cache(
+    cache_path: Path,
+    payload: dict[str, Any],
+    *,
+    root: Path | None = None,
+) -> None:
     """Atomically write JSON payload to cache_path via .tmp + os.replace."""
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, cache_path)
+        atomic_write_private_text(
+            cache_path,
+            json.dumps(payload, ensure_ascii=False),
+            root=root,
+        )
     except OSError:
         pass
 
@@ -188,16 +196,20 @@ def cross_project_summary(self_root: Path, *, home: Path | None = None) -> dict[
 
     cache_path = _federated_cache_path(self_root)
     try:
-        if cache_path.exists():
-            st = cache_path.stat()
-            age = time.time() - st.st_mtime
-            if age < _FEDERATED_CACHE_TTL_SECONDS and not _audit_index_newer_than(st.st_mtime, home=home):
-                payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                if isinstance(payload, dict):
-                    return payload
+        text, state = read_root_confined_text(
+            cache_path,
+            root=self_root,
+            max_bytes=1_000_000,
+            require_private=True,
+        )
+        age = time.time() - state.st_mtime
+        if age < _FEDERATED_CACHE_TTL_SECONDS and not _audit_index_newer_than(state.st_mtime, home=home):
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                return payload
     except (OSError, ValueError, json.JSONDecodeError):
         pass
 
     fresh = _compute_cross_project_summary(self_root, home=home)
-    _write_federated_cache(cache_path, fresh)
+    _write_federated_cache(cache_path, fresh, root=self_root)
     return fresh

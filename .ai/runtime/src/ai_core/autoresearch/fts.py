@@ -62,6 +62,14 @@ def search(root: Path, query: str, k: int = 10) -> list[dict]:
     """BM25 query. bm25() returns lower=better, so ascending order is most-relevant first."""
     if not storage.fts_db_path(root).is_file():
         return []
+    query_text = str(query or "").strip()
+    if not query_text:
+        return []
+    # Natural-language questions routinely contain FTS5 operators or punctuation
+    # (`/`, `:`, `-`, `?`). Reuse the main code-search normalizer so those inputs
+    # become quoted OR terms instead of parser errors.
+    from ..search import escape_fts_query
+
     conn = connect(root)
     try:
         try:
@@ -70,7 +78,7 @@ def search(root: Path, query: str, k: int = 10) -> list[dict]:
                 "snippet(pages_fts, 2, '[', ']', '…', 12) as snip, "
                 "bm25(pages_fts) as score "
                 "from pages_fts where pages_fts match ? order by score limit ?",
-                (query, k),
+                (escape_fts_query(query_text), k),
             )
             rows = cur.fetchall()
         except sqlite3.OperationalError:

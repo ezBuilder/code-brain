@@ -49,6 +49,28 @@ make uninstall-from TARGET=/path/to/project
 
 The installer records managed files in `.ai/generated/install-manifest.json`, refuses to overwrite unrelated existing files, preserves target `.ai/memory/` during upgrades, rebuilds the audit index, installs git pull/checkout hooks, and runs a forced session rebuild once. It does not commit `.ai/cache/` or `.ai/runtime/.venv/`; each Mac/VPS regenerates those local artifacts after `git pull`.
 
+The default install keeps the runtime dependency-light and uses BM25 search. Provision the optional ONNX dense-search dependencies only when required:
+
+```bash
+AI_INSTALL_DENSE=1 ./scripts/install-into.sh install /path/to/project
+AI_INSTALL_DENSE=1 ./scripts/install-into.sh upgrade /path/to/project
+```
+
+Dense search remains separately controlled at runtime by `AI_SEARCH_DENSE`; missing optional dependencies degrade safely to BM25.
+
+For package images, CI fixtures, or other staged provisioning, defer the expensive local runtime activation while still writing every managed file and the install manifest:
+
+```bash
+AI_INSTALL_DEFER_RUNTIME=1 ./scripts/install-into.sh install /path/to/project
+cd /path/to/project
+./bootstrap-code-brain.sh --skip-doctor --skip-render
+.ai/bin/ai session start --agent operator --rebuild auto --repair-audit-index --render-manifest --json
+```
+
+The defer flag is explicit and fail-safe: normal installs still bootstrap, repair the audit index, and create the first session before returning.
+
+The one-command `scripts/install.sh` wrapper requests strict health on that same first session. It does not launch a second doctor process or create another session snapshot.
+
 Run normal startup in the target project:
 
 ```bash
@@ -59,10 +81,14 @@ cd /path/to/project
 
 `session start` can return `ok: true` while `doctor.ok` is `false` when strict quality warnings exist, such as tracked plaintext secret candidates. Treat `doctor --strict` as the release gate, not as a blocker for initial attachment.
 
+Normal `session start` is the low-latency attachment path. It may reuse root-confined, private local state for unchanged files and reports the security-scan work explicitly as `mode=incremental baseline=cache total=... reused=... rescanned=... unreadable=... unstable=...`. Reuse is bound to file device, inode, mode, size, nanosecond mtime, nanosecond ctime, symlink payload, and the current secret-matcher fingerprint. A replaced, unstable, unreadable, publicly writable, foreign-owned, symlinked, or out-of-root cache entry is never trusted; affected files are rescanned or conservatively surfaced.
+
+`doctor --strict` remains authoritative. It bypasses tracked-file and search-candidate caches, reads the live Git baseline, re-hashes indexable source content, performs the full tracked-file credential scan, and runs the full diagnostics and synthetic hot-path checks. A project without `.git` uses a pruned `baseline=filesystem` that excludes Code Brain state, virtual environments, dependency trees, build output, and `.chatgpt2codex`; a project with a `.git` marker but an unreadable Git baseline fails explicitly instead of silently scanning untracked local state. Local caches improve interactive startup only; they cannot weaken the release or security gate.
+
 ## Search Cache Profile
 
 `.ai/cache/code.sqlite` uses SQLite FTS5 for lexical code search. The cache stores file paths, hashes, summaries, provenance, and a contentless FTS index; it does not store duplicate full source bodies in the `chunks` table. Query snippets are read lazily from the current source file and redacted before output.
-If a source file changes after indexing, local query paths auto-refresh before searching: dirty/untracked/deleted paths from `git status` are reindexed directly, and only clean-tree checkout/pull drift falls back to a broader incremental scan. CI remains read-only; set `AI_SEARCH_AUTO_REFRESH=0` to force stale-report-only behavior.
+If a source file changes after indexing, local query paths auto-refresh before searching: tracked dirty/deleted paths from `git status` are hash-checked directly, while new untracked files and clean-tree checkout/pull drift are detected by metadata-triggered hash comparison. The interactive path can reuse a private candidate-list cache and per-file size/mtime_ns/ctime_ns state. Strict freshness checks and full rebuilds bypass that candidate cache and query Git directly. Internal runtime state under `.ai/memory/`, `.ai/cache/`, and `.chatgpt2codex/` is excluded from the code index. CI remains read-only; set `AI_SEARCH_AUTO_REFRESH=0` to force stale-report-only behavior.
 
 ### Stale Index Handling
 
@@ -112,6 +138,7 @@ uv run --project .ai/runtime ai report release-notes
 The release gate runs environment checks, fresh-clone preflight, `uv.lock` drift verification, bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, package reproducibility check, rollback drill, bootstrap idempotency drill, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
 It starts with `scripts/env-check.sh`, which reports bash, git, make, uv, uv-managed Python, and optional PowerShell status as JSON.
 It also starts with `scripts/preflight.sh --check-only`, which verifies repo layout, required tools, Python version, conditional encrypted-secret tooling, conditional Git LFS tooling, and cache permission posture.
+Bootstrap records that successful result in `.ai/cache/preflight-proof.json`. The proof is mode `0600`, root-confined, and bound to the preflight script hash, repository root, PATH/tool binary states, runtime Python, encrypted-secret requirements, Git attributes, bootstrap files, cache permissions, and relevant environment variables. Doctor may reuse an unchanged proof for up to one hour; any fingerprint, ownership, permission, symlink, path-confinement, or age mismatch forces the real preflight command to run again.
 It runs `scripts/lockfile-check.sh` before package creation so runtime dependency changes cannot drift from the checked-in lockfile. The script wraps `uv lock --check --project .ai/runtime` and prints the `uv lock --project .ai/runtime` remediation when the lockfile is missing or stale.
 It starts with `scripts/lint.sh`, which checks shell syntax, Python compilation, Makefile dry-runs, and PowerShell bootstrap/shim parsing when PowerShell is available.
 Direct `bootstrap.sh` runs also start with `scripts/env-check.sh` and `scripts/preflight.sh --check-only`; `bootstrap.sh` and `bootstrap.ps1` render with `--dry-run` under CI/GitHub Actions.
@@ -273,13 +300,14 @@ For shell commands with potentially large output (`grep`, `find`, `cat`, `tree`,
 
 ```bash
 ai exec run --timeout 30 -- grep -rn "useEffect" src/        # short summary
+ai exec run --isolate-network --isolate-env -- python3 check.py # deny network + inherited secrets
 ai exec fetch --exec-id <id> --line-start 100 --line-end 200 # specific range
 ai exec fetch --exec-id <id> --grep "useEffect.*deps"        # filter by substring
 ai exec list --json                                          # recent executions
 ai exec prune --older-than-seconds 86400                     # clean cache (24h default)
 ```
 
-Storage: `.ai/cache/sandbox/<exec_id>.{txt,meta.json}` (mode `0o600`, gitignored). MCP equivalents: `sandbox_execute`, `sandbox_fetch`, `sandbox_list`. The summary (first 30 lines + last 5 lines, capped 4 KB) replaces a 50–500 KB raw grep dump in the model's context window. `sandbox_execute` is in `WRITE_COMMANDS` and rejected in CI unless explicitly run with the same write policy as `index rebuild`.
+Storage: `.ai/cache/sandbox/<exec_id>.{txt,meta.json}` (mode `0o600`, gitignored). MCP equivalents: `sandbox_execute`, `sandbox_fetch`, `sandbox_list`. Execution `cwd` must resolve inside the repository; output IDs are fixed 16-character lowercase hex values, symlink artifacts are rejected, and fetch/read paths are capped at 4 MB. The summary (first 30 lines + last 5 lines, capped 4 KB) replaces a 50–500 KB raw grep dump in the model's context window. Network and environment isolation are opt-in for compatibility: use both `--isolate-network --isolate-env` (or matching MCP booleans) for untrusted metric commands; `--extra-env NAME` may add reviewed non-secret variables, while secret-looking names fail closed. `sandbox_execute` is in `WRITE_COMMANDS` and rejected in CI unless explicitly run with the same write policy as `index rebuild`.
 
 ### Cross-Session Memory (proactive logging)
 

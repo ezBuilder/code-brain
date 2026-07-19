@@ -185,7 +185,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "sandbox_execute",
-        "description": "샌드박스에서 셸을 실행; 요약+exec_id를 반환하고 전체 출력은 디스크에 저장. 쓰기성. command는 argv 배열(예: [\"git\", \"log\"]) 또는 단일 셸 문자열(`bash -lc`로 실행) 모두 허용해 heredoc/파이프를 JSON 이스케이프 없이 쓸 수 있다. 출력이 작으면(≤20줄/≤1KB) first_lines/last_lines 대신 단일 `output` 필드로 반환.",
+        "description": "Run a shell command with compact output in the sandbox; 요약+exec_id를 반환하고 전체 출력은 디스크에 저장. 쓰기성. command는 argv 배열 또는 단일 셸 문자열 모두 허용한다. isolate_network는 IP/DNS를 차단하고 제공 불가 시 fail-closed, isolate_env는 자격증명 환경을 제거한다. 두 옵션은 독립적이며 강한 실행에는 함께 사용한다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -195,8 +195,17 @@ TOOLS: tuple[dict[str, Any], ...] = (
                         {"type": "array", "items": {"type": "string"}, "minItems": 1},
                     ]
                 },
-                "cwd": {"type": "string"},
-                "timeout": {"type": "integer", "default": 30},
+                "cwd": {"type": "string", "description": "Repo-relative or repo-contained path"},
+                "timeout": {"type": "integer", "minimum": 1, "maximum": 900, "default": 30},
+                "isolate_network": {"type": "boolean", "default": False},
+                "isolate_env": {"type": "boolean", "default": False},
+                "extra_env_vars": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$"},
+                    "maxItems": 32,
+                    "default": [],
+                    "description": "Additional non-secret env names allowed only with isolate_env; secret-looking names are rejected.",
+                },
             },
             "required": ["command"],
         },
@@ -738,6 +747,71 @@ def _invalidate_tools_list_cache() -> None:
     _TOOLS_LIST_CACHE = None
 
 
+_TOOL_SEARCH_TOKEN_RE = re.compile(r"[a-z0-9가-힣]+")
+
+
+def _tool_search_tokens(value: object) -> list[str]:
+    """Normalize natural-language/tool-name text into stable search terms."""
+    text = str(value or "").lower().replace("_", " ").replace("-", " ")
+    return _TOOL_SEARCH_TOKEN_RE.findall(text)
+
+
+def _search_tool_catalog(query_text: str, *, limit: int) -> list[dict[str, Any]]:
+    """Return a deterministic, specificity-weighted shortlist from the MCP catalog.
+
+    Exact tool-name tokens receive the strongest weight, description matches are
+    weaker, and terms occurring in fewer catalog entries receive a larger weight.
+    This keeps generic words such as ``code`` from outranking a rare, decisive term
+    such as ``rebuild`` while preserving a dependency-free local implementation.
+    """
+    terms = list(dict.fromkeys(_tool_search_tokens(query_text)))
+    if not terms:
+        return []
+
+    documents: list[tuple[dict[str, Any], str, str, set[str], set[str]]] = []
+    for tool in TOOLS:
+        name_tokens = _tool_search_tokens(tool["name"])
+        description_tokens = _tool_search_tokens(tool.get("description", ""))
+        documents.append(
+            (
+                tool,
+                " ".join(name_tokens),
+                " ".join(description_tokens),
+                set(name_tokens),
+                set(description_tokens),
+            )
+        )
+
+    document_frequency = {
+        term: sum(term in name_text or term in description_text for _, name_text, description_text, _, _ in documents)
+        for term in terms
+    }
+    scored: list[tuple[int, int, str, dict[str, Any]]] = []
+    catalog_size = len(documents)
+    for tool, name_text, description_text, name_tokens, description_tokens in documents:
+        score = 0
+        matched_terms = 0
+        for term in terms:
+            rarity = max(1, catalog_size // max(1, document_frequency[term]))
+            if term in name_tokens:
+                score += 8 * rarity
+            elif term in name_text:
+                score += 5 * rarity
+            elif term in description_tokens:
+                score += 3 * rarity
+            elif term in description_text:
+                score += rarity
+            else:
+                continue
+            matched_terms += 1
+        if score:
+            scored.append((score, matched_terms, str(tool["name"]), tool))
+
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    bounded_limit = max(1, min(int(limit or 8), catalog_size))
+    return [dict(tool) for _, _, _, tool in scored[:bounded_limit]]
+
+
 def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run the underlying handler for a tool by name. Raises KeyError if unknown."""
     args = arguments or {}
@@ -921,11 +995,23 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             command_payload = [str(part) for part in command]
         else:
             raise ValueError("sandbox_execute requires command as non-empty string or array")
+        extra_env_vars = args.get("extra_env_vars", [])
+        if not isinstance(extra_env_vars, list) or len(extra_env_vars) > 32:
+            raise ValueError("sandbox_execute extra_env_vars must be an array of at most 32 names")
+        if any(
+            not isinstance(item, str)
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", item) is None
+            for item in extra_env_vars
+        ):
+            raise ValueError("sandbox_execute extra_env_vars contains an invalid environment name")
         return sandbox_execute(
             root,
             command=command_payload,
             cwd=str(args["cwd"]) if isinstance(args.get("cwd"), str) else None,
             timeout=int(args.get("timeout", 30) or 30),
+            isolate_network=bool(args.get("isolate_network", False)),
+            isolate_env=bool(args.get("isolate_env", False)),
+            extra_env_vars=extra_env_vars,
         )
     if name == "record_decision":
         text = args.get("text")
@@ -988,17 +1074,9 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
                                autonomous=bool(args.get("autonomous", False)),
                                tier=args.get("tier") if args.get("tier") in ("cheap", "balanced", "best") else None)
     if name == "tool_search":
-        q = str(args.get("query", "")).strip().lower()
-        terms = [t for t in q.split() if t]
-        scored: list[tuple[int, dict[str, Any]]] = []
-        for tool in TOOLS:
-            hay = (tool["name"] + " " + str(tool.get("description", ""))).lower()
-            score = sum(1 for t in terms if t in hay)
-            if score:
-                scored.append((score, tool))
-        scored.sort(key=lambda s: s[0], reverse=True)
+        q = str(args.get("query", "")).strip()
         limit = int(args.get("limit", 8) or 8)
-        return {"ok": True, "tools": [dict(t) for _, t in scored[:limit]]}
+        return {"ok": True, "tools": _search_tool_catalog(q, limit=limit)}
     if name == "lessons_recall":
         recall_query = args.get("query")
         if not isinstance(recall_query, str) or not recall_query.strip():

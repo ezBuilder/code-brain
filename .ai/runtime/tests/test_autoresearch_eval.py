@@ -1,7 +1,9 @@
 """Stage 0 smoke retrieval eval tests (PRD §12.3) — retrieval-miss regression guard."""
 from __future__ import annotations
 
-from ai_core.autoresearch import evalset, ingest, storage
+import math
+
+from ai_core.autoresearch import evalset, fts, ingest, storage
 
 
 def _build_corpus(ar):
@@ -25,6 +27,7 @@ def test_smoke_eval_all_hit(tmp_path):
     ]
     rep = evalset.evaluate(ar, golden, k=5)
     assert rep["recall_at_k"] == 1.0 and rep["misses"] == [] and rep["hits"] == 3
+    assert rep["hit_rate_at_k"] == 1.0 and rep["mrr"] == 1.0 and rep["ndcg_at_k"] == 1.0
 
 
 def test_smoke_eval_detects_miss(tmp_path):
@@ -33,6 +36,7 @@ def test_smoke_eval_detects_miss(tmp_path):
     _build_corpus(ar)
     rep = evalset.evaluate(ar, [{"query": "zzz nonexistent topic", "expect": "concepts/rrf.md"}], k=5)
     assert rep["recall_at_k"] == 0.0 and len(rep["misses"]) == 1
+    assert rep["mrr"] == 0.0 and rep["ndcg_at_k"] == 0.0
 
 
 def test_smoke_eval_reports_rank(tmp_path):
@@ -41,6 +45,48 @@ def test_smoke_eval_reports_rank(tmp_path):
     _build_corpus(ar)
     rep = evalset.evaluate(ar, [{"query": "fusion", "expect": "concepts/rrf.md"}], k=5)
     assert rep["results"][0]["rank"] == 1
+
+
+def test_fts_accepts_natural_language_punctuation(tmp_path):
+    ar = tmp_path / "ar"
+    storage.ensure_tree(ar)
+    _build_corpus(ar)
+    for query in (
+        "How does reciprocal/fusion work?",
+        "retrieval: contextual chunks",
+        "dense-retrieval ranking",
+    ):
+        result = fts.search(ar, query, k=5)
+        assert result and "error" not in result[0]
+
+
+def test_smoke_eval_reports_rank_sensitive_metrics(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        evalset.fts_mod,
+        "search",
+        lambda _root, _query, k: [{"page": "noise.md"}, {"page": "target.md"}][:k],
+    )
+    rep = evalset.evaluate(tmp_path, [{"query": "topic", "expect": "target.md"}], k=5)
+    assert rep["recall_at_k"] == 1.0
+    assert rep["mrr"] == 0.5
+    assert rep["ndcg_at_k"] == round(1.0 / math.log2(3), 6)
+
+
+def test_smoke_eval_supports_multiple_relevant_pages(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        evalset.fts_mod,
+        "search",
+        lambda _root, _query, k: [
+            {"page": "a.md"},
+            {"page": "noise.md"},
+            {"page": "b.md"},
+        ][:k],
+    )
+    rep = evalset.evaluate(tmp_path, [{"query": "topic", "expect": ["a.md", "b.md"]}], k=5)
+    expected_ndcg = (1.0 + 1.0 / math.log2(4)) / (1.0 + 1.0 / math.log2(3))
+    assert rep["recall_at_k"] == 1.0
+    assert rep["mrr"] == 1.0
+    assert rep["ndcg_at_k"] == round(expected_ndcg, 6)
 
 
 def test_load_golden_tsv(tmp_path):

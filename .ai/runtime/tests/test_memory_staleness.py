@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import os
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
@@ -115,6 +118,51 @@ def test_decisions_jsonl_timestamp_also_counts_as_recorded(tmp_path: Path) -> No
     assert info["last_recorded"] == "2099-01-01T00:00:00Z"
     assert info["commit_count"] == 0
     assert info["stale"] is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
+def test_memory_freshness_never_reads_external_symlink_timestamps(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    _commit(tmp_path, "feature_a.txt", "feat: a")
+    mem = tmp_path / ".ai" / "memory"
+    mem.mkdir(parents=True)
+    external_note = tmp_path / "external-session.md"
+    external_note.write_text(
+        "# Current Session\n\n- [2099-01-01T00:00:00Z] EXTERNAL_FRESHNESS\n",
+        encoding="utf-8",
+    )
+    external_decisions = tmp_path / "external-decisions.jsonl"
+    external_decisions.write_text(
+        '{"decided_at":"2099-01-01T00:00:00Z","decision":"EXTERNAL_FRESHNESS"}\n',
+        encoding="utf-8",
+    )
+    (mem / "session-current.md").symlink_to(external_note)
+    (mem / "decisions.jsonl").symlink_to(external_decisions)
+
+    info = memory_freshness(tmp_path)
+
+    assert info["last_recorded"] == ""
+    assert info["stale"] is True
+    assert "EXTERNAL_FRESHNESS" not in staleness_banner(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")
+def test_memory_freshness_never_reads_external_hardlink_timestamps(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    _commit(tmp_path, "feature_a.txt", "feat: a")
+    mem = tmp_path / ".ai" / "memory"
+    mem.mkdir(parents=True)
+    external = tmp_path / "external-session.md"
+    external.write_text(
+        "# Current Session\n\n- [2099-01-01T00:00:00Z] EXTERNAL_HARDLINK\n",
+        encoding="utf-8",
+    )
+    os.link(external, mem / "session-current.md")
+
+    info = memory_freshness(tmp_path)
+
+    assert info["last_recorded"] == ""
+    assert info["stale"] is True
 
 
 def _session_note_text(repo: Path) -> str:

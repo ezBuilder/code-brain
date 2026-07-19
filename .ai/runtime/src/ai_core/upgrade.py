@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import shutil
@@ -77,12 +79,21 @@ def upgrade_apply(root: Path, *, target_version: str, dry_run: bool = False) -> 
     if dry_run:
         return result
     backup_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / ".ai" / "generated" / "manifest.json"
+    if manifest_path.is_file():
+        manifest_bytes = manifest_path.read_bytes()
+    else:
+        manifest_bytes = (
+            json.dumps(build_manifest(root), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
     backup_path.write_text(
         json.dumps(
             {
                 "runtime_version": __version__,
                 "target_version": target_version,
                 "manifest": build_manifest(root),
+                "manifest_bytes_b64": base64.b64encode(manifest_bytes).decode("ascii"),
+                "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
             },
             ensure_ascii=False,
             indent=2,
@@ -259,15 +270,54 @@ def upgrade_latest(
 
 
 def rollback(root: Path, *, backup_path: str) -> dict[str, Any]:
-    source = root / backup_path
-    if not source.exists():
+    root = root.resolve()
+    upgrade_dir = (root / ".ai" / "cache" / "upgrade").resolve()
+    raw_source = Path(backup_path)
+    source = raw_source.resolve() if raw_source.is_absolute() else (root / raw_source).resolve()
+    try:
+        source.relative_to(upgrade_dir)
+    except ValueError as exc:
+        raise PermissionError("rollback backup must stay under .ai/cache/upgrade") from exc
+    if source.is_symlink() or not source.is_file():
         raise FileNotFoundError(f"rollback backup not found: {backup_path}")
     data = json.loads(source.read_text(encoding="utf-8"))
     manifest_path = root / ".ai" / "generated" / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(data["manifest"], ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    encoded = data.get("manifest_bytes_b64")
+    if isinstance(encoded, str):
+        try:
+            manifest_bytes = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ValueError("rollback backup contains invalid manifest bytes") from exc
+        expected_sha = data.get("manifest_sha256")
+        actual_sha = hashlib.sha256(manifest_bytes).hexdigest()
+        if not isinstance(expected_sha, str) or actual_sha != expected_sha:
+            raise ValueError("rollback backup manifest checksum mismatch")
+    else:
+        # Backward-compatible fallback for backups created before exact-byte storage.
+        manifest_bytes = (
+            json.dumps(data["manifest"], ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=".manifest.rollback.", suffix=".tmp", dir=str(manifest_path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(manifest_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, manifest_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     append_audit(root, action="upgrade.rollback", category="upgrade", payload={"backup_path": backup_path})
-    return {"ok": True, "restored": "manifest", "backup_path": backup_path}
+    return {
+        "ok": True,
+        "restored": "manifest",
+        "backup_path": backup_path,
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
 
 
 def clean_upgrade_cache(root: Path) -> dict[str, Any]:

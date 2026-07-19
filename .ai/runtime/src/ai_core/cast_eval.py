@@ -260,11 +260,10 @@ def _build_eval_index(
 
 
 def _escape_fts_query(text: str) -> str:
-    """Quote each term and OR them (mirrors search.escape_fts_query)."""
-    terms = [term.replace('"', "") for term in str(text or "").split() if term.strip()]
-    if not terms:
-        return '""'
-    return " OR ".join(f'"{term}"' for term in terms)
+    """Use the production FTS query normalizer so eval and runtime cannot drift."""
+    from .search import escape_fts_query
+
+    return escape_fts_query(text)
 
 
 def _query_index(conn: sqlite3.Connection, text: str, *, k: int) -> list[dict[str, Any]]:

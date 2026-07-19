@@ -125,6 +125,11 @@ if should_install_global; then
   INSTALL_GLOBAL=1
 fi
 
+RUNTIME_DEFERRED=0
+case "${AI_INSTALL_DEFER_RUNTIME:-0}" in
+  1|true|TRUE|yes|YES|on|ON) RUNTIME_DEFERRED=1 ;;
+esac
+
 # 1. uv is the only hard prerequisite (it provisions Python 3.11+ itself). Auto-install.
 if ! command -v uv >/dev/null 2>&1; then
   echo "[code-brain] 'uv' not found — installing from astral.sh ..." >&2
@@ -145,16 +150,14 @@ fi
 
 # 2. Copy + wire repo-local config.
 echo "[code-brain] installing into: $TARGET" >&2
-bash "$SOURCE_ROOT/scripts/install-into.sh" install "$TARGET"
-
-# 3. Bootstrap the runtime, verify strict health, and create the first session snapshot.
-if [[ -f "$TARGET/bootstrap-code-brain.sh" ]]; then
-  ( cd "$TARGET" && bash ./bootstrap-code-brain.sh )
+if [[ "$RUNTIME_DEFERRED" -eq 0 ]]; then
+  AI_INSTALL_STRICT=1 bash "$SOURCE_ROOT/scripts/install-into.sh" install "$TARGET"
 else
-  ( cd "$TARGET" && uv sync --project .ai/runtime --extra dense )
+  bash "$SOURCE_ROOT/scripts/install-into.sh" install "$TARGET"
 fi
-( cd "$TARGET" && uv run --project .ai/runtime ai doctor --strict --json >/dev/null )
-( cd "$TARGET" && uv run --project .ai/runtime ai session start --agent installer --query "initial Code Brain setup" --json >/dev/null )
+
+# 3. install-into.sh owns bootstrap, index repair, first-session creation, and
+# the requested strict health result. Do not repeat any runtime command here.
 
 if [[ "$INSTALL_GLOBAL" -eq 1 ]]; then
   if [[ ! -x "$SOURCE_ROOT/kits/global-agent-kit/install.sh" ]]; then
@@ -167,5 +170,9 @@ else
   echo "[code-brain] global Claude/Codex kit skipped. Use --global to install it." >&2
 fi
 
-echo "[code-brain] installed. New AI sessions in $TARGET now load Code Brain memory, search, hooks, and MCP automatically." >&2
+if [[ "$RUNTIME_DEFERRED" -eq 1 ]]; then
+  echo "[code-brain] files staged. Runtime activation was deferred for $TARGET." >&2
+else
+  echo "[code-brain] installed. New AI sessions in $TARGET now load Code Brain memory, search, hooks, and MCP automatically." >&2
+fi
 echo "[code-brain] (optional) cross-machine sync: set memory_sync.enabled: true in .ai/config.yaml + AI_REMOTE_FETCH=1." >&2

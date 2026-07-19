@@ -13,14 +13,23 @@ Public API:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import stat as stat_module
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from ai_core.context_budget import PROTECTED_SIGNALS, policy as context_budget_policy
+from ai_core.private_write import (
+    atomic_write_private_text,
+    ensure_root_confined_directory,
+    private_file_lock,
+    read_root_confined_text,
+)
 from ai_core.redact import redact_value
 
 RESUME_RETENTION_DAYS = 14
@@ -29,6 +38,7 @@ try:
 except (ValueError, TypeError):
     RESUME_MAX_BYTES = 4096
 SCHEMA_VERSION = 1
+_SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 _DONE_STATUSES = {"done", "closed", "completed", "cancelled", "canceled"}
 
@@ -36,19 +46,32 @@ _DONE_STATUSES = {"done", "closed", "completed", "cancelled", "canceled"}
 # Earlier entries are dropped first; later entries are kept longer.
 _DROP_ORDER = ("audit_tail_actions", "session_tail", "todos_open")
 _PROTECTED_FIELDS = ("handoff", *PROTECTED_SIGNALS)
+_SECONDARY_DROP_ORDER = (
+    "decisions_tail",
+    "forced_reason",
+    "resume_hint",
+    "context_budget",
+    "machine_id",
+    "agent",
+)
+_SESSION_ID_PAYLOAD_MAX_BYTES = 128
+_MEMORY_SOURCE_MAX_BYTES = 10_000_000
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file():
-        return []
+def _read_jsonl(path: Path, *, root: Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        text, _state = read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=_MEMORY_SOURCE_MAX_BYTES,
+            require_private=False,
+        )
+    except (OSError, UnicodeDecodeError):
         return []
     for line in text.splitlines():
         line = line.strip()
@@ -63,22 +86,26 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-def _read_text(path: Path) -> str:
-    if not path.is_file():
-        return ""
+def _read_text(path: Path, *, root: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
+        text, _state = read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=_MEMORY_SOURCE_MAX_BYTES,
+            require_private=False,
+        )
+        return text
+    except (OSError, UnicodeDecodeError):
         return ""
 
 
 def _decisions_tail(root: Path) -> list[dict[str, Any]]:
-    entries = _read_jsonl(root / ".ai" / "memory" / "decisions.jsonl")
+    entries = _read_jsonl(root / ".ai" / "memory" / "decisions.jsonl", root=root)
     return entries[-5:]
 
 
 def _todos_open(root: Path) -> list[dict[str, Any]]:
-    entries = _read_jsonl(root / ".ai" / "memory" / "todos.jsonl")
+    entries = _read_jsonl(root / ".ai" / "memory" / "todos.jsonl", root=root)
     latest: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for item in entries:
@@ -103,7 +130,7 @@ def _todos_open(root: Path) -> list[dict[str, Any]]:
 
 
 def _session_tail(root: Path) -> str:
-    text = _read_text(root / ".ai" / "memory" / "session-current.md")
+    text = _read_text(root / ".ai" / "memory" / "session-current.md", root=root)
     if not text:
         return ""
     lines = text.splitlines()
@@ -125,9 +152,9 @@ def _audit_tail_actions(root: Path) -> list[str]:
         files = []
     if not files:
         legacy = root / ".ai" / "memory" / "audit.jsonl"
-        files = [legacy] if legacy.is_file() else []
+        files = [legacy]
     for path in files[-2:]:
-        entries.extend(_read_jsonl(path))
+        entries.extend(_read_jsonl(path, root=root))
     seen: set[str] = set()
     actions: list[str] = []
     # Walk from newest to oldest so most recent unique actions are preferred.
@@ -145,32 +172,123 @@ def _audit_tail_actions(root: Path) -> list[str]:
     return list(reversed(actions))
 
 
+def _snapshot_json(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _payload_size(payload: dict[str, Any]) -> int:
-    return len(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    return len(_snapshot_json(payload).encode("utf-8"))
+
+
+def _shrink_value_once(value: Any) -> tuple[Any, bool]:
+    if isinstance(value, str):
+        if not value:
+            return value, False
+        return value[: max(0, len(value) // 2)], True
+    if isinstance(value, list):
+        if len(value) > 1:
+            return value[: max(1, len(value) // 2)], True
+        if len(value) == 1:
+            shrunk, changed = _shrink_value_once(value[0])
+            if changed:
+                return [shrunk], True
+            return [], True
+        return value, False
+    if isinstance(value, dict):
+        if not value:
+            return value, False
+        ordered = sorted(
+            value,
+            key=lambda key: _payload_size({str(key): value[key]}),
+            reverse=True,
+        )
+        for key in ordered:
+            shrunk, changed = _shrink_value_once(value[key])
+            if changed:
+                updated = dict(value)
+                updated[key] = shrunk
+                return updated, True
+        return {}, True
+    return value, False
 
 
 def _shrink_to_fit(payload: dict[str, Any], cap: int) -> dict[str, Any]:
-    if _payload_size(payload) <= cap:
-        return payload
-    for field in _DROP_ORDER:
+    cap = int(cap)
+    if cap <= 0:
+        raise ValueError("snapshot byte cap must be positive")
+    result = json.loads(json.dumps(payload, ensure_ascii=False))
+    if _payload_size(result) <= cap:
+        return result
+    for field in (*_DROP_ORDER, *_SECONDARY_DROP_ORDER):
         if field in _PROTECTED_FIELDS:
             continue
-        if field in payload:
-            # Replace with empty container while still indicating drop.
-            payload.pop(field, None)
-            if _payload_size(payload) <= cap:
-                return payload
-    return payload
+        if field in result:
+            result.pop(field, None)
+            if _payload_size(result) <= cap:
+                return result
+
+    # Protected signals remain present, but their values may be compacted when
+    # the protected content alone would otherwise violate the hard byte cap.
+    for _attempt in range(512):
+        if _payload_size(result) <= cap:
+            return result
+        candidates = [field for field in _PROTECTED_FIELDS if field in result]
+        if not candidates:
+            break
+        field = max(candidates, key=lambda name: _payload_size({name: result[name]}))
+        shrunk, changed = _shrink_value_once(result[field])
+        if not changed:
+            break
+        result[field] = shrunk
+
+    # Last-resort compaction of non-protected identity strings. The full
+    # session identifier is already represented by session_id_sha256 when it
+    # was truncated before composition.
+    for field in ("session_id", "written_at", "session_id_sha256"):
+        while field in result and _payload_size(result) > cap:
+            shrunk, changed = _shrink_value_once(result[field])
+            if not changed:
+                break
+            result[field] = shrunk
+
+    if _payload_size(result) > cap:
+        raise ValueError(
+            f"resume snapshot cannot fit hard byte cap: {_payload_size(result)} > {cap}"
+        )
+    return result
+
+
+def _bounded_utf8_prefix(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _snapshot_session_identity(session_id: str) -> tuple[str, str | None]:
+    value = str(session_id or "")
+    if len(value.encode("utf-8")) <= _SESSION_ID_PAYLOAD_MAX_BYTES:
+        return value, None
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return _bounded_utf8_prefix(value, _SESSION_ID_PAYLOAD_MAX_BYTES), digest
+
+
+def _session_directory_name(session_id: str) -> str:
+    value = str(session_id or "").strip()
+    if _SAFE_SESSION_ID.fullmatch(value):
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+    return f"sid-{digest}"
 
 
 def _ensure_session_dir(root: Path, session_id: str) -> Path:
-    session_dir = root / ".ai" / "memory" / "sessions" / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(session_dir, 0o700)
-    except OSError:
-        pass
-    return session_dir
+    session_dir = root / ".ai" / "memory" / "sessions" / _session_directory_name(session_id)
+    return ensure_root_confined_directory(session_dir, root=root, mode=0o700)
 
 
 # ---------------------------------------------------------------------------
@@ -179,15 +297,23 @@ def _ensure_session_dir(root: Path, session_id: str) -> Path:
 # never syncs; snapshots then record where they were written for cross-machine
 # provenance and "prior thread was on <machine>" handoff hints.
 # ---------------------------------------------------------------------------
-def machine_id(root: Path) -> str:
-    cache = Path(root) / ".ai" / "cache" / "machine_id"
+def _read_machine_id(cache: Path, root: Path) -> str:
     try:
-        if cache.is_file():
-            existing = cache.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing[:48]
+        text, _state = read_root_confined_text(
+            cache,
+            root=root,
+            max_bytes=128,
+            require_private=True,
+        )
+        existing = text.strip()
+        if existing:
+            return existing[:48]
     except OSError:
         pass
+    return ""
+
+
+def _new_machine_id() -> str:
     # OPAQUE by default — never derive from hostname/username. machine_id is embedded in
     # GIT-TRACKED memory (handoff.json) that travels Mac↔VPS and is publicly distributable,
     # so it must carry NO PII. Users who want a readable label ("mac"/"vps") opt in via
@@ -202,12 +328,27 @@ def machine_id(root: Path) -> str:
         mid = re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-")[:48] or ("cb-" + secrets.token_hex(4))
     else:
         mid = "cb-" + secrets.token_hex(4)
-    try:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(mid, encoding="utf-8")
-    except OSError:
-        pass
     return mid
+
+
+def machine_id(root: Path) -> str:
+    root = Path(root)
+    cache = root / ".ai" / "cache" / "machine_id"
+    existing = _read_machine_id(cache, root)
+    if existing:
+        return existing
+    try:
+        with private_file_lock(cache.with_name(".machine_id.lock"), root=root):
+            existing = _read_machine_id(cache, root)
+            if existing:
+                return existing
+            mid = _new_machine_id()
+            atomic_write_private_text(cache, mid, root=root)
+            return mid
+    except OSError:
+        # Fail-soft when the cache cannot be created; callers still receive an
+        # opaque non-PII identifier for the current payload.
+        return _new_machine_id()
 
 
 def _resume_hint(agent: str, session_id: str) -> str:
@@ -216,12 +357,13 @@ def _resume_hint(agent: str, session_id: str) -> str:
     so this is only a pointer the other machine can act on by hand."""
     a = (agent or "").lower()
     sid = (session_id or "").strip()
+    safe_sid = sid if _SAFE_SESSION_ID.fullmatch(sid) else ""
     if a == "claude":
-        return f"claude --resume {sid}" if sid else "claude --resume"
+        return f"claude --resume {safe_sid}" if safe_sid else "claude --resume"
     if a == "codex":
         return "codex resume"  # interactive picker; rollout id lives under ~/.codex/sessions
     if a in {"antigravity", "agy"}:
-        return f"agy --conversation={sid}" if sid else "agy --continue"
+        return f"agy --conversation={safe_sid}" if safe_sid else "agy --continue"
     return ""
 
 
@@ -257,13 +399,19 @@ def _clean_list(items: Any) -> list[str]:
 def read_handoff(root: Path) -> dict[str, Any]:
     path = handoff_path(root)
     try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
+        text, _state = read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=65536,
+            require_private=False,
+        )
+        obj = json.loads(text)
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
     return obj if isinstance(obj, dict) else {}
 
 
-def write_handoff(
+def _write_handoff_unlocked(
     root: Path,
     *,
     goal: str | None = None,
@@ -293,11 +441,38 @@ def write_handoff(
     current["agent"] = (agent or "operator")[:32]
     current["machine_id"] = machine_id(root)
     current = redact_value(current)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_private_text(
+        path,
+        json.dumps(current, ensure_ascii=False, indent=2),
+        root=root,
+    )
     return {"ok": True, "path": str(path), "handoff": current}
+
+
+def write_handoff(
+    root: Path,
+    *,
+    goal: str | None = None,
+    plan: list[str] | None = None,
+    next_step: str | None = None,
+    open_questions: list[str] | None = None,
+    blockers: list[str] | None = None,
+    agent: str = "operator",
+    clear: bool = False,
+) -> dict[str, Any]:
+    root = Path(root)
+    lock_path = handoff_path(root).with_name(".handoff.lock")
+    with private_file_lock(lock_path, root=root):
+        return _write_handoff_unlocked(
+            root,
+            goal=goal,
+            plan=plan,
+            next_step=next_step,
+            open_questions=open_questions,
+            blockers=blockers,
+            agent=agent,
+            clear=clear,
+        )
 
 
 def _handoff_for_snapshot(root: Path) -> dict[str, Any]:
@@ -335,13 +510,13 @@ def write_snapshot(
     root = Path(root)
     session_dir = _ensure_session_dir(root, session_id)
     target = session_dir / "resume.json"
-    tmp = session_dir / "resume.json.tmp"
     budget = context_budget_policy(context_budget_mode, base_max_bytes=RESUME_MAX_BYTES)
+    payload_session_id, session_id_sha256 = _snapshot_session_identity(session_id)
 
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "session_id": session_id,
-        "agent": agent,
+        "session_id": payload_session_id,
+        "agent": str(agent or "operator")[:64],
         "context_budget": budget,
         # P2: provenance — which machine + how to reopen the native transcript there.
         "machine_id": machine_id(root),
@@ -354,6 +529,9 @@ def write_snapshot(
         "session_tail": _session_tail(root),
         "audit_tail_actions": _audit_tail_actions(root),
     }
+    if session_id_sha256 is not None:
+        payload["session_id_sha256"] = session_id_sha256
+        payload["session_id_truncated"] = True
     if not payload["handoff"]:
         payload.pop("handoff")
     if force:
@@ -365,31 +543,15 @@ def write_snapshot(
     # Enforce hard size cap by dropping fields in priority order.
     payload = _shrink_to_fit(payload, int(budget["max_bytes"]))
 
-    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+    data = _snapshot_json(payload)
     encoded = data.encode("utf-8")
+    if len(encoded) > int(budget["max_bytes"]):
+        raise ValueError(
+            f"resume snapshot exceeded hard byte cap after compaction: "
+            f"{len(encoded)} > {budget['max_bytes']}"
+        )
 
-    # Atomic write: tmp -> rename. Cleanup tmp on any failure.
-    try:
-        with open(tmp, "wb") as fh:
-            fh.write(encoded)
-            fh.flush()
-            os.fsync(fh.fileno())
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, target)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
-
-    try:
-        os.chmod(target, 0o600)
-    except OSError:
-        pass
+    atomic_write_private_text(target, data, root=root)
 
     return {"ok": True, "path": str(target), "bytes_written": len(encoded)}
 
@@ -403,28 +565,46 @@ def read_latest_snapshot(
 
     root = Path(root)
     base = root / ".ai" / "memory" / "sessions"
-    if not base.is_dir():
+    try:
+        base_state = base.lstat()
+    except OSError:
+        return None
+    if not stat_module.S_ISDIR(base_state.st_mode) or stat_module.S_ISLNK(base_state.st_mode):
         return None
 
+    excluded_dir_name = (
+        _session_directory_name(exclude_session_id)
+        if exclude_session_id is not None
+        else None
+    )
     candidates: list[tuple[float, Path]] = []
     for session_dir in base.iterdir():
-        if not session_dir.is_dir():
-            continue
-        if exclude_session_id is not None and session_dir.name == exclude_session_id:
-            continue
-        snap = session_dir / "resume.json"
-        if not snap.is_file():
-            continue
         try:
-            mtime = snap.stat().st_mtime
+            session_state = session_dir.lstat()
         except OSError:
             continue
-        candidates.append((mtime, snap))
+        if not stat_module.S_ISDIR(session_state.st_mode) or stat_module.S_ISLNK(session_state.st_mode):
+            continue
+        if excluded_dir_name is not None and session_dir.name == excluded_dir_name:
+            continue
+        snap = session_dir / "resume.json"
+        try:
+            snap_state = snap.lstat()
+        except OSError:
+            continue
+        if not stat_module.S_ISREG(snap_state.st_mode) or stat_module.S_ISLNK(snap_state.st_mode):
+            continue
+        candidates.append((snap_state.st_mtime, snap))
 
     candidates.sort(key=lambda t: t[0], reverse=True)
     for _, snap in candidates:
         try:
-            text = snap.read_text(encoding="utf-8")
+            text, _state = read_root_confined_text(
+                snap,
+                root=root,
+                max_bytes=max(RESUME_MAX_BYTES, 8192),
+                require_private=False,
+            )
         except OSError:
             continue
         try:
@@ -445,23 +625,31 @@ def prune_snapshots(
 
     root = Path(root)
     base = root / ".ai" / "memory" / "sessions"
-    if not base.is_dir():
+    try:
+        base_state = base.lstat()
+    except OSError:
+        return {"ok": True, "removed": 0, "kept": 0}
+    if not stat_module.S_ISDIR(base_state.st_mode) or stat_module.S_ISLNK(base_state.st_mode):
         return {"ok": True, "removed": 0, "kept": 0}
 
     cutoff = time.time() - max(0, int(older_than_days)) * 86400
     removed = 0
     kept = 0
     for session_dir in base.iterdir():
-        if not session_dir.is_dir():
-            continue
-        snap = session_dir / "resume.json"
-        if not snap.is_file():
-            continue
         try:
-            mtime = snap.stat().st_mtime
+            session_state = session_dir.lstat()
         except OSError:
             continue
-        if mtime < cutoff:
+        if not stat_module.S_ISDIR(session_state.st_mode) or stat_module.S_ISLNK(session_state.st_mode):
+            continue
+        snap = session_dir / "resume.json"
+        try:
+            snap_state = snap.lstat()
+        except OSError:
+            continue
+        if not stat_module.S_ISREG(snap_state.st_mode) or stat_module.S_ISLNK(snap_state.st_mode):
+            continue
+        if snap_state.st_mtime < cutoff:
             try:
                 snap.unlink()
                 removed += 1

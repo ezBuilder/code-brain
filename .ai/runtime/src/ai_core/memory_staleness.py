@@ -21,6 +21,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .private_write import read_root_confined_text
+
 # Matches the leading ``- [2026-05-26T11:43:18.640870Z] ...`` timestamp that
 # append_session_note / append_event prepend to each milestone line.
 _ISO_LINE_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\]]*)\]")
@@ -36,8 +38,13 @@ MAX_COMMITS = 20
 def _last_session_note_iso(root: Path) -> str:
     path = root / ".ai" / "memory" / "session-current.md"
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        text, _state = read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=10_000_000,
+            require_private=False,
+        )
+    except (OSError, UnicodeDecodeError):
         return ""
     last = ""
     for line in text.splitlines():
@@ -50,8 +57,13 @@ def _last_session_note_iso(root: Path) -> str:
 def _last_decision_iso(root: Path) -> str:
     path = root / ".ai" / "memory" / "decisions.jsonl"
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        text, _state = read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=10_000_000,
+            require_private=False,
+        )
+    except (OSError, UnicodeDecodeError):
         return ""
     last = ""
     for line in text.splitlines():

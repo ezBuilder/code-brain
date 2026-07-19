@@ -19,6 +19,95 @@ PATTERNS = [
 ]
 
 SECRET_PATTERNS = PATTERNS[:8]
+SECRET_MATCHER_VERSION = 2
+_ASSIGNMENT_TERMS = ("apikey", "api_key", "api-key", "secret", "token", "password")
+_ASSIGNMENT_VALUE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./+=-"
+)
+_UNICODE_IGNORECASE_EXTRAS = frozenset("İıſK")
+
+
+def _contains_assignment_secret(value: str, lowered: str) -> bool:
+    length = len(value)
+    for term in _ASSIGNMENT_TERMS:
+        offset = 0
+        while True:
+            found = lowered.find(term, offset)
+            if found < 0:
+                break
+            cursor = found + len(term)
+            while cursor < length and value[cursor].isspace():
+                cursor += 1
+            if cursor >= length or value[cursor] not in {":", "="}:
+                offset = found + 1
+                continue
+            cursor += 1
+            while cursor < length and value[cursor].isspace():
+                cursor += 1
+            if cursor < length and value[cursor] in {"'", '"'}:
+                cursor += 1
+            start = cursor
+            while cursor < length and value[cursor] in _ASSIGNMENT_VALUE_CHARS:
+                cursor += 1
+            if cursor - start >= 20:
+                return True
+            offset = found + 1
+    return False
+
+
+def contains_secret(value: str) -> bool:
+    """Existence-only secret scan with necessary-prefix prefilters.
+
+    Each branch still delegates the final decision to the original compiled
+    regex. The cheap literal checks are necessary conditions, so this is
+    semantically identical to ``any(pattern.search(value) ...)`` while avoiding
+    eight full-text regex passes for ordinary source files.
+    """
+    if "AKIA" in value and SECRET_PATTERNS[0].search(value):
+        return True
+    lowered = value.lower()
+    is_ascii = value.isascii()
+    needs_unicode_fallback = not is_ascii and any(
+        character in value for character in _UNICODE_IGNORECASE_EXTRAS
+    )
+    github_candidate = (
+        "ghp_" in lowered
+        or "gho_" in lowered
+        or "ghu_" in lowered
+        or "ghs_" in lowered
+        or "ghr_" in lowered
+    )
+    if github_candidate or needs_unicode_fallback:
+        if SECRET_PATTERNS[1].search(value):
+            return True
+    if "github_pat_" in value and SECRET_PATTERNS[2].search(value):
+        return True
+    if "sk-" in value and SECRET_PATTERNS[3].search(value):
+        return True
+    if "xox" in value and SECRET_PATTERNS[4].search(value):
+        return True
+    if ("authorization" in lowered and "bearer" in lowered) or needs_unicode_fallback:
+        if SECRET_PATTERNS[5].search(value):
+            return True
+    assignment_candidate = (
+        "apikey" in lowered
+        or "api_key" in lowered
+        or "api-key" in lowered
+        or "secret" in lowered
+        or "token" in lowered
+        or "password" in lowered
+    )
+    if assignment_candidate or needs_unicode_fallback:
+        if (
+            _contains_assignment_secret(value, lowered)
+            if not needs_unicode_fallback
+            else SECRET_PATTERNS[6].search(value) is not None
+        ):
+            return True
+    if "-----BEGIN " in value and "PRIVATE KEY-----" in value:
+        if SECRET_PATTERNS[7].search(value):
+            return True
+    return False
 
 
 def redact_text(value: str) -> str:

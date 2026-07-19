@@ -22,6 +22,8 @@ _FETCH_DEFAULT_WINDOW = 100
 _FETCH_GREP_CAP = 200
 _COMPACT_MAX_LINES = 20
 _COMPACT_MAX_BYTES = 1024
+_MAX_TIMEOUT_SECONDS = 900
+_EXEC_ID_HEX = frozenset("0123456789abcdef")
 
 # --- Opt-in execution isolation (PRD §12.2.1: real sandbox layer for Stage 2 auto-run) ---
 # macOS sandbox profile: deny IP network (egress/ingress) + raw IP sockets + mount changes.
@@ -107,18 +109,69 @@ def _sandbox_dir(root: Path) -> Path:
     return root.joinpath(*_SANDBOX_DIR)
 
 
+def _validated_sandbox_dir(root: Path, *, create: bool) -> Path:
+    """Return the repo-confined sandbox directory without following symlink components."""
+    root_resolved = root.resolve()
+    current = root_resolved
+    for part in _SANDBOX_DIR:
+        candidate = current / part
+        if candidate.is_symlink():
+            raise PermissionError("sandbox path must not contain symlinks")
+        if create:
+            candidate.mkdir(mode=0o700, exist_ok=True)
+        if candidate.exists() and not candidate.is_dir():
+            raise PermissionError("sandbox path component is not a directory")
+        current = candidate
+    resolved = current.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise PermissionError("sandbox path must stay under repo root") from exc
+    return resolved
+
+
 def _ensure_dir(root: Path) -> Path:
-    sandbox = _sandbox_dir(root)
-    sandbox.mkdir(parents=True, exist_ok=True)
-    return sandbox
+    return _validated_sandbox_dir(root, create=True)
+
+
+def _valid_exec_id(exec_id: object) -> bool:
+    return (
+        isinstance(exec_id, str)
+        and len(exec_id) == 16
+        and all(char in _EXEC_ID_HEX for char in exec_id)
+    )
+
+
+def _artifact_path(root: Path, exec_id: object, suffix: str) -> Path:
+    if not _valid_exec_id(exec_id):
+        raise ValueError("invalid exec_id")
+    path = _validated_sandbox_dir(root, create=False) / f"{exec_id}{suffix}"
+    if path.is_symlink():
+        raise PermissionError("sandbox artifact must not be a symlink")
+    return path
+
+
+def _resolve_work_cwd(root: Path, cwd: str | None) -> Path:
+    root_resolved = root.resolve()
+    raw = Path(cwd).expanduser() if cwd is not None else root_resolved
+    candidate = raw if raw.is_absolute() else root_resolved / raw
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError("cwd must stay under repo root") from exc
+    if not resolved.is_dir():
+        raise FileNotFoundError(str(cwd or root))
+    return resolved
 
 
 def _write_secure(path: Path, data: str) -> None:
-    path.write_text(data, encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(data)
 
 
 def _trim_first_lines(first_lines: list[str], last_lines: list[str]) -> list[str]:
@@ -137,6 +190,8 @@ def _trim_first_lines(first_lines: list[str], last_lines: list[str]) -> list[str
 
 
 def _read_meta(path: Path) -> dict[str, Any] | None:
+    if path.is_symlink():
+        return None
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
@@ -198,8 +253,27 @@ def execute(
             return redact_value({"ok": False, "reason": "empty_command"})
         cmd_argv = list(command)
 
+    try:
+        bounded_timeout = int(timeout)
+    except (TypeError, ValueError):
+        return redact_value({"ok": False, "reason": "invalid_timeout"})
+    if bounded_timeout < 1 or bounded_timeout > _MAX_TIMEOUT_SECONDS:
+        return redact_value({"ok": False, "reason": "invalid_timeout"})
+
+    try:
+        work_cwd_path = _resolve_work_cwd(root, cwd)
+    except ValueError:
+        return redact_value({"ok": False, "reason": "cwd_outside_root"})
+    except FileNotFoundError:
+        return redact_value({"ok": False, "reason": "cwd_not_found"})
+
+    try:
+        sandbox_dir = _ensure_dir(root)
+    except (OSError, PermissionError):
+        return redact_value({"ok": False, "reason": "invalid_sandbox_path"})
+
     exec_id = secrets.token_hex(8)
-    work_cwd = cwd if cwd is not None else str(root)
+    work_cwd = str(work_cwd_path)
 
     # Opt-in isolation. Defaults off → identical behavior to before for current callers.
     run_argv = cmd_argv
@@ -224,7 +298,7 @@ def execute(
             cwd=work_cwd,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=bounded_timeout,
             check=False,
             env=child_env,
         )
@@ -242,9 +316,11 @@ def execute(
     redacted_combined = redact_value(combined)
     redacted_stderr = redact_value(stderr)
 
-    sandbox_dir = _ensure_dir(root)
     out_path = sandbox_dir / f"{exec_id}.txt"
-    _write_secure(out_path, redacted_combined)
+    try:
+        _write_secure(out_path, redacted_combined)
+    except (FileExistsError, OSError):
+        return redact_value({"ok": False, "reason": "artifact_write_failed", "exec_id": exec_id})
 
     all_lines = redacted_combined.splitlines()
     total_lines = len(all_lines)
@@ -276,7 +352,11 @@ def execute(
         "isolate_env": isolate_env,
     }
     meta_path = sandbox_dir / f"{exec_id}.meta.json"
-    _write_secure(meta_path, json.dumps(meta, ensure_ascii=False, sort_keys=True))
+    try:
+        _write_secure(meta_path, json.dumps(meta, ensure_ascii=False, sort_keys=True))
+    except (FileExistsError, OSError):
+        out_path.unlink(missing_ok=True)
+        return redact_value({"ok": False, "reason": "artifact_write_failed", "exec_id": exec_id})
 
     # Compact mode: when the full output is short, return it raw and skip the
     # first_lines/last_lines split. Saves model-side tokens for small results.
@@ -289,6 +369,8 @@ def execute(
         "total_lines": total_lines,
         "stderr_tail": stderr_tail,
         "created_at": created_at,
+        "isolate_network": isolate_network,
+        "isolate_env": isolate_env,
     }
     if is_compact:
         summary["output"] = redacted_combined
@@ -320,12 +402,11 @@ def read_output(root: Path, exec_id: str) -> str | None:
     as 16 hex chars (the token_hex(8) format) so it cannot traverse paths; the read is capped
     at _READ_OUTPUT_CAP_BYTES to bound memory.
     """
-    if not isinstance(exec_id, str) or len(exec_id) != 16 or any(c not in "0123456789abcdef" for c in exec_id):
-        return None
-    out_path = _sandbox_dir(root) / f"{exec_id}.txt"
     try:
-        return out_path.read_bytes()[:_READ_OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
-    except OSError:
+        out_path = _artifact_path(root, exec_id, ".txt")
+        with out_path.open("rb") as handle:
+            return handle.read(_READ_OUTPUT_CAP_BYTES).decode("utf-8", errors="replace")
+    except (OSError, PermissionError, ValueError):
         return None
 
 
@@ -337,12 +418,24 @@ def fetch(
     line_end: int | None = None,
     grep_pattern: str | None = None,
 ) -> dict[str, Any]:
-    sandbox_dir = _sandbox_dir(root)
-    out_path = sandbox_dir / f"{exec_id}.txt"
+    if not _valid_exec_id(exec_id):
+        return redact_value({"ok": False, "reason": "invalid_exec_id"})
+    try:
+        out_path = _artifact_path(root, exec_id, ".txt")
+    except PermissionError:
+        return redact_value({"ok": False, "reason": "invalid_artifact", "exec_id": exec_id})
+    except (OSError, ValueError):
+        return redact_value({"ok": False, "reason": "invalid_sandbox_path", "exec_id": exec_id})
     if not out_path.exists():
         return redact_value({"ok": False, "reason": "not_found", "exec_id": exec_id})
 
-    text = out_path.read_text(encoding="utf-8")
+    try:
+        with out_path.open("rb") as handle:
+            raw = handle.read(_READ_OUTPUT_CAP_BYTES + 1)
+    except OSError:
+        return redact_value({"ok": False, "reason": "not_found", "exec_id": exec_id})
+    truncated = len(raw) > _READ_OUTPUT_CAP_BYTES
+    text = raw[:_READ_OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
     all_lines = text.splitlines()
     total_lines = len(all_lines)
 
@@ -360,6 +453,7 @@ def fetch(
             "total_lines": total_lines,
             "matched_lines": matched,
             "pattern": grep_pattern,
+            "truncated": truncated,
         }
         return redact_value(result)
 
@@ -386,12 +480,16 @@ def fetch(
         "line_start": line_start,
         "line_end": line_end,
         "lines": lines_payload,
+        "truncated": truncated,
     }
     return redact_value(result)
 
 
 def list_executions(root: Path, *, limit: int = 20) -> dict[str, Any]:
-    sandbox_dir = _sandbox_dir(root)
+    try:
+        sandbox_dir = _validated_sandbox_dir(root, create=False)
+    except (OSError, PermissionError):
+        return redact_value({"ok": False, "reason": "invalid_sandbox_path", "count": 0, "items": []})
     if not sandbox_dir.exists():
         return redact_value({"ok": True, "count": 0, "items": []})
 
@@ -427,7 +525,10 @@ def list_executions(root: Path, *, limit: int = 20) -> dict[str, Any]:
 
 
 def prune(root: Path, *, older_than_seconds: int = 86400) -> dict[str, Any]:
-    sandbox_dir = _sandbox_dir(root)
+    try:
+        sandbox_dir = _validated_sandbox_dir(root, create=False)
+    except (OSError, PermissionError):
+        return redact_value({"ok": False, "reason": "invalid_sandbox_path", "removed_count": 0, "kept_count": 0})
     if not sandbox_dir.exists():
         return redact_value({"ok": True, "removed_count": 0, "kept_count": 0})
 
@@ -458,7 +559,14 @@ def prune(root: Path, *, older_than_seconds: int = 86400) -> dict[str, Any]:
 
         if age_seconds is not None and age_seconds >= threshold:
             exec_id = meta.get("exec_id") or meta_path.stem.replace(".meta", "")
-            txt_path = sandbox_dir / f"{exec_id}.txt"
+            if not _valid_exec_id(exec_id):
+                kept += 1
+                continue
+            try:
+                txt_path = _artifact_path(root, exec_id, ".txt")
+            except (OSError, PermissionError, ValueError):
+                kept += 1
+                continue
             try:
                 meta_path.unlink()
             except OSError:

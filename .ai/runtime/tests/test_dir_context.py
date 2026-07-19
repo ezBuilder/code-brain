@@ -1,7 +1,12 @@
 """G9: Read-triggered walk-up directory context injection — opt-in, sealed, per-session dedup."""
 from __future__ import annotations
 
+import json
+import os
+import stat
 from pathlib import Path
+
+import pytest
 
 from ai_core import dir_context as dc
 
@@ -81,3 +86,96 @@ def test_hook_postooluse_read_injects_when_enabled(tmp_path: Path, monkeypatch) 
     on = hooks.handle_hook(root, "PostToolUse", dict(payload))
     assert on.get("dir_context") is True
     assert "auth guidance" in on["hookSpecificOutput"]["additionalContext"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
+def test_external_context_symlink_is_never_injected(tmp_path: Path, monkeypatch) -> None:
+    root = _seed(tmp_path)
+    external = tmp_path.parent / f"{tmp_path.name}-external-agents.md"
+    external.write_text("EXTERNAL_CONTEXT_INJECTION", encoding="utf-8")
+    context = root / "pkg" / "auth" / "AGENTS.md"
+    context.unlink()
+    context.symlink_to(external)
+    monkeypatch.setenv("AI_DIR_CONTEXT", "1")
+    payload = {
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(root / "pkg" / "auth" / "login.py")},
+        "session_id": "external-context",
+    }
+
+    result = dc.directory_context_for_read(root, payload)
+
+    assert "EXTERNAL_CONTEXT_INJECTION" not in result
+    assert "pkg guidance" in result
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
+def test_internal_context_symlink_remains_supported(tmp_path: Path, monkeypatch) -> None:
+    root = _seed(tmp_path)
+    auth = root / "pkg" / "auth"
+    agents = auth / "AGENTS.md"
+    claude = auth / "CLAUDE.md"
+    agents.rename(claude)
+    agents.symlink_to(claude.name)
+    monkeypatch.setenv("AI_DIR_CONTEXT", "1")
+    payload = {
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(auth / "login.py")},
+        "session_id": "internal-context",
+    }
+
+    result = dc.directory_context_for_read(root, payload)
+
+    assert "auth guidance" in result
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")
+def test_external_context_hardlink_is_never_injected(tmp_path: Path, monkeypatch) -> None:
+    root = _seed(tmp_path)
+    external = tmp_path / "external-agents.md"
+    external.write_text("EXTERNAL_HARDLINK_CONTEXT", encoding="utf-8")
+    context = root / "pkg" / "auth" / "AGENTS.md"
+    context.unlink()
+    os.link(external, context)
+    monkeypatch.setenv("AI_DIR_CONTEXT", "1")
+    payload = {
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(root / "pkg" / "auth" / "login.py")},
+        "session_id": "hardlinked-context",
+    }
+
+    result = dc.directory_context_for_read(root, payload)
+
+    assert "EXTERNAL_HARDLINK_CONTEXT" not in result
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix cache trust semantics")
+def test_seen_cache_symlink_and_public_mode_are_ignored_and_replaced(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _seed(tmp_path)
+    monkeypatch.setenv("AI_DIR_CONTEXT", "1")
+    payload = {
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(root / "pkg" / "auth" / "login.py")},
+        "session_id": "seen-cache",
+    }
+    cache = dc._seen_path(root, "seen-cache")
+    cache.parent.mkdir(parents=True)
+    external = tmp_path / "external-seen.json"
+    external.write_text(
+        json.dumps([str(root / "pkg" / "auth" / "AGENTS.md")]),
+        encoding="utf-8",
+    )
+    cache.symlink_to(external)
+
+    first = dc.directory_context_for_read(root, payload)
+    assert "auth guidance" in first
+    assert not cache.is_symlink()
+    assert stat.S_IMODE(cache.stat().st_mode) == 0o600
+
+    cache.write_text("[]", encoding="utf-8")
+    cache.chmod(0o644)
+    second = dc.directory_context_for_read(root, payload)
+    assert "auth guidance" in second

@@ -186,85 +186,109 @@ legacy_code_brain_install() {
   [[ -x "$TARGET_ROOT/.ai/bin/ai" || -f "$TARGET_ROOT/.ai/AGENTS.md" ]]
 }
 
-is_code_brain_managed_rel() {
-  local rel="$1"
-  case "$rel" in
-    .ai/*|.githooks/*|.claude/commands/*|.codex/prompts/*|.agents/skills/*|scripts/env-check.sh|scripts/preflight.sh)
-      return 0
-      ;;
-  esac
-  return 1
-}
-
-is_managed_existing_file() {
-  local rel="$1"
-  local manifest
-  manifest="$(manifest_path)"
-  if [[ -f "$manifest" ]] && py - "$manifest" "$rel" <<'PY'
+copy_managed_files() {
+  # Materialize the complete managed set in one Python process. The previous
+  # Bash loop spawned dirname/mkdir/cp for every file (300 files in this repo),
+  # which dominated fresh-install time on macOS. This preserves the existing
+  # manifest/legacy/marker overwrite rules while adding symlink confinement.
+  py -c '
+import filecmp
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 
-manifest = Path(sys.argv[1])
-rel = sys.argv[2]
-payload = json.loads(manifest.read_text(encoding="utf-8"))
-raise SystemExit(0 if rel in payload.get("files", []) else 1)
-PY
-  then
-    return 0
-  fi
-  if [[ "$ACTION" == "upgrade" ]] && [[ ! -f "$manifest" ]] && legacy_code_brain_install && is_code_brain_managed_rel "$rel"; then
-    return 0
-  fi
-  local target="$TARGET_ROOT/$rel"
-  [[ -f "$target" ]] && grep -q "managed-by: code-brain" "$target"
-}
+source_root = Path(sys.argv[1]).resolve()
+target_root = Path(sys.argv[2]).resolve()
+action = sys.argv[3]
+manifest = Path(sys.argv[4])
+rels = [line.strip() for line in sys.stdin if line.strip()]
 
-copy_file() {
-  local rel="$1"
-  local src="$SOURCE_ROOT/$rel"
-  local dst="$TARGET_ROOT/$rel"
-  if [[ "$rel" == "bootstrap-code-brain.sh" ]]; then
-    return 0
-  fi
-  if [[ -e "$dst" ]]; then
-    local src_abs dst_abs
-    src_abs="$(cd "$(dirname "$src")" && pwd -P)/$(basename "$src")"
-    dst_abs="$(cd "$(dirname "$dst")" && pwd -P)/$(basename "$dst")"
-    if [[ "$src_abs" == "$dst_abs" ]]; then
-      return 0
-    fi
-  fi
-  if [[ "$ACTION" == "upgrade" && "$rel" == .ai/memory/* && -e "$dst" ]]; then
-    return 0
-  fi
-  if [[ ! -f "$src" ]]; then
-    echo "install-into failed: missing source file $rel" >&2
-    exit 2
-  fi
-  if [[ -e "$dst" ]] && ! cmp -s "$src" "$dst" && ! is_managed_existing_file "$rel"; then
-    echo "install-into failed: refusing to overwrite existing untracked target file $rel" >&2
-    exit 3
-  fi
-  mkdir -p "$(dirname "$dst")"
-  cp "$src" "$dst"
+manifest_files: set[str] = set()
+if manifest.is_file():
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        manifest_files = {item for item in payload.get("files", []) if isinstance(item, str)}
+    except Exception:
+        manifest_files = set()
+
+legacy_install = os.access(target_root / ".ai" / "bin" / "ai", os.X_OK) or (
+    target_root / ".ai" / "AGENTS.md"
+).is_file()
+managed_prefixes = (
+    ".ai/",
+    ".githooks/",
+    ".claude/commands/",
+    ".codex/prompts/",
+    ".agents/skills/",
+)
+managed_exact = {"scripts/env-check.sh", "scripts/preflight.sh"}
+
+
+def confined(root: Path, path: Path, rel: str, label: str) -> Path:
+    resolved = path.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        print(f"install-into failed: {label} path escapes project root: {rel}", file=sys.stderr)
+        raise SystemExit(3)
+    return resolved
+
+
+def is_managed_existing(rel: str, dst: Path) -> bool:
+    if rel in manifest_files:
+        return True
+    managed_rel = rel in managed_exact or rel.startswith(managed_prefixes)
+    if action == "upgrade" and not manifest.is_file() and legacy_install and managed_rel:
+        return True
+    try:
+        return b"managed-by: code-brain" in dst.read_bytes()
+    except OSError:
+        return False
+
+
+for rel in rels:
+    rel_path = Path(rel)
+    if rel == "bootstrap-code-brain.sh":
+        continue
+    if rel_path.is_absolute() or ".." in rel_path.parts:
+        print(f"install-into failed: invalid managed path {rel}", file=sys.stderr)
+        raise SystemExit(3)
+    src = source_root / rel_path
+    dst = target_root / rel_path
+    src_resolved = confined(source_root, src, rel, "source")
+    dst_resolved = confined(target_root, dst, rel, "target")
+    if src_resolved == dst_resolved:
+        continue
+    if action == "upgrade" and rel.startswith(".ai/memory/") and dst.exists():
+        continue
+    if not src.is_file():
+        print(f"install-into failed: missing source file {rel}", file=sys.stderr)
+        raise SystemExit(2)
+    if dst.exists():
+        if not dst.is_file():
+            print(f"install-into failed: refusing to overwrite non-file target {rel}", file=sys.stderr)
+            raise SystemExit(3)
+        identical = filecmp.cmp(src, dst, shallow=False)
+        if not identical and not is_managed_existing(rel, dst):
+            print(
+                f"install-into failed: refusing to overwrite existing untracked target file {rel}",
+                file=sys.stderr,
+            )
+            raise SystemExit(3)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst, follow_symlinks=True)
+' "$SOURCE_ROOT" "$TARGET_ROOT" "$ACTION" "$(manifest_path)" < <(managed_files)
 }
 
 write_bootstrap() {
-  cat >"$TARGET_ROOT/bootstrap-code-brain.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-umask 077
-cd "$(dirname "$0")"
-./scripts/preflight.sh --check-only >/dev/null
-./scripts/env-check.sh >/dev/null
-uv sync --project .ai/runtime --extra dense
-if git rev-parse --git-dir >/dev/null 2>&1; then
-  git config core.hooksPath .githooks
-fi
-uv run --project .ai/runtime ai render --manifest-only --json >/dev/null
-uv run --project .ai/runtime ai doctor --json >/dev/null
-EOF
+  local src="$SOURCE_ROOT/bootstrap-code-brain.sh"
+  if [[ ! -f "$src" ]]; then
+    echo "install-into failed: missing source file bootstrap-code-brain.sh" >&2
+    exit 2
+  fi
+  cp "$src" "$TARGET_ROOT/bootstrap-code-brain.sh"
   chmod +x "$TARGET_ROOT/bootstrap-code-brain.sh"
 }
 
@@ -487,7 +511,7 @@ block = (
     "args = []\n"
     # Compact tools on by default (parity with .mcp.json): only hot core tools in tools/list,
     # rest load on demand via tool_search. Per-session schema-token cut, no capability loss.
-    "env = { AI_MCP_COMPACT_TOOLS = \"1\" }\n"
+    "env = { AI_CODE_BRAIN_PROFILE = \"usage\", AI_MCP_COMPACT_TOOLS = \"1\" }\n"
 )
 existing = dst.read_text(encoding="utf-8") if dst.exists() else ""
 
@@ -578,6 +602,11 @@ def ensure_features_hooks(text: str) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 new_text = ensure_features_hooks(new_text)
+# Canonicalize the managed MCP section at the end. On an empty target the old
+# merge emitted MCP then features, while the second merge emitted features then
+# MCP, causing one no-op upgrade to change bytes and invalidate the code index.
+without_managed = strip_section(new_text, "[mcp_servers.code-brain]").rstrip()
+new_text = without_managed + "\n\n" + block if without_managed else block
 
 dst.parent.mkdir(parents=True, exist_ok=True)
 dst.write_text(new_text, encoding="utf-8")
@@ -972,9 +1001,7 @@ PY
 
 install_or_upgrade() {
   prune_orphans
-  while IFS= read -r rel; do
-    copy_file "$rel"
-  done < <(managed_files)
+  copy_managed_files
   seed_user_owned_files
   merge_mcp_json
   merge_codex_config
@@ -989,6 +1016,14 @@ install_or_upgrade() {
   chmod +x "$TARGET_ROOT/.githooks/post-merge" "$TARGET_ROOT/.githooks/post-checkout"
   chmod +x "$TARGET_ROOT/scripts/env-check.sh" "$TARGET_ROOT/scripts/preflight.sh"
   write_install_manifest
+
+  case "${AI_INSTALL_DEFER_RUNTIME:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      echo "install-into: runtime activation deferred; run bootstrap-code-brain.sh and session start in the target" >&2
+      restore_managed_owner_if_root
+      return 0
+      ;;
+  esac
 
   cd "$TARGET_ROOT"
   # When install-into runs as root (typical on shared servers like the Phalanx
@@ -1038,9 +1073,18 @@ install_or_upgrade() {
       rm -rf "$TARGET_ROOT/.ai/runtime/.venv"
     fi
   fi
-  $_run_as ./bootstrap-code-brain.sh >/dev/null
-  $_run_as .ai/bin/ai audit rebuild-index --json >/dev/null
-  $_run_as .ai/bin/ai session start --agent operator --rebuild always --json >/dev/null
+  # session start below runs the complete doctor checks after rebuilding the
+  # code and audit indexes, so avoid separate CLI startup and doctor scans.
+  $_run_as ./bootstrap-code-brain.sh --skip-doctor --skip-render >/dev/null
+  local -a _session_args=(session start --agent operator --rebuild auto --repair-audit-index --render-manifest)
+  case "${AI_INSTALL_STRICT:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      _session_args+=(--strict)
+      echo "install-into: strict first-session health enabled" >&2
+      ;;
+  esac
+  _session_args+=(--json)
+  $_run_as .ai/bin/ai "${_session_args[@]}" >/dev/null
   restore_managed_owner_if_root
 }
 

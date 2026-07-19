@@ -16,9 +16,28 @@ from .memory import (
     read_text_tail as _read_text_tail,
 )
 from .policy import is_ci
+from .private_write import atomic_write_private_text, read_root_confined_text
 from .redact import redact_value
 
 import os as _os
+
+
+def _read_hook_state_text(
+    root: Path,
+    path: Path,
+    *,
+    max_bytes: int = 100_000_000,
+) -> str:
+    try:
+        text, _state = read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=max_bytes,
+            require_private=False,
+        )
+        return text
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 HOT_PATH_TARGET_MS = 200
 SESSION_START_TARGET_MS = 1500
@@ -888,24 +907,29 @@ def _cached_hook_summary(
     import time
 
     cache_path = root / ".ai" / "cache" / f"{cache_name}.json"
-    if cache_path.exists():
-        try:
-            cache_mt = cache_path.stat().st_mtime
-            age = time.time() - cache_mt
-            if age < _HOOK_SUMMARY_CACHE_TTL_SECONDS:
-                if all((not p.exists()) or p.stat().st_mtime <= cache_mt for p in deps):
-                    payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                    if isinstance(payload, dict) and tuple(payload.get("extra") or ()) == cache_key_extra:
-                        return str(payload.get("text") or "")
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
+    try:
+        cache_text, cache_state = read_root_confined_text(
+            cache_path,
+            root=root,
+            max_bytes=2_000_000,
+            require_private=True,
+        )
+        cache_mt = cache_state.st_mtime
+        age = time.time() - cache_mt
+        if age < _HOOK_SUMMARY_CACHE_TTL_SECONDS:
+            if all((not p.exists()) or p.stat().st_mtime <= cache_mt for p in deps):
+                payload = json.loads(cache_text)
+                if isinstance(payload, dict) and tuple(payload.get("extra") or ()) == cache_key_extra:
+                    return str(payload.get("text") or "")
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        pass
     text = str(compute() or "")
     try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        tmp.write_text(json.dumps({"extra": list(cache_key_extra), "text": text}), encoding="utf-8")
-        import os as _os_atomic
-        _os_atomic.replace(tmp, cache_path)
+        atomic_write_private_text(
+            cache_path,
+            json.dumps({"extra": list(cache_key_extra), "text": text}),
+            root=root,
+        )
     except OSError:
         pass
     return text
@@ -964,31 +988,35 @@ def _cached_recommend_invoke(
     import time
 
     cache_path = root / ".ai" / "cache" / f"{cache_name}.json"
-    if cache_path.exists():
-        try:
-            cache_mt = cache_path.stat().st_mtime
-            age = time.time() - cache_mt
-            if age < _RECOMMEND_CACHE_TTL_SECONDS:
-                if all((not p.exists()) or p.stat().st_mtime <= cache_mt for p in deps):
-                    payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                    if (
-                        isinstance(payload, dict)
-                        and payload.get("min_signal") == min_signal
-                        and tuple(payload.get("extra") or ()) == cache_key_extra
-                    ):
-                        return payload.get("result") or {"candidates": []}
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
+    try:
+        cache_text, cache_state = read_root_confined_text(
+            cache_path,
+            root=root,
+            max_bytes=2_000_000,
+            require_private=True,
+        )
+        cache_mt = cache_state.st_mtime
+        age = time.time() - cache_mt
+        if age < _RECOMMEND_CACHE_TTL_SECONDS:
+            if all((not p.exists()) or p.stat().st_mtime <= cache_mt for p in deps):
+                payload = json.loads(cache_text)
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("min_signal") == min_signal
+                    and tuple(payload.get("extra") or ()) == cache_key_extra
+                ):
+                    return payload.get("result") or {"candidates": []}
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        pass
     result = compute()
     try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps({"min_signal": min_signal, "extra": list(cache_key_extra), "result": result}),
-            encoding="utf-8",
+        atomic_write_private_text(
+            cache_path,
+            json.dumps(
+                {"min_signal": min_signal, "extra": list(cache_key_extra), "result": result}
+            ),
+            root=root,
         )
-        import os as _os_atomic
-        _os_atomic.replace(tmp, cache_path)
     except OSError:
         pass
     return result
@@ -2168,6 +2196,39 @@ def _learned_prompt_context(root: Path) -> str:
     return text or ""
 
 
+def _session_harness_context(root: Path) -> str:
+    """Return the always-on SessionStart harness hint without repo-wide analysis.
+
+    Detailed mode/source/test/dirty analysis remains available through
+    autonomous_harness.analyze/context_line and explicit harness directives.
+    SessionStart only needs the invariant operating rule plus active-plan
+    progress; counting files and spawning `git status` on every new session was
+    pure hint-generation overhead.
+    """
+    base = (
+        "cb-harness: target=95%. "
+        "For build/harden: scope, own paths, verify, iterate until done/blocker."
+    )
+    plans_root = root / ".ai" / "memory" / "plans"
+    if not plans_root.is_dir():
+        return base
+    try:
+        from . import plan_state
+
+        active = plan_state.active_summary(root)
+    except Exception:
+        return base
+    if not active:
+        return base
+    next_label = active.get("next_label")
+    tail = f" next: {str(next_label)[:80]}" if next_label else ""
+    return (
+        base
+        + f" | plan {active['plan_id']}: {active['completed']}/{active['total']} done,"
+        + f" {active['remaining']} left.{tail}"
+    )
+
+
 def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None = None) -> str:
     agent = normalize_agent(payload)
     writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
@@ -2195,11 +2256,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         map_context = _codebase_map_summary_context(root)
         if map_context:
             sections.append(map_context)
-        try:
-            from .autonomous_harness import context_line as _harness_context_line
-            sections.append(_harness_context_line(root))
-        except Exception:
-            pass
+        sections.append(_session_harness_context(root))
     if hook_name == "UserPromptSubmit":
         try:
             from .autonomous_harness import directive as _harness_directive, requested as _harness_requested
@@ -2333,18 +2390,10 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         memory_tier = _memory_tier_summary_context(root)
         if memory_tier:
             sections.append(memory_tier)
-    # T35 codegraph hotspot teaser — surfaces the top-3 most-called callees so
-    # downstream agents can `code_graph_callers <name>` without prior knowledge.
     if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_CODEGRAPH_SUMMARY"):
-        try:
-            from .codegraph import hotspot_callees
-            hot = hotspot_callees(root, limit=3)
-            entries = hot.get("hotspots") or []
-            if entries:
-                top = ", ".join(f"{h['callee']}({h['calls']})" for h in entries)
-                sections.append(f"cb-graph: top callees — {top}. MCP: code_graph_callers/callees/symbol/hotspots.")
-        except Exception:
-            pass
+        codegraph_summary = _codegraph_hotspot_context(root)
+        if codegraph_summary:
+            sections.append(codegraph_summary)
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
         sections.append("session tail:\n" + session_tail)
@@ -2552,6 +2601,55 @@ def _memory_tier_summary_context(root: Path) -> str:
             return ""
 
     return _cached_hook_summary(root, cache_name="memory_tier_hot", deps=deps, compute=compute)
+
+
+def _codegraph_hotspot_context(root: Path) -> str:
+    """Cache the top-callee teaser until the code index changes.
+
+    The full codegraph/search import graph is useful on an index rebuild, but
+    importing and querying it on every SessionStart was pure repeated work.
+    The SQLite DB and WAL mtimes are authoritative invalidation dependencies.
+    """
+    db = root / ".ai" / "cache" / "code.sqlite"
+    try:
+        db_state = db.lstat()
+    except OSError:
+        return ""
+    import stat as _stat
+
+    if not _stat.S_ISREG(db_state.st_mode) or _stat.S_ISLNK(db_state.st_mode):
+        return ""
+    generation = root / ".ai" / "cache" / "code-index-generation"
+    if not generation.exists() and db.exists():
+        try:
+            atomic_write_private_text(
+                generation,
+                str(db_state.st_mtime_ns) + "\n",
+                root=root,
+            )
+        except OSError:
+            pass
+    deps = [generation]
+
+    def compute() -> str:
+        try:
+            from .codegraph import hotspot_callees
+
+            hot = hotspot_callees(root, limit=3)
+            entries = hot.get("hotspots") or []
+            if not entries:
+                return ""
+            top = ", ".join(f"{item['callee']}({item['calls']})" for item in entries)
+            return f"cb-graph: top callees — {top}. MCP: code_graph_callers/callees/symbol/hotspots."
+        except Exception:
+            return ""
+
+    return _cached_hook_summary(
+        root,
+        cache_name="codegraph_hotspots",
+        deps=deps,
+        compute=compute,
+    )
 
 
 def _codebase_map_summary_context(root: Path) -> str:

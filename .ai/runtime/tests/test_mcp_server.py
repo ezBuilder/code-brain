@@ -7,6 +7,11 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
 from ai_core import mcp_server  # noqa: E402
+from ai_core.mcp_catalog_meta import MCP_METHOD_COUNT  # noqa: E402
+
+
+def test_lightweight_catalog_count_matches_server_tools() -> None:
+    assert MCP_METHOD_COUNT == len(mcp_server.MCP_METHODS)
 
 
 def test_tools_list_response_shape(tmp_path: Path) -> None:
@@ -32,6 +37,46 @@ def test_tools_list_response_shape(tmp_path: Path) -> None:
     assert "stream_guard_scan" in names
     hashline_tool = next(t for t in tools if t["name"] == "code_read_hashline")
     assert "편집하기 전" in hashline_tool["description"]
+    sandbox_tool = next(t for t in tools if t["name"] == "sandbox_execute")
+    sandbox_properties = sandbox_tool["inputSchema"]["properties"]
+    assert {"isolate_network", "isolate_env", "extra_env_vars"} <= set(sandbox_properties)
+
+
+def test_sandbox_execute_forwards_isolation_options(tmp_path: Path, monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_execute(root: Path, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(mcp_server, "sandbox_execute", fake_execute)
+    result = mcp_server._dispatch_tool(
+        tmp_path,
+        "sandbox_execute",
+        {
+            "command": ["echo", "ok"],
+            "isolate_network": True,
+            "isolate_env": True,
+            "extra_env_vars": ["NODE_ENV"],
+        },
+    )
+    assert result == {"ok": True}
+    assert captured["isolate_network"] is True
+    assert captured["isolate_env"] is True
+    assert captured["extra_env_vars"] == ["NODE_ENV"]
+
+
+def test_sandbox_execute_rejects_invalid_extra_env_name(tmp_path: Path) -> None:
+    try:
+        mcp_server._dispatch_tool(
+            tmp_path,
+            "sandbox_execute",
+            {"command": ["echo", "ok"], "extra_env_vars": ["BAD-NAME"]},
+        )
+    except ValueError as exc:
+        assert "invalid environment name" in str(exc)
+    else:
+        raise AssertionError("invalid environment name must fail closed")
 
 
 def test_tools_list_response_cached(tmp_path: Path, monkeypatch) -> None:

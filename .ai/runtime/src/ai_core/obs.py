@@ -11,7 +11,7 @@ from typing import Any
 
 from . import __version__
 from .doctor import as_payload
-from .memory import all_audit_files
+from .memory import all_audit_files, read_state_text
 from .redact import redact_value
 
 
@@ -453,74 +453,68 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
     pending_count_by_id: dict[str, int] = {}
     for audit_file in audit_files:
         try:
-            fh = audit_file.open(encoding="utf-8", errors="replace")
-        except OSError:
+            audit_text = read_state_text(audit_file, max_bytes=100_000_000)
+        except (OSError, UnicodeDecodeError):
             continue
-        with fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
+        for line in audit_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            act = str(rec.get("action") or "")
+            if not act.startswith(("skill.", "agent.", "precall.")):
+                continue
+            source = act.split(".", 1)[0]  # T25: "skill" | "agent" | "precall"
+            tail = act.split(".", 1)[1]
+            pid = (rec.get("payload") or {}).get("id") if isinstance(rec.get("payload"), dict) else None
+            ts_raw = str(rec.get("ts") or "")
+            parsed_ts: datetime | None = None
+            if ts_raw:
                 try:
-                    rec = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                act = str(rec.get("action") or "")
-                if not act.startswith(("skill.", "agent.", "precall.")):
-                    continue
-                source = act.split(".", 1)[0]  # T25: "skill" | "agent" | "precall"
-                tail = act.split(".", 1)[1]
-                pid = (rec.get("payload") or {}).get("id") if isinstance(rec.get("payload"), dict) else None
-                ts_raw = str(rec.get("ts") or "")
-                parsed_ts: datetime | None = None
-                if ts_raw:
-                    try:
-                        parsed_ts = (
-                            datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
-                            if ts_raw.endswith("Z") else datetime.fromisoformat(ts_raw)
-                        )
-                    except ValueError:
-                        parsed_ts = None
-                if tail == "recommend_pending":
-                    counts["surfaced"] += 1
-                    if isinstance(pid, str):
-                        pending_count_by_id[pid] = pending_count_by_id.get(pid, 0) + 1
-                    if parsed_ts is not None and isinstance(pid, str):
-                        surfaced_records.append((parsed_ts, pid))
-                        id_events.setdefault(pid, []).append((parsed_ts, "recommend_pending"))
-                        # T25 latency: remember earliest unpaired pending ts for this id.
-                        if pid not in pending_ts_by_id:
-                            pending_ts_by_id[pid] = parsed_ts
-                elif tail.startswith("accept"):
-                    counts["accepted"] += 1
-                    # T25 source bucket
-                    bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
-                    bucket["accepted"] += 1
-                    if isinstance(pid, str):
-                        acted_ids.add(pid)
-                        # T25 latency: pair with earliest pending for this id, if any.
-                        if parsed_ts is not None and pid in pending_ts_by_id:
-                            delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
-                            if delta >= 0:
-                                latency_seconds.append(delta)
-                    if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
-                        last_act_dt = parsed_ts
-                elif tail == "reject":
-                    counts["rejected"] += 1
-                    # T25 source bucket
-                    bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
-                    bucket["rejected"] += 1
-                    if isinstance(pid, str):
-                        acted_ids.add(pid)
-                        if parsed_ts is not None:
-                            id_events.setdefault(pid, []).append((parsed_ts, "reject"))
-                        # T25 latency: a reject also closes the pending pairing.
-                        if parsed_ts is not None and pid in pending_ts_by_id:
-                            delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
-                            if delta >= 0:
-                                latency_seconds.append(delta)
-                    if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
-                        last_act_dt = parsed_ts
+                    parsed_ts = (
+                        datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
+                        if ts_raw.endswith("Z") else datetime.fromisoformat(ts_raw)
+                    )
+                except ValueError:
+                    parsed_ts = None
+            if tail == "recommend_pending":
+                counts["surfaced"] += 1
+                if isinstance(pid, str):
+                    pending_count_by_id[pid] = pending_count_by_id.get(pid, 0) + 1
+                if parsed_ts is not None and isinstance(pid, str):
+                    surfaced_records.append((parsed_ts, pid))
+                    id_events.setdefault(pid, []).append((parsed_ts, "recommend_pending"))
+                    if pid not in pending_ts_by_id:
+                        pending_ts_by_id[pid] = parsed_ts
+            elif tail.startswith("accept"):
+                counts["accepted"] += 1
+                bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
+                bucket["accepted"] += 1
+                if isinstance(pid, str):
+                    acted_ids.add(pid)
+                    if parsed_ts is not None and pid in pending_ts_by_id:
+                        delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
+                        if delta >= 0:
+                            latency_seconds.append(delta)
+                if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
+                    last_act_dt = parsed_ts
+            elif tail == "reject":
+                counts["rejected"] += 1
+                bucket = per_source.setdefault(source, {"accepted": 0, "rejected": 0})
+                bucket["rejected"] += 1
+                if isinstance(pid, str):
+                    acted_ids.add(pid)
+                    if parsed_ts is not None:
+                        id_events.setdefault(pid, []).append((parsed_ts, "reject"))
+                    if parsed_ts is not None and pid in pending_ts_by_id:
+                        delta = (parsed_ts - pending_ts_by_id.pop(pid)).total_seconds()
+                        if delta >= 0:
+                            latency_seconds.append(delta)
+                if parsed_ts is not None and (last_act_dt is None or parsed_ts > last_act_dt):
+                    last_act_dt = parsed_ts
     # resurface_after_reject: for each reject (with parsed ts), check if any
     # subsequent recommend_pending for the same id occurs within 7 days.
     total_rejected_with_ts = 0
@@ -757,46 +751,43 @@ def mem_eval_summary(root: Path, *, window_days: int = 7) -> dict[str, Any]:
 
     for audit_file in audit_files:
         try:
-            fh = audit_file.open(encoding="utf-8", errors="replace")
-        except OSError:
+            audit_text = read_state_text(audit_file, max_bytes=100_000_000)
+        except (OSError, UnicodeDecodeError):
             continue
-        with fh:
-            for line in fh:
-                if not line.strip():
-                    continue
+        for line in audit_text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts_raw = str(rec.get("ts") or "")
+            parsed_ts: datetime | None = None
+            if ts_raw:
                 try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                ts_raw = str(rec.get("ts") or "")
-                parsed_ts: datetime | None = None
-                if ts_raw:
-                    try:
-                        parsed_ts = (
-                            datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
-                            if ts_raw.endswith("Z")
-                            else datetime.fromisoformat(ts_raw)
-                        )
-                    except ValueError:
-                        parsed_ts = None
-                if parsed_ts is None or parsed_ts < window_start:
-                    continue
-                date_key = parsed_ts.strftime("%Y-%m-%d")
+                    parsed_ts = (
+                        datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
+                        if ts_raw.endswith("Z")
+                        else datetime.fromisoformat(ts_raw)
+                    )
+                except ValueError:
+                    parsed_ts = None
+            if parsed_ts is None or parsed_ts < window_start:
+                continue
+            date_key = parsed_ts.strftime("%Y-%m-%d")
 
-                # Accept/reject tracking
-                action = str(rec.get("action") or "")
-                if action.startswith(("skill.", "agent.", "precall.")):
-                    tail = action.split(".", 1)[1]
-                    if "accept" in tail:
-                        bucket = accept_rate_by_day.setdefault(date_key, {"accept": 0, "reject": 0})
-                        bucket["accept"] += 1
-                    elif tail == "reject":
-                        bucket = accept_rate_by_day.setdefault(date_key, {"accept": 0, "reject": 0})
-                        bucket["reject"] += 1
+            action = str(rec.get("action") or "")
+            if action.startswith(("skill.", "agent.", "precall.")):
+                tail = action.split(".", 1)[1]
+                if "accept" in tail:
+                    bucket = accept_rate_by_day.setdefault(date_key, {"accept": 0, "reject": 0})
+                    bucket["accept"] += 1
+                elif tail == "reject":
+                    bucket = accept_rate_by_day.setdefault(date_key, {"accept": 0, "reject": 0})
+                    bucket["reject"] += 1
 
-                # Hot-tier pressure: count recommend_pending + accept actions (surfaced candidates)
-                if action in ("skill.recommend_pending", "agent.recommend_pending", "precall.recommend_pending"):
-                    hot_audit_by_day[date_key] = hot_audit_by_day.get(date_key, 0) + 1
+            if action in ("skill.recommend_pending", "agent.recommend_pending", "precall.recommend_pending"):
+                hot_audit_by_day[date_key] = hot_audit_by_day.get(date_key, 0) + 1
 
     # 2. Search index age: max(chunks.updated_at) from code.sqlite
     search_index_age_seconds: int | None = None

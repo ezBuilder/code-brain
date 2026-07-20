@@ -173,16 +173,27 @@ def _stub_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(lsp, "_detect_servers", lambda: ["pyright"], raising=True)
 
 
+def _write_python(root: Path, rel: str = "pkg/a.py", *, lines: int = 12) -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(f"value_{index} = {index}\n" for index in range(lines)),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_find_references_cache_hits_on_repeat(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """When available, identical (file,line,col) calls reuse the cached entry."""
     _stub_available(monkeypatch)
+    _write_python(tmp_path)
     monkeypatch.setattr(lsp, "_lsp_call", lambda *a, **k: [], raising=True)  # backend present, no refs
 
     out1 = lsp.find_references(tmp_path, "pkg/a.py", 1, 2)
     out2 = lsp.find_references(tmp_path, "pkg/a.py", 1, 2)
     assert out1["ok"] is True
-    # Cached value must be the same object reference.
-    assert out1 is out2
+    assert out1 == out2
+    assert out1 is not out2
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +213,7 @@ def test_map_location_pure(tmp_path: Path) -> None:
 
 def test_find_references_wired_maps_locations(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _stub_available(monkeypatch)
+    _write_python(tmp_path)
     fake = [{"relativePath": "pkg/a.py", "range": {"start": {"line": 3, "character": 0}}}]
     monkeypatch.setattr(lsp, "_lsp_call", lambda *a, **k: fake, raising=True)
     out = lsp.find_references(tmp_path, "pkg/a.py", 3, 0)
@@ -211,6 +223,7 @@ def test_find_references_wired_maps_locations(monkeypatch: pytest.MonkeyPatch, t
 
 def test_goto_definition_wired_maps_first(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _stub_available(monkeypatch)
+    _write_python(tmp_path)
     fake = [{"relativePath": "pkg/a.py", "range": {"start": {"line": 9, "character": 2}}}]
     monkeypatch.setattr(lsp, "_lsp_call", lambda *a, **k: fake, raising=True)
     out = lsp.goto_definition(tmp_path, "pkg/a.py", 1, 1)
@@ -219,6 +232,7 @@ def test_goto_definition_wired_maps_first(monkeypatch: pytest.MonkeyPatch, tmp_p
 
 def test_query_failure_returns_ok_false(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _stub_available(monkeypatch)
+    _write_python(tmp_path)
     monkeypatch.setattr(lsp, "_lsp_call", lambda *a, **k: None, raising=True)  # backend threw
     refs = lsp.find_references(tmp_path, "pkg/a.py", 1, 1)
     assert refs["ok"] is False and refs["reason"] == "lsp_query_failed" and refs["references"] == []

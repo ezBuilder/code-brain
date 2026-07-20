@@ -16,12 +16,21 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .private_write import (
+    atomic_write_private_text,
+    ensure_root_confined_directory,
+    list_root_confined_directory,
+    read_root_confined_text,
+    validate_root_confined_regular_file,
+)
 from .redact import redact_value
 
 _PLAN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 _CHECKBOX_RE = re.compile(r"^\s*[-*]\s*\[([ xX])\]\s+(.+?)\s*$")
 _LABEL_MAX = 240
 MAX_STEPS = 200
+MAX_PLANS = 256
+PLAN_MAX_BYTES = 512 * 1024
 
 
 def _safe_plan_id(plan_id: str) -> str:
@@ -78,27 +87,54 @@ def _summarize(plan_id: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
 def init_plan(root: Path, *, plan_id: str, steps: list[str], title: str = "", force: bool = False) -> dict[str, Any]:
     """Create a plan from step labels. Refuses to clobber an existing plan unless force."""
     pid = _safe_plan_id(plan_id)
+    root = Path(root)
     path = plan_path(root, pid)
-    if path.exists() and not force:
+    try:
+        ensure_root_confined_directory(plans_root(root), root=root)
+        ensure_root_confined_directory(path.parent, root=root)
+    except OSError:
+        return {"ok": False, "reason": "unsafe_plan_path", "plan_id": pid}
+    try:
+        validate_root_confined_regular_file(path, root=root)
+        existing = True
+    except FileNotFoundError:
+        existing = False
+    except OSError:
+        if not force:
+            return {"ok": False, "reason": "unsafe_plan_path", "plan_id": pid}
+        existing = True
+    if existing and not force:
         return {"ok": False, "reason": "plan_exists", "plan_id": pid}
     clean = [{"label": str(redact_value(str(s))).strip()[:_LABEL_MAX], "done": False}
              for s in (steps or []) if str(s).strip()][:MAX_STEPS]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".md.tmp")
-    tmp.write_text(render(clean, title=str(redact_value(title))[:120]), encoding="utf-8")
-    tmp.replace(path)
+    try:
+        atomic_write_private_text(
+            path,
+            render(clean, title=str(redact_value(title))[:120]),
+            root=root,
+        )
+    except OSError:
+        return {"ok": False, "reason": "write_error", "plan_id": pid}
     return _summarize(pid, clean)
 
 
 def read_plan(root: Path, plan_id: str) -> dict[str, Any]:
     """Re-derive plan state from disk every call (never trust an in-memory copy). Fail-soft."""
     pid = _safe_plan_id(plan_id)
+    root = Path(root)
     path = plan_path(root, pid)
-    if not path.exists():
-        return {"ok": False, "reason": "not_found", "plan_id": pid}
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        text, _state = read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=PLAN_MAX_BYTES,
+            require_private=False,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "reason": "not_found", "plan_id": pid}
+    except (OSError, UnicodeDecodeError):
         return {"ok": False, "reason": "read_error", "plan_id": pid}
     return _summarize(pid, parse_steps(text))
 
@@ -125,43 +161,56 @@ def mark_step(root: Path, *, plan_id: str, match: str | None = None, index: int 
         return {"ok": False, "reason": "step_not_found", "plan_id": pid}
     steps[target]["done"] = bool(done)
     path = plan_path(root, pid)
-    tmp = path.with_suffix(".md.tmp")
-    tmp.write_text(render(steps), encoding="utf-8")
-    tmp.replace(path)
+    try:
+        atomic_write_private_text(path, render(steps), root=Path(root))
+    except OSError:
+        return {"ok": False, "reason": "write_error", "plan_id": pid}
     return _summarize(pid, steps)
 
 
 def list_plans(root: Path) -> dict[str, Any]:
+    root = Path(root)
     base = plans_root(root)
     items: list[dict[str, Any]] = []
-    if base.is_dir():
-        for d in sorted(base.iterdir()):
-            p = d / "plan.md"
-            if p.is_file():
-                st = read_plan(root, d.name)
-                if st.get("ok"):
-                    items.append({"plan_id": st["plan_id"], "completed": st["completed"],
-                                  "total": st["total"], "remaining": st["remaining"]})
+    try:
+        names = list_root_confined_directory(base, root=root, max_entries=MAX_PLANS)
+    except (FileNotFoundError, OSError):
+        names = []
+    for name in names:
+        try:
+            pid = _safe_plan_id(name)
+        except ValueError:
+            continue
+        st = read_plan(root, pid)
+        if st.get("ok"):
+            items.append({"plan_id": st["plan_id"], "completed": st["completed"],
+                          "total": st["total"], "remaining": st["remaining"]})
     return {"ok": True, "count": len(items), "plans": items}
 
 
 def active_summary(root: Path) -> dict[str, Any] | None:
     """The most-recently-modified plan that still has remaining steps (for context surfacing)."""
+    root = Path(root)
     base = plans_root(root)
-    if not base.is_dir():
+    try:
+        names = list_root_confined_directory(base, root=root, max_entries=MAX_PLANS)
+    except (FileNotFoundError, OSError):
         return None
     best: tuple[float, str] | None = None
-    for d in base.iterdir():
-        p = d / "plan.md"
-        if not p.is_file():
-            continue
+    for name in names:
         try:
-            mtime = p.stat().st_mtime
-        except OSError:
+            pid = _safe_plan_id(name)
+        except ValueError:
             continue
-        st = read_plan(root, d.name)
+        p = plan_path(root, pid)
+        try:
+            state = validate_root_confined_regular_file(p, root=root)
+            mtime = state.st_mtime
+        except (FileNotFoundError, OSError):
+            continue
+        st = read_plan(root, pid)
         if st.get("ok") and st["remaining"] > 0 and (best is None or mtime > best[0]):
-            best = (mtime, d.name)
+            best = (mtime, pid)
     if best is None:
         return None
     return read_plan(root, best[1])

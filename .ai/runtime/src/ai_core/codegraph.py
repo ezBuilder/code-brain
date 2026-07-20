@@ -18,9 +18,40 @@ from __future__ import annotations
 
 import ast
 import os
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
+
+
+GRAPH_QUERY_MAX_CHARS = 512
+GRAPH_MAX_DEPTH = 32
+GRAPH_MAX_NODES = 10_000
+GRAPH_MAX_SEEDS = 100
+GRAPH_BRANCH_LIMIT = 200
+
+
+def _normalize_graph_text(value: object) -> tuple[str | None, str | None]:
+    text = str(value or "").strip()
+    if not text:
+        return None, "empty_query"
+    if "\x00" in text:
+        return None, "invalid_query_control_character"
+    if len(text) > GRAPH_QUERY_MAX_CHARS:
+        return None, "query_too_long"
+    return text, None
+
+
+def _normalize_depth(value: object, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(1, min(GRAPH_MAX_DEPTH, parsed))
+
+
+def _escape_like_fragment(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @dataclass
@@ -156,15 +187,22 @@ def _resolve_call_target(node: ast.AST) -> str | None:
 
 def query_callers(root: Path, qualname: str, *, limit: int = 20) -> dict:
     """Return rows where callee == qualname (exact match)."""
-    from .search import connect, init_schema
+    from .search import _connection_scope, init_schema, normalize_result_limit
 
-    with connect(root) as conn:
-        init_schema(conn)
-        rows = conn.execute(
-            "select path, caller, callee, lineno, lang from code_calls "
-            "where callee = ? order by path, lineno limit ?",
-            (qualname, limit),
-        ).fetchall()
+    qualname, reason = _normalize_graph_text(qualname)
+    if reason:
+        return {"ok": False, "reason": reason, "callee": "", "count": 0, "callers": []}
+    limit = normalize_result_limit(limit, default=20)
+    try:
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            rows = conn.execute(
+                "select path, caller, callee, lineno, lang from code_calls "
+                "where callee = ? order by path, lineno limit ?",
+                (qualname, limit),
+            ).fetchall()
+    except sqlite3.Error:
+        return {"ok": False, "reason": "index_unavailable", "callee": qualname, "count": 0, "callers": []}
     return {
         "ok": True,
         "callee": qualname,
@@ -175,15 +213,22 @@ def query_callers(root: Path, qualname: str, *, limit: int = 20) -> dict:
 
 def query_callees(root: Path, qualname: str, *, limit: int = 20) -> dict:
     """Return rows where caller == qualname (exact match)."""
-    from .search import connect, init_schema
+    from .search import _connection_scope, init_schema, normalize_result_limit
 
-    with connect(root) as conn:
-        init_schema(conn)
-        rows = conn.execute(
-            "select path, caller, callee, lineno, lang from code_calls "
-            "where caller = ? order by lineno limit ?",
-            (qualname, limit),
-        ).fetchall()
+    qualname, reason = _normalize_graph_text(qualname)
+    if reason:
+        return {"ok": False, "reason": reason, "caller": "", "count": 0, "callees": []}
+    limit = normalize_result_limit(limit, default=20)
+    try:
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            rows = conn.execute(
+                "select path, caller, callee, lineno, lang from code_calls "
+                "where caller = ? order by lineno limit ?",
+                (qualname, limit),
+            ).fetchall()
+    except sqlite3.Error:
+        return {"ok": False, "reason": "index_unavailable", "caller": qualname, "count": 0, "callees": []}
     return {
         "ok": True,
         "caller": qualname,
@@ -194,16 +239,24 @@ def query_callees(root: Path, qualname: str, *, limit: int = 20) -> dict:
 
 def find_symbol(root: Path, name: str, *, limit: int = 20) -> dict:
     """LIKE-match qualname; matches both exact and fragment (e.g. 'recommend')."""
-    from .search import connect, init_schema
+    from .search import _connection_scope, init_schema, normalize_result_limit
 
-    pat = f"%{name}%"
-    with connect(root) as conn:
-        init_schema(conn)
-        rows = conn.execute(
-            "select path, qualname, kind, lineno, end_lineno, parent, lang from code_symbols "
-            "where qualname like ? order by length(qualname), path, lineno limit ?",
-            (pat, limit),
-        ).fetchall()
+    name, reason = _normalize_graph_text(name)
+    if reason:
+        return {"ok": False, "reason": reason, "needle": "", "count": 0, "symbols": []}
+    limit = normalize_result_limit(limit, default=20)
+    pat = f"%{_escape_like_fragment(name)}%"
+    try:
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            rows = conn.execute(
+                "select path, qualname, kind, lineno, end_lineno, parent, lang from code_symbols "
+                "where qualname like ? escape '\\' "
+                "order by length(qualname), path, lineno limit ?",
+                (pat, limit),
+            ).fetchall()
+    except sqlite3.Error:
+        return {"ok": False, "reason": "index_unavailable", "needle": name, "count": 0, "symbols": []}
     return {
         "ok": True,
         "needle": name,
@@ -214,15 +267,19 @@ def find_symbol(root: Path, name: str, *, limit: int = 20) -> dict:
 
 def hotspot_callees(root: Path, *, limit: int = 20) -> dict:
     """Most-frequently-called callees across the indexed codebase."""
-    from .search import connect, init_schema
+    from .search import _connection_scope, init_schema, normalize_result_limit
 
-    with connect(root) as conn:
-        init_schema(conn)
-        rows = conn.execute(
-            "select callee, count(*) as n from code_calls "
-            "group by callee order by n desc, callee asc limit ?",
-            (limit,),
-        ).fetchall()
+    limit = normalize_result_limit(limit, default=20)
+    try:
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            rows = conn.execute(
+                "select callee, count(*) as n from code_calls "
+                "group by callee order by n desc, callee asc limit ?",
+                (limit,),
+            ).fetchall()
+    except sqlite3.Error:
+        return {"ok": False, "reason": "index_unavailable", "count": 0, "hotspots": []}
     return {
         "ok": True,
         "count": len(rows),
@@ -234,27 +291,44 @@ def trace_call_path(root: Path, *, src: str, dst: str, max_depth: int = 6) -> di
     """Shortest caller→callee chain from `src` to `dst` (multi-hop BFS). Orientation aid only."""
     from collections import deque
 
-    from .search import connect, init_schema
+    from .search import _connection_scope, init_schema
 
-    with connect(root) as conn:
-        init_schema(conn)
-        seen = {src}
-        q: deque[list[str]] = deque([[src]])
-        while q:
-            chain = q.popleft()
-            if len(chain) > max(1, int(max_depth)):
-                continue
-            node = chain[-1]
-            rows = conn.execute(
-                "select distinct callee from code_calls where caller = ? limit 200", (node,)
-            ).fetchall()
-            for r in rows:
-                callee = r["callee"]
-                if callee == dst:
-                    return {"ok": True, "found": True, "path": chain + [callee], "hops": len(chain)}
-                if callee not in seen:
-                    seen.add(callee)
-                    q.append(chain + [callee])
+    src, src_reason = _normalize_graph_text(src)
+    dst, dst_reason = _normalize_graph_text(dst)
+    if src_reason or dst_reason:
+        return {
+            "ok": False,
+            "reason": src_reason or dst_reason,
+            "found": False,
+            "path": [],
+            "scanned": 0,
+        }
+    depth_limit = _normalize_depth(max_depth, default=6)
+    try:
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            seen = {src}
+            q: deque[list[str]] = deque([[src]])
+            while q and len(seen) < GRAPH_MAX_NODES:
+                chain = q.popleft()
+                if len(chain) > depth_limit:
+                    continue
+                node = chain[-1]
+                rows = conn.execute(
+                    "select distinct callee from code_calls where caller = ? limit ?",
+                    (node, GRAPH_BRANCH_LIMIT),
+                ).fetchall()
+                for r in rows:
+                    callee = r["callee"]
+                    if callee == dst:
+                        return {"ok": True, "found": True, "path": chain + [callee], "hops": len(chain)}
+                    if callee not in seen:
+                        seen.add(callee)
+                        if len(seen) >= GRAPH_MAX_NODES:
+                            break
+                        q.append(chain + [callee])
+    except sqlite3.Error:
+        return {"ok": False, "reason": "index_unavailable", "found": False, "path": [], "scanned": 0}
     return {"ok": True, "found": False, "path": [], "scanned": len(seen)}
 
 
@@ -262,46 +336,86 @@ def blast_radius(root: Path, *, symbols: list[str], max_depth: int = 4, limit: i
     """Transitive callers of `symbols` (reverse BFS) = the impact set of changing them."""
     from collections import deque
 
-    from .search import connect, init_schema
+    from .search import _connection_scope, init_schema, normalize_result_limit
 
-    seeds = [s for s in (symbols or []) if isinstance(s, str) and s]
+    depth_limit = _normalize_depth(max_depth, default=4)
+    result_limit = normalize_result_limit(limit, default=100)
+    seeds: list[str] = []
+    seen_seeds: set[str] = set()
+    for raw in symbols or []:
+        seed, reason = _normalize_graph_text(raw)
+        if reason or seed in seen_seeds:
+            continue
+        seeds.append(seed)
+        seen_seeds.add(seed)
+        if len(seeds) >= GRAPH_MAX_SEEDS:
+            break
     impacted: dict[str, int] = {}
-    with connect(root) as conn:
-        init_schema(conn)
-        q: deque[tuple[str, int]] = deque((s, 0) for s in seeds)
-        seen = set(seeds)
-        while q and len(impacted) < limit:
-            node, depth = q.popleft()
-            if depth >= max(1, int(max_depth)):
-                continue
-            rows = conn.execute(
-                "select distinct caller from code_calls where callee = ? limit 200", (node,)
-            ).fetchall()
-            for r in rows:
-                caller = r["caller"]
-                if not caller or caller in seen:
+    try:
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            q: deque[tuple[str, int]] = deque((s, 0) for s in seeds)
+            seen = set(seeds)
+            while q and len(impacted) < result_limit and len(seen) < GRAPH_MAX_NODES:
+                node, depth = q.popleft()
+                if depth >= depth_limit:
                     continue
-                seen.add(caller)
-                impacted[caller] = depth + 1
-                q.append((caller, depth + 1))
+                rows = conn.execute(
+                    "select distinct caller from code_calls where callee = ? limit ?",
+                    (node, GRAPH_BRANCH_LIMIT),
+                ).fetchall()
+                for r in rows:
+                    caller = r["caller"]
+                    if not caller or caller in seen:
+                        continue
+                    seen.add(caller)
+                    impacted[caller] = depth + 1
+                    if len(impacted) >= result_limit or len(seen) >= GRAPH_MAX_NODES:
+                        break
+                    q.append((caller, depth + 1))
+    except sqlite3.Error:
+        return {"ok": False, "reason": "index_unavailable", "seeds": seeds, "count": 0, "impacted": []}
     ranked = sorted(impacted.items(), key=lambda kv: (kv[1], kv[0]))
     return {"ok": True, "seeds": seeds, "count": len(ranked),
-            "impacted": [{"symbol": s, "distance": d} for s, d in ranked[:limit]]}
+            "impacted": [{"symbol": s, "distance": d} for s, d in ranked[:result_limit]]}
 
 
 def impacted_by_paths(root: Path, *, paths: list[str], max_depth: int = 4) -> dict:
     """Map changed file paths → the symbols they define → transitive callers (git-diff blast radius)."""
-    from .search import connect, init_schema
+    from .search import _connection_scope, init_schema
 
-    norm = [str(p).split("::", 1)[0] for p in (paths or []) if isinstance(p, str) and p]
+    norm: list[str] = []
+    for raw in paths or []:
+        if not isinstance(raw, str):
+            continue
+        path = raw.split("::", 1)[0].strip()
+        if not path or "\x00" in path or len(path) > 1024:
+            continue
+        norm.append(path)
+        if len(norm) >= GRAPH_MAX_SEEDS:
+            break
     symbols: list[str] = []
-    with connect(root) as conn:
-        init_schema(conn)
-        for p in norm[:100]:
-            rows = conn.execute(
-                "select qualname from code_symbols where path = ? limit 500", (p,)
-            ).fetchall()
-            symbols.extend(r["qualname"] for r in rows)
+    try:
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            for p in norm:
+                rows = conn.execute(
+                    "select qualname from code_symbols where path = ? limit ?",
+                    (p, GRAPH_BRANCH_LIMIT),
+                ).fetchall()
+                symbols.extend(r["qualname"] for r in rows)
+                if len(symbols) >= GRAPH_MAX_NODES:
+                    symbols = symbols[:GRAPH_MAX_NODES]
+                    break
+    except sqlite3.Error:
+        return {
+            "ok": False,
+            "reason": "index_unavailable",
+            "changed_paths": norm,
+            "changed_symbols": 0,
+            "count": 0,
+            "impacted": [],
+        }
     out = blast_radius(root, symbols=symbols, max_depth=max_depth)
     out["changed_paths"] = norm
     out["changed_symbols"] = len(symbols)
@@ -310,17 +424,21 @@ def impacted_by_paths(root: Path, *, paths: list[str], max_depth: int = 4) -> di
 
 def architecture_summary(root: Path, *, limit: int = 8) -> dict:
     """Cheap whole-repo orientation: top modules by symbol count and incoming-call centrality."""
-    from .search import connect, init_schema
+    from .search import _connection_scope, init_schema, normalize_result_limit
 
-    with connect(root) as conn:
-        init_schema(conn)
-        sym_rows = conn.execute(
-            "select path, count(*) as n from code_symbols group by path order by n desc limit 500"
-        ).fetchall()
-        call_rows = conn.execute(
-            "select c.path as path, count(*) as n from code_calls c group by c.path "
-            "order by n desc limit 500"
-        ).fetchall()
+    limit = normalize_result_limit(limit, default=8)
+    try:
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            sym_rows = conn.execute(
+                "select path, count(*) as n from code_symbols group by path order by n desc limit 500"
+            ).fetchall()
+            call_rows = conn.execute(
+                "select c.path as path, count(*) as n from code_calls c group by c.path "
+                "order by n desc limit 500"
+            ).fetchall()
+    except sqlite3.Error:
+        return {"ok": False, "reason": "index_unavailable", "count": 0, "modules": []}
     calls_by_path = {r["path"]: r["n"] for r in call_rows}
 
     def _module(p: str) -> str:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -230,16 +232,16 @@ def test_rg_fallback_triggers_on_zero_fts_hits(tmp_path: Path, monkeypatch) -> N
     rebuild(repo)
 
     calls: list[list] = []
-    original_run = search_mod.subprocess.run
+    original_popen = search_mod.subprocess.Popen
 
-    def _spy_run(cmd, *args, **kwargs):
+    def _spy_popen(cmd, *args, **kwargs):
         # Only record the rg invocation; let other subprocess calls (git ls-files
         # in rebuild) pass through normally.
         if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("rg"):
             calls.append(list(cmd))
-        return original_run(cmd, *args, **kwargs)
+        return original_popen(cmd, *args, **kwargs)
 
-    monkeypatch.setattr(search_mod.subprocess, "run", _spy_run)
+    monkeypatch.setattr(search_mod.subprocess, "Popen", _spy_popen)
 
     result = query(repo, "ZeXyQuPlBazXYZ", limit=5)
     assert result["ok"] is True
@@ -442,3 +444,415 @@ def main():
                 "(select id from chunks where path like 'app.py:%')"
             ).fetchall()
             assert len(meta) > 0, "function chunks should have qualname metadata"
+
+
+def test_rg_fallback_treats_leading_dash_and_regex_syntax_as_literal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    _write(repo, "doc.md", "literal option --hidden\nliteral bracket [needle\n")
+
+    option_results = _rg_fallback(repo, "--hidden")
+    bracket_results = _rg_fallback(repo, "[needle")
+
+    assert option_results[0]["path"] == "doc.md"
+    assert "--hidden" in option_results[0]["snippet"]
+    assert bracket_results[0]["path"] == "doc.md"
+    assert "[needle" in bracket_results[0]["snippet"]
+
+
+def test_rg_fallback_fails_soft_for_invalid_process_argument(tmp_path: Path, monkeypatch) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    _write(repo, "doc.md", "ordinary content\n")
+
+    assert _rg_fallback(repo, "\x00") == []
+
+
+def test_search_payload_and_evidence_redact_credential_shaped_query(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    query_value = "to" + "ken=" + "privacyQ7" * 3
+    _write(repo, "doc.md", f"privacy marker {query_value}\n")
+    rebuild(repo)
+
+    payload = query(repo, query_value, evidence_source="privacy-test")
+    serialized = json.dumps(payload, sort_keys=True)
+
+    assert payload["results"]
+    assert payload["query"] == "[REDACTED]"
+    assert query_value not in serialized
+    evidence_text = (repo / ".ai" / "memory" / "evidence.jsonl").read_text(encoding="utf-8")
+    audit_text = "".join(
+        path.read_text(encoding="utf-8")
+        for path in (repo / ".ai" / "memory" / "audit").glob("*.jsonl")
+    )
+    assert query_value not in evidence_text
+    assert query_value not in audit_text
+    assert "[REDACTED]" in evidence_text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="colon is not a valid Windows filename character")
+def test_rg_fallback_handles_colon_in_filename(tmp_path: Path, monkeypatch) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/part:name.py", "ColonPathNeedle = True\n")
+
+    results = _rg_fallback(repo, "ColonPathNeedle")
+
+    assert results[0]["path"] == "src/part:name.py"
+    assert "ColonPathNeedle" in results[0]["snippet"]
+
+
+def test_rg_fallback_does_not_read_source_for_ordinary_preview(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    _write(repo, "doc.md", "OrdinaryFallbackNeedle\n")
+
+    monkeypatch.setattr(
+        search_mod,
+        "read_root_confined_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary fallback preview must not reread the source file")
+        ),
+    )
+
+    results = _rg_fallback(repo, "OrdinaryFallbackNeedle")
+
+    assert results[0]["path"] == "doc.md"
+    assert results[0]["snippet"] == "L1: OrdinaryFallbackNeedle"
+
+
+def test_rg_fallback_does_not_enumerate_all_repository_candidates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/match.py", "CandidateEnumerationNeedle = True\n")
+    monkeypatch.setattr(
+        search_mod,
+        "iter_text_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fallback must validate returned paths without repository enumeration")
+        ),
+    )
+
+    results = _rg_fallback(repo, "CandidateEnumerationNeedle")
+
+    assert [item["path"] for item in results] == ["src/match.py"]
+
+
+def test_rg_fallback_validates_only_paths_returned_by_ripgrep(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    for index in range(100):
+        _write(repo, f"src/unmatched_{index}.py", f"VALUE_{index} = {index}\n")
+    match = _write(repo, "src/match.py", "ReturnedPathNeedle = True\n")
+    original = search_mod._is_indexable_text_file
+    validated: list[Path] = []
+
+    def counting_policy(root: Path, path: Path) -> bool:
+        validated.append(path)
+        return original(root, path)
+
+    monkeypatch.setattr(search_mod, "_is_indexable_text_file", counting_policy)
+
+    results = _rg_fallback(repo, "ReturnedPathNeedle")
+
+    assert [item["path"] for item in results] == ["src/match.py"]
+    assert validated == [match]
+
+
+def test_rg_fallback_rejects_non_indexable_text_suffix(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    _write(repo, "artifact.bin", "UnsupportedSuffixNeedle\n")
+
+    assert _rg_fallback(repo, "UnsupportedSuffixNeedle") == []
+
+
+def test_rg_result_path_is_lexically_root_confined(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    inside = repo / "src" / "main.py"
+    outside = tmp_path / "outside.py"
+
+    assert search_mod._rg_result_path(repo, "src/../src/main.py") == (
+        inside,
+        "src/main.py",
+    )
+    assert search_mod._rg_result_path(repo, "../outside.py") is None
+    assert search_mod._rg_result_path(repo, str(outside)) is None
+
+
+def test_rg_fallback_skips_literal_query_inside_private_key_block(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    begin = "-----BEGIN " + "PRIVATE " + "KEY-----"
+    end = "-----END " + "PRIVATE " + "KEY-----"
+    needle = "InsideKeyNeedleQ7"
+    _write(repo, "key.txt", f"{begin}\n{needle}\n{end}\n")
+
+    assert _rg_fallback(repo, needle) == []
+
+
+def test_rg_fallback_returns_same_literal_outside_private_key_block(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    begin = "-----BEGIN " + "PRIVATE " + "KEY-----"
+    end = "-----END " + "PRIVATE " + "KEY-----"
+    needle = "SharedKeyNeedleQ7"
+    _write(repo, "key.txt", f"{begin}\n{needle}\n{end}\nafter {needle}\n")
+
+    results = _rg_fallback(repo, needle)
+
+    assert len(results) == 1
+    assert results[0]["path"] == "key.txt"
+    assert results[0]["snippet"] == f"L4: after {needle}"
+
+
+def test_rg_fallback_quotes_embedded_pcre2_quote_terminator(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    needle = r"LiteralNeedle\E[x"
+    _write(repo, "doc.md", f"prefix {needle} suffix\n")
+
+    results = _rg_fallback(repo, needle)
+
+    assert results[0]["path"] == "doc.md"
+    assert needle in results[0]["snippet"]
+
+
+def test_rg_fallback_redacts_private_key_boundary_line(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    marker = "BoundaryMarkerQ7"
+    begin = "-----BEGIN " + "PRIVATE " + "KEY-----"
+    end = "-----END " + "PRIVATE " + "KEY-----"
+    _write(repo, "key.txt", f"{marker} {begin}\nbody\n{end}\n")
+
+    results = _rg_fallback(repo, marker)
+
+    assert results[0]["snippet"] == "L1: [REDACTED]"
+
+
+@pytest.mark.parametrize(
+    ("query_value", "reason"),
+    [
+        ("", "empty_query"),
+        ("\x00", "invalid_query_control_character"),
+        ("x" * (search_mod.SEARCH_QUERY_MAX_CHARS + 1), "query_too_long"),
+        (
+            " ".join(f"term{index}" for index in range(search_mod.SEARCH_QUERY_MAX_TERMS + 1)),
+            "query_too_many_terms",
+        ),
+    ],
+)
+def test_query_rejects_invalid_or_oversized_input_before_auto_refresh(
+    tmp_path: Path,
+    monkeypatch,
+    query_value: str,
+    reason: str,
+) -> None:
+    repo = _make_repo(tmp_path)
+    refresh_calls: list[Path] = []
+    monkeypatch.setattr(
+        search_mod,
+        "_auto_refresh_if_stale",
+        lambda root: refresh_calls.append(root),
+    )
+
+    payload = query(repo, query_value)
+
+    assert payload["ok"] is False
+    assert payload["reason"] == reason
+    assert payload["results"] == []
+    assert payload["retrieval_policy"] == "none"
+    assert payload["auto_refresh"]["reason"] == "query_rejected"
+    assert len(payload["query"]) <= search_mod.SEARCH_QUERY_ECHO_MAX_CHARS
+    assert refresh_calls == []
+
+
+def test_rg_fallback_rejects_oversized_query_before_process_spawn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    monkeypatch.setattr(search_mod.shutil, "which", lambda _name: "/usr/bin/rg")
+
+    def unexpected_popen(*_args, **_kwargs):
+        raise AssertionError("oversized query must not spawn ripgrep")
+
+    monkeypatch.setattr(search_mod.subprocess, "Popen", unexpected_popen)
+
+    oversized = "x" * (search_mod.SEARCH_QUERY_MAX_CHARS + 1)
+    assert _rg_fallback(repo, oversized) == []
+
+
+def test_rg_fallback_nonpositive_limit_does_not_spawn_process(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    monkeypatch.setattr(search_mod.shutil, "which", lambda _name: "/usr/bin/rg")
+    monkeypatch.setattr(
+        search_mod.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("nonpositive result limit must not spawn ripgrep")
+        ),
+    )
+
+    assert _rg_fallback(repo, "needle", limit=0) == []
+    assert _rg_fallback(repo, "needle", limit=-1) == []
+
+
+def test_bounded_process_reader_caps_event_count_and_output_memory() -> None:
+    script = (
+        "import json,sys\n"
+        "for i in range(10000):\n"
+        " print(json.dumps({'type':'match','index':i,'payload':'x'*200}), flush=True)\n"
+    )
+    started = time.monotonic()
+
+    lines = search_mod._run_process_lines_bounded(
+        [sys.executable, "-c", script],
+        timeout_seconds=2.0,
+        max_output_bytes=4096,
+        max_events=5,
+    )
+
+    assert 1 <= len(lines) <= 5
+    assert sum(len(line.encode("utf-8")) for line in lines) <= 4096
+    assert time.monotonic() - started < 2.0
+
+
+def test_bounded_process_reader_timeout_reaps_process(tmp_path: Path) -> None:
+    pid_path = tmp_path / "pid.txt"
+    script = (
+        "import os,sys,time\n"
+        "open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid()))\n"
+        "time.sleep(60)\n"
+    )
+
+    lines = search_mod._run_process_lines_bounded(
+        [sys.executable, "-c", script, str(pid_path)],
+        timeout_seconds=0.1,
+        max_output_bytes=4096,
+        max_events=10,
+    )
+
+    assert lines == []
+    pid = int(pid_path.read_text(encoding="utf-8"))
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("timed-out fallback process was not reaped")
+
+
+def test_bounded_process_reader_supports_nul_records_and_cwd(tmp_path: Path) -> None:
+    cwd_marker = tmp_path / "cwd.txt"
+    script = (
+        "import os,sys\n"
+        "open(sys.argv[1], 'w', encoding='utf-8').write(os.getcwd())\n"
+        "sys.stdout.buffer.write(b'src/a.py\\0src/b.py\\0')\n"
+    )
+
+    records = search_mod._run_process_lines_bounded(
+        [sys.executable, "-c", script, str(cwd_marker)],
+        cwd=tmp_path,
+        delimiter=b"\0",
+        timeout_seconds=2.0,
+        max_output_bytes=4096,
+        max_events=10,
+        allowed_returncodes={0},
+        require_complete=True,
+    )
+
+    assert records == ["src/a.py", "src/b.py"]
+    assert Path(cwd_marker.read_text(encoding="utf-8")) == tmp_path
+
+
+def test_bounded_process_reader_rejects_disallowed_returncode() -> None:
+    records = search_mod._run_process_lines_bounded(
+        [sys.executable, "-c", "print('partial'); raise SystemExit(3)"],
+        timeout_seconds=2.0,
+        max_output_bytes=4096,
+        max_events=10,
+        allowed_returncodes={0},
+        require_complete=True,
+    )
+
+    assert records == []
+
+
+def test_bounded_process_reader_complete_mode_rejects_partial_overflow() -> None:
+    script = "import sys; sys.stdout.write('a\\0b\\0c\\0')"
+
+    records = search_mod._run_process_lines_bounded(
+        [sys.executable, "-c", script],
+        delimiter=b"\0",
+        timeout_seconds=2.0,
+        max_output_bytes=4096,
+        max_events=2,
+        allowed_returncodes={0},
+        require_complete=True,
+    )
+
+    assert records == []

@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+import os
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable
 
+from .private_write import read_root_confined_text
 from .redact import redact_text
 from .search import connect, init_schema
 
 MAX_LIMIT = 100
 SNIPPET_LINES = 3
+MAX_SEED_PATHS = 100
+MAX_PATH_CHARS = 1024
+MAX_SYMBOL_QUERY_CHARS = 512
+MAX_SOURCE_BYTES = 512 * 1024
+MAX_SOURCE_CACHE_PATHS = 32
+MAX_RELATED_NAMES = 400
+MAX_CONTEXT_BYTES = 64 * 1024
+MAX_SUMMARY_CHARS = 1000
 
 
 def pack_graph_context(
@@ -18,34 +30,69 @@ def pack_graph_context(
     limit: int = 20,
 ) -> dict[str, Any]:
     """Build a small deterministic context pack from codegraph adjacency tables."""
+    root = Path(os.path.abspath(root))
     bounded_limit = _bounded_limit(limit)
-    paths = _normalize_paths(seed_paths or [])
+    try:
+        paths = _normalize_paths(seed_paths or [])
+    except ValueError:
+        return _empty_payload(bounded_limit, reason="invalid_seed_path")
     query = (symbol_query or "").strip()
+    if "\x00" in query or len(query) > MAX_SYMBOL_QUERY_CHARS:
+        return _empty_payload(bounded_limit, paths=paths, reason="invalid_symbol_query")
 
-    with connect(root) as conn:
-        init_schema(conn)
-        summaries = _load_summaries(conn)
-        seed_symbols = _seed_symbols(conn, paths=paths, symbol_query=query, limit=bounded_limit)
-        seed_qualnames = [row["qualname"] for row in seed_symbols]
-        alias_map = _alias_map(seed_qualnames)
-        aliases = sorted({alias for values in alias_map.values() for alias in values})
-        caller_edges = _caller_edges(conn, aliases=aliases, limit=bounded_limit * 4)
-        callee_edges = _callee_edges(conn, qualnames=seed_qualnames, paths=paths, limit=bounded_limit * 4)
-        related_symbols = _related_symbols(conn, seed_symbols, caller_edges, callee_edges, limit=bounded_limit * 4)
+    try:
+        with closing(connect(root)) as conn:
+            init_schema(conn)
+            seed_symbols = _sanitize_rows(
+                _seed_symbols(conn, paths=paths, symbol_query=query, limit=bounded_limit)
+            )
+            seed_qualnames = [row["qualname"] for row in seed_symbols]
+            alias_map = _alias_map(seed_qualnames)
+            aliases = sorted({alias for values in alias_map.values() for alias in values})
+            caller_edges = _sanitize_rows(
+                _caller_edges(conn, aliases=aliases, limit=bounded_limit * 4)
+            )
+            callee_edges = _sanitize_rows(
+                _callee_edges(conn, qualnames=seed_qualnames, paths=paths, limit=bounded_limit * 4)
+            )
+            related_symbols = _sanitize_rows(
+                _related_symbols(
+                    conn,
+                    seed_symbols,
+                    caller_edges,
+                    callee_edges,
+                    limit=bounded_limit * 4,
+                )
+            )
+            summary_paths = sorted({
+                str(row["path"])
+                for row in [*seed_symbols, *caller_edges, *callee_edges, *related_symbols]
+            })
+            summaries = _load_summaries(conn, summary_paths)
+    except (sqlite3.Error, OSError):
+        return _empty_payload(bounded_limit, paths=paths, query=query, reason="index_unavailable")
 
     items: list[dict[str, Any]] = []
     for row in seed_symbols:
-        items.append(_symbol_item(root, row, summaries, role="seed"))
+        items.append(_symbol_item(row, summaries, role="seed"))
     for row in caller_edges:
-        items.append(_edge_item(root, row, summaries, relation="caller", matched_symbol=_match_alias(alias_map, row["callee"])))
+        items.append(_edge_item(row, summaries, relation="caller", matched_symbol=_match_alias(alias_map, row["callee"])))
     for row in callee_edges:
-        items.append(_edge_item(root, row, summaries, relation="callee"))
+        items.append(_edge_item(row, summaries, relation="callee"))
     for row in related_symbols:
-        items.append(_symbol_item(root, row, summaries, role="related"))
+        items.append(_symbol_item(row, summaries, role="related"))
 
     deduped = _dedupe(items)
     deduped.sort(key=_sort_key)
     results = deduped[:bounded_limit]
+    source_cache: dict[str, list[str]] = {}
+    for item in results:
+        item["snippet"] = _source_snippet(
+            root,
+            str(item["path"]),
+            int(item["line"]),
+            source_cache,
+        )
     return {
         "ok": True,
         "limit": bounded_limit,
@@ -54,31 +101,85 @@ def pack_graph_context(
         "seed_symbols": [_public_symbol(row) for row in seed_symbols],
         "count": len(results),
         "results": results,
-        "additionalContext": "\n".join(_context_line(item) for item in results),
+        "additionalContext": _bounded_context(results),
     }
 
 
 def _bounded_limit(limit: int) -> int:
     try:
         value = int(limit)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         value = 20
     return max(1, min(MAX_LIMIT, value))
 
 
+def _empty_payload(
+    limit: int,
+    *,
+    paths: list[str] | None = None,
+    query: str = "",
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "reason": reason,
+        "limit": limit,
+        "seed_paths": paths or [],
+        "symbol_query": query,
+        "seed_symbols": [],
+        "count": 0,
+        "results": [],
+        "additionalContext": "",
+    }
+
+
+def _safe_relative_path(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text or "\x00" in text or len(text) > MAX_PATH_CHARS:
+        return None
+    path = Path(text)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    parts = tuple(part for part in path.parts if part not in ("", "."))
+    if not parts:
+        return None
+    return Path(*parts).as_posix()
+
+
 def _normalize_paths(paths: Iterable[str]) -> list[str]:
-    cleaned = []
+    cleaned: list[str] = []
     for path in paths:
-        value = str(path).strip()
-        if not value:
+        if len(cleaned) >= MAX_SEED_PATHS:
+            raise ValueError("too many seed paths")
+        value = _safe_relative_path(path)
+        if value is None:
+            if not str(path or "").strip():
+                continue
+            raise ValueError("invalid seed path")
+        if value in cleaned:
             continue
-        cleaned.append(value.lstrip("./"))
-    return sorted(dict.fromkeys(cleaned))
+        cleaned.append(value)
+    return sorted(cleaned)
 
 
-def _load_summaries(conn) -> dict[str, str]:
-    rows = conn.execute("select path, summary from summaries order by path").fetchall()
-    return {str(row["path"]): redact_text(str(row["summary"] or "")) for row in rows}
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _load_summaries(conn, paths: list[str]) -> dict[str, str]:
+    if not paths:
+        return {}
+    summaries: dict[str, str] = {}
+    for offset in range(0, len(paths), 400):
+        chunk = paths[offset:offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"select path, summary from summaries where path in ({placeholders}) order by path",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            summaries[str(row["path"])] = redact_text(str(row["summary"] or ""))[:MAX_SUMMARY_CHARS]
+    return summaries
 
 
 def _seed_symbols(conn, *, paths: list[str], symbol_query: str, limit: int) -> list[dict[str, Any]]:
@@ -100,11 +201,11 @@ def _seed_symbols(conn, *, paths: list[str], symbol_query: str, limit: int) -> l
             """
             select path, qualname, kind, lineno, end_lineno, parent
             from code_symbols
-            where qualname like ?
+            where qualname like ? escape '\\'
             order by length(qualname), path, lineno, qualname
             limit ?
             """,
-            (f"%{symbol_query}%", limit),
+            (f"%{_escape_like(symbol_query)}%", limit),
         ).fetchall())
     return _dedupe_rows([dict(row) for row in rows], ("path", "qualname", "lineno"))[:limit]
 
@@ -112,6 +213,8 @@ def _seed_symbols(conn, *, paths: list[str], symbol_query: str, limit: int) -> l
 def _alias_map(qualnames: list[str]) -> dict[str, list[str]]:
     aliases: dict[str, list[str]] = {}
     for qualname in qualnames:
+        if not qualname or len(qualname) > MAX_SYMBOL_QUERY_CHARS or "\x00" in qualname:
+            continue
         tail = qualname.rsplit(".", 1)[-1]
         aliases[qualname] = sorted({qualname, tail, f"self.{tail}", f"cls.{tail}"})
     return aliases
@@ -171,21 +274,58 @@ def _related_symbols(conn, seed_symbols: list[dict[str, Any]], caller_edges: lis
     if not names:
         return []
     rows: list[dict[str, Any]] = []
-    for name in sorted(names):
+    for name in sorted(names)[:MAX_RELATED_NAMES]:
+        if len(rows) >= limit:
+            break
+        if not name or len(name) > MAX_SYMBOL_QUERY_CHARS or "\x00" in name:
+            continue
+        remaining = max(1, limit - len(rows))
         rows.extend(dict(row) for row in conn.execute(
             """
             select path, qualname, kind, lineno, end_lineno, parent
             from code_symbols
-            where qualname = ? or qualname like ?
+            where qualname = ? or qualname like ? escape '\\'
             order by length(qualname), path, lineno, qualname
             limit ?
             """,
-            (name, f"%.{name}", limit),
+            (name, f"%.{_escape_like(name)}", remaining),
         ).fetchall())
     return _dedupe_rows(rows, ("path", "qualname", "lineno"))[:limit]
 
 
-def _symbol_item(root: Path, row: dict[str, Any], summaries: dict[str, str], *, role: str) -> dict[str, Any]:
+def _sanitize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for row in rows:
+        path = _safe_relative_path(row.get("path"))
+        if path is None:
+            continue
+        try:
+            lineno = int(row.get("lineno") or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if lineno <= 0 or lineno > 10_000_000:
+            continue
+        clean = dict(row)
+        clean["path"] = path
+        clean["lineno"] = lineno
+        for key in ("qualname", "caller", "callee", "kind", "parent"):
+            if key not in clean:
+                continue
+            value = redact_text(str(clean.get(key) or ""))[:MAX_SYMBOL_QUERY_CHARS]
+            if "\x00" in value:
+                value = value.replace("\x00", "")
+            clean[key] = value
+        if "end_lineno" in clean:
+            try:
+                end_lineno = int(clean.get("end_lineno") or lineno)
+            except (TypeError, ValueError, OverflowError):
+                end_lineno = lineno
+            clean["end_lineno"] = max(lineno, min(10_000_000, end_lineno))
+        sanitized.append(clean)
+    return sanitized
+
+
+def _symbol_item(row: dict[str, Any], summaries: dict[str, str], *, role: str) -> dict[str, Any]:
     path = str(row["path"])
     qualname = str(row["qualname"])
     return {
@@ -197,11 +337,11 @@ def _symbol_item(root: Path, row: dict[str, Any], summaries: dict[str, str], *, 
         "line": int(row["lineno"]),
         "end_line": int(row["end_lineno"]),
         "summary": summaries.get(path, ""),
-        "snippet": _source_snippet(root, path, int(row["lineno"])),
+        "snippet": "",
     }
 
 
-def _edge_item(root: Path, row: dict[str, Any], summaries: dict[str, str], *, relation: str, matched_symbol: str | None = None) -> dict[str, Any]:
+def _edge_item(row: dict[str, Any], summaries: dict[str, str], *, relation: str, matched_symbol: str | None = None) -> dict[str, Any]:
     path = str(row["path"])
     item = {
         "kind": "edge",
@@ -211,25 +351,58 @@ def _edge_item(root: Path, row: dict[str, Any], summaries: dict[str, str], *, re
         "callee": str(row["callee"]),
         "line": int(row["lineno"]),
         "summary": summaries.get(path, ""),
-        "snippet": _source_snippet(root, path, int(row["lineno"])),
+        "snippet": "",
     }
     if matched_symbol:
         item["matched_symbol"] = matched_symbol
     return item
 
 
-def _source_snippet(root: Path, rel_path: str, lineno: int) -> str:
-    try:
-        text = (root / rel_path).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return ""
-    lines = redact_text(text).splitlines()
+def _source_snippet(
+    root: Path,
+    rel_path: str,
+    lineno: int,
+    cache: dict[str, list[str]],
+) -> str:
+    lines = cache.get(rel_path)
+    if lines is None:
+        safe_rel = _safe_relative_path(rel_path)
+        if safe_rel is None:
+            return ""
+        try:
+            text, _state = read_root_confined_text(
+                root / safe_rel,
+                root=root,
+                max_bytes=MAX_SOURCE_BYTES,
+                require_private=False,
+                require_owner=True,
+                reject_group_other_writable=True,
+            )
+        except (OSError, UnicodeDecodeError):
+            return ""
+        lines = redact_text(text).splitlines()
+        if len(cache) < MAX_SOURCE_CACHE_PATHS:
+            cache[safe_rel] = lines
     if not lines:
         return ""
     start = max(1, lineno)
     end = min(len(lines), start + SNIPPET_LINES - 1)
     snippet = "\\n".join(f"L{idx}: {lines[idx - 1].strip()}" for idx in range(start, end + 1))
     return snippet[:480]
+
+
+def _bounded_context(results: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    total = 0
+    for item in results:
+        line = _context_line(item)
+        encoded = line.encode("utf-8")
+        separator = 1 if lines else 0
+        if total + separator + len(encoded) > MAX_CONTEXT_BYTES:
+            break
+        lines.append(line)
+        total += separator + len(encoded)
+    return "\n".join(lines)
 
 
 def _match_alias(alias_map: dict[str, list[str]], callee: str) -> str | None:

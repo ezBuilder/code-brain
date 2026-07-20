@@ -5,16 +5,29 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import stat as stat_module
 import subprocess
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from .config import load_config
 from .policy import is_ci
-from .private_write import atomic_write_private_text, read_root_confined_text
+from .private_write import (
+    atomic_write_private_bytes,
+    atomic_write_private_text,
+    ensure_root_confined_directory,
+    ensure_root_confined_private_regular_file,
+    private_file_try_lock,
+    read_root_confined_text,
+    validate_root_confined_directory,
+    validate_root_confined_regular_file,
+)
 from .redact import redact_value
 
 SCHEMA_VERSION = 8
@@ -25,6 +38,20 @@ try:
     SNIPPET_MAX_BYTES = max(80, min(2048, int(_os.environ.get("AI_SNIPPET_MAX_BYTES", "240"))))
 except (ValueError, TypeError):
     SNIPPET_MAX_BYTES = 240
+SEARCH_QUERY_MAX_CHARS = 4096
+SEARCH_QUERY_MAX_TERMS = 128
+SEARCH_QUERY_ECHO_MAX_CHARS = 512
+SEARCH_RESULT_DEFAULT = 5
+SEARCH_RESULT_MAX = 100
+SEARCH_DENSE_CANDIDATE_MAX = SEARCH_RESULT_MAX * 8
+RG_OUTPUT_MAX_BYTES = 256 * 1024
+RG_OUTPUT_MAX_EVENTS = 512
+RG_TIMEOUT_SECONDS = 10.0
+GIT_CANDIDATE_MAX_BYTES = 16 * 1024 * 1024
+GIT_CANDIDATE_MAX_PATHS = 200_000
+GIT_CANDIDATE_TIMEOUT_SECONDS = 10.0
+FILESYSTEM_CANDIDATE_MAX_VISITED = 1_000_000
+FILESYSTEM_CANDIDATE_TIMEOUT_SECONDS = 10.0
 # Path prefixes excluded from FTS5 indexing. These are runtime-accumulating
 # operational logs / caches whose content changes on every CLI invocation,
 # so indexing them creates a perpetual `index_freshness` staleness loop.
@@ -113,12 +140,71 @@ def db_path(root: Path) -> Path:
     return root / ".ai" / "cache" / "code.sqlite"
 
 
-def connect(root: Path) -> sqlite3.Connection:
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _prepare_index_storage(root: Path) -> Path:
+    """Prepare private confined SQLite main/sidecar files without following links."""
     path = db_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_root_confined_directory(path.parent, root=root, mode=0o700)
+    ensure_root_confined_private_regular_file(
+        path,
+        root=root,
+        replace_unsafe=True,
+    )
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        ensure_root_confined_private_regular_file(
+            Path(str(path) + suffix),
+            root=root,
+            replace_unsafe=True,
+        )
+    return path
+
+
+def connect(root: Path) -> sqlite3.Connection:
+    path = _prepare_index_storage(root)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+@contextmanager
+def _connection_scope(root: Path):
+    """Commit/rollback like sqlite's context manager and always close."""
+    conn = connect(root)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def _is_corrupt_index_error(exc: BaseException) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        base_code = code & 0xFF
+        if base_code in {
+            int(getattr(sqlite3, "SQLITE_CORRUPT", 11)),
+            int(getattr(sqlite3, "SQLITE_NOTADB", 26)),
+        }:
+            return True
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "file is not a database",
+            "database disk image is malformed",
+            "malformed database schema",
+            "database corruption",
+        )
+    )
+
+
+def _reset_index_storage(root: Path) -> None:
+    path = db_path(root)
+    ensure_root_confined_directory(path.parent, root=root, mode=0o700)
+    for target in (path, *(Path(str(path) + suffix) for suffix in _SQLITE_SIDECAR_SUFFIXES)):
+        atomic_write_private_bytes(target, b"", root=root)
 
 
 def init_schema(conn: sqlite3.Connection, *, migrate_legacy: bool = False) -> None:
@@ -241,29 +327,53 @@ def rebuild(
     incremental: bool = False,
     paths: set[str] | None = None,
 ) -> dict[str, Any]:
-    if single_flight:
-        from .portable import lock_exclusive_nonblocking, unlock
-        lock_path = root / ".ai" / "cache" / ".rebuild.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_fd = open(lock_path, "w")
+    def execute() -> dict[str, Any]:
         try:
-            if not lock_exclusive_nonblocking(lock_fd):
-                lock_fd.close()
+            return (
+                _rebuild_incremental_inner(root, paths=paths)
+                if incremental
+                else _rebuild_inner(root)
+            )
+        except sqlite3.DatabaseError as exc:
+            if not _is_corrupt_index_error(exc):
+                raise
+            try:
+                _reset_index_storage(root)
+                result = _rebuild_inner(root)
+            except (OSError, sqlite3.DatabaseError) as retry_exc:
                 return {
-                    "ok": True,
-                    "skipped": "another rebuild in progress",
+                    "ok": False,
+                    "reason": "corrupt_index_recovery_failed",
+                    "detail": type(retry_exc).__name__,
                     "db_path": db_path(root).relative_to(root).as_posix(),
                 }
-            try:
-                return _rebuild_incremental_inner(root, paths=paths) if incremental else _rebuild_inner(root)
-            finally:
-                unlock(lock_fd)
-        finally:
-            try:
-                lock_fd.close()
-            except Exception:
-                pass
-    return _rebuild_incremental_inner(root, paths=paths) if incremental else _rebuild_inner(root)
+            result["recovered_corrupt_index"] = True
+            return result
+
+    if single_flight:
+        lock_path = root / ".ai" / "cache" / ".rebuild.lock"
+        entered_lock = False
+        try:
+            with private_file_try_lock(lock_path, root=root) as acquired:
+                entered_lock = True
+                if not acquired:
+                    return {
+                        "ok": True,
+                        "skipped": "another rebuild in progress",
+                        "db_path": db_path(root).relative_to(root).as_posix(),
+                    }
+                return execute()
+        except OSError:
+            return {
+                "ok": False,
+                "reason": (
+                    "index_storage_unavailable"
+                    if entered_lock
+                    else "rebuild_lock_unavailable"
+                ),
+                "db_path": db_path(root).relative_to(root).as_posix(),
+            }
+    return execute()
 
 
 def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> dict[str, Any]:
@@ -284,7 +394,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
     if not db_p.exists():
         return _rebuild_inner(root)
 
-    with connect(root) as conn:
+    with _connection_scope(root) as conn:
         try:
             init_schema(conn, migrate_legacy=False)
         except RuntimeError:
@@ -318,16 +428,16 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             )
         )
         for rel, path in candidate_paths:
-            seen.add(rel)
-            try:
-                content = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
+            loaded = _read_indexable_text(root, path)
+            if loaded is None:
                 continue
+            content, source_state = loaded
+            seen.add(rel)
             redacted = redact_value(content)
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
             existing_pair = existing.get(rel)
             if existing_pair is not None and existing_pair[1] == digest:
-                _upsert_file_state(conn, rel, path, digest)
+                _upsert_file_state(conn, rel, path, digest, state=source_state)
                 unchanged += 1
                 continue
             # Need to (re)write this file: drop dependent rows, including the
@@ -372,7 +482,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             _insert_codegraph_for_path(conn, rel, redacted, path)
             # For supported languages, also insert function/class level chunks (hybrid chunking)
             _insert_function_chunks(conn, rel, content, chunk_id, root=root)
-            _upsert_file_state(conn, rel, path, digest)
+            _upsert_file_state(conn, rel, path, digest, state=source_state)
             if existing_pair is not None:
                 changed += 1
             else:
@@ -429,7 +539,7 @@ def _delete_chunk_rows(conn: sqlite3.Connection, chunk_id: int) -> None:
 
 
 def _rebuild_inner(root: Path) -> dict[str, Any]:
-    with connect(root) as conn:
+    with _connection_scope(root) as conn:
         init_schema(conn, migrate_legacy=True)
         conn.execute("begin immediate")
         drop_schema(conn)
@@ -437,10 +547,10 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
         indexed = 0
         for path in iter_text_files(root, use_cache=False, update_cache=True):
             rel = path.relative_to(root).as_posix()
-            try:
-                content = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
+            loaded = _read_indexable_text(root, path)
+            if loaded is None:
                 continue
+            content, source_state = loaded
             redacted = redact_value(content)
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
             summary = summarize(redacted)
@@ -463,7 +573,7 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
             _insert_codegraph_for_path(conn, rel, redacted, path)
             # For supported languages, also insert function/class level chunks (hybrid chunking)
             _insert_function_chunks(conn, rel, content, chunk_id, root=root)
-            _upsert_file_state(conn, rel, path, digest)
+            _upsert_file_state(conn, rel, path, digest, state=source_state)
             indexed += 1
         conn.commit()
         conn.execute("vacuum")
@@ -473,10 +583,7 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
 
 def _mark_index_generation(root: Path) -> None:
     marker = root / ".ai" / "cache" / "code-index-generation"
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    temporary = marker.with_suffix(".tmp")
-    temporary.write_text(str(time.time_ns()) + "\n", encoding="utf-8")
-    os.replace(temporary, marker)
+    atomic_write_private_text(marker, str(time.time_ns()) + "\n", root=root)
 
 
 def _file_stat_values(
@@ -496,8 +603,10 @@ def _upsert_file_state(
     rel: str,
     path: Path,
     digest: str,
+    *,
+    state: os.stat_result | None = None,
 ) -> None:
-    size, mtime_ns, ctime_ns = _file_stat_values(path)
+    size, mtime_ns, ctime_ns = _file_stat_values(path, state)
     conn.execute(
         """
         insert into file_state(path, size, mtime_ns, ctime_ns, sha256)
@@ -679,32 +788,32 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
         lang = "javascript"
         try:
             from .astgrep_integration import extract_symbols_js, extract_calls_js
-            extract_symbols_func = lambda src, **kw: extract_symbols_js(str(abs_path))
-            extract_calls_func = lambda src, **kw: extract_calls_js(str(abs_path))
+            extract_symbols_func = extract_symbols_js
+            extract_calls_func = extract_calls_js
         except Exception:
             return
     elif rel.endswith((".ts", ".tsx")):
         lang = "typescript"
         try:
             from .astgrep_integration import extract_symbols_ts, extract_calls_ts
-            extract_symbols_func = lambda src, **kw: extract_symbols_ts(str(abs_path))
-            extract_calls_func = lambda src, **kw: extract_calls_ts(str(abs_path))
+            extract_symbols_func = extract_symbols_ts
+            extract_calls_func = extract_calls_ts
         except Exception:
             return
     elif rel.endswith(".go"):
         lang = "go"
         try:
             from .astgrep_integration import extract_symbols_go, extract_calls_go
-            extract_symbols_func = lambda src, **kw: extract_symbols_go(str(abs_path))
-            extract_calls_func = lambda src, **kw: extract_calls_go(str(abs_path))
+            extract_symbols_func = extract_symbols_go
+            extract_calls_func = extract_calls_go
         except Exception:
             return
     elif rel.endswith(".rs"):
         lang = "rust"
         try:
             from .astgrep_integration import extract_symbols_rs, extract_calls_rs
-            extract_symbols_func = lambda src, **kw: extract_symbols_rs(str(abs_path))
-            extract_calls_func = lambda src, **kw: extract_calls_rs(str(abs_path))
+            extract_symbols_func = extract_symbols_rs
+            extract_calls_func = extract_calls_rs
         except Exception:
             return
     else:
@@ -728,20 +837,26 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
                     (c.path, c.caller, c.callee, c.lineno, lang),
                 )
         else:
-            # Multi-language extraction (ast-grep) returns dicts
-            syms = extract_symbols_func(redacted_text)
-            for s in syms:
-                conn.execute(
-                    "insert into code_symbols(path, qualname, kind, lineno, end_lineno, lang) "
-                    "values (?, ?, ?, ?, ?, ?)",
-                    (rel, s.get("qualname"), s.get("kind"), s.get("lineno"), s.get("end_lineno"), lang),
-                )
-            calls = extract_calls_func(redacted_text)
-            for c in calls:
-                conn.execute(
-                    "insert into code_calls(path, caller, callee, lineno, lang) values (?, ?, ?, ?, ?)",
-                    (rel, "<module>", c.get("callee"), c.get("lineno"), lang),
-                )
+            # ast-grep requires a file path. Parse a private temporary copy of
+            # the already-redacted trusted descriptor content, never the
+            # repository path, so path replacement cannot change the input.
+            suffix = abs_path.suffix or ".txt"
+            with tempfile.TemporaryDirectory(prefix="code-brain-codegraph-") as temp_dir:
+                trusted_path = Path(temp_dir) / f"source{suffix}"
+                trusted_path.write_text(redacted_text, encoding="utf-8")
+                syms = extract_symbols_func(str(trusted_path))
+                for s in syms:
+                    conn.execute(
+                        "insert into code_symbols(path, qualname, kind, lineno, end_lineno, lang) "
+                        "values (?, ?, ?, ?, ?, ?)",
+                        (rel, s.get("qualname"), s.get("kind"), s.get("lineno"), s.get("end_lineno"), lang),
+                    )
+                calls = extract_calls_func(str(trusted_path))
+                for c in calls:
+                    conn.execute(
+                        "insert into code_calls(path, caller, callee, lineno, lang) values (?, ?, ?, ?, ?)",
+                        (rel, "<module>", c.get("callee"), c.get("lineno"), lang),
+                    )
     except Exception:
         # Indexer must continue even if one file misbehaves.
         return
@@ -916,7 +1031,11 @@ def _function_chunks_for_lang(path: str, source_text: str, lang: str) -> list[di
         return []
 
     try:
-        symbols = extract_func(path)
+        suffix = Path(path).suffix or f".{lang}"
+        with tempfile.TemporaryDirectory(prefix="code-brain-chunks-") as temp_dir:
+            trusted_path = Path(temp_dir) / f"source{suffix}"
+            trusted_path.write_text(source_text, encoding="utf-8")
+            symbols = extract_func(str(trusted_path))
     except Exception:
         return []
 
@@ -1043,66 +1162,321 @@ def _rg_fallback_enabled() -> bool:
     return str(raw).strip().lower() not in {"0", "off", "false", "no"}
 
 
+def _query_rejection_reason(text: str) -> str | None:
+    if not text:
+        return "empty_query"
+    if "\x00" in text:
+        return "invalid_query_control_character"
+    if len(text) > SEARCH_QUERY_MAX_CHARS:
+        return "query_too_long"
+    if len(re.findall(r"\w+", text, flags=re.UNICODE)) > SEARCH_QUERY_MAX_TERMS:
+        return "query_too_many_terms"
+    return None
+
+
+def normalize_result_limit(
+    value: Any,
+    *,
+    default: int = SEARCH_RESULT_DEFAULT,
+    allow_zero: bool = False,
+) -> int:
+    """Coerce caller-provided result limits to a small deterministic range."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = int(default)
+    if allow_zero and parsed <= 0:
+        return 0
+    return max(1, min(SEARCH_RESULT_MAX, parsed))
+
+
+def _safe_query_echo(text: str) -> str:
+    redacted = str(redact_value(text)).replace("\x00", "")
+    if len(redacted) <= SEARCH_QUERY_ECHO_MAX_CHARS:
+        return redacted
+    return redacted[: SEARCH_QUERY_ECHO_MAX_CHARS - 1] + "…"
+
+
+def _rejected_query_payload(text: str, reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "reason": reason,
+        "query": _safe_query_echo(text),
+        "retrieval_policy": "none",
+        "recommended_retrieval_policy": "none",
+        "results": [],
+        "rg_fallback": False,
+        "dense_rerank": False,
+        "auto_refresh": {"checked": False, "rebuilt": False, "reason": "query_rejected"},
+    }
+
+
+def _redacted_rg_preview(root: Path, rel_path: str, lineno: int, preview: str) -> str:
+    """Redact one rg preview after multiline secret blocks were skipped in rg."""
+    raw_preview = preview.strip()
+    direct = str(redact_value(raw_preview))
+    if direct != raw_preview:
+        return direct
+    if "PRIVATE KEY-----" in raw_preview and (
+        "-----BEGIN " in raw_preview or "-----END " in raw_preview
+    ):
+        return "[REDACTED]"
+    return raw_preview
+
+
+def _pcre2_literal(value: str) -> str:
+    """Quote arbitrary text for PCRE2, including embedded ``\\E`` sequences."""
+    return r"\Q" + value.replace(r"\E", r"\E\\E\Q") + r"\E"
+
+
+def _rg_safe_pattern(query_text: str) -> str:
+    private_key_block = (
+        r"(?s:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?"
+        r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)(*SKIP)(*F)|"
+    )
+    return private_key_block + _pcre2_literal(query_text)
+
+
+def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """Best-effort terminate one isolated subprocess group and reap its leader."""
+    if proc.poll() is not None:
+        return
+    if os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+    else:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=0.25)
+        return
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    if os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=1.0)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _run_process_lines_bounded(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+    max_output_bytes: int,
+    max_events: int,
+    delimiter: bytes = b"\n",
+    cwd: Path | None = None,
+    allowed_returncodes: set[int] | None = None,
+    require_complete: bool = False,
+) -> list[str]:
+    """Run a command with bounded stdout records and fail-soft cleanup."""
+    separator = bytes(delimiter)
+    if not separator:
+        return []
+    popen_kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if creation_flag:
+            popen_kwargs["creationflags"] = creation_flag
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=False,
+            bufsize=0,
+            cwd=cwd,
+            **popen_kwargs,
+        )
+    except (OSError, ValueError):
+        return []
+    if proc.stdout is None:
+        _terminate_process_group(proc)
+        return []
+
+    lines: list[bytes] = []
+    state = {"overflow": False, "failed": False}
+    byte_limit = max(1, int(max_output_bytes))
+    event_limit = max(1, int(max_events))
+
+    def read_stdout() -> None:
+        pending = bytearray()
+        total = 0
+        try:
+            while True:
+                chunk = os.read(proc.stdout.fileno(), min(65536, byte_limit + 1))
+                if not chunk:
+                    break
+                remaining = byte_limit - total
+                if remaining <= 0:
+                    state["overflow"] = True
+                    break
+                if len(chunk) > remaining:
+                    pending.extend(chunk[:remaining])
+                    total = byte_limit
+                    state["overflow"] = True
+                else:
+                    pending.extend(chunk)
+                    total += len(chunk)
+                while True:
+                    boundary = pending.find(separator)
+                    if boundary < 0:
+                        break
+                    if len(lines) >= event_limit:
+                        state["overflow"] = True
+                        break
+                    lines.append(bytes(pending[:boundary]).rstrip(b"\r"))
+                    del pending[: boundary + len(separator)]
+                if state["overflow"]:
+                    break
+            if pending and len(lines) < event_limit and not state["overflow"]:
+                lines.append(bytes(pending).rstrip(b"\r"))
+            elif pending and len(lines) >= event_limit:
+                state["overflow"] = True
+        except OSError:
+            state["failed"] = True
+
+    reader = threading.Thread(target=read_stdout, name="code-brain-process-reader", daemon=True)
+    reader.start()
+    reader.join(timeout=max(0.01, float(timeout_seconds)))
+    timed_out = reader.is_alive()
+    if timed_out or state["overflow"]:
+        _terminate_process_group(proc)
+        reader.join(timeout=1.0)
+    else:
+        try:
+            proc.wait(timeout=0.5)
+        except (subprocess.TimeoutExpired, OSError):
+            _terminate_process_group(proc)
+    try:
+        proc.stdout.close()
+    except OSError:
+        pass
+    if timed_out or state["failed"] or reader.is_alive():
+        return []
+    if require_complete and state["overflow"]:
+        return []
+    if allowed_returncodes is not None and proc.returncode not in allowed_returncodes:
+        return []
+    return [line.decode("utf-8", errors="replace") for line in lines]
+
+
+def _rg_result_path(root: Path, raw_path: str) -> tuple[Path, str] | None:
+    """Normalize one rg path lexically without following repository links."""
+    root_abs = Path(os.path.abspath(root))
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = root_abs / candidate
+    candidate_abs = Path(os.path.abspath(candidate))
+    try:
+        rel = candidate_abs.relative_to(root_abs)
+    except ValueError:
+        return None
+    if not rel.parts:
+        return None
+    return candidate_abs, rel.as_posix()
+
+
 def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[str, Any]]:
     """Run ripgrep as an exact-match fallback. Returns [] if rg missing or fails."""
+    limit = normalize_result_limit(limit, default=10, allow_zero=True)
+    if limit == 0:
+        return []
     if not _rg_fallback_enabled():
         return []
     rg_bin = shutil.which("rg")
     if not rg_bin:
         return []
     q = (query_text or "").strip()
-    if not q:
+    if _query_rejection_reason(q) is not None:
         return []
-    try:
-        proc = subprocess.run(
-            [
-                rg_bin,
-                q,
-                str(root),
-                "--line-number",
-                "--with-filename",
-                "--smart-case",
-                "--max-count",
-                "3",
-                "--max-columns",
-                "200",
-                "--no-heading",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return []
-    if not proc.stdout:
+    raw_events = _run_process_lines_bounded(
+        [
+            rg_bin,
+            "--json",
+            "--pcre2",
+            "--multiline",
+            "--smart-case",
+            "--max-count",
+            "3",
+            "--max-columns",
+            "200",
+            "--max-filesize",
+            "10M",
+            "--",
+            _rg_safe_pattern(q),
+            str(root),
+        ],
+        timeout_seconds=RG_TIMEOUT_SECONDS,
+        max_output_bytes=RG_OUTPUT_MAX_BYTES,
+        max_events=max(64, min(RG_OUTPUT_MAX_EVENTS, max(1, int(limit)) * 12 + 8)),
+    )
+    if not raw_events:
         return []
     results: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
-    allowed_paths = {path.relative_to(root).as_posix() for path in iter_text_files(root)}
-    for idx, line in enumerate(proc.stdout.splitlines()):
-        if not line:
-            continue
-        # Format: path:lineno:content
-        parts = line.split(":", 2)
-        if len(parts) < 3:
-            continue
-        raw_path, lineno_str, preview = parts[0], parts[1], parts[2]
-        try:
-            lineno = int(lineno_str)
-        except ValueError:
+    path_allowed: dict[str, bool] = {}
+    policy_root = Path(os.path.abspath(root))
+    for idx, raw_event in enumerate(raw_events):
+        if not raw_event:
             continue
         try:
-            abs_path = Path(raw_path).resolve()
-            rel_path = abs_path.relative_to(root.resolve()).as_posix()
-        except (ValueError, OSError):
-            rel_path = raw_path
-        if rel_path not in allowed_paths:
+            event = json.loads(raw_event)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "match":
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        path_data = data.get("path")
+        lines_data = data.get("lines")
+        raw_path = path_data.get("text") if isinstance(path_data, dict) else None
+        preview = lines_data.get("text") if isinstance(lines_data, dict) else None
+        lineno_value = data.get("line_number")
+        if not isinstance(raw_path, str) or not isinstance(preview, str):
+            continue
+        try:
+            lineno = int(lineno_value)
+        except (TypeError, ValueError):
+            continue
+        normalized = _rg_result_path(policy_root, raw_path)
+        if normalized is None:
+            continue
+        candidate_path, rel_path = normalized
+        allowed = path_allowed.get(rel_path)
+        if allowed is None:
+            allowed = _is_indexable_text_file(policy_root, candidate_path)
+            path_allowed[rel_path] = allowed
+        if not allowed:
             continue
         if rel_path in seen_paths:
             continue
         seen_paths.add(rel_path)
-        preview_clean = preview.strip()
+        preview_clean = _redacted_rg_preview(root, rel_path, lineno, preview)
         if len(preview_clean) > SNIPPET_MAX_BYTES:
             preview_clean = preview_clean[:SNIPPET_MAX_BYTES]
         results.append({
@@ -1150,6 +1524,11 @@ def _result_scope(path: str, summary: str | None) -> str:
 
 
 def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None = None) -> dict[str, Any]:
+    text = str(text or "").strip()
+    limit = normalize_result_limit(limit)
+    rejection_reason = _query_rejection_reason(text)
+    if rejection_reason is not None:
+        return _rejected_query_payload(text, rejection_reason)
     auto_refresh = _auto_refresh_if_stale(root)
     retriever = configured_retriever(root)
     if retriever != "bm25":
@@ -1162,44 +1541,92 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
         dense_active = _emb.is_active_for(root)
     except Exception:
         dense_active = False
-    candidate_limit = max(limit * 8, 40) if dense_active else limit
-    with connect(root) as conn:
-        init_schema(conn)
-        index_state = _index_state_from_conn(conn)
-        recommended_policy = retrieval_policy_for_query(text, index_state)
-        rows = conn.execute(
-            """
-            select c.id, c.path, c.sha256, c.summary, p.processor,
-                   p.model_hash, p.prompt_version, p.chunker_version, p.confidence
-            from chunks_fts
-            join chunks c on c.id = chunks_fts.rowid
-            join provenance p on p.path = c.path
-            where chunks_fts match ?
-            order by bm25(chunks_fts, ?, ?)
-            limit ?
-            """,
-            (escape_fts_query(text), path_weight, content_weight, candidate_limit),
-        ).fetchall()
-        # If dense active, fetch vectors for the candidates so we can rerank.
-        vectors_by_id: dict[int, list[float]] = {}
-        if dense_active and rows:
-            chunk_ids = [int(r["id"]) for r in rows]
-            placeholders = ",".join("?" * len(chunk_ids))
-            vec_rows = conn.execute(
-                f"select chunk_id, vector from embeddings_vec0 "
-                f"where chunk_id in ({placeholders}) and vector is not null",
-                chunk_ids,
+    candidate_limit = (
+        min(SEARCH_DENSE_CANDIDATE_MAX, max(limit * 8, 40))
+        if dense_active
+        else limit
+    )
+
+    def load_index_rows():
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            state = _index_state_from_conn(conn)
+            loaded_rows = conn.execute(
+                """
+                select c.id, c.path, c.sha256, c.summary, p.processor,
+                       p.model_hash, p.prompt_version, p.chunker_version, p.confidence
+                from chunks_fts
+                join chunks c on c.id = chunks_fts.rowid
+                join provenance p on p.path = c.path
+                where chunks_fts match ?
+                order by bm25(chunks_fts, ?, ?)
+                limit ?
+                """,
+                (escape_fts_query(text), path_weight, content_weight, candidate_limit),
             ).fetchall()
-            import struct as _struct
-            for vr in vec_rows:
-                blob = vr["vector"]
-                if not blob:
-                    continue
+            loaded_vectors: dict[int, list[float]] = {}
+            if dense_active and loaded_rows:
+                chunk_ids = [int(row["id"]) for row in loaded_rows]
+                placeholders = ",".join("?" * len(chunk_ids))
+                vec_rows = conn.execute(
+                    f"select chunk_id, vector from embeddings_vec0 "
+                    f"where chunk_id in ({placeholders}) and vector is not null",
+                    chunk_ids,
+                ).fetchall()
+                import struct as _struct
+
+                for vector_row in vec_rows:
+                    blob = vector_row["vector"]
+                    if not blob:
+                        continue
+                    try:
+                        floats = list(_struct.unpack(f"<{len(blob)//4}f", blob))
+                        loaded_vectors[int(vector_row["chunk_id"])] = floats
+                    except Exception:
+                        continue
+            return state, loaded_rows, loaded_vectors
+
+    empty_state = {
+        "indexed_chunks": 0,
+        "indexed_files": 0,
+        "symbol_count": 0,
+        "call_edge_count": 0,
+    }
+    try:
+        index_state, rows, vectors_by_id = load_index_rows()
+    except sqlite3.Error as exc:
+        index_state, rows, vectors_by_id = empty_state, [], {}
+        if _is_corrupt_index_error(exc):
+            recovery = rebuild(root, single_flight=True)
+            if recovery.get("ok") and not recovery.get("skipped"):
                 try:
-                    floats = list(_struct.unpack(f"<{len(blob)//4}f", blob))
-                    vectors_by_id[int(vr["chunk_id"])] = floats
-                except Exception:
-                    continue
+                    index_state, rows, vectors_by_id = load_index_rows()
+                    auto_refresh = {
+                        "enabled": True,
+                        "rebuilt": True,
+                        "reason": "corrupt_index",
+                        "result": recovery,
+                    }
+                except sqlite3.Error:
+                    auto_refresh = {
+                        "enabled": True,
+                        "rebuilt": False,
+                        "reason": "corrupt_index_recovery_failed",
+                    }
+            else:
+                auto_refresh = {
+                    "enabled": True,
+                    "rebuilt": False,
+                    "reason": "corrupt_index_recovery_deferred",
+                    "result": recovery,
+                }
+        else:
+            auto_refresh = {
+                "enabled": bool(auto_refresh.get("enabled", True)),
+                "rebuilt": False,
+                "reason": "index_unavailable",
+            }
+    recommended_policy = retrieval_policy_for_query(text, index_state)
     fts_results: list[dict[str, Any]] = []
     for row in rows:
         fts_results.append({
@@ -1290,7 +1717,7 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
         actual_policy += "+rg"
     payload = {
         "ok": True,
-        "query": text,
+        "query": _safe_query_echo(text),
         "retrieval_policy": actual_policy,
         "recommended_retrieval_policy": recommended_policy,
         "results": fts_results[:limit],
@@ -1306,6 +1733,7 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
 def context_pack(root: Path, text: str, *, limit: int = 5, mode: str = "balanced") -> dict[str, Any]:
     from .context_budget import apply as apply_context_budget
 
+    limit = normalize_result_limit(limit)
     payload = query(root, text, limit=limit, evidence_source="context_pack")
     payload.update(apply_context_budget(payload["results"], mode=mode, limit=limit))
     return payload
@@ -1383,7 +1811,7 @@ def index_hash_status(
             "indexed_files": 0,
         }
     try:
-        with connect(root) as conn:
+        with _connection_scope(root) as conn:
             init_schema(conn)
             indexed = {
                 str(row["path"]): (
@@ -1438,7 +1866,7 @@ def index_hash_status(
 
     changed: set[str] = set()
     seen: set[str] = set()
-    metadata_updates: list[tuple[str, Path, str]] = []
+    metadata_updates: list[tuple[str, Path, str, os.stat_result]] = []
     if paths is None:
         candidates = [
             (path.relative_to(root).as_posix(), path, state)
@@ -1473,24 +1901,25 @@ def index_hash_status(
                 continue
             if current_metadata == indexed_metadata:
                 continue
-        try:
-            redacted = str(redact_value(path.read_text(encoding="utf-8")))
-        except (OSError, UnicodeDecodeError):
+        loaded = _read_indexable_text(root, path)
+        if loaded is None:
             changed.add(rel)
             continue
+        content, source_state = loaded
+        redacted = str(redact_value(content))
         digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
         if digest != expected:
             changed.add(rel)
         elif use_metadata and refresh_metadata:
-            metadata_updates.append((rel, path, digest))
+            metadata_updates.append((rel, path, digest, source_state))
     if paths is None:
         changed.update(set(indexed) - seen)
     if metadata_updates:
         try:
-            with connect(root) as conn:
+            with _connection_scope(root) as conn:
                 init_schema(conn)
-                for rel, path, digest in metadata_updates:
-                    _upsert_file_state(conn, rel, path, digest)
+                for rel, path, digest, source_state in metadata_updates:
+                    _upsert_file_state(conn, rel, path, digest, state=source_state)
                 conn.commit()
         except (OSError, sqlite3.Error, RuntimeError):
             pass
@@ -1544,6 +1973,7 @@ def _git_dirty_paths(root: Path) -> set[str]:
 
 
 def observability(root: Path, *, query_text: str | None = None, limit: int = 5) -> dict[str, Any]:
+    limit = normalize_result_limit(limit)
     path = db_path(root)
     payload: dict[str, Any] = {
         "ok": True,
@@ -1565,7 +1995,7 @@ def observability(root: Path, *, query_text: str | None = None, limit: int = 5) 
     payload["sqlite_bytes"] = path.stat().st_size
     wal = path.with_name(path.name + "-wal")
     payload["sqlite_wal_bytes"] = wal.stat().st_size if wal.exists() else 0
-    with connect(root) as conn:
+    with _connection_scope(root) as conn:
         init_schema(conn)
         payload["schema_version"] = int(conn.execute("pragma user_version").fetchone()[0])
         row = conn.execute(
@@ -1608,7 +2038,7 @@ def indexed_bytes_for_paths(root: Path, paths: list[str]) -> int:
     if not paths:
         return 0
     placeholders = ",".join("?" for _ in paths)
-    with connect(root) as conn:
+    with _connection_scope(root) as conn:
         init_schema(conn)
         row = conn.execute(
             f"""
@@ -1677,20 +2107,31 @@ def _indexable_text_stat(root: Path, path: Path) -> os.stat_result | None:
         return None
     if any(path.name.endswith(suffix) for suffix in SKIP_SUFFIXES):
         return None
-    try:
-        stat_result = path.lstat()
-    except OSError:
-        return None
-    # Never follow repository symlinks while indexing. A tracked or untracked
-    # link can point outside the project and would otherwise copy arbitrary
-    # external source or credential material into the local SQLite index.
-    if stat_module.S_ISLNK(stat_result.st_mode):
-        return None
-    if not stat_module.S_ISREG(stat_result.st_mode) or stat_result.st_size > MAX_TEXT_BYTES:
-        return None
     if path.suffix not in TEXT_SUFFIXES and path.name not in {"AGENTS.md", "CLAUDE.md"}:
         return None
-    return stat_result
+    try:
+        return validate_root_confined_regular_file(
+            path,
+            root=root,
+            max_bytes=MAX_TEXT_BYTES,
+        )
+    except OSError:
+        return None
+
+
+def _read_indexable_text(root: Path, path: Path) -> tuple[str, os.stat_result] | None:
+    """Read one source file from the same confined descriptor used for trust checks."""
+    if _indexable_text_stat(root, path) is None:
+        return None
+    try:
+        return read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=MAX_TEXT_BYTES,
+            require_private=False,
+        )
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _target_text_files(root: Path, rel_paths: set[str]):
@@ -1713,33 +2154,10 @@ def _candidate_policy_fingerprint() -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _candidate_cache_parent_confined(root: Path, path: Path) -> bool:
-    try:
-        path.parent.resolve().relative_to(root.resolve())
-    except (OSError, ValueError):
-        return False
-    return True
-
-
-def _trusted_candidate_cache(root: Path) -> Path | None:
-    path = _candidate_cache_path(root)
-    try:
-        if path.is_symlink() or not path.is_file():
-            return None
-        if not _candidate_cache_parent_confined(root, path):
-            return None
-        state = path.stat()
-        if os.name != "nt" and stat_module.S_IMODE(state.st_mode) & 0o077:
-            return None
-        if hasattr(os, "geteuid") and state.st_uid != os.geteuid():
-            return None
-    except OSError:
-        return None
-    return path
-
-
 def _candidate_rel_allowed(rel: str) -> bool:
     rel_path = Path(rel)
+    if rel_path.is_absolute() or not rel_path.parts or ".." in rel_path.parts:
+        return False
     rel_posix = rel_path.as_posix()
     if any(part in SKIP_DIRS for part in rel_path.parts):
         return False
@@ -1823,9 +2241,7 @@ def _candidate_cache_tree_state(root: Path) -> tuple[dict[str, list[int]], dict[
 
 
 def _candidate_cache_load(root: Path) -> list[Path] | None:
-    cache_path = _trusted_candidate_cache(root)
-    if cache_path is None:
-        return None
+    cache_path = _candidate_cache_path(root)
     try:
         text, _state = read_root_confined_text(
             cache_path,
@@ -1834,8 +2250,11 @@ def _candidate_cache_load(root: Path) -> list[Path] | None:
             require_private=True,
         )
         payload = json.loads(text)
+        if not isinstance(payload, dict):
+            return None
         created = float(payload.get("created_at_unix", 0))
-        if time.time() - created < 0 or time.time() - created > CANDIDATE_CACHE_MAX_AGE_SECONDS:
+        age = time.time() - created
+        if age < 0 or age > CANDIDATE_CACHE_MAX_AGE_SECONDS:
             return None
         if payload.get("schema") != CANDIDATE_CACHE_SCHEMA:
             return None
@@ -1855,7 +2274,16 @@ def _candidate_cache_load(root: Path) -> list[Path] | None:
             ):
                 return None
             path = root if rel == "." else root / rel
-            state = path.stat()
+            if rel == ".":
+                state = root.lstat()
+                if stat_module.S_ISLNK(state.st_mode) or not stat_module.S_ISDIR(state.st_mode):
+                    return None
+            else:
+                state = validate_root_confined_directory(
+                    path,
+                    root=root,
+                    require_safe_permissions=True,
+                )
             current_state = [
                 int(state.st_mtime_ns),
                 int(getattr(state, "st_ctime_ns", int(state.st_ctime * 1_000_000_000))),
@@ -1881,9 +2309,7 @@ def _candidate_cache_load(root: Path) -> list[Path] | None:
 def _candidate_cache_write(root: Path, rels: list[str]) -> None:
     cache_path = _candidate_cache_path(root)
     try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        if not _candidate_cache_parent_confined(root, cache_path):
-            return
+        ensure_root_confined_directory(cache_path.parent, root=root, mode=0o700)
         directories, ignore_files = _candidate_cache_tree_state(root)
         payload = {
             "schema": CANDIDATE_CACHE_SCHEMA,
@@ -1902,6 +2328,77 @@ def _candidate_cache_write(root: Path, rels: list[str]) -> None:
         pass
 
 
+def _filesystem_candidate_files(
+    root: Path,
+    *,
+    max_paths: int | None = None,
+    max_visited: int | None = None,
+    timeout_seconds: float | None = None,
+) -> list[Path]:
+    """Bounded no-follow fallback when Git candidate discovery is unavailable."""
+    root = Path(root)
+    path_limit = max(0, int(GIT_CANDIDATE_MAX_PATHS if max_paths is None else max_paths))
+    visit_limit = max(
+        0,
+        int(FILESYSTEM_CANDIDATE_MAX_VISITED if max_visited is None else max_visited),
+    )
+    if path_limit == 0 or visit_limit == 0:
+        return []
+    duration = (
+        FILESYSTEM_CANDIDATE_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else timeout_seconds
+    )
+    deadline = time.monotonic() + max(0.01, float(duration))
+    visited = 0
+    found: list[Path] = []
+    for current, dir_names, file_names in os.walk(root, topdown=True, followlinks=False):
+        if time.monotonic() >= deadline or visited >= visit_limit:
+            break
+        current_path = Path(current)
+        try:
+            current_rel = current_path.relative_to(root)
+        except ValueError:
+            dir_names[:] = []
+            continue
+        kept_dirs: list[str] = []
+        for name in dir_names:
+            visited += 1
+            if visited > visit_limit or time.monotonic() >= deadline:
+                break
+            child_rel = current_rel / name
+            child_posix = child_rel.as_posix().rstrip("/") + "/"
+            if name == ".git" or name in SKIP_DIRS:
+                continue
+            if any(child_posix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
+                continue
+            try:
+                state = (current_path / name).lstat()
+            except OSError:
+                continue
+            if stat_module.S_ISDIR(state.st_mode) and not stat_module.S_ISLNK(state.st_mode):
+                kept_dirs.append(name)
+        dir_names[:] = kept_dirs
+        if visited > visit_limit or time.monotonic() >= deadline:
+            break
+        for name in file_names:
+            visited += 1
+            if visited > visit_limit or time.monotonic() >= deadline:
+                return sorted(found)
+            path = current_path / name
+            try:
+                rel = path.relative_to(root).as_posix()
+                state = path.lstat()
+            except (OSError, ValueError):
+                continue
+            if not _candidate_rel_allowed(rel) or not stat_module.S_ISREG(state.st_mode):
+                continue
+            found.append(path)
+            if len(found) >= path_limit:
+                return sorted(found)
+    return sorted(found)
+
+
 def candidate_files(
     root: Path,
     *,
@@ -1912,25 +2409,23 @@ def candidate_files(
         cached = _candidate_cache_load(root)
         if cached is not None:
             return cached
-    try:
-        result = subprocess.run(
-            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            cwd=root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return sorted(
-            path
-            for path in root.rglob("*")
-            if path.is_file() and _candidate_rel_allowed(path.relative_to(root).as_posix())
-        )
-    rels = [
-        rel
-        for item in result.stdout.split(b"\0")
-        if item and _candidate_rel_allowed(rel := item.decode("utf-8"))
-    ]
+    rels = _run_process_lines_bounded(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=root,
+        delimiter=b"\0",
+        timeout_seconds=GIT_CANDIDATE_TIMEOUT_SECONDS,
+        max_output_bytes=GIT_CANDIDATE_MAX_BYTES,
+        max_events=GIT_CANDIDATE_MAX_PATHS + 1,
+        allowed_returncodes={0},
+        require_complete=True,
+    )
+    if (
+        not rels
+        or len(rels) > GIT_CANDIDATE_MAX_PATHS
+        or any("\ufffd" in rel for rel in rels)
+    ):
+        return _filesystem_candidate_files(root)
+    rels = [rel for rel in rels if _candidate_rel_allowed(rel)]
     if update_cache and not is_ci():
         _candidate_cache_write(root, rels)
     return sorted(root / rel for rel in rels)
@@ -1946,10 +2441,10 @@ def summarize(content: str) -> str:
 
 def snippet_from_file(root: Path, rel_path: str, query_text: str, *, fallback: str, expected_sha: str | None = None) -> str:
     path = root / rel_path
-    try:
-        content = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    loaded = _read_indexable_text(root, path)
+    if loaded is None:
         return f"[stale index: source unavailable; run ai index rebuild] {fallback}"
+    content, _source_state = loaded
     redacted = str(redact_value(content))
     if expected_sha:
         current_sha = hashlib.sha256(redacted.encode("utf-8")).hexdigest()

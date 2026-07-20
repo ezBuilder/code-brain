@@ -39,6 +39,19 @@ def _write(repo: Path, rel: str, content: str) -> Path:
     return path
 
 
+def _count_candidate_discovery(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    real_discovery = search_mod._run_process_lines_bounded
+    calls = {"git": 0}
+
+    def counting_discovery(command, *args, **kwargs):
+        if command[:2] == ["git", "ls-files"]:
+            calls["git"] += 1
+        return real_discovery(command, *args, **kwargs)
+
+    monkeypatch.setattr(search_mod, "_run_process_lines_bounded", counting_discovery)
+    return calls
+
+
 def test_schema_version_is_eight() -> None:
     """Schema v8 enables row-level FTS delete for true incremental updates."""
     assert SCHEMA_VERSION == 8
@@ -83,7 +96,7 @@ def test_git_dirty_paths_ignores_untracked_files_but_keeps_tracked_drift(tmp_pat
     assert dirty == {"src/tracked.py"}
 
 
-def test_text_file_enumeration_reuses_one_stat_per_candidate(
+def test_text_file_enumeration_uses_descriptor_stat_not_path_stat(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -104,7 +117,7 @@ def test_text_file_enumeration_reuses_one_stat_per_candidate(
     yielded = [path for path, _state in search_mod.iter_text_file_states(repo)]
 
     assert source in yielded
-    assert calls["source"] == 1
+    assert calls["source"] == 0
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
@@ -157,7 +170,7 @@ def test_candidate_files_cache_hit_avoids_second_git_process(
     def unexpected_git(*_args, **_kwargs):
         raise AssertionError("valid candidate cache must avoid a second git process")
 
-    monkeypatch.setattr(search_mod.subprocess, "run", unexpected_git)
+    monkeypatch.setattr(search_mod, "_run_process_lines_bounded", unexpected_git)
     second = search_mod.candidate_files(repo)
 
     assert second == first
@@ -177,14 +190,7 @@ def test_candidate_files_cache_invalidates_for_new_untracked_file(
     previous = src.stat().st_mtime_ns
     added = _write(repo, "src/new.py", "NEW = True\n")
     os.utime(src, ns=(previous + 1_000_000_000, previous + 1_000_000_000))
-    real_run = subprocess.run
-    calls = {"git": 0}
-
-    def counting_git(*args, **kwargs):
-        calls["git"] += 1
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(search_mod.subprocess, "run", counting_git)
+    calls = _count_candidate_discovery(monkeypatch)
     paths = search_mod.candidate_files(repo)
 
     assert added in paths
@@ -203,14 +209,7 @@ def test_candidate_cache_uses_directory_ctime_when_mtime_is_restored(
     original = src.stat()
     added = _write(repo, "src/ctime-only.py", "CTIME_ONLY = True\n")
     os.utime(src, ns=(original.st_atime_ns, original.st_mtime_ns))
-    real_run = subprocess.run
-    calls = {"git": 0}
-
-    def counting_git(*args, **kwargs):
-        calls["git"] += 1
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(search_mod.subprocess, "run", counting_git)
+    calls = _count_candidate_discovery(monkeypatch)
     paths = search_mod.candidate_files(repo)
 
     assert added in paths
@@ -240,14 +239,7 @@ def test_candidate_cache_file_does_not_self_invalidate(
     repo = _make_repo(tmp_path)
     _write(repo, "src/main.py", "VALUE = 1\n")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    real_run = subprocess.run
-    calls = {"git": 0}
-
-    def counting_git(*args, **kwargs):
-        calls["git"] += 1
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(search_mod.subprocess, "run", counting_git)
+    calls = _count_candidate_discovery(monkeypatch)
     search_mod.candidate_files(repo)
     search_mod.candidate_files(repo)
 
@@ -262,14 +254,7 @@ def test_candidate_cache_invalidates_when_filter_policy_changes(
     _write(repo, "src/main.py", "VALUE = 1\n")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     search_mod.candidate_files(repo)
-    real_run = subprocess.run
-    calls = {"git": 0}
-
-    def counting_git(*args, **kwargs):
-        calls["git"] += 1
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(search_mod.subprocess, "run", counting_git)
+    calls = _count_candidate_discovery(monkeypatch)
     monkeypatch.setattr(search_mod, "_candidate_policy_fingerprint", lambda: "f" * 64)
 
     search_mod.candidate_files(repo)
@@ -324,20 +309,54 @@ def test_symlinked_candidate_cache_is_ignored(tmp_path: Path, monkeypatch: pytes
     sibling = repo.with_name(repo.name + "-candidate-cache.json")
     sibling.write_text('{"schema": 3, "paths": []}\n', encoding="utf-8")
     cache.symlink_to(sibling)
-    real_run = subprocess.run
-    calls = {"git": 0}
-
-    def counting_git(*args, **kwargs):
-        calls["git"] += 1
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(search_mod.subprocess, "run", counting_git)
+    calls = _count_candidate_discovery(monkeypatch)
     paths = search_mod.candidate_files(repo)
 
     assert source in paths
     assert calls["git"] == 1
     assert sibling.read_text(encoding="utf-8") == '{"schema": 3, "paths": []}\n'
     assert cache.is_file() and not cache.is_symlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix directory symlink semantics")
+def test_candidate_cache_write_rejects_external_cache_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    source = _write(repo, "src/main.py", "VALUE = 1\n")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    external = tmp_path / "external-cache"
+    external.mkdir()
+    cache_dir = repo / ".ai" / "cache"
+    cache_dir.symlink_to(external, target_is_directory=True)
+    calls = _count_candidate_discovery(monkeypatch)
+
+    paths = search_mod.candidate_files(repo)
+
+    assert source in paths
+    assert calls["git"] == 1
+    assert list(external.iterdir()) == []
+
+
+def test_candidate_cache_non_mapping_json_forces_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    source = _write(repo, "src/main.py", "VALUE = 1\n")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    cache = repo / ".ai" / "cache" / "candidate-files.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text("[]\n", encoding="utf-8")
+    if os.name != "nt":
+        cache.chmod(0o600)
+    calls = _count_candidate_discovery(monkeypatch)
+
+    paths = search_mod.candidate_files(repo)
+
+    assert source in paths
+    assert calls["git"] == 1
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix cache mode")
@@ -351,14 +370,7 @@ def test_public_candidate_cache_mode_forces_git_refresh(
     search_mod.candidate_files(repo)
     cache = repo / ".ai" / "cache" / "candidate-files.json"
     cache.chmod(0o644)
-    real_run = subprocess.run
-    calls = {"git": 0}
-
-    def counting_git(*args, **kwargs):
-        calls["git"] += 1
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(search_mod.subprocess, "run", counting_git)
+    calls = _count_candidate_discovery(monkeypatch)
     search_mod.candidate_files(repo)
 
     assert calls["git"] == 1
@@ -382,14 +394,7 @@ def test_hardlinked_candidate_cache_forces_git_refresh_without_modifying_externa
     if os.name != "nt":
         external.chmod(0o600)
     os.link(external, cache)
-    real_run = subprocess.run
-    calls = {"git": 0}
-
-    def counting_git(*args, **kwargs):
-        calls["git"] += 1
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(search_mod.subprocess, "run", counting_git)
+    calls = _count_candidate_discovery(monkeypatch)
     actual = search_mod.candidate_files(repo)
 
     assert actual == expected
@@ -397,6 +402,88 @@ def test_hardlinked_candidate_cache_forces_git_refresh_without_modifying_externa
     assert calls["git"] == 1
     assert external.read_text(encoding="utf-8") == content
     assert cache.stat().st_ino != external.stat().st_ino
+
+
+def test_candidate_discovery_fallback_is_bounded_when_git_output_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    for index in range(8):
+        _write(repo, f"src/file-{index}.py", f"VALUE_{index} = {index}\n")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    monkeypatch.setattr(search_mod, "GIT_CANDIDATE_MAX_PATHS", 3)
+    monkeypatch.setattr(search_mod, "_run_process_lines_bounded", lambda *_args, **_kwargs: [])
+
+    paths = search_mod.candidate_files(repo, use_cache=False, update_cache=False)
+
+    assert 1 <= len(paths) <= 3
+    assert all(path.is_relative_to(repo) for path in paths)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix directory symlink semantics")
+def test_filesystem_candidate_fallback_prunes_skipped_and_linked_directories(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    source = _write(repo, "src/main.py", "VALUE = 1\n")
+    skipped = _write(repo, "node_modules/pkg/hidden.py", "HIDDEN = True\n")
+    external = tmp_path / "external-source"
+    external.mkdir()
+    external_file = external / "outside.py"
+    external_file.write_text("OUTSIDE = True\n", encoding="utf-8")
+    linked = repo / "linked-source"
+    linked.symlink_to(external, target_is_directory=True)
+
+    paths = search_mod._filesystem_candidate_files(repo)
+
+    assert source in paths
+    assert skipped not in paths
+    assert linked / "outside.py" not in paths
+    assert external_file not in paths
+
+
+def test_filesystem_candidate_fallback_respects_visit_and_result_caps(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    for index in range(20):
+        _write(repo, f"src/file-{index}.py", f"VALUE_{index} = {index}\n")
+
+    result_capped = search_mod._filesystem_candidate_files(
+        repo,
+        max_paths=4,
+        max_visited=100,
+        timeout_seconds=10,
+    )
+    visit_capped = search_mod._filesystem_candidate_files(
+        repo,
+        max_paths=100,
+        max_visited=3,
+        timeout_seconds=10,
+    )
+
+    assert len(result_capped) == 4
+    assert len(visit_capped) <= 3
+
+
+def test_filesystem_candidate_fallback_respects_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/main.py", "VALUE = 1\n")
+    ticks = iter([0.0, 20.0])
+    monkeypatch.setattr(search_mod.time, "monotonic", lambda: next(ticks, 20.0))
+
+    paths = search_mod._filesystem_candidate_files(
+        repo,
+        max_paths=100,
+        max_visited=100,
+        timeout_seconds=10,
+    )
+
+    assert paths == []
 
 
 def test_chatgpt2codex_artifacts_are_not_indexed_or_cache_dependencies(tmp_path: Path) -> None:

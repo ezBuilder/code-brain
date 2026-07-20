@@ -16,9 +16,22 @@ Architecture (per T26 PoC plan):
 from __future__ import annotations
 
 import os
-import time
+import secrets
 from pathlib import Path
 from typing import Any
+
+from .model_artifacts import (
+    artifacts_present,
+    artifacts_signature,
+    install_model_files,
+    read_model_artifact,
+)
+from .private_write import (
+    claim_private_ttl_marker,
+    release_private_ttl_marker,
+    remove_root_confined_tree,
+    validate_root_confined_executable,
+)
 
 EMBEDDING_DIM = 384
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -34,6 +47,7 @@ _MODEL_FILES = {
     "tokenizer.json": _TOKENIZER_URL,
     "config.json": _CONFIG_URL,
 }
+_INSTALL_MARKER_ENV = "AI_CODE_BRAIN_EMBEDDING_INSTALL_MARKER"
 
 
 def is_enabled() -> bool:
@@ -86,35 +100,45 @@ def _maybe_spawn_background_install(root: Path) -> None:
     downloads.
     """
     import subprocess
-    import sys
-    lock = model_cache_dir(root) / ".install-lock"
-    if lock.exists():
-        try:
-            age = time.time() - lock.stat().st_mtime
-            if age < 3600:  # another install attempted within the last hour
-                return
-        except OSError:
-            return
+    ai_bin = root / ".ai" / "bin" / "ai"
     try:
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text("running", encoding="utf-8")
+        validate_root_confined_executable(ai_bin, root=root)
     except OSError:
         return
-    ai_bin = root / ".ai" / "bin" / "ai"
-    if not ai_bin.exists():
+    lock = model_cache_dir(root) / ".install-lock"
+    marker_token = f"embedding:{secrets.token_urlsafe(24)}"
+    try:
+        if not claim_private_ttl_marker(
+            lock,
+            root=root,
+            ttl_seconds=3600,
+            text=marker_token,
+        ):
+            return
+    except OSError:
         return
     try:
         from .portable import detached_popen_kwargs
         from .process_janitor import cleanup_children, register_child
         cleanup_children(root, ttl_seconds=3600)
 
+        child_env = os.environ.copy()
+        child_env[_INSTALL_MARKER_ENV] = marker_token
         with open(os.devnull, "wb") as devnull:
             cmd = [str(ai_bin), "embedding", "install", "--json"]
             proc = subprocess.Popen(
                 cmd,
                 stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
+                env=child_env,
                 **detached_popen_kwargs(),
             )
+    except Exception:
+        try:
+            release_private_ttl_marker(lock, root=root, expected_text=marker_token)
+        except OSError:
+            pass
+        return
+    try:
         register_child(root, pid=proc.pid, kind="embedding_install", command=cmd)
     except Exception:
         pass
@@ -126,7 +150,7 @@ def model_cache_dir(root: Path) -> Path:
 
 def is_model_present(root: Path) -> bool:
     cache = model_cache_dir(root)
-    return (cache / "model.onnx").exists() and (cache / "tokenizer.json").exists()
+    return artifacts_present(root, cache, ("model.onnx", "tokenizer.json"))
 
 
 # Process-level runtime cache so we don't re-create the ONNX session
@@ -136,6 +160,7 @@ def is_model_present(root: Path) -> bool:
 # server, test harness) can rotate across many roots; an unbounded dict would
 # leak that footprint per distinct root.
 _RUNTIME_CACHE: dict[str, Any] = {}
+_RUNTIME_CACHE_SIGNATURES: dict[str, Any] = {}
 _RUNTIME_CACHE_CAP = 2
 _MAX_SEQ_LEN = 256
 
@@ -143,7 +168,9 @@ _MAX_SEQ_LEN = 256
 def _evict_to_cap() -> None:
     """Drop oldest entries until ``_RUNTIME_CACHE`` is within capacity."""
     while len(_RUNTIME_CACHE) > _RUNTIME_CACHE_CAP:
-        _RUNTIME_CACHE.pop(next(iter(_RUNTIME_CACHE)), None)
+        oldest = next(iter(_RUNTIME_CACHE))
+        _RUNTIME_CACHE.pop(oldest, None)
+        _RUNTIME_CACHE_SIGNATURES.pop(oldest, None)
 
 
 def _get_runtime(root: Path):
@@ -154,27 +181,41 @@ def _get_runtime(root: Path):
     """
     cache = model_cache_dir(root)
     key = str(cache)
-    if key in _RUNTIME_CACHE:
+    signature = artifacts_signature(root, cache, ("model.onnx", "tokenizer.json"))
+    if signature is None:
+        _RUNTIME_CACHE.pop(key, None)
+        _RUNTIME_CACHE_SIGNATURES.pop(key, None)
+        return None
+    if key in _RUNTIME_CACHE and _RUNTIME_CACHE_SIGNATURES.get(key) == signature:
         _RUNTIME_CACHE[key] = _RUNTIME_CACHE.pop(key)  # LRU touch
         return _RUNTIME_CACHE[key]
-    if not is_model_present(root):
-        return None
+    _RUNTIME_CACHE.pop(key, None)
+    _RUNTIME_CACHE_SIGNATURES.pop(key, None)
     try:
         import onnxruntime as ort
         from tokenizers import Tokenizer
     except ImportError:
         return None
     try:
+        from_str = getattr(Tokenizer, "from_str", None)
+        if not callable(from_str):
+            return None
+        model_bytes = read_model_artifact(root, cache / "model.onnx")
+        tokenizer_json = read_model_artifact(root, cache / "tokenizer.json").decode("utf-8")
         sess = ort.InferenceSession(
-            str(cache / "model.onnx"),
+            model_bytes,
             providers=["CPUExecutionProvider"],
         )
-        tok = Tokenizer.from_file(str(cache / "tokenizer.json"))
+        tok = from_str(tokenizer_json)
         tok.enable_truncation(max_length=_MAX_SEQ_LEN)
         tok.enable_padding(length=None, pad_id=0)
     except Exception:
         return None
+    final_signature = artifacts_signature(root, cache, ("model.onnx", "tokenizer.json"))
+    if final_signature != signature:
+        return None
     _RUNTIME_CACHE[key] = (sess, tok)
+    _RUNTIME_CACHE_SIGNATURES[key] = final_signature
     _evict_to_cap()
     return _RUNTIME_CACHE[key]
 
@@ -237,6 +278,13 @@ def embed_batch(texts: list[str], root: Path) -> list[list[float]] | None:
 def reset_runtime_cache() -> None:
     """Test helper: drop the process-level session cache."""
     _RUNTIME_CACHE.clear()
+    _RUNTIME_CACHE_SIGNATURES.clear()
+
+
+def _drop_runtime_cache(root: Path) -> None:
+    key = str(model_cache_dir(root))
+    _RUNTIME_CACHE.pop(key, None)
+    _RUNTIME_CACHE_SIGNATURES.pop(key, None)
 
 
 def status(root: Path) -> dict[str, Any]:
@@ -272,76 +320,32 @@ def install_model(root: Path, *, verify_only: bool = False) -> dict[str, Any]:
     Returns {"ok": bool, "downloaded": [...], "skipped": [...], "errors": [...]}.
     `verify_only=True` reports state without downloading.
     """
-    import urllib.request
-    import urllib.error
-
     cache = model_cache_dir(root)
-    cache.mkdir(parents=True, exist_ok=True)
-
-    result: dict[str, Any] = {
-        "ok": True,
-        "cache_dir": str(cache),
-        "downloaded": [],
-        "skipped": [],
-        "errors": [],
-    }
-
-    if verify_only:
-        for name in _MODEL_FILES:
-            target = cache / name
-            if target.exists() and target.stat().st_size > 0:
-                result["skipped"].append(name)
-            else:
-                result["errors"].append({"file": name, "reason": "missing"})
-        result["ok"] = not result["errors"]
-        return result
-
-    # macOS Python often can't find the system CA bundle (Apple ships its own
-    # which Python 3.11+ uses via the framework, but homebrew/pyenv builds
-    # commonly fail with CERTIFICATE_VERIFY_FAILED). Wire in certifi explicitly.
-    import ssl
+    marker_token = os.environ.get(_INSTALL_MARKER_ENV, "")
     try:
-        import certifi  # listed in pyproject dependencies
-        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-    except Exception:
-        ssl_ctx = ssl.create_default_context()
-
-    for name, url in _MODEL_FILES.items():
-        target = cache / name
-        if target.exists() and target.stat().st_size > 0:
-            result["skipped"].append(name)
-            continue
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        try:
-            with urllib.request.urlopen(url, timeout=120, context=ssl_ctx) as resp, open(tmp, "wb") as out:
-                while True:
-                    block = resp.read(65536)
-                    if not block:
-                        break
-                    out.write(block)
-            os.replace(tmp, target)
-            result["downloaded"].append({"file": name, "bytes": target.stat().st_size})
-        except (urllib.error.URLError, OSError) as exc:
+        result = install_model_files(root, cache, _MODEL_FILES, verify_only=verify_only)
+        if result["downloaded"]:
+            _drop_runtime_cache(root)
+        return result
+    finally:
+        if marker_token:
             try:
-                if tmp.exists():
-                    tmp.unlink()
+                release_private_ttl_marker(
+                    cache / ".install-lock",
+                    root=root,
+                    expected_text=marker_token,
+                )
             except OSError:
                 pass
-            result["errors"].append({"file": name, "reason": str(exc)[:200]})
-            result["ok"] = False
-
-    return result
 
 
 def uninstall_model(root: Path) -> dict[str, Any]:
     """Delete the cached model dir. Safe even if absent."""
-    import shutil
-
     cache = model_cache_dir(root)
-    existed = cache.exists()
-    if existed:
-        try:
-            shutil.rmtree(cache)
-        except OSError as exc:
-            return {"ok": False, "reason": str(exc)[:200]}
-    return {"ok": True, "removed": existed, "cache_dir": str(cache)}
+    try:
+        removed = remove_root_confined_tree(cache, root=root)
+    except OSError as exc:
+        _drop_runtime_cache(root)
+        return {"ok": False, "reason": str(exc)[:200]}
+    _drop_runtime_cache(root)
+    return {"ok": True, "removed": removed, "cache_dir": str(cache)}

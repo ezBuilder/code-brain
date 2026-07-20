@@ -14,10 +14,15 @@ from typing import Iterable
 
 from .config import load_config
 from .preflight_proof import PROOF_MAX_AGE_SECONDS, PROOF_SCHEMA, environment_fingerprint
-from .private_write import read_root_confined_text, validate_root_confined_directory
+from .private_write import (
+    list_root_confined_directory,
+    read_root_confined_text,
+    validate_root_confined_directory,
+    validate_root_confined_regular_file,
+)
 from .redact import contains_secret, redact_value
 from .render import build_manifest
-from .trust import parse_simple_toml
+from .trust import inspect_machine_files
 
 
 @dataclass
@@ -281,7 +286,19 @@ def check_config(root: Path) -> Check:
 
 def check_gitattributes(root: Path) -> Check:
     path = root / ".ai" / ".gitattributes"
-    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    try:
+        text, _state = read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=1024 * 1024,
+            require_private=False,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
+    except FileNotFoundError:
+        text = ""
+    except (OSError, UnicodeDecodeError):
+        return Check("gitattributes", False, "unavailable or untrusted")
     required = ["*.jsonl merge=union", "memory/daily/*.md merge=union", "*.enc.yaml -merge", "* text=auto eol=lf"]
     missing = [item for item in required if item not in text]
     return Check("gitattributes", not missing, "ok" if not missing else "missing: " + ", ".join(missing))
@@ -329,12 +346,25 @@ def check_index_freshness_from_status(status: dict[str, object]) -> Check:
 
 def check_manifest(root: Path) -> Check:
     path = root / ".ai" / "generated" / "manifest.json"
-    if not path.exists():
-        return Check("manifest", False, "manifest missing; run ai render")
     try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        return Check("manifest", False, f"invalid json: {exc}")
+        text, _state = read_root_confined_text(
+            path,
+            root=root,
+            max_bytes=2 * 1024 * 1024,
+            require_private=False,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
+    except FileNotFoundError:
+        return Check("manifest", False, "manifest missing; run ai render")
+    except (OSError, UnicodeDecodeError):
+        return Check("manifest", False, "manifest unavailable or untrusted")
+    try:
+        existing = json.loads(text)
+    except json.JSONDecodeError:
+        return Check("manifest", False, "invalid json")
+    if not isinstance(existing, dict):
+        return Check("manifest", False, "invalid manifest shape")
     expected = build_manifest(root)
     drift_fields = []
     for key in ("schema_version", "embedding", "sqlite_vec", "summarizer", "chunker", "trust"):
@@ -344,15 +374,7 @@ def check_manifest(root: Path) -> Check:
 
 
 def check_trust(root: Path) -> Check:
-    bad = []
-    for path in sorted((root / ".ai" / "trust" / "machines").glob("*.pub.toml")):
-        data = parse_simple_toml(path.read_text(encoding="utf-8"))
-        public_key = data.get("public_key", "")
-        expected_hash = __import__("hashlib").sha256(public_key.strip().encode("utf-8")).hexdigest()
-        if data.get("machine_id_hash") != expected_hash:
-            bad.append(path.relative_to(root).as_posix())
-        if data.get("status") not in {"trusted", "revoked"}:
-            bad.append(path.relative_to(root).as_posix() + ":status")
+    _machines, bad = inspect_machine_files(root)
     return Check("trust", not bad, "ok" if not bad else "invalid: " + ", ".join(bad))
 
 
@@ -417,6 +439,31 @@ def audit_key(record: dict[str, object], path: str | None = None) -> tuple[objec
     return (record.get("ts"), record.get("action"), record.get("category"), path or record.get("path"))
 
 
+def _unsafe_audit_entries(root: Path) -> list[str]:
+    audit_root = root / ".ai" / "memory" / "audit"
+    try:
+        names = list_root_confined_directory(audit_root, root=root, max_entries=256)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return ["audit-directory-untrusted"]
+    bad: list[str] = []
+    for name in names:
+        if len(name) != 10 or not name[:4].isdigit() or name[4:] != ".jsonl":
+            continue
+        path = audit_root / name
+        try:
+            validate_root_confined_regular_file(
+                path,
+                root=root,
+                require_owner=True,
+                reject_group_other_writable=True,
+            )
+        except (FileNotFoundError, OSError):
+            bad.append(path.relative_to(root).as_posix())
+    return bad
+
+
 def check_audit_index(root: Path) -> Check:
     audit_root = root / ".ai" / "memory" / "audit"
     index_path = root / ".ai" / "memory" / "audit-index.jsonl"
@@ -427,6 +474,7 @@ def check_audit_index(root: Path) -> Check:
         pass
     except OSError as exc:
         bad.append(f"audit-directory-untrusted:{exc}")
+    bad.extend(_unsafe_audit_entries(root))
     try:
         index_records = read_jsonl(index_path, root=root)
     except FileNotFoundError:
@@ -442,17 +490,17 @@ def check_audit_index(root: Path) -> Check:
             bad.append("audit-index:path")
             continue
         target = root / rel_path
+        if target.parent != audit_root or target.suffix != ".jsonl":
+            bad.append(rel_path)
+            continue
         try:
-            target_state = target.lstat()
-        except OSError:
-            target_state = None
-        if (
-            target_state is None
-            or not stat.S_ISREG(target_state.st_mode)
-            or stat.S_ISLNK(target_state.st_mode)
-            or target.parent != audit_root
-            or target.suffix != ".jsonl"
-        ):
+            validate_root_confined_regular_file(
+                target,
+                root=root,
+                require_owner=True,
+                reject_group_other_writable=True,
+            )
+        except (FileNotFoundError, OSError):
             bad.append(rel_path)
 
     audit_keys: set[tuple[object, object, object, object]] = set()
@@ -488,6 +536,7 @@ def check_audit_chain(root: Path) -> Check:
         return Check("audit_chain", True, detail)
     except OSError as exc:
         return Check("audit_chain", False, f"invalid: audit-directory-untrusted:{exc}")
+    bad.extend(_unsafe_audit_entries(root))
 
     from .memory import all_audit_files
 

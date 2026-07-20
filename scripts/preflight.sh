@@ -8,6 +8,8 @@ cd "$ROOT"
 # python/python3 aliases before a real interpreter; uv avoids that trap.
 if [[ -n "${PYTHON:-}" ]]; then
   PYTHON_CMD=("$PYTHON")
+elif [[ -x "$ROOT/.ai/runtime/.venv/bin/python" ]]; then
+  PYTHON_CMD=("$ROOT/.ai/runtime/.venv/bin/python")
 elif [[ -x "$ROOT/.ai/runtime/.venv/Scripts/python.exe" ]]; then
   PYTHON_CMD=("$ROOT/.ai/runtime/.venv/Scripts/python.exe")
 elif command -v uv >/dev/null 2>&1; then

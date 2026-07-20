@@ -129,6 +129,20 @@ def test_github_upgrade_uses_single_low_memory_activation() -> None:
 
     assert "UV_CONCURRENT_DOWNLOADS" in bootstrap
     assert "--low-memory" in bootstrap
+    assert 'EXISTING_PYTHON=".ai/runtime/.venv/bin/python"' in bootstrap
+    assert "retaining the verified existing runtime" in bootstrap
+    preflight = (root / "scripts" / "preflight.sh").read_text()
+    env_check = (root / "scripts" / "env-check.sh").read_text()
+    assert preflight.index('.venv/bin/python') < preflight.index('command -v uv')
+    assert 'installed_python = next(' in env_check
+    for launcher_name in ("ai", "ai-hook", "ai-mcp"):
+        launcher = (root / ".ai" / "bin" / launcher_name).read_text()
+        assert "import ai_core.cli' >/dev/null" not in launcher
+    assert "preflight-proof.json >/dev/null" not in bootstrap
+    assert "bootstrap-code-brain.sh --skip-doctor --skip-render --low-memory >/dev/null" not in installer
+    assert ".ai/bin/ai doctor --strict --json >/dev/null" not in upgrader
+    smoke = (root / "scripts" / "smoke.sh").read_text()
+    assert 'QUIET_LOG="$TMP/quiet.log"' in smoke
     assert "AI_BOOTSTRAP_LOW_MEMORY=1" in installer
     assert 'AI_INSTALL_DEFER_RUNTIME=1 bash "$CHECKOUT/scripts/install-into.sh" upgrade' in upgrader
     assert upgrader.count("bash ./bootstrap-code-brain.sh") == 1

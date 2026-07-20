@@ -48,7 +48,7 @@ export AI_PRECALL_RECOMMENDATIONS="${AI_PRECALL_RECOMMENDATIONS:-0}"
 export AI_FEDERATED_SUMMARY="${AI_FEDERATED_SUMMARY:-0}"
 export AI_SATISFACTION_SUMMARY="${AI_SATISFACTION_SUMMARY:-0}"
 PYTHON="$ROOT/.ai/runtime/.venv/bin/python"
-if [[ -x "$PYTHON" ]] && "$PYTHON" -c 'import ai_core.cli' >/dev/null 2>&1; then
+if [[ -x "$PYTHON" ]] && "$PYTHON" -c 'import ai_core.cli'; then
   exec "$PYTHON" -m ai_core.cli hook "$@"
 fi
 exec uv run --project "$ROOT/.ai/runtime" python -m ai_core.cli hook "$@"

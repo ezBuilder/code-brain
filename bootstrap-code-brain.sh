@@ -31,22 +31,32 @@ if [[ "$LOW_MEMORY" -eq 1 ]]; then
 fi
 
 mkdir -p .ai/cache
-./scripts/preflight.sh --check-only --json --proof-file .ai/cache/preflight-proof.json >/dev/null
-./scripts/env-check.sh >/dev/null
+./scripts/preflight.sh --check-only --json --proof-file .ai/cache/preflight-proof.json
+./scripts/env-check.sh
+SYNC_ARGS=(sync --no-progress --project .ai/runtime)
 case "${AI_INSTALL_DENSE:-0}" in
-  1|true|TRUE|yes|YES|on|ON)
-    uv sync --no-progress --project .ai/runtime --extra dense
-    ;;
-  *)
-    uv sync --no-progress --project .ai/runtime
-    ;;
+  1|true|TRUE|yes|YES|on|ON) SYNC_ARGS+=(--extra dense) ;;
 esac
+if ! uv "${SYNC_ARGS[@]}"; then
+  EXISTING_PYTHON=""
+  if [[ -x ".ai/runtime/.venv/bin/python" ]]; then
+    EXISTING_PYTHON=".ai/runtime/.venv/bin/python"
+  elif [[ -x ".ai/runtime/.venv/Scripts/python.exe" ]]; then
+    EXISTING_PYTHON=".ai/runtime/.venv/Scripts/python.exe"
+  fi
+  if [[ "$LOW_MEMORY" -eq 1 && -n "$EXISTING_PYTHON" ]] && "$EXISTING_PYTHON" -c 'import ai_core.cli'; then
+    echo "bootstrap warning: uv sync failed; retaining the verified existing runtime" >&2
+  else
+    echo "bootstrap failed: uv sync did not complete and no usable existing runtime is available" >&2
+    exit 1
+  fi
+fi
 if git rev-parse --git-dir >/dev/null 2>&1; then
   git config core.hooksPath .githooks
 fi
 if [[ "$SKIP_RENDER" -eq 0 ]]; then
-  uv run --project .ai/runtime ai render --manifest-only --json >/dev/null
+  uv run --project .ai/runtime ai render --manifest-only --json
 fi
 if [[ "$SKIP_DOCTOR" -eq 0 ]]; then
-  uv run --project .ai/runtime ai doctor --json >/dev/null
+  uv run --project .ai/runtime ai doctor --json
 fi

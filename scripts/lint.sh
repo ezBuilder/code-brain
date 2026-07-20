@@ -9,7 +9,7 @@ for script in scripts/*.sh; do
   bash -n "$script"
 done
 
-./scripts/env-check.sh >/dev/null
+./scripts/env-check.sh
 uv run --project .ai/runtime python -m compileall -q .ai/runtime/src .ai/runtime/tests
 
 make -n env-check >/dev/null

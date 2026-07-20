@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
 import platform
-import shutil
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -11,8 +11,10 @@ from typing import Any
 
 from . import __version__
 from .doctor import as_payload
-from .memory import all_audit_files, read_state_text
+from .memory import all_audit_files, append_jsonl, read_state_text
+from .private_write import atomic_write_private_bytes, atomic_write_private_text
 from .redact import redact_value
+from .storage_lifecycle import prune_diagnostics_files, prune_logs
 
 
 def now_iso() -> str:
@@ -32,9 +34,14 @@ def write_log(root: Path, level: str, event: str, payload: dict[str, Any]) -> di
         "payload": redact_value(payload),
     }
     path = log_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.open("a", encoding="utf-8").write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-    return {"ok": True, "path": path.relative_to(root).as_posix(), "record": record}
+    append_jsonl(path, record)
+    retention = prune_logs(root)
+    return {
+        "ok": True,
+        "path": path.relative_to(root).as_posix(),
+        "record": record,
+        "retention": retention,
+    }
 
 
 def metrics(root: Path, *, include_usage: bool = True) -> dict[str, Any]:
@@ -688,32 +695,29 @@ def diagnostics(
     }
     if dry_run:
         return {"ok": True, "dry_run": True, "bundle": bundle}
+    prune_diagnostics_files(root)
     diag_root = root / ".ai" / "cache" / "diagnostics"
-    diag_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     json_path = diag_root / f"diagnostics-{stamp}.json"
     zip_path = diag_root / f"diagnostics-{stamp}.zip"
-    json_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(json_path, json_path.name)
-    return {"ok": True, "dry_run": False, "path": zip_path.relative_to(root).as_posix(), "retention_days": 30}
+    encoded = (json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_write_private_text(json_path, encoded.decode("utf-8"), root=root)
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(json_path.name, encoded)
+    atomic_write_private_bytes(zip_path, archive_bytes.getvalue(), root=root)
+    retention = prune_diagnostics_files(root)
+    return {
+        "ok": True,
+        "dry_run": False,
+        "path": zip_path.relative_to(root).as_posix(),
+        "retention_days": 30,
+        "retention": retention,
+    }
 
 
 def prune_diagnostics(root: Path, *, keep_days: int = 30) -> dict[str, Any]:
-    cutoff = time.time() - keep_days * 86400
-    removed = 0
-    diag_root = root / ".ai" / "cache" / "diagnostics"
-    if not diag_root.exists():
-        return {"ok": True, "removed": 0}
-    for path in diag_root.iterdir():
-        if path.is_file() and path.stat().st_mtime < cutoff:
-            path.unlink()
-            removed += 1
-    for path in diag_root.iterdir():
-        if path.is_dir() and path.stat().st_mtime < cutoff:
-            shutil.rmtree(path)
-            removed += 1
-    return {"ok": True, "removed": removed}
+    return dict(prune_diagnostics_files(root, keep_days=keep_days))
 
 
 def mem_eval_summary(root: Path, *, window_days: int = 7) -> dict[str, Any]:

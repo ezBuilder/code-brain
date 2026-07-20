@@ -13,7 +13,9 @@ from typing import Any
 
 from . import __version__
 from .memory import append_audit
+from .private_write import atomic_write_private_text
 from .render import build_manifest, render
+from .storage_lifecycle import prune_upgrade_backups
 from .worker.ipc import PROTOCOL_VERSION
 
 DEFAULT_REPO_URL = "https://github.com/ezBuilder/code-brain.git"
@@ -78,7 +80,7 @@ def upgrade_apply(root: Path, *, target_version: str, dry_run: bool = False) -> 
     result = {"ok": True, "dry_run": dry_run, "plan": plan, "backup_path": backup_path.relative_to(root).as_posix()}
     if dry_run:
         return result
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    prune_upgrade_backups(root)
     manifest_path = root / ".ai" / "generated" / "manifest.json"
     if manifest_path.is_file():
         manifest_bytes = manifest_path.read_bytes()
@@ -86,7 +88,8 @@ def upgrade_apply(root: Path, *, target_version: str, dry_run: bool = False) -> 
         manifest_bytes = (
             json.dumps(build_manifest(root), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
-    backup_path.write_text(
+    atomic_write_private_text(
+        backup_path,
         json.dumps(
             {
                 "runtime_version": __version__,
@@ -100,11 +103,12 @@ def upgrade_apply(root: Path, *, target_version: str, dry_run: bool = False) -> 
             sort_keys=True,
         )
         + "\n",
-        encoding="utf-8",
+        root=root,
     )
     migrate(root)
     render(root)
     append_audit(root, action="upgrade.apply", category="upgrade", payload={"target_version": target_version, "backup_path": result["backup_path"]})
+    result["retention"] = prune_upgrade_backups(root)
     return result
 
 

@@ -1075,7 +1075,7 @@ install_or_upgrade() {
   fi
   # session start below runs the complete doctor checks after rebuilding the
   # code and audit indexes, so avoid separate CLI startup and doctor scans.
-  $_run_as ./bootstrap-code-brain.sh --skip-doctor --skip-render >/dev/null
+  $_run_as env AI_BOOTSTRAP_LOW_MEMORY=1 ./bootstrap-code-brain.sh --skip-doctor --skip-render --low-memory >/dev/null
   local -a _session_args=(session start --agent operator --rebuild auto --repair-audit-index --render-manifest)
   case "${AI_INSTALL_STRICT:-0}" in
     1|true|TRUE|yes|YES|on|ON)

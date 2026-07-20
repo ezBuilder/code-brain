@@ -179,6 +179,10 @@ def violation_signals(root: Path, *, window: int = WINDOW) -> dict[str, Any]:
 # --- 2. measurement (real tokens only, no estimates) ---
 
 def _output_tokens(root: Path) -> int:
+    # Transcript aggregation scans agent homes and is meaningful only for a real
+    # Code Brain installation. Minimal/test roots have no config and must stay fast.
+    if not (Path(root) / ".ai" / "config.yaml").is_file():
+        return 0
     try:
         from .obs import usage_report
 

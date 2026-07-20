@@ -304,6 +304,39 @@ def list_root_confined_directory(
     return sorted(names)
 
 
+def unlink_root_confined_regular_file(path: Path, *, root: Path) -> bool:
+    """Unlink one confined regular single-link file without following links."""
+    path = Path(path)
+    root = Path(root)
+    if os.name != "nt":
+        try:
+            with _open_confined_parent_fd(path, root=root, create=False) as parent_fd:
+                try:
+                    state = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return False
+                if not stat.S_ISREG(state.st_mode) or stat.S_ISLNK(state.st_mode):
+                    raise OSError("unlink target is not a regular file")
+                _require_single_link(state)
+                os.unlink(path.name, dir_fd=parent_fd)
+                try:
+                    os.fsync(parent_fd)
+                except OSError:
+                    pass
+                return True
+        except FileNotFoundError:
+            return False
+    _require_root_confined_parent(path, root)
+    try:
+        state = path.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(state.st_mode) or stat.S_ISLNK(state.st_mode) or state.st_nlink != 1:
+        raise OSError("unlink target is not a regular single-link file")
+    path.unlink()
+    return True
+
+
 def remove_root_confined_tree(path: Path, *, root: Path) -> bool:
     """Remove one confined directory tree without following directory links.
 

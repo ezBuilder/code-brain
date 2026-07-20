@@ -44,7 +44,9 @@ def _set_machine_id(repo: Path, mid: str) -> None:
     hostnames; the test clones share one host, so set it explicitly to mirror reality."""
     d = repo / ".ai" / "cache"
     d.mkdir(parents=True, exist_ok=True)
-    (d / "machine_id").write_text(mid, encoding="utf-8")
+    path = d / "machine_id"
+    path.write_text(mid, encoding="utf-8")
+    path.chmod(0o600)
 
 
 def _origin_with_mac(tmp_path: Path) -> tuple[Path, Path]:

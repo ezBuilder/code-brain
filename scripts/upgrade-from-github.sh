@@ -150,10 +150,11 @@ export CODE_BRAIN_REF="$REF"
 if [[ "$ACTION" == "install" ]]; then
   bash "$CHECKOUT/scripts/install.sh" "${GLOBAL_INSTALL_ARG[@]}" "$TARGET"
 else
-  bash "$CHECKOUT/scripts/install-into.sh" upgrade "$TARGET"
+  AI_INSTALL_DEFER_RUNTIME=1 bash "$CHECKOUT/scripts/install-into.sh" upgrade "$TARGET"
   if [[ -f "$TARGET/bootstrap-code-brain.sh" ]]; then
-    ( cd "$TARGET" && bash ./bootstrap-code-brain.sh )
+    ( cd "$TARGET" && AI_BOOTSTRAP_LOW_MEMORY=1 bash ./bootstrap-code-brain.sh --skip-doctor --skip-render --low-memory )
   fi
+  ( cd "$TARGET" && .ai/bin/ai session start --agent operator --rebuild auto --repair-audit-index --render-manifest --json >/dev/null )
   ( cd "$TARGET" && .ai/bin/ai doctor --strict --json >/dev/null )
   if [[ "${GLOBAL_INSTALL_ARG[*]:-}" == "--global" ]]; then
     ( cd "$CHECKOUT/kits/global-agent-kit" && ./install.sh --all --yes >/dev/null )

@@ -15,6 +15,7 @@ from typing import Iterable
 from .config import load_config
 from .preflight_proof import PROOF_MAX_AGE_SECONDS, PROOF_SCHEMA, environment_fingerprint
 from .private_write import (
+    iter_root_confined_text_lines,
     list_root_confined_directory,
     read_root_confined_text,
     validate_root_confined_directory,
@@ -65,6 +66,7 @@ def run_checks(
         check_trust(root),
         check_jsonl(root),
         check_generated_artifacts_bounded(root),
+        check_storage_limits(root),
         check_audit_index(root),
         check_audit_chain(root),
         hot_path_check,
@@ -379,16 +381,152 @@ def check_trust(root: Path) -> Check:
 
 
 def check_jsonl(root: Path) -> Check:
+    from .memory import _AUDIT_MAX_BYTES, _JSONL_AUTO_MAX_BYTES, _JSONL_LINE_MAX_BYTES
+
+    memory_root = root / ".ai" / "memory"
     bad: list[str] = []
-    for path in root.joinpath(".ai", "memory").rglob("*.jsonl"):
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
+    try:
+        validate_root_confined_directory(memory_root, root=root)
+    except FileNotFoundError:
+        return Check("jsonl", True, "ok")
+    except OSError:
+        return Check("jsonl", False, "invalid: memory-directory-untrusted")
+    files_seen = 0
+    dirs_seen = 0
+    for current, dirnames, filenames in os.walk(memory_root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        dirs_seen += 1
+        if dirs_seen > 2_000:
+            bad.append("directory-limit")
+            break
+        safe_dirs: list[str] = []
+        for name in dirnames:
+            candidate = current_path / name
             try:
-                json.loads(line)
-            except json.JSONDecodeError:
-                bad.append(f"{path.relative_to(root)}:{line_no}")
-    return Check("jsonl", not bad, "ok" if not bad else "invalid: " + ", ".join(bad))
+                validate_root_confined_directory(candidate, root=root)
+            except (FileNotFoundError, OSError):
+                bad.append(f"{candidate.relative_to(root).as_posix()}:untrusted-directory")
+                continue
+            safe_dirs.append(name)
+        dirnames[:] = safe_dirs
+        for name in filenames:
+            if not name.endswith(".jsonl"):
+                continue
+            files_seen += 1
+            if files_seen > 5_000:
+                bad.append("file-limit")
+                break
+            path = current_path / name
+            rel = path.relative_to(root).as_posix()
+            cap = _AUDIT_MAX_BYTES if path.parent.name == "audit" else _JSONL_AUTO_MAX_BYTES
+            try:
+                validate_root_confined_regular_file(
+                    path,
+                    root=root,
+                    max_bytes=cap,
+                    require_owner=True,
+                    reject_group_other_writable=True,
+                )
+                for line_no, line in enumerate(
+                    iter_root_confined_text_lines(
+                        path,
+                        root=root,
+                        max_bytes=cap,
+                        max_line_bytes=_JSONL_LINE_MAX_BYTES,
+                        require_private=False,
+                        require_owner=True,
+                        reject_group_other_writable=True,
+                    ),
+                    1,
+                ):
+                    if not line.strip():
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError:
+                        bad.append(f"{rel}:{line_no}")
+                        continue
+                    if not isinstance(value, dict):
+                        bad.append(f"{rel}:{line_no}:not-object")
+            except (OSError, UnicodeDecodeError):
+                bad.append(f"{rel}:untrusted-or-oversized")
+        if bad and bad[-1] == "file-limit":
+            break
+    return Check("jsonl", not bad, "ok" if not bad else "invalid: " + ", ".join(bad[:10]))
+
+
+def check_storage_limits(root: Path) -> Check:
+    from .search import INDEX_DB_MAX_BYTES, INDEX_SIDECAR_MAX_BYTES, db_path
+    from .storage_lifecycle import (
+        DIAGNOSTIC_MAX_FILES,
+        DIAGNOSTIC_MAX_TOTAL_BYTES,
+        DIAGNOSTIC_RETENTION_DAYS,
+        LOG_MAX_FILES,
+        LOG_MAX_TOTAL_BYTES,
+        LOG_RETENTION_DAYS,
+        UPGRADE_BACKUP_MAX_FILES,
+        UPGRADE_BACKUP_MAX_TOTAL_BYTES,
+        UPGRADE_BACKUP_RETENTION_DAYS,
+    )
+
+    bad: list[str] = []
+    db = db_path(root)
+    for path, cap in (
+        (db, INDEX_DB_MAX_BYTES),
+        (Path(str(db) + "-wal"), INDEX_SIDECAR_MAX_BYTES),
+        (Path(str(db) + "-shm"), INDEX_SIDECAR_MAX_BYTES),
+        (Path(str(db) + "-journal"), INDEX_SIDECAR_MAX_BYTES),
+    ):
+        try:
+            state = validate_root_confined_regular_file(
+                path, root=root, require_owner=True, reject_group_other_writable=True
+            )
+        except FileNotFoundError:
+            continue
+        except OSError:
+            bad.append(f"{path.relative_to(root).as_posix()}:untrusted")
+            continue
+        if int(state.st_size) > cap:
+            bad.append(f"{path.relative_to(root).as_posix()}:oversized")
+
+    policies = (
+        (root / ".ai" / "cache" / "logs", lambda n: n.endswith(".jsonl"), LOG_RETENTION_DAYS, LOG_MAX_FILES, LOG_MAX_TOTAL_BYTES),
+        (root / ".ai" / "cache" / "diagnostics", lambda n: n.startswith("diagnostics-") and n.endswith((".json", ".zip")), DIAGNOSTIC_RETENTION_DAYS, DIAGNOSTIC_MAX_FILES, DIAGNOSTIC_MAX_TOTAL_BYTES),
+        (root / ".ai" / "cache" / "upgrade", lambda n: n.startswith("rollback-") and n.endswith(".json"), UPGRADE_BACKUP_RETENTION_DAYS, UPGRADE_BACKUP_MAX_FILES, UPGRADE_BACKUP_MAX_TOTAL_BYTES),
+    )
+    now = time.time()
+    checked = 0
+    for directory, accept, keep_days, max_files, max_total in policies:
+        try:
+            names = list_root_confined_directory(directory, root=root, max_entries=4096)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            bad.append(f"{directory.relative_to(root).as_posix()}:untrusted")
+            continue
+        count = 0
+        total = 0
+        for name in names:
+            if not accept(name):
+                continue
+            path = directory / name
+            try:
+                state = validate_root_confined_regular_file(
+                    path, root=root, require_owner=True, reject_group_other_writable=True
+                )
+            except (FileNotFoundError, OSError):
+                bad.append(f"{path.relative_to(root).as_posix()}:untrusted")
+                continue
+            checked += 1
+            count += 1
+            total += int(state.st_size)
+            if float(state.st_mtime) < now - keep_days * 86400:
+                bad.append(f"{path.relative_to(root).as_posix()}:expired")
+        if count > max_files:
+            bad.append(f"{directory.relative_to(root).as_posix()}:file-count")
+        if total > max_total:
+            bad.append(f"{directory.relative_to(root).as_posix()}:total-bytes")
+    return Check("storage_limits", not bad, f"ok checked={checked}" if not bad else "invalid: " + ", ".join(bad[:10]))
 
 
 def check_generated_artifacts_bounded(root: Path) -> Check:

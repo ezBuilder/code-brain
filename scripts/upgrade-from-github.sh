@@ -154,8 +154,8 @@ else
   if [[ -f "$TARGET/bootstrap-code-brain.sh" ]]; then
     ( cd "$TARGET" && AI_BOOTSTRAP_LOW_MEMORY=1 bash ./bootstrap-code-brain.sh --skip-doctor --skip-render --low-memory )
   fi
-  ( cd "$TARGET" && .ai/bin/ai session start --agent operator --rebuild auto --repair-audit-index --render-manifest --json >/dev/null )
-  ( cd "$TARGET" && .ai/bin/ai doctor --strict --json >/dev/null )
+  ( cd "$TARGET" && .ai/bin/ai session start --agent operator --rebuild auto --repair-audit-index --render-manifest --json )
+  ( cd "$TARGET" && .ai/bin/ai doctor --strict --json )
   if [[ "${GLOBAL_INSTALL_ARG[*]:-}" == "--global" ]]; then
     ( cd "$CHECKOUT/kits/global-agent-kit" && ./install.sh --all --yes >/dev/null )
     echo "[code-brain] global Claude/Codex kit refreshed by managed merge" >&2

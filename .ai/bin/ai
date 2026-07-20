@@ -3,7 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 PYTHON="$ROOT/.ai/runtime/.venv/bin/python"
-if [[ -x "$PYTHON" ]] && "$PYTHON" -c 'import ai_core.cli' >/dev/null 2>&1; then
+if [[ -x "$PYTHON" ]] && "$PYTHON" -c 'import ai_core.cli'; then
   exec "$PYTHON" -m ai_core.cli "$@"
 fi
 exec uv run --project "$ROOT/.ai/runtime" python -m ai_core.cli "$@"

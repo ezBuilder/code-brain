@@ -4,8 +4,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Prefer python3; some systems (e.g. macOS) ship only `python3`, not `python`.
-PYTHON="${PYTHON:-$(command -v python3 || command -v python || true)}"
+# Prefer an already-installed project runtime. This avoids making a health
+# check trigger dependency resolution or installation through `uv run`.
+if [[ -n "${PYTHON:-}" ]]; then
+  PYTHON="$PYTHON"
+elif [[ -x "$ROOT/.ai/runtime/.venv/bin/python" ]]; then
+  PYTHON="$ROOT/.ai/runtime/.venv/bin/python"
+elif [[ -x "$ROOT/.ai/runtime/.venv/Scripts/python.exe" ]]; then
+  PYTHON="$ROOT/.ai/runtime/.venv/Scripts/python.exe"
+else
+  PYTHON="$(command -v python3 || command -v python || true)"
+fi
 if [[ -z "$PYTHON" ]]; then
   echo "env-check failed: no python3/python interpreter found on PATH" >&2
   exit 2
@@ -45,15 +54,34 @@ checks = {
 
 python_check = {"command": "python", "path": None, "ok": False, "version": None}
 uv_path = checks["uv"].get("path")
-if uv_path:
+installed_python = next(
+    (
+        path
+        for path in (
+            root / ".ai" / "runtime" / ".venv" / "bin" / "python",
+            root / ".ai" / "runtime" / ".venv" / "Scripts" / "python.exe",
+        )
+        if path.exists()
+    ),
+    None,
+)
+command = None
+path_label = None
+if installed_python is not None:
+    command = [str(installed_python), "-c", "import sys; print(sys.version.split()[0])"]
+    path_label = installed_python.relative_to(root).as_posix()
+elif uv_path:
+    command = [uv_path, "run", "--project", ".ai/runtime", "python", "-c", "import sys; print(sys.version.split()[0])"]
+    path_label = "uv run --project .ai/runtime python"
+if command:
     try:
         output = subprocess.check_output(
-            [uv_path, "run", "--project", ".ai/runtime", "python", "-c", "import sys; print(sys.version.split()[0])"],
+            command,
             cwd=root,
             text=True,
             stderr=subprocess.STDOUT,
         ).strip()
-        python_check.update({"path": "uv run --project .ai/runtime python", "ok": True, "version": output})
+        python_check.update({"path": path_label, "ok": True, "version": output})
     except Exception as exc:
         python_check["error"] = str(exc)
 checks["python"] = python_check

@@ -86,6 +86,29 @@ def _coerce_int(
     return parsed
 
 
+def _int_argument_warning(value: object, *, field: str, default: int) -> dict[str, object] | None:
+    """Return a bounded redacted warning when integer coercion used its default."""
+    valid = False
+    if isinstance(value, int) and not isinstance(value, bool):
+        valid = True
+    elif isinstance(value, float):
+        valid = math.isfinite(value) and value.is_integer()
+    elif isinstance(value, str):
+        text = value.strip()
+        valid = (
+            0 < len(text) <= MCP_SCALAR_TEXT_MAX_CHARS
+            and re.fullmatch(r"[+-]?\d+", text) is not None
+        )
+    if value is None or valid:
+        return None
+    preview = str(redact_value(value))[:256]
+    return {
+        "field": field,
+        "value": preview,
+        "used_default": int(default),
+    }
+
+
 def _coerce_float(
     value: object,
     default: float,
@@ -1136,12 +1159,17 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             raise ValueError("autoresearch_loop_stop requires session_id")
         return _loop.stop(root, sid)
     if name in ("memory_query", "code_query"):
-        return query(
+        raw_limit = args.get("limit")
+        result = query(
             root,
             str(args.get("query", "")),
-            limit=_coerce_int(args.get("limit"), 5, minimum=1, maximum=100),
+            limit=_coerce_int(raw_limit, 5, minimum=1, maximum=100),
             evidence_source="search",
         )
+        warning = _int_argument_warning(raw_limit, field="limit", default=5)
+        if warning is not None:
+            result["argument_warning"] = warning
+        return result
     if name == "context_pack":
         return context_pack(
             root,

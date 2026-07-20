@@ -259,10 +259,14 @@ def _process_identity(pid: int) -> str | None:
             check=False,
             timeout=2,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, AttributeError, TypeError, ValueError):
         return None
-    raw = result.stdout.strip()
-    if result.returncode != 0 or not raw:
+    try:
+        raw = result.stdout.strip()
+        returncode = int(result.returncode)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if returncode != 0 or not raw:
         return None
     return hashlib.sha256(("ps:" + raw).encode("utf-8")).hexdigest()
 

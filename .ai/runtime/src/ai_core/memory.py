@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from collections import deque
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from .private_write import (
     atomic_write_private_text,
     iter_root_confined_text_lines,
     list_root_confined_directory,
+    unlink_root_confined_regular_file,
     private_file_lock,
     read_root_confined_tail_bytes,
     read_root_confined_text,
@@ -32,6 +34,14 @@ _JSONL_TAIL_BYTES_PER_ITEM = 64 * 1024
 _JSONL_LINE_MAX_BYTES = 1_000_000
 _JSONL_ROTATE_MAX_BYTES = 100_000_000
 _JSONL_ROTATE_MAX_LINES = 100_000
+_JSONL_AUTO_MAX_BYTES = 32 * 1024 * 1024
+_JSONL_AUTO_KEEP_BYTES = 16 * 1024 * 1024
+_JSONL_AUTO_KEEP_LINES = 50_000
+_AUDIT_MAX_BYTES = 64 * 1024 * 1024
+_AUDIT_KEEP_BYTES = 32 * 1024 * 1024
+_AUDIT_KEEP_LINES = 50_000
+_AUDIT_RETENTION_YEARS = 3
+_AUDIT_INDEX_MAX_ROWS = 50_000
 _TEXT_TAIL_MAX_LINES = 1_000
 _TEXT_TAIL_MIN_BYTES = 64 * 1024
 _TEXT_TAIL_MAX_BYTES = 8 * 1024 * 1024
@@ -152,6 +162,52 @@ def audit_transaction_lock_path(root: Path) -> Path:
     return Path(root) / ".ai" / "memory" / ".audit-transaction.lock"
 
 
+def _trim_jsonl_locked(path: Path, *, root: Path) -> bool:
+    try:
+        state = validate_root_confined_regular_file(
+            path,
+            root=root,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
+    except FileNotFoundError:
+        return False
+    if int(state.st_size) <= _JSONL_AUTO_MAX_BYTES:
+        return False
+    data, _state, complete = read_root_confined_tail_bytes(
+        path,
+        root=root,
+        max_bytes=_JSONL_AUTO_KEEP_BYTES + _JSONL_LINE_MAX_BYTES + 1,
+        require_private=False,
+        require_owner=True,
+        reject_group_other_writable=True,
+    )
+    if not complete:
+        boundary = data.find(b"\n")
+        data = data[boundary + 1:] if boundary >= 0 else b""
+    text = data.decode("utf-8")
+    lines = text.splitlines()[-_JSONL_AUTO_KEEP_LINES:]
+    kept_reversed: list[str] = []
+    total = 0
+    for candidate in reversed(lines):
+        encoded = (candidate + "\n").encode("utf-8")
+        if len(encoded) > _JSONL_LINE_MAX_BYTES:
+            continue
+        if total + len(encoded) > _JSONL_AUTO_KEEP_BYTES:
+            break
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        kept_reversed.append(candidate)
+        total += len(encoded)
+    replacement = "".join(line + "\n" for line in reversed(kept_reversed))
+    atomic_write_private_text(path, replacement, root=root)
+    return True
+
+
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path = Path(path)
     root = state_root_for_path(path)
@@ -166,6 +222,7 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
         raise OSError("JSONL record exceeds line limit")
     with private_file_lock(jsonl_lock_path(path), root=root):
         append_private_text(path, line + "\n", root=root)
+        _trim_jsonl_locked(path, root=root)
 
 
 def decisions_path(root: Path) -> Path:
@@ -625,6 +682,88 @@ def all_audit_files(root: Path) -> list[Path]:
     return files
 
 
+def _rotate_audit_chain_locked(root: Path, path: Path) -> bool:
+    try:
+        state = validate_root_confined_regular_file(
+            path,
+            root=root,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
+    except FileNotFoundError:
+        return False
+    before = int(state.st_size)
+    if before <= _AUDIT_MAX_BYTES:
+        return False
+    budget = max(0, min(_AUDIT_KEEP_BYTES, _AUDIT_MAX_BYTES - (2 * _AUDIT_LINE_MAX_BYTES)))
+    data, _state, complete = read_root_confined_tail_bytes(
+        path,
+        root=root,
+        max_bytes=budget + _AUDIT_LINE_MAX_BYTES + 1,
+        require_private=False,
+        require_owner=True,
+        reject_group_other_writable=True,
+    )
+    if not complete:
+        boundary = data.find(b"\n")
+        data = data[boundary + 1:] if boundary >= 0 else b""
+    candidates: list[dict[str, Any]] = []
+    total = 0
+    for raw in reversed(data.decode("utf-8").splitlines()[-_AUDIT_KEEP_LINES:]):
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        encoded_size = len((raw + "\n").encode("utf-8"))
+        if total + encoded_size > budget:
+            break
+        candidates.append(record)
+        total += encoded_size
+    candidates.reverse()
+    marker = {
+        "ts": now_iso(),
+        "monotonic_ns": time.monotonic_ns(),
+        "action": "audit.storage_rotated",
+        "category": "storage",
+        "payload": {"bytes_before": before, "bytes_retained": total},
+        "prev_sha": None,
+    }
+    rebuilt: list[str] = []
+    prev_sha: str | None = None
+    for record in [marker, *candidates]:
+        bounded, line = _bounded_audit_line(
+            timestamp=datetime.fromisoformat(str(record.get("ts", now_iso())).replace("Z", "+00:00")),
+            action=record.get("action", "unknown"),
+            category=record.get("category", "unknown"),
+            payload=record.get("payload", {}),
+            prev_sha=prev_sha,
+        )
+        if "monotonic_ns" in record:
+            bounded["monotonic_ns"] = record["monotonic_ns"]
+            line = json.dumps(bounded, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        rebuilt.append(line)
+        prev_sha = line_sha(line)
+    atomic_write_private_text(path, "".join(line + "\n" for line in rebuilt), root=root)
+    return True
+
+
+def _prune_old_audit_files_locked(root: Path, *, current_year: int) -> int:
+    removed = 0
+    minimum_year = current_year - max(0, _AUDIT_RETENTION_YEARS - 1)
+    for candidate in all_audit_files(root):
+        year = int(candidate.name[:4])
+        if year >= minimum_year or year == current_year:
+            continue
+        try:
+            if unlink_root_confined_regular_file(candidate, root=root):
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def append_audit(root: Path, *, action: str, category: str, payload: dict[str, Any]) -> dict[str, Any]:
     root = Path(root)
     timestamp = datetime.now(timezone.utc)
@@ -641,22 +780,27 @@ def append_audit(root: Path, *, action: str, category: str, payload: dict[str, A
                     prev_sha=prev_sha,
                 )
                 append_private_text(path, line + "\n", root=root)
-            append_jsonl(
-                root / ".ai" / "memory" / "audit-index.jsonl",
-                {
-                    "ts": record["ts"],
-                    "category": record["category"],
-                    "action": record["action"],
-                    "path": path.relative_to(root).as_posix(),
-                },
-            )
+                rotated = _rotate_audit_chain_locked(root, path)
+            pruned = _prune_old_audit_files_locked(root, current_year=timestamp.year)
+            if rotated or pruned:
+                _rebuild_audit_index_locked(root)
+            else:
+                append_jsonl(
+                    root / ".ai" / "memory" / "audit-index.jsonl",
+                    {
+                        "ts": record["ts"],
+                        "category": record["category"],
+                        "action": record["action"],
+                        "path": path.relative_to(root).as_posix(),
+                    },
+                )
     return record
 
 
 def _rebuild_audit_index_locked(root: Path) -> dict[str, Any]:
     audit_root = root / ".ai" / "memory" / "audit"
     index_path = root / ".ai" / "memory" / "audit-index.jsonl"
-    rows: list[dict[str, Any]] = []
+    rows: deque[dict[str, Any]] = deque(maxlen=_AUDIT_INDEX_MAX_ROWS)
     skipped = 0
     for path in all_audit_files(root):
         rel = path.relative_to(root).as_posix()

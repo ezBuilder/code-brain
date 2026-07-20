@@ -90,6 +90,8 @@ SKIP_DIRS = {
     "generated",
 }
 MAX_TEXT_BYTES = 100_000
+INDEX_DB_MAX_BYTES = 512 * 1024 * 1024
+INDEX_SIDECAR_MAX_BYTES = 128 * 1024 * 1024
 MTIME_STALE_GRACE_SECONDS = 2.0
 SKIP_NAMES = {
     "package-lock.json",
@@ -144,20 +146,24 @@ _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
 def _prepare_index_storage(root: Path) -> Path:
-    """Prepare private confined SQLite main/sidecar files without following links."""
+    """Prepare private confined SQLite files and reset storage above hard limits."""
     path = db_path(root)
     ensure_root_confined_directory(path.parent, root=root, mode=0o700)
-    ensure_root_confined_private_regular_file(
-        path,
-        root=root,
-        replace_unsafe=True,
-    )
-    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+    targets = (path, *(Path(str(path) + suffix) for suffix in _SQLITE_SIDECAR_SUFFIXES))
+    states = [
         ensure_root_confined_private_regular_file(
-            Path(str(path) + suffix),
+            target,
             root=root,
             replace_unsafe=True,
         )
+        for target in targets
+    ]
+    oversized = int(states[0].st_size) > INDEX_DB_MAX_BYTES or any(
+        int(state.st_size) > INDEX_SIDECAR_MAX_BYTES for state in states[1:]
+    )
+    if oversized:
+        for target in targets:
+            atomic_write_private_bytes(target, b"", root=root)
     return path
 
 
@@ -165,6 +171,9 @@ def connect(root: Path) -> sqlite3.Connection:
     path = _prepare_index_storage(root)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    page_size = max(512, int(conn.execute("pragma page_size").fetchone()[0]))
+    max_pages = max(1, INDEX_DB_MAX_BYTES // page_size)
+    conn.execute(f"pragma max_page_count={max_pages}")
     return conn
 
 
@@ -196,6 +205,18 @@ def _is_corrupt_index_error(exc: BaseException) -> bool:
             "database disk image is malformed",
             "malformed database schema",
             "database corruption",
+        )
+    )
+
+
+def _is_index_size_error(exc: BaseException) -> bool:
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "database or disk is full",
+            "database full",
+            "sqlite_full",
         )
     )
 
@@ -335,6 +356,13 @@ def rebuild(
                 else _rebuild_inner(root)
             )
         except sqlite3.DatabaseError as exc:
+            if _is_index_size_error(exc):
+                return {
+                    "ok": False,
+                    "reason": "index_size_limit",
+                    "max_bytes": INDEX_DB_MAX_BYTES,
+                    "db_path": db_path(root).relative_to(root).as_posix(),
+                }
             if not _is_corrupt_index_error(exc):
                 raise
             try:
@@ -578,7 +606,12 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
         conn.commit()
         conn.execute("vacuum")
     _mark_index_generation(root)
-    return {"ok": True, "db_path": db_path(root).relative_to(root).as_posix(), "indexed": indexed}
+    return {
+        "ok": True,
+        "db_path": db_path(root).relative_to(root).as_posix(),
+        "indexed": indexed,
+        "max_db_bytes": INDEX_DB_MAX_BYTES,
+    }
 
 
 def _mark_index_generation(root: Path) -> None:

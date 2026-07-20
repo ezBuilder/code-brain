@@ -224,12 +224,12 @@ def _run_bootstrap_with_fake_uv(
 
 def test_bootstrap_installs_base_runtime_by_default(tmp_path: Path) -> None:
     calls = _run_bootstrap_with_fake_uv(tmp_path, install_dense=False)
-    assert calls[0] == "sync --project .ai/runtime"
+    assert calls[0] == "sync --no-progress --project .ai/runtime"
 
 
 def test_bootstrap_dense_dependencies_are_explicit_opt_in(tmp_path: Path) -> None:
     calls = _run_bootstrap_with_fake_uv(tmp_path, install_dense=True)
-    assert calls[0] == "sync --project .ai/runtime --extra dense"
+    assert calls[0] == "sync --no-progress --project .ai/runtime --extra dense"
 
 
 def test_bootstrap_skip_doctor_keeps_render_but_avoids_duplicate_scan(tmp_path: Path) -> None:

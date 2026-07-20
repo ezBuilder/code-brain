@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -18,6 +20,12 @@ from .memory import (
 )
 from .obs import health_summary, search_report, usage_report
 from .policy import is_ci, reject_ci_write
+from .private_write import (
+    list_root_confined_directory,
+    read_root_confined_text,
+    validate_root_confined_directory,
+    validate_root_confined_regular_file,
+)
 from .redact import redact_value
 from .sandbox import execute as sandbox_execute, fetch as sandbox_fetch, list_executions as sandbox_list
 from .search import context_pack, query, rebuild
@@ -25,6 +33,99 @@ from .worker.ipc import health
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_SERVER_NAME = "code-brain"
+MCP_STDIN_MAX_BYTES = 1024 * 1024
+MCP_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
+MCP_METHOD_MAX_CHARS = 256
+MCP_REQUEST_ID_MAX_CHARS = 256
+MCP_PROMPT_MAX_BYTES = 256 * 1024
+MCP_RESOURCE_MAX_BYTES = 1024 * 1024
+MCP_RESOURCE_LIST_MAX = 256
+MCP_SCALAR_TEXT_MAX_CHARS = 64
+MCP_ARGUMENT_MAX_DEPTH = 16
+MCP_ARGUMENT_MAX_NODES = 10_000
+MCP_ARGUMENT_MAX_STRING_CHARS = 1_000_000
+MCP_ARGUMENT_MAX_TOTAL_CHARS = 4_000_000
+MCP_ARGUMENT_MAX_ARRAY_ITEMS = 1_000
+MCP_ARGUMENT_MAX_OBJECT_KEYS = 1_000
+MCP_ARGUMENT_MAX_KEY_CHARS = 256
+
+
+def _coerce_int(
+    value: object,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    parsed: int
+    if isinstance(value, bool):
+        parsed = int(default)
+    elif isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        parsed = int(value) if math.isfinite(value) and value.is_integer() else int(default)
+    elif isinstance(value, str):
+        text = value.strip()
+        if (
+            not text
+            or len(text) > MCP_SCALAR_TEXT_MAX_CHARS
+            or re.fullmatch(r"[+-]?\d+", text) is None
+        ):
+            parsed = int(default)
+        else:
+            try:
+                parsed = int(text)
+            except (ValueError, OverflowError):
+                parsed = int(default)
+    else:
+        parsed = int(default)
+    if minimum is not None:
+        parsed = max(int(minimum), parsed)
+    if maximum is not None:
+        parsed = min(int(maximum), parsed)
+    return parsed
+
+
+def _coerce_float(
+    value: object,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    parsed: float
+    if isinstance(value, bool):
+        parsed = float(default)
+    elif isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str) and 0 < len(value.strip()) <= MCP_SCALAR_TEXT_MAX_CHARS:
+        try:
+            parsed = float(value.strip())
+        except (ValueError, OverflowError):
+            parsed = float(default)
+    else:
+        parsed = float(default)
+    if not math.isfinite(parsed):
+        parsed = float(default)
+    if minimum is not None:
+        parsed = max(float(minimum), parsed)
+    if maximum is not None:
+        parsed = min(float(maximum), parsed)
+    return parsed
+
+
+def _coerce_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().casefold()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return bool(default)
 
 # Tool catalog. Each entry is exposed via tools/list and dispatched via tools/call.
 # Description text is short; the inputSchema follows JSON Schema (draft 2020-12 compatible).
@@ -34,7 +135,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": "인덱싱된 소스를 BM25로 검색. 출처가 붙은 상위 K개 스니펫 반환.",
         "inputSchema": {
             "type": "object",
-            "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 5}},
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 100},
+            },
             "required": ["query"],
         },
     },
@@ -43,7 +147,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": "memory_query 별칭 — BM25 코드 검색.",
         "inputSchema": {
             "type": "object",
-            "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 5}},
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 100},
+            },
             "required": ["query"],
         },
     },
@@ -54,7 +161,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "limit": {"type": "integer", "default": 5},
+                "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 100},
                 "mode": {
                     "type": "string",
                     "enum": ["high_fidelity", "balanced", "aggressive"],
@@ -70,8 +177,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {
             "type": "object",
             "properties": {
-                "qualname": {"type": "string", "description": "Function/method qualname (e.g. 'append_audit' or 'C.method')"},
-                "limit": {"type": "integer", "default": 20},
+                "qualname": {"type": "string", "maxLength": 512, "description": "Function/method qualname (e.g. 'append_audit' or 'C.method')"},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
             },
             "required": ["qualname"],
         },
@@ -82,8 +189,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {
             "type": "object",
             "properties": {
-                "qualname": {"type": "string"},
-                "limit": {"type": "integer", "default": 20},
+                "qualname": {"type": "string", "maxLength": 512},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
             },
             "required": ["qualname"],
         },
@@ -94,8 +201,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Substring to match against qualname (LIKE %name%)"},
-                "limit": {"type": "integer", "default": 20},
+                "name": {"type": "string", "maxLength": 512, "description": "Literal substring to match against qualname"},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
             },
             "required": ["name"],
         },
@@ -106,9 +213,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string"},
-                "line": {"type": "integer", "description": "0-indexed"},
-                "column": {"type": "integer", "description": "0-indexed"},
+                "file_path": {"type": "string", "maxLength": 1024},
+                "line": {"type": "integer", "minimum": 0},
+                "column": {"type": "integer", "minimum": 0},
             },
             "required": ["file_path", "line", "column"],
         },
@@ -119,9 +226,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string"},
-                "line": {"type": "integer", "description": "0-indexed"},
-                "column": {"type": "integer", "description": "0-indexed"},
+                "file_path": {"type": "string", "maxLength": 1024},
+                "line": {"type": "integer", "minimum": 0},
+                "column": {"type": "integer", "minimum": 0},
             },
             "required": ["file_path", "line", "column"],
         },
@@ -132,9 +239,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "start": {"type": "integer"},
-                "end": {"type": "integer"},
+                "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "start": {"type": "integer", "minimum": 1, "maximum": 10000000},
+                "end": {"type": "integer", "minimum": 1, "maximum": 10000000},
             },
             "required": ["path"],
         },
@@ -234,21 +341,22 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "name": "code_graph_trace",
         "description": "두 심볼 간 최단 caller→callee 사슬을 추적(멀티홉). 방향 잡기용; 결과는 code_query에 넘겨 쓴다.",
         "inputSchema": {"type": "object", "properties": {
-            "src": {"type": "string"}, "dst": {"type": "string"}, "max_depth": {"type": "integer", "default": 6}},
+            "src": {"type": "string", "maxLength": 512}, "dst": {"type": "string", "maxLength": 512},
+            "max_depth": {"type": "integer", "default": 6, "minimum": 1, "maximum": 32}},
             "required": ["src", "dst"]},
     },
     {
         "name": "code_graph_impact",
         "description": "파일/심볼 변경의 영향 범위: 전이적으로 영향받는 호출자들. 변경된 repo 상대경로를 넘기면 리뷰 범위를 좁힌다.",
         "inputSchema": {"type": "object", "properties": {
-            "paths": {"type": "array", "items": {"type": "string"}},
-            "symbols": {"type": "array", "items": {"type": "string"}},
-            "max_depth": {"type": "integer", "default": 4}}},
+            "paths": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 1024}},
+            "symbols": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 512}},
+            "max_depth": {"type": "integer", "default": 4, "minimum": 1, "maximum": 32}}},
     },
     {
         "name": "code_graph_architecture",
         "description": "repo 전체 조망: 심볼 수와 호출 중심성 기준 상위 모듈. supervisor용 저비용 지도.",
-        "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 8}}},
+        "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 8, "minimum": 1, "maximum": 100}}},
     },
     {
         "name": "ast_grep_search",
@@ -256,10 +364,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "ast-grep pattern; $VAR / $$$ metavars"},
+                "pattern": {"type": "string", "maxLength": 4096, "description": "ast-grep structural pattern"},
                 "lang": {"type": "string", "description": "python|javascript|typescript|tsx|go|rust|java|..."},
-                "path": {"type": "string", "description": "optional repo-relative subpath to scope"},
-                "max_results": {"type": "integer", "default": 40},
+                "path": {"type": "string", "maxLength": 1024, "description": "optional repo-relative subpath"},
+                "max_results": {"type": "integer", "default": 40, "minimum": 1, "maximum": 100},
             },
             "required": ["pattern", "lang"],
         },
@@ -750,6 +858,100 @@ def _invalidate_tools_list_cache() -> None:
 _TOOL_SEARCH_TOKEN_RE = re.compile(r"[a-z0-9가-힣]+")
 
 
+_TOOL_BY_NAME = {str(tool["name"]): tool for tool in TOOLS}
+
+
+def _argument_shape_error(
+    value: object,
+    schema: dict[str, Any],
+    *,
+    depth: int,
+    state: dict[str, int],
+    path: str,
+) -> str | None:
+    if depth > MCP_ARGUMENT_MAX_DEPTH:
+        return f"{path}: nesting too deep"
+    state["nodes"] += 1
+    if state["nodes"] > MCP_ARGUMENT_MAX_NODES:
+        return f"{path}: too many values"
+    if isinstance(value, str):
+        state["chars"] += len(value)
+        if state["chars"] > MCP_ARGUMENT_MAX_TOTAL_CHARS:
+            return f"{path}: total text too large"
+        maximum = _coerce_int(
+            schema.get("maxLength"),
+            MCP_ARGUMENT_MAX_STRING_CHARS,
+            minimum=0,
+            maximum=MCP_ARGUMENT_MAX_STRING_CHARS,
+        )
+        if len(value) > maximum:
+            return f"{path}: text too long"
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"{path}: non-finite number"
+    if isinstance(value, list):
+        maximum = _coerce_int(
+            schema.get("maxItems"),
+            MCP_ARGUMENT_MAX_ARRAY_ITEMS,
+            minimum=0,
+            maximum=MCP_ARGUMENT_MAX_ARRAY_ITEMS,
+        )
+        if len(value) > maximum:
+            return f"{path}: too many items"
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, dict):
+            item_schema = {}
+        for index, item in enumerate(value):
+            error = _argument_shape_error(
+                item,
+                item_schema,
+                depth=depth + 1,
+                state=state,
+                path=f"{path}[{index}]",
+            )
+            if error:
+                return error
+        return None
+    if isinstance(value, dict):
+        if len(value) > MCP_ARGUMENT_MAX_OBJECT_KEYS:
+            return f"{path}: too many keys"
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            properties = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or len(key) > MCP_ARGUMENT_MAX_KEY_CHARS:
+                return f"{path}: invalid key"
+            child_schema = properties.get(key)
+            if not isinstance(child_schema, dict):
+                child_schema = {}
+            error = _argument_shape_error(
+                item,
+                child_schema,
+                depth=depth + 1,
+                state=state,
+                path=f"{path}.{key}",
+            )
+            if error:
+                return error
+    return None
+
+
+def _validate_tool_arguments(name: str, arguments: object) -> str | None:
+    if not isinstance(arguments, dict):
+        return "arguments: expected object"
+    tool = _TOOL_BY_NAME.get(name)
+    schema = tool.get("inputSchema") if isinstance(tool, dict) else None
+    if not isinstance(schema, dict):
+        schema = {}
+    return _argument_shape_error(
+        arguments,
+        schema,
+        depth=0,
+        state={"nodes": 0, "chars": 0},
+        path="arguments",
+    )
+
+
 def _tool_search_tokens(value: object) -> list[str]:
     """Normalize natural-language/tool-name text into stable search terms."""
     text = str(value or "").lower().replace("_", " ").replace("-", " ")
@@ -808,16 +1010,23 @@ def _search_tool_catalog(query_text: str, *, limit: int) -> list[dict[str, Any]]
             scored.append((score, matched_terms, str(tool["name"]), tool))
 
     scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
-    bounded_limit = max(1, min(int(limit or 8), catalog_size))
+    bounded_limit = _coerce_int(limit, 8, minimum=1, maximum=catalog_size)
     return [dict(tool) for _, _, _, tool in scored[:bounded_limit]]
 
 
 def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run the underlying handler for a tool by name. Raises KeyError if unknown."""
     args = arguments or {}
+    argument_error = _validate_tool_arguments(name, args)
+    if argument_error:
+        raise ValueError(f"invalid tool arguments: {argument_error}")
     if name == "autoresearch_search":
         from .autoresearch import storage as _ars, hybrid as _arh
-        return {"results": _arh.search(_ars.data_root(root), str(args.get("q", "")), k=int(args.get("k", 10) or 10))}
+        return {"results": _arh.search(
+            _ars.data_root(root),
+            str(args.get("q", "")),
+            k=_coerce_int(args.get("k"), 10, minimum=1, maximum=100),
+        )}
     if name == "autoresearch_ingest_stage":
         from .autoresearch import storage as _ars, ingest as _ari
         content = args.get("content")
@@ -848,7 +1057,11 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         return _arl.lint(_ars.data_root(root), stale_before=str(sb) if isinstance(sb, str) and sb else None)
     if name == "autoresearch_query":
         from .autoresearch import storage as _ars, query as _arq
-        return _arq.query(_ars.data_root(root), str(args.get("question", "")), k=int(args.get("k", 10) or 10))
+        return _arq.query(
+            _ars.data_root(root),
+            str(args.get("question", "")),
+            k=_coerce_int(args.get("k"), 10, minimum=1, maximum=100),
+        )
     if name == "autoresearch_verify":
         from .autoresearch import storage as _ars, verify as _arv
         claims = args.get("claims")
@@ -888,7 +1101,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         from .autoresearch import orchestration as _orch
         return _orch.survey_plan(
             args.get("subtopics", []),
-            independent=bool(args.get("independent", False)),
+            independent=_coerce_bool(args.get("independent")),
             max_workers=args.get("max_workers", _orch.DEFAULT_MAX_WORKERS),
         )
     if name == "autoresearch_loop_start":
@@ -923,44 +1136,84 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             raise ValueError("autoresearch_loop_stop requires session_id")
         return _loop.stop(root, sid)
     if name in ("memory_query", "code_query"):
-        return query(root, str(args.get("query", "")), limit=int(args.get("limit", 5) or 5), evidence_source="search")
+        return query(
+            root,
+            str(args.get("query", "")),
+            limit=_coerce_int(args.get("limit"), 5, minimum=1, maximum=100),
+            evidence_source="search",
+        )
     if name == "context_pack":
         return context_pack(
             root,
             str(args.get("query", "")),
-            limit=int(args.get("limit", 5) or 5),
+            limit=_coerce_int(args.get("limit"), 5, minimum=1, maximum=100),
             mode=str(args.get("mode", "balanced") or "balanced"),
         )
     if name == "code_graph_callers":
         from .codegraph import query_callers
-        return query_callers(root, str(args.get("qualname", "")), limit=int(args.get("limit", 20) or 20))
+        return query_callers(
+            root,
+            str(args.get("qualname", "")),
+            limit=_coerce_int(args.get("limit"), 20, minimum=1, maximum=100),
+        )
     if name == "code_graph_callees":
         from .codegraph import query_callees
-        return query_callees(root, str(args.get("qualname", "")), limit=int(args.get("limit", 20) or 20))
+        return query_callees(
+            root,
+            str(args.get("qualname", "")),
+            limit=_coerce_int(args.get("limit"), 20, minimum=1, maximum=100),
+        )
     if name == "code_graph_symbol":
         from .codegraph import find_symbol
-        return find_symbol(root, str(args.get("name", "")), limit=int(args.get("limit", 20) or 20))
+        return find_symbol(
+            root,
+            str(args.get("name", "")),
+            limit=_coerce_int(args.get("limit"), 20, minimum=1, maximum=100),
+        )
     if name == "code_find_references":
         from .lsp import find_references
-        return find_references(root, str(args.get("file_path", "")),
-                               int(args.get("line", 0) or 0), int(args.get("column", 0) or 0))
+        return find_references(
+            root,
+            str(args.get("file_path", "")),
+            args.get("line", 0),
+            args.get("column", 0),
+        )
     if name == "code_goto_definition":
         from .lsp import goto_definition
-        return goto_definition(root, str(args.get("file_path", "")),
-                               int(args.get("line", 0) or 0), int(args.get("column", 0) or 0))
+        return goto_definition(
+            root,
+            str(args.get("file_path", "")),
+            args.get("line", 0),
+            args.get("column", 0),
+        )
     if name == "code_graph_trace":
         from .codegraph import trace_call_path
-        return trace_call_path(root, src=str(args.get("src", "")), dst=str(args.get("dst", "")),
-                               max_depth=int(args.get("max_depth", 6) or 6))
+        return trace_call_path(
+            root,
+            src=str(args.get("src", "")),
+            dst=str(args.get("dst", "")),
+            max_depth=_coerce_int(args.get("max_depth"), 6, minimum=1, maximum=32),
+        )
     if name == "code_graph_impact":
         from .codegraph import blast_radius, impacted_by_paths
         paths = args.get("paths") if isinstance(args.get("paths"), list) else None
         if paths:
-            return impacted_by_paths(root, paths=paths, max_depth=int(args.get("max_depth", 4) or 4))
-        return blast_radius(root, symbols=args.get("symbols") or [], max_depth=int(args.get("max_depth", 4) or 4))
+            return impacted_by_paths(
+                root,
+                paths=paths,
+                max_depth=_coerce_int(args.get("max_depth"), 4, minimum=1, maximum=32),
+            )
+        return blast_radius(
+            root,
+            symbols=args.get("symbols") or [],
+            max_depth=_coerce_int(args.get("max_depth"), 4, minimum=1, maximum=32),
+        )
     if name == "code_graph_architecture":
         from .codegraph import architecture_summary
-        return architecture_summary(root, limit=int(args.get("limit", 8) or 8))
+        return architecture_summary(
+            root,
+            limit=_coerce_int(args.get("limit"), 8, minimum=1, maximum=100),
+        )
     if name == "code_read_hashline":
         from .hashline import read_hashline
         target = args.get("path")
@@ -978,11 +1231,15 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
     if name == "ai_request_rebuild":
         return rebuild(root)
     if name == "obs_usage":
-        return usage_report(root, include_sessions=bool(args.get("include_sessions", False)))
+        return usage_report(root, include_sessions=_coerce_bool(args.get("include_sessions")))
     if name == "obs_health_summary":
         return health_summary(root)
     if name == "obs_search":
-        return search_report(root, query_text=args.get("query"), limit=int(args.get("limit", 5) or 5))
+        return search_report(
+            root,
+            query_text=args.get("query"),
+            limit=_coerce_int(args.get("limit"), 5, minimum=1, maximum=100),
+        )
     if name == "doctor_strict":
         return as_payload(run_checks(root))
     if name == "sandbox_execute":
@@ -1008,9 +1265,9 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             root,
             command=command_payload,
             cwd=str(args["cwd"]) if isinstance(args.get("cwd"), str) else None,
-            timeout=int(args.get("timeout", 30) or 30),
-            isolate_network=bool(args.get("isolate_network", False)),
-            isolate_env=bool(args.get("isolate_env", False)),
+            timeout=_coerce_int(args.get("timeout"), 30, minimum=1, maximum=3600),
+            isolate_network=_coerce_bool(args.get("isolate_network")),
+            isolate_env=_coerce_bool(args.get("isolate_env")),
             extra_env_vars=extra_env_vars,
         )
     if name == "record_decision":
@@ -1040,7 +1297,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         return ast_grep_search(
             root, pattern=pattern, lang=lang,
             path=args.get("path") if isinstance(args.get("path"), str) else None,
-            max_results=int(args.get("max_results", 40) or 40),
+            max_results=args.get("max_results", 40),
         )
     if name == "loopd_status":
         from . import loopd as _ld
@@ -1065,17 +1322,25 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         dispatch = {"model_tier": args["model_tier"]} if args.get("model_tier") in ("cheap", "balanced", "best") else None
         goal = str(args.get("goal") or "").strip() or instruction.strip().splitlines()[0][:120]
         # tier pinned atomically at submit (no read-modify-write of the queued file → no TOCTOU)
-        return _le.submit(root, instruction=instruction, goal=goal,
-                          reviewer_required=bool(args.get("reviewer_required", False)),
-                          priority=str(args.get("priority", "P1") or "P1"), dispatch=dispatch)
+        return _le.submit(
+            root,
+            instruction=instruction,
+            goal=goal,
+            reviewer_required=_coerce_bool(args.get("reviewer_required")),
+            priority=str(args.get("priority", "P1") or "P1"),
+            dispatch=dispatch,
+        )
     if name == "loopd_up":
         from . import worker_launch as _wl
-        return _wl.launch_pool(root, dry_run=bool(args.get("dry_run", False)),
-                               autonomous=bool(args.get("autonomous", False)),
-                               tier=args.get("tier") if args.get("tier") in ("cheap", "balanced", "best") else None)
+        return _wl.launch_pool(
+            root,
+            dry_run=_coerce_bool(args.get("dry_run")),
+            autonomous=_coerce_bool(args.get("autonomous")),
+            tier=args.get("tier") if args.get("tier") in ("cheap", "balanced", "best") else None,
+        )
     if name == "tool_search":
         q = str(args.get("query", "")).strip()
-        limit = int(args.get("limit", 8) or 8)
+        limit = _coerce_int(args.get("limit"), 8, minimum=1, maximum=len(TOOLS))
         return {"ok": True, "tools": _search_tool_catalog(q, limit=limit)}
     if name == "lessons_recall":
         recall_query = args.get("query")
@@ -1083,7 +1348,11 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             raise ValueError("lessons_recall requires non-empty query")
         from .lessons import recall_lessons
 
-        return recall_lessons(root, query=recall_query, limit=int(args.get("limit", 5) or 5))
+        return recall_lessons(
+            root,
+            query=recall_query,
+            limit=_coerce_int(args.get("limit"), 5, minimum=1, maximum=100),
+        )
     if name == "memory_recall":
         mr_query = args.get("query")
         if not isinstance(mr_query, str) or not mr_query.strip():
@@ -1093,7 +1362,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         return recall_memory(
             root,
             query=mr_query,
-            limit=int(args.get("limit", 8) or 8),
+            limit=_coerce_int(args.get("limit"), 8, minimum=1, maximum=100),
             types=[str(t) for t in mr_types] if mr_types else None,
         )
     if name == "list_decisions":
@@ -1105,8 +1374,8 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             tag=args.get("tag") if isinstance(args.get("tag"), str) else None,
             source=args.get("source") if isinstance(args.get("source"), str) else None,
             text=args.get("text") if isinstance(args.get("text"), str) else None,
-            limit=int(args.get("limit", 20) or 20),
-            include_retired=bool(args.get("include_retired", False)),
+            limit=_coerce_int(args.get("limit"), 20, minimum=1, maximum=100),
+            include_retired=_coerce_bool(args.get("include_retired")),
         )
     if name == "record_todo":
         title = args.get("title")
@@ -1140,7 +1409,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         return list_evidence(
             root,
             status=status if isinstance(status, str) and status else None,
-            limit=int(args.get("limit", 20) or 20),
+            limit=_coerce_int(args.get("limit"), 20, minimum=1, maximum=100),
         )
     if name == "evidence_record":
         from .evidence import record_evidence
@@ -1176,7 +1445,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         return list_records(
             root,
             status=status if isinstance(status, str) and status else None,
-            limit=int(args.get("limit", 50) or 50),
+            limit=_coerce_int(args.get("limit"), 50, minimum=1, maximum=100),
         )
     if name == "security_finding_record":
         from .security_findings import record
@@ -1225,7 +1494,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             open_questions=_as_list(args.get("open_questions")),
             blockers=_as_list(args.get("blockers")),
             agent=str(args.get("agent") or "agent"),
-            clear=bool(args.get("clear")),
+            clear=_coerce_bool(args.get("clear")),
         )
     # remote_memory_* dispatchers removed (T37)
     # ---- Innovation modules (PoC dispatch) ----
@@ -1233,16 +1502,24 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         from .speculative import mine_patterns
         return mine_patterns(
             root,
-            min_support=int(args.get("min_support", 3) or 3),
-            min_confidence=float(args.get("min_confidence", 0.5) or 0.5),
-            limit=int(args.get("limit", 100) or 100),
+            min_support=_coerce_int(args.get("min_support"), 3, minimum=1, maximum=100_000),
+            min_confidence=_coerce_float(
+                args.get("min_confidence"),
+                0.5,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            limit=_coerce_int(args.get("limit"), 100, minimum=1, maximum=1_000),
         )
     if name == "speculative_hit_rate":
         from .speculative import hit_rate
         return hit_rate(root)
     if name == "trajectory_summarize":
         from .trajectory import summarize
-        return summarize(root, limit=int(args.get("limit", 10) or 10))
+        return summarize(
+            root,
+            limit=_coerce_int(args.get("limit"), 10, minimum=1, maximum=100),
+        )
     raise KeyError(name)
 
 
@@ -1273,14 +1550,52 @@ def _parse_prompt_md(text: str) -> tuple[str, str | None, str]:
     return desc, arg_hint, body
 
 
+_PROMPT_NAME_RE = re.compile(r"^cb-[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _read_mcp_text(root: Path, path: Path, *, max_bytes: int) -> str:
+    text, _state = read_root_confined_text(
+        path,
+        root=root,
+        max_bytes=max_bytes,
+        require_private=False,
+        require_owner=True,
+        reject_group_other_writable=True,
+    )
+    return text
+
+
+def _mcp_file_present(root: Path, path: Path) -> bool:
+    try:
+        validate_root_confined_regular_file(
+            path,
+            root=root,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
+        return True
+    except (FileNotFoundError, OSError):
+        return False
+
+
 def _list_prompts(root: Path) -> list[dict[str, Any]]:
     prompts: list[dict[str, Any]] = []
     cmd_dir = root / ".claude" / "commands"
-    if not cmd_dir.exists():
+    try:
+        validate_root_confined_directory(cmd_dir, root=root)
+        names = list_root_confined_directory(
+            cmd_dir,
+            root=root,
+            max_entries=MCP_RESOURCE_LIST_MAX,
+        )
+    except (FileNotFoundError, OSError):
         return prompts
-    for md in sorted(cmd_dir.glob("cb-*.md")):
+    for name in names:
+        if not name.endswith(".md") or not _PROMPT_NAME_RE.fullmatch(name[:-3]):
+            continue
+        md = cmd_dir / name
         try:
-            text = md.read_text(encoding="utf-8")
+            text = _read_mcp_text(root, md, max_bytes=MCP_PROMPT_MAX_BYTES)
         except (OSError, UnicodeDecodeError):
             continue
         desc, arg_hint, _ = _parse_prompt_md(text)
@@ -1292,10 +1607,13 @@ def _list_prompts(root: Path) -> list[dict[str, Any]]:
 
 
 def _get_prompt(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(name, str) or not _PROMPT_NAME_RE.fullmatch(name):
+        raise KeyError("invalid prompt")
     md = root / ".claude" / "commands" / f"{name}.md"
-    if not md.is_file():
-        raise KeyError(name)
-    text = md.read_text(encoding="utf-8")
+    try:
+        text = _read_mcp_text(root, md, max_bytes=MCP_PROMPT_MAX_BYTES)
+    except (FileNotFoundError, OSError, UnicodeDecodeError) as exc:
+        raise KeyError("prompt unavailable") from exc
     desc, _, body = _parse_prompt_md(text)
     args_value = ""
     if isinstance(arguments, dict):
@@ -1348,7 +1666,7 @@ def _list_resources(root: Path) -> list[dict[str, Any]]:
         plans = plan_state.list_plans(root).get("plans", [])
     except Exception:
         plans = []
-    for p in plans:
+    for p in plans[:MCP_RESOURCE_LIST_MAX]:
         pid = str(p.get("plan_id", ""))
         if not pid:
             continue
@@ -1370,7 +1688,7 @@ def _list_resources(root: Path) -> list[dict[str, Any]]:
         }
     )
     handoff = root / ".ai" / "memory" / "handoff.json"
-    if handoff.is_file():
+    if _mcp_file_present(root, handoff):
         resources.append(
             {
                 "uri": "codebrain://handoff/current",
@@ -1380,7 +1698,7 @@ def _list_resources(root: Path) -> list[dict[str, Any]]:
             }
         )
     session = root / ".ai" / "memory" / "session-current.md"
-    if session.is_file():
+    if _mcp_file_present(root, session):
         resources.append(
             {
                 "uri": "codebrain://session/current",
@@ -1406,9 +1724,10 @@ def _read_resource(root: Path, uri: str) -> dict[str, Any]:
         # _safe_plan_id re-validates; combined with the regex this rejects traversal.
         pid = plan_state._safe_plan_id(plan_match.group(1))
         path = plan_state.plan_path(root, pid)
-        if not path.is_file():
-            raise ValueError(f"unknown resource uri: {uri!r}")
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = _read_mcp_text(root, path, max_bytes=MCP_RESOURCE_MAX_BYTES)
+        except (FileNotFoundError, OSError, UnicodeDecodeError) as exc:
+            raise ValueError("unknown resource uri") from exc
         return {"uri": uri, "mimeType": "text/markdown", "text": str(redact_value(text))}
 
     if uri == "codebrain://report/status":
@@ -1416,25 +1735,27 @@ def _read_resource(root: Path, uri: str) -> dict[str, Any]:
 
         try:
             payload: Any = status_report(root)
-        except Exception as exc:
+        except Exception:
             # The resource is valid; status generation itself failed (e.g. uninitialized
             # repo). Surface a graceful body rather than masquerade as a bad-uri error.
-            payload = {"ok": False, "error": str(exc)}
+            payload = {"ok": False, "error": "status unavailable"}
         text = json.dumps(redact_value(payload), ensure_ascii=False, sort_keys=True, indent=2)
         return {"uri": uri, "mimeType": "application/json", "text": text}
 
     if uri == "codebrain://handoff/current":
         path = root / ".ai" / "memory" / "handoff.json"
-        if not path.is_file():
-            raise ValueError(f"unknown resource uri: {uri!r}")
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = _read_mcp_text(root, path, max_bytes=MCP_RESOURCE_MAX_BYTES)
+        except (FileNotFoundError, OSError, UnicodeDecodeError) as exc:
+            raise ValueError("unknown resource uri") from exc
         return {"uri": uri, "mimeType": "application/json", "text": str(redact_value(text))}
 
     if uri == "codebrain://session/current":
         path = root / ".ai" / "memory" / "session-current.md"
-        if not path.is_file():
-            raise ValueError(f"unknown resource uri: {uri!r}")
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = _read_mcp_text(root, path, max_bytes=MCP_RESOURCE_MAX_BYTES)
+        except (FileNotFoundError, OSError, UnicodeDecodeError) as exc:
+            raise ValueError("unknown resource uri") from exc
         return {"uri": uri, "mimeType": "text/markdown", "text": str(redact_value(text))}
 
     raise ValueError(f"unknown resource uri: {uri!r}")
@@ -1448,12 +1769,56 @@ def _err(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None:
+def _safe_handler_error(exc: BaseException) -> str:
+    if isinstance(exc, PermissionError):
+        return "operation not permitted"
+    if isinstance(exc, (ValueError, TypeError, OverflowError)):
+        return "invalid arguments"
+    if isinstance(exc, KeyError):
+        return "not found"
+    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
+        return "operation timed out"
+    if isinstance(exc, FileNotFoundError):
+        return "required file not found"
+    return "operation failed"
+
+
+def _validate_rpc_request(request: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not isinstance(request, dict):
+        return None, _err(None, -32600, "invalid request")
+    request_id = request.get("id")
+    if request.get("jsonrpc") not in (None, "2.0"):
+        return None, _err(request_id, -32600, "invalid request")
+    method = request.get("method")
+    if (
+        not isinstance(method, str)
+        or not method
+        or len(method) > MCP_METHOD_MAX_CHARS
+        or "\x00" in method
+    ):
+        return None, _err(request_id, -32600, "invalid request")
+    if "params" in request and request["params"] is not None and not isinstance(request["params"], dict):
+        return None, _err(request_id, -32602, "params must be an object")
+    if "id" in request:
+        if isinstance(request_id, bool) or not isinstance(request_id, (str, int, type(None))):
+            return None, _err(None, -32600, "invalid request id")
+        if isinstance(request_id, str) and len(request_id) > MCP_REQUEST_ID_MAX_CHARS:
+            return None, _err(None, -32600, "invalid request id")
+        if isinstance(request_id, int) and len(str(abs(request_id))) > MCP_REQUEST_ID_MAX_CHARS:
+            return None, _err(None, -32600, "invalid request id")
+    return request, None
+
+
+def handle_request(root: Path, request: Any) -> dict[str, Any] | None:
     """Route a single JSON-RPC message. Returns None for notifications (no response).
 
     Supports both standard MCP protocol (initialize, tools/list, tools/call, etc.)
     and direct tool-name dispatch (legacy/internal callers like ai-mcp --once-json).
     """
+    validated, validation_error = _validate_rpc_request(request)
+    if validation_error is not None or validated is None:
+        return validation_error
+    request = validated
     start = time.perf_counter()
     method = request.get("method")
     params = request.get("params") or {}
@@ -1482,9 +1847,9 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
         elif method == "tools/call":
             name = params.get("name")
             arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-            audit_tool_name = name if isinstance(name, str) else None
+            audit_tool_name = name if isinstance(name, str) and name in TOOL_NAMES else None
             if not isinstance(name, str) or name not in TOOL_NAMES:
-                response = _err(request_id, -32602, f"unknown tool: {name!r}")
+                response = _err(request_id, -32602, "unknown tool")
             else:
                 try:
                     tool_result = _dispatch_tool(root, name, arguments or {})
@@ -1505,7 +1870,7 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
                     response = _ok(
                         request_id,
                         {
-                            "content": [{"type": "text", "text": f"error: {exc}"}],
+                            "content": [{"type": "text", "text": _safe_handler_error(exc)}],
                             "isError": True,
                         },
                     )
@@ -1527,8 +1892,8 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
                 try:
                     contents = _read_resource(root, uri)
                     response = _ok(request_id, {"contents": [contents]})
-                except ValueError as exc:
-                    response = _err(request_id, -32602, str(exc))
+                except ValueError:
+                    response = _err(request_id, -32602, "invalid resource uri")
         elif method == "resources/templates/list":
             response = _ok(request_id, {"resourceTemplates": []})
         elif isinstance(method, str) and method in TOOL_NAMES:
@@ -1537,9 +1902,9 @@ def handle_request(root: Path, request: dict[str, Any]) -> dict[str, Any] | None
             result = _dispatch_tool(root, method, params if isinstance(params, dict) else {})
             response = _ok(request_id, result)
         else:
-            response = _err(request_id, -32601, f"method not found: {method}")
+            response = _err(request_id, -32601, "method not found")
     except Exception as exc:
-        response = _err(request_id, -32000, str(exc))
+        response = _err(request_id, -32000, _safe_handler_error(exc))
 
     record_mcp_request(
         root,
@@ -1566,9 +1931,20 @@ def record_mcp_request(
     if is_ci():
         return
     try:
+        known_method = method if method in {
+            "initialize",
+            "ping",
+            "tools/list",
+            "tools/call",
+            "prompts/list",
+            "prompts/get",
+            "resources/list",
+            "resources/read",
+            "resources/templates/list",
+        } or method in TOOL_NAMES else "unknown"
         event = {
             "hook": "mcp.request",
-            "method": method,
+            "method": known_method,
             "elapsed_ms": int((time.perf_counter() - start) * 1000),
             "request_bytes": len(json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")),
             "response_bytes": len(json.dumps(response, ensure_ascii=False, sort_keys=True).encode("utf-8")),
@@ -1582,17 +1958,56 @@ def record_mcp_request(
         pass
 
 
+def _read_stdio_line(stream: Any) -> tuple[str | None, bool]:
+    binary = getattr(stream, "buffer", None)
+    if binary is not None:
+        raw = binary.readline(MCP_STDIN_MAX_BYTES + 1)
+        if raw == b"":
+            return None, False
+        overflow = len(raw) > MCP_STDIN_MAX_BYTES
+        while overflow and raw and not raw.endswith(b"\n"):
+            raw = binary.readline(8192)
+        if overflow:
+            return "", True
+        try:
+            return raw.decode("utf-8"), False
+        except UnicodeDecodeError:
+            return "", False
+
+    line = stream.readline(MCP_STDIN_MAX_BYTES + 1)
+    if line == "":
+        return None, False
+    overflow = len(line.encode("utf-8", errors="replace")) > MCP_STDIN_MAX_BYTES
+    while overflow and line and not line.endswith("\n"):
+        line = stream.readline(8192)
+    return ("", True) if overflow else (line, False)
+
+
+def _serialize_stdio_response(response: dict[str, Any]) -> str:
+    serialized = json.dumps(response, ensure_ascii=False, sort_keys=True)
+    if len(serialized.encode("utf-8")) <= MCP_RESPONSE_MAX_BYTES:
+        return serialized
+    fallback = _err(response.get("id"), -32001, "response too large")
+    return json.dumps(fallback, ensure_ascii=False, sort_keys=True)
+
+
 def serve_stdio(root: Path) -> int:
-    for line in sys.stdin:
+    while True:
+        line, overflow = _read_stdio_line(sys.stdin)
+        if line is None:
+            break
+        if overflow:
+            print(_serialize_stdio_response(_err(None, -32600, "request too large")), flush=True)
+            continue
         if not line.strip():
             continue
         try:
             request = json.loads(line)
-        except json.JSONDecodeError as exc:
-            print(json.dumps(_err(None, -32700, f"parse error: {exc}"), ensure_ascii=False, sort_keys=True), flush=True)
+        except json.JSONDecodeError:
+            print(_serialize_stdio_response(_err(None, -32700, "parse error")), flush=True)
             continue
         response = handle_request(root, request)
         if response is None:
             continue
-        print(json.dumps(response, ensure_ascii=False, sort_keys=True), flush=True)
+        print(_serialize_stdio_response(response), flush=True)
     return 0

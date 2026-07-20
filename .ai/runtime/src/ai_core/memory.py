@@ -8,16 +8,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .portable import lock_exclusive_blocking, unlock
 from .private_write import (
     append_private_text,
     atomic_write_private_text,
+    iter_root_confined_text_lines,
+    list_root_confined_directory,
     private_file_lock,
+    read_root_confined_tail_bytes,
     read_root_confined_text,
+    validate_root_confined_regular_file,
 )
 from .redact import redact_value
 
 _AUDIT_THREAD_LOCK = threading.RLock()
+_AUDIT_FILE_MAX_COUNT = 256
+_AUDIT_LINE_MAX_BYTES = 1_000_000
+_AUDIT_ACTION_MAX_CHARS = 256
+_AUDIT_CATEGORY_MAX_CHARS = 128
+_JSONL_TAIL_MAX_LIMIT = 1_000
+_JSONL_TAIL_MIN_BYTES = 256 * 1024
+_JSONL_TAIL_MAX_BYTES = 8 * 1024 * 1024
+_JSONL_TAIL_BYTES_PER_ITEM = 64 * 1024
+_JSONL_LINE_MAX_BYTES = 1_000_000
+_JSONL_ROTATE_MAX_BYTES = 100_000_000
+_JSONL_ROTATE_MAX_LINES = 100_000
+_TEXT_TAIL_MAX_LINES = 1_000
+_TEXT_TAIL_MIN_BYTES = 64 * 1024
+_TEXT_TAIL_MAX_BYTES = 8 * 1024 * 1024
+_TEXT_TAIL_BYTES_PER_LINE = 64 * 1024
+_JSONL_ALL_MAX_BYTES = 100_000_000
+_JSONL_ALL_MAX_RECORDS = 100_000
+_OPEN_TODO_MAX_LIMIT = 1_000
 
 
 def now_iso() -> str:
@@ -28,12 +49,78 @@ def line_sha(line: str) -> str:
     return hashlib.sha256(line.encode("utf-8")).hexdigest()
 
 
-def _lock_exclusive(handle: Any) -> None:
-    lock_exclusive_blocking(handle)
+def _previous_audit_sha(path: Path, *, root: Path) -> str | None:
+    try:
+        data, _state, complete = read_root_confined_tail_bytes(
+            path,
+            root=root,
+            max_bytes=_AUDIT_LINE_MAX_BYTES + 1,
+            require_private=False,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
+    except FileNotFoundError:
+        return None
+    if not data:
+        return None
+    if not complete:
+        boundary = data.find(b"\n")
+        if boundary < 0:
+            raise OSError("previous audit record exceeds line limit")
+        data = data[boundary + 1:]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise OSError("audit tail is not valid UTF-8") from exc
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        if complete:
+            return None
+        raise OSError("previous audit record exceeds line limit")
+    last = lines[-1]
+    if len(last.encode("utf-8")) > _AUDIT_LINE_MAX_BYTES:
+        raise OSError("previous audit record exceeds line limit")
+    return line_sha(last)
 
 
-def _unlock(handle: Any) -> None:
-    unlock(handle)
+def _bounded_audit_line(
+    *,
+    timestamp: datetime,
+    action: object,
+    category: object,
+    payload: object,
+    prev_sha: str | None,
+) -> tuple[dict[str, Any], str]:
+    action_clean = str(redact_value(action))[:_AUDIT_ACTION_MAX_CHARS]
+    category_clean = str(redact_value(category))[:_AUDIT_CATEGORY_MAX_CHARS]
+    payload_clean = redact_value(payload)
+    record: dict[str, Any] = {
+        "ts": timestamp.isoformat().replace("+00:00", "Z"),
+        "monotonic_ns": time.monotonic_ns(),
+        "action": action_clean,
+        "category": category_clean,
+        "payload": payload_clean,
+        "prev_sha": prev_sha,
+    }
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = line.encode("utf-8")
+    if len(encoded) <= _AUDIT_LINE_MAX_BYTES:
+        return record, line
+    payload_bytes = json.dumps(
+        payload_clean,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    record["payload"] = {
+        "_truncated": True,
+        "bytes": len(payload_bytes),
+        "sha256": hashlib.sha256(payload_bytes).hexdigest(),
+    }
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(line.encode("utf-8")) > _AUDIT_LINE_MAX_BYTES:
+        raise OSError("audit record exceeds line limit")
+    return record, line
 
 
 def state_root_for_path(path: Path) -> Path:
@@ -61,10 +148,22 @@ def jsonl_lock_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.lock")
 
 
+def audit_transaction_lock_path(root: Path) -> Path:
+    return Path(root) / ".ai" / "memory" / ".audit-transaction.lock"
+
+
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path = Path(path)
     root = state_root_for_path(path)
-    line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    line = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if len(line.encode("utf-8")) > _JSONL_LINE_MAX_BYTES:
+        raise OSError("JSONL record exceeds line limit")
     with private_file_lock(jsonl_lock_path(path), root=root):
         append_private_text(path, line + "\n", root=root)
 
@@ -431,34 +530,59 @@ def append_session_note(root: Path, *, text: str) -> dict[str, Any]:
     text_clean = redact_value(str(text)).strip()
     if not text_clean:
         return {"ok": False, "reason": "empty_text"}
+    root = Path(root)
     path = session_current_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
     line = f"- [{now_iso()}] {text_clean[:1024]}\n"
-    if not path.exists():
-        path.write_text("# Current Session\n\n", encoding="utf-8")
-    else:
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
-        if size > _SESSION_NOTE_MAX_BYTES:
+    line_bytes = line.encode("utf-8")
+    max_bytes = max(2048, int(_SESSION_NOTE_MAX_BYTES))
+    keep_bytes = max(0, min(int(_SESSION_NOTE_KEEP_BYTES), max_bytes))
+    read_cap = max(max_bytes + keep_bytes + 65536, max_bytes * 2)
+    header = "# Current Session\n\n"
+    lock_path = jsonl_lock_path(path)
+    try:
+        with private_file_lock(lock_path, root=root):
+            recovered = False
             try:
-                raw = path.read_bytes()
-                tail = raw[-_SESSION_NOTE_KEEP_BYTES:]
-                nl = tail.find(b"\n")
-                if nl >= 0:
-                    tail = tail[nl + 1:]
-                path.write_bytes(b"# Current Session\n\n[rotated]\n" + tail)
-            except OSError:
-                pass
-    with path.open("a", encoding="utf-8") as handle:
-        _lock_exclusive(handle)
-        try:
-            handle.write(line)
-        finally:
-            _unlock(handle)
+                existing, _state = read_root_confined_text(
+                    path,
+                    root=root,
+                    max_bytes=read_cap,
+                    require_private=False,
+                    require_owner=True,
+                    reject_group_other_writable=True,
+                )
+            except FileNotFoundError:
+                existing = header
+            except (OSError, UnicodeDecodeError):
+                existing = header
+                recovered = True
+
+            raw = existing.encode("utf-8")
+            if len(raw) + len(line_bytes) > max_bytes:
+                marker = "[recovered]\n" if recovered else "[rotated]\n"
+                prefix = (header + marker).encode("utf-8")
+                tail_budget = max(0, min(keep_bytes, max_bytes - len(prefix) - len(line_bytes)))
+                tail = raw[-tail_budget:] if tail_budget else b""
+                newline = tail.find(b"\n")
+                if newline >= 0:
+                    tail = tail[newline + 1:]
+                content = (prefix + tail + line_bytes).decode("utf-8", errors="replace")
+            else:
+                if recovered and existing == header:
+                    existing += "[recovered]\n"
+                content = existing + line
+
+            atomic_write_private_text(path, content, root=root)
+    except OSError:
+        return {"ok": False, "reason": "write_error"}
+
+    try:
+        appended_bytes = len(line_bytes)
+        relative_path = str(path.relative_to(root))
+    except ValueError:
+        return {"ok": False, "reason": "write_error"}
     append_audit(root, action="memory.session_append", category="memory", payload={"bytes": len(line)})
-    return {"ok": True, "appended_bytes": len(line.encode("utf-8")), "path": str(path.relative_to(root))}
+    return {"ok": True, "appended_bytes": appended_bytes, "path": relative_path}
 
 
 def audit_path(root: Path, *, at: datetime | None = None) -> Path:
@@ -473,60 +597,63 @@ def all_audit_files(root: Path) -> list[Path]:
     min_signal) that must aggregate across year boundaries. Returns an empty
     list when the audit directory is missing.
     """
+    root = Path(root)
     d = root / ".ai" / "memory" / "audit"
     try:
-        state = d.lstat()
-    except OSError:
-        return []
-    import stat as stat_module
-
-    if not stat_module.S_ISDIR(state.st_mode) or stat_module.S_ISLNK(state.st_mode):
+        names = list_root_confined_directory(
+            d,
+            root=root,
+            max_entries=_AUDIT_FILE_MAX_COUNT,
+        )
+    except (FileNotFoundError, OSError):
         return []
     files: list[Path] = []
-    for path in sorted(d.glob("*.jsonl")):
-        try:
-            item_state = path.lstat()
-        except OSError:
+    for name in names:
+        if len(name) != 10 or not name[:4].isdigit() or name[4:] != ".jsonl":
             continue
-        if stat_module.S_ISREG(item_state.st_mode) and not stat_module.S_ISLNK(item_state.st_mode):
-            files.append(path)
+        path = d / name
+        try:
+            validate_root_confined_regular_file(
+                path,
+                root=root,
+                require_owner=True,
+                reject_group_other_writable=True,
+            )
+        except (FileNotFoundError, OSError):
+            continue
+        files.append(path)
     return files
 
 
 def append_audit(root: Path, *, action: str, category: str, payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(root)
     timestamp = datetime.now(timezone.utc)
     path = audit_path(root, at=timestamp)
     with _AUDIT_THREAD_LOCK:
-        with private_file_lock(jsonl_lock_path(path), root=root):
-            try:
-                text, _state = read_root_confined_text(
-                    path,
-                    root=root,
-                    max_bytes=100_000_000,
-                    require_private=False,
+        with private_file_lock(audit_transaction_lock_path(root), root=root):
+            with private_file_lock(jsonl_lock_path(path), root=root):
+                prev_sha = _previous_audit_sha(path, root=root)
+                record, line = _bounded_audit_line(
+                    timestamp=timestamp,
+                    action=action,
+                    category=category,
+                    payload=payload,
+                    prev_sha=prev_sha,
                 )
-            except FileNotFoundError:
-                text = ""
-            previous_lines = [line for line in text.splitlines() if line.strip()]
-            prev_sha = line_sha(previous_lines[-1]) if previous_lines else None
-            record = {
-                "ts": timestamp.isoformat().replace("+00:00", "Z"),
-                "monotonic_ns": time.monotonic_ns(),
-                "action": action,
-                "category": category,
-                "payload": redact_value(payload),
-                "prev_sha": prev_sha,
-            }
-            line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            append_private_text(path, line + "\n", root=root)
-    append_jsonl(
-        root / ".ai" / "memory" / "audit-index.jsonl",
-        {"ts": record["ts"], "category": category, "action": action, "path": path.relative_to(root).as_posix()},
-    )
+                append_private_text(path, line + "\n", root=root)
+            append_jsonl(
+                root / ".ai" / "memory" / "audit-index.jsonl",
+                {
+                    "ts": record["ts"],
+                    "category": record["category"],
+                    "action": record["action"],
+                    "path": path.relative_to(root).as_posix(),
+                },
+            )
     return record
 
 
-def rebuild_audit_index(root: Path) -> dict[str, Any]:
+def _rebuild_audit_index_locked(root: Path) -> dict[str, Any]:
     audit_root = root / ".ai" / "memory" / "audit"
     index_path = root / ".ai" / "memory" / "audit-index.jsonl"
     rows: list[dict[str, Any]] = []
@@ -576,15 +703,48 @@ def rebuild_audit_index(root: Path) -> dict[str, Any]:
     return result
 
 
+def rebuild_audit_index(root: Path) -> dict[str, Any]:
+    root = Path(root)
+    with _AUDIT_THREAD_LOCK:
+        with private_file_lock(audit_transaction_lock_path(root), root=root):
+            return _rebuild_audit_index_locked(root)
+
+
 def read_jsonl_tail(path: Path, limit: int) -> list[dict[str, Any]]:
-    if limit <= 0:
-        return []
     try:
-        lines = read_state_text(path).splitlines()
+        bounded_limit = max(0, min(_JSONL_TAIL_MAX_LIMIT, int(limit)))
+    except (TypeError, ValueError, OverflowError):
+        bounded_limit = 0
+    if bounded_limit <= 0:
+        return []
+    path = Path(path)
+    root = state_root_for_path(path)
+    byte_budget = min(
+        _JSONL_TAIL_MAX_BYTES,
+        max(_JSONL_TAIL_MIN_BYTES, bounded_limit * _JSONL_TAIL_BYTES_PER_ITEM),
+    )
+    try:
+        data, _state, complete = read_root_confined_tail_bytes(
+            path,
+            root=root,
+            max_bytes=byte_budget,
+            require_private=False,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
     except (OSError, UnicodeDecodeError):
         return []
+    if not complete:
+        boundary = data.find(b"\n")
+        if boundary < 0:
+            return []
+        data = data[boundary + 1:]
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return []
     out: list[dict[str, Any]] = []
-    for line in lines[-(limit * 4):]:
+    for line in lines[-(bounded_limit * 4):]:
         line = line.strip()
         if not line:
             continue
@@ -594,38 +754,55 @@ def read_jsonl_tail(path: Path, limit: int) -> list[dict[str, Any]]:
             continue
         if isinstance(entry, dict):
             out.append(entry)
-    return out[-limit:]
+    return out[-bounded_limit:]
 
 
 def read_jsonl_open_todos(path: Path, limit: int) -> list[dict[str, Any]]:
-    if limit <= 0:
-        return []
     try:
-        lines = read_state_text(path).splitlines()
-    except (OSError, UnicodeDecodeError):
+        bounded_limit = max(0, min(_OPEN_TODO_MAX_LIMIT, int(limit)))
+    except (TypeError, ValueError, OverflowError):
+        bounded_limit = 0
+    if bounded_limit <= 0:
         return []
+    path = Path(path)
+    root = state_root_for_path(path)
     latest: dict[str, dict[str, Any]] = {}
     order: list[str] = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        eid = str(entry.get("id") or "")
-        if not eid:
-            title = str(entry.get("title") or entry.get("text") or entry.get("summary") or "").strip()
-            if title:
-                eid = f"legacy:{title}"
-        if not eid:
-            continue
-        if eid not in latest:
-            order.append(eid)
-        latest[eid] = entry
+    seen_records = 0
+    try:
+        for line in iter_root_confined_text_lines(
+            path,
+            root=root,
+            max_bytes=_JSONL_ALL_MAX_BYTES,
+            max_line_bytes=_JSONL_LINE_MAX_BYTES,
+            require_private=False,
+            require_owner=True,
+            reject_group_other_writable=True,
+        ):
+            line = line.strip()
+            if not line:
+                continue
+            seen_records += 1
+            if seen_records > _JSONL_ALL_MAX_RECORDS:
+                return []
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            eid = str(entry.get("id") or "")
+            if not eid:
+                title = str(entry.get("title") or entry.get("text") or entry.get("summary") or "").strip()
+                if title:
+                    eid = f"legacy:{title}"
+            if not eid:
+                continue
+            if eid not in latest:
+                order.append(eid)
+            latest[eid] = entry
+    except (OSError, UnicodeDecodeError):
+        return []
     open_items: list[dict[str, Any]] = []
     for eid in order:
         entry = latest[eid]
@@ -633,38 +810,77 @@ def read_jsonl_open_todos(path: Path, limit: int) -> list[dict[str, Any]]:
         if status in {"done", "closed", "completed", "cancelled", "canceled"}:
             continue
         open_items.append(entry)
-        if len(open_items) >= limit:
+        if len(open_items) >= bounded_limit:
             break
     return open_items
 
 
 def read_jsonl_all(path: Path) -> list[dict[str, Any]]:
+    path = Path(path)
+    root = state_root_for_path(path)
+    out: list[dict[str, Any]] = []
+    seen_records = 0
     try:
-        lines = read_state_text(path).splitlines()
+        for line in iter_root_confined_text_lines(
+            path,
+            root=root,
+            max_bytes=_JSONL_ALL_MAX_BYTES,
+            max_line_bytes=_JSONL_LINE_MAX_BYTES,
+            require_private=False,
+            require_owner=True,
+            reject_group_other_writable=True,
+        ):
+            line = line.strip()
+            if not line:
+                continue
+            seen_records += 1
+            if seen_records > _JSONL_ALL_MAX_RECORDS:
+                return []
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                out.append(entry)
     except (OSError, UnicodeDecodeError):
         return []
-    out: list[dict[str, Any]] = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(entry, dict):
-            out.append(entry)
     return out
 
 
 def read_text_tail(path: Path, lines: int) -> str:
-    if lines <= 0:
-        return ""
     try:
-        text = read_state_text(path)
-    except (OSError, UnicodeDecodeError):
+        line_cap = max(0, min(_TEXT_TAIL_MAX_LINES, int(lines)))
+    except (TypeError, ValueError, OverflowError):
+        line_cap = 0
+    if line_cap <= 0:
         return ""
-    tail = text.rstrip().splitlines()[-lines:]
+    path = Path(path)
+    root = state_root_for_path(path)
+    byte_budget = min(
+        _TEXT_TAIL_MAX_BYTES,
+        max(_TEXT_TAIL_MIN_BYTES, line_cap * _TEXT_TAIL_BYTES_PER_LINE),
+    )
+    try:
+        data, _state, complete = read_root_confined_tail_bytes(
+            path,
+            root=root,
+            max_bytes=byte_budget,
+            require_private=False,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
+    except OSError:
+        return ""
+    if not complete:
+        boundary = data.find(b"\n")
+        if boundary < 0:
+            return ""
+        data = data[boundary + 1:]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    tail = text.rstrip().splitlines()[-line_cap:]
     return "\n".join(tail)
 
 
@@ -680,32 +896,37 @@ def rotate_jsonl_tail(
     root = state_root_for_path(path)
     rel = path.as_posix()
     try:
-        text, state = read_root_confined_text(
+        byte_cap = max(0, min(_JSONL_ROTATE_MAX_BYTES, int(max_bytes)))
+        line_cap = max(0, min(_JSONL_ROTATE_MAX_LINES, int(keep_lines)))
+    except (TypeError, ValueError, OverflowError):
+        return {"ok": False, "path": rel, "exists": False, "rotated": False, "error": "invalid_bounds"}
+    try:
+        state = validate_root_confined_regular_file(
             path,
             root=root,
-            max_bytes=max(100_000_000, int(max_bytes) * 8),
-            require_private=False,
+            require_owner=True,
+            reject_group_other_writable=True,
         )
         before = int(state.st_size)
     except FileNotFoundError:
         return {"ok": True, "path": rel, "exists": False, "rotated": False, "bytes_before": 0, "bytes_after": 0}
-    except (OSError, UnicodeDecodeError) as exc:
-        return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": str(exc)}
-    if before <= max_bytes:
+    except OSError as exc:
+        return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": type(exc).__name__}
+    if before <= byte_cap:
         return {"ok": True, "path": rel, "exists": True, "rotated": False, "bytes_before": before, "bytes_after": before}
 
     try:
         with private_file_lock(jsonl_lock_path(path), root=root):
-            # Re-read under the same lock used by append_jsonl so concurrent
-            # appends cannot be lost between the size check and replacement.
-            text, state = read_root_confined_text(
+            data, state, complete = read_root_confined_tail_bytes(
                 path,
                 root=root,
-                max_bytes=max(100_000_000, int(max_bytes) * 8),
+                max_bytes=byte_cap + _JSONL_LINE_MAX_BYTES + 1,
                 require_private=False,
+                require_owner=True,
+                reject_group_other_writable=True,
             )
             before = int(state.st_size)
-            if before <= max_bytes:
+            if before <= byte_cap:
                 return {
                     "ok": True,
                     "path": rel,
@@ -714,21 +935,24 @@ def rotate_jsonl_tail(
                     "bytes_before": before,
                     "bytes_after": before,
                 }
+            if not complete:
+                boundary = data.find(b"\n")
+                data = data[boundary + 1:] if boundary >= 0 else b""
+            text = data.decode("utf-8")
             lines = text.splitlines()
-            tail = lines[-max(1, int(keep_lines)):]
+            tail = lines[-line_cap:] if line_cap else []
             kept_reversed: list[str] = []
             total = 0
             for line in reversed(tail):
                 line_bytes = len((line + "\n").encode("utf-8"))
-                if kept_reversed and total + line_bytes > max_bytes:
+                if line_bytes > byte_cap:
+                    continue
+                if total + line_bytes > byte_cap:
                     break
                 kept_reversed.append(line)
                 total += line_bytes
-                if total >= max_bytes:
+                if total >= byte_cap:
                     break
-            if not kept_reversed and tail:
-                kept_reversed.append(tail[-1])
-                total = len((tail[-1] + "\n").encode("utf-8"))
             kept = list(reversed(kept_reversed))
             replacement = ("\n".join(kept) + "\n") if kept else ""
             after = len(replacement.encode("utf-8"))
@@ -744,9 +968,10 @@ def rotate_jsonl_tail(
                 "bytes_after": after,
                 "lines_before": len(lines),
                 "lines_after": len(kept),
+                "tail_complete": complete,
             }
-    except OSError as exc:
-        return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": str(exc)}
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": type(exc).__name__}
 
 
 EVENTS_MAX_BYTES = 4_000_000  # events.jsonl is hook telemetry mined only for RECENT command

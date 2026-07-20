@@ -20,9 +20,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
+
+from .private_write import read_root_confined_text, validate_root_confined_directory
 
 
 def astgrep_available() -> bool:
@@ -32,6 +34,59 @@ def astgrep_available() -> bool:
 
 def _binary() -> str | None:
     return shutil.which("ast-grep") or shutil.which("sg")
+
+
+AST_PATTERN_MAX_CHARS = 4096
+AST_RULE_MAX_CHARS = 64 * 1024
+AST_PATH_MAX_CHARS = 1024
+AST_RESULT_MAX = 100
+AST_SCAN_MAX_FINDINGS = 2_000
+AST_OUTPUT_MAX_BYTES = 2 * 1024 * 1024
+AST_OUTPUT_MAX_EVENTS = 2_000
+AST_TIMEOUT_MAX_SECONDS = 30.0
+AST_MATERIALIZE_MAX_FILES = 5_000
+AST_MATERIALIZE_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _normalise_timeout(value: object, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    if parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        parsed = default
+    return max(0.1, min(AST_TIMEOUT_MAX_SECONDS, parsed))
+
+
+def _parse_findings(lines: list[str], *, max_findings: int) -> list[dict[str, Any]]:
+    cap = max(0, min(AST_SCAN_MAX_FINDINGS, int(max_findings)))
+    if cap == 0:
+        return []
+    stripped = "\n".join(lines).strip()
+    if not stripped:
+        return []
+    if stripped.startswith("["):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)][:cap]
+    findings: list[dict[str, Any]] = []
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            findings.append(item)
+            if len(findings) >= cap:
+                break
+    return findings
 
 
 # Minimal cross-language ruleset. Each rule must be a valid ast-grep rule
@@ -86,12 +141,17 @@ def scan_path(
         return []
 
     p = Path(path)
-    if not p.exists():
+    try:
+        state = p.lstat()
+    except OSError:
+        return []
+    if p.is_symlink() or not (p.is_file() or p.is_dir()):
         return []
 
     yaml_body = rule_yaml if rule_yaml is not None else _DEFAULT_RULES
+    if "\x00" in yaml_body or len(yaml_body) > AST_RULE_MAX_CHARS:
+        return []
 
-    findings: list[dict] = []
     with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
         rule_file = Path(tmp) / "rules.yml"
         try:
@@ -107,43 +167,16 @@ def scan_path(
             "--json=stream",
             str(p),
         ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                timeout=timeout_seconds,
-                capture_output=True,
-                text=True,
-                check=False,
-                shell=False,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return []
+        from .search import _run_process_lines_bounded
 
-        stdout = proc.stdout or ""
-        # ast-grep --json=stream emits NDJSON. Older versions emit a single
-        # JSON array — handle both.
-        stripped = stdout.strip()
-        if not stripped:
-            return []
-        if stripped.startswith("["):
-            try:
-                data = json.loads(stripped)
-                if isinstance(data, list):
-                    return [d for d in data if isinstance(d, dict)]
-            except json.JSONDecodeError:
-                return []
-            return []
-        for line in stripped.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                findings.append(obj)
-    return findings
+        lines = _run_process_lines_bounded(
+            cmd,
+            timeout_seconds=_normalise_timeout(timeout_seconds, default=5.0),
+            max_output_bytes=AST_OUTPUT_MAX_BYTES,
+            max_events=AST_OUTPUT_MAX_EVENTS,
+            require_complete=True,
+        )
+        return _parse_findings(lines, max_findings=AST_SCAN_MAX_FINDINGS)
 
 
 _SG_LANGS = {
@@ -151,6 +184,71 @@ _SG_LANGS = {
     "go", "rust", "rs", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "scala",
 }
 _SG_LANG_ALIAS = {"py": "python", "js": "javascript", "ts": "typescript", "rs": "rust"}
+_SG_LANG_SUFFIXES = {
+    "python": {".py"},
+    "javascript": {".js", ".jsx"},
+    "jsx": {".jsx"},
+    "typescript": {".ts", ".tsx"},
+    "tsx": {".tsx"},
+    "go": {".go"},
+    "rust": {".rs"},
+    "java": {".java"},
+    "c": {".c", ".h"},
+    "cpp": {".cc", ".cpp", ".cxx", ".h", ".hpp"},
+    "ruby": {".rb"},
+    "php": {".php"},
+    "kotlin": {".kt", ".kts"},
+    "swift": {".swift"},
+    "scala": {".scala"},
+}
+
+
+def _normalise_result_limit(value: object, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(1, min(AST_RESULT_MAX, parsed))
+
+
+def _normalise_scope_path(value: object) -> tuple[Path | None, str | None]:
+    if value is None or str(value).strip() == "":
+        return None, None
+    raw = str(value).strip()
+    if raw in {".", "./"}:
+        return None, None
+    if "\x00" in raw:
+        return None, "invalid path control character"
+    if len(raw) > AST_PATH_MAX_CHARS:
+        return None, "path too long"
+    path = Path(raw)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        return None, "path escapes repo"
+    return path, None
+
+
+def _finding_repo_path(
+    raw: object,
+    *,
+    mirror_root: Path,
+    exact_scope: Path | None,
+) -> str | None:
+    value = str(raw or "").strip()
+    if not value or "\x00" in value:
+        return None
+    path = Path(value)
+    if path.is_absolute():
+        try:
+            return path.relative_to(mirror_root).as_posix()
+        except ValueError:
+            return None
+    if exact_scope is not None and (len(path.parts) == 1 or path == exact_scope.name):
+        return exact_scope.as_posix()
+    if path.parts and path.parts[0] == mirror_root.name:
+        path = Path(*path.parts[1:])
+    if ".." in path.parts or not path.parts:
+        return None
+    return path.as_posix()
 
 
 def ast_grep_search(
@@ -174,31 +272,119 @@ def ast_grep_search(
     pat = str(pattern or "").strip()
     if not pat:
         return {"ok": False, "reason": "empty pattern", "matches": []}
-    # scope target strictly inside the repo (no traversal outside root)
-    root = Path(root).resolve()
-    target = root
-    if path:
-        cand = (root / path).resolve()
-        if root == cand or root in cand.parents:
-            target = cand
-        else:
-            return {"ok": False, "reason": "path escapes repo", "matches": []}
+    if "\x00" in pat:
+        return {"ok": False, "reason": "invalid pattern control character", "matches": []}
+    if len(pat) > AST_PATTERN_MAX_CHARS:
+        return {"ok": False, "reason": "pattern too long", "matches": []}
+    scope_rel, path_reason = _normalise_scope_path(path)
+    if path_reason:
+        return {"ok": False, "reason": path_reason, "matches": []}
+    result_limit = _normalise_result_limit(max_results, default=40)
+    timeout = _normalise_timeout(timeout_seconds, default=8.0)
+    root = Path(os.path.abspath(root))
     if not astgrep_available():
         return {"ok": False, "reason": "ast-grep not installed", "matches": []}
     rule_yaml = "id: cb-search\nlanguage: {lang}\nrule:\n  pattern: |\n    {pat}\n".format(
         lang=lang_norm, pat=pat.replace("\n", "\n    "))
     from .redact import redact_value
+    from .search import MAX_TEXT_BYTES, _is_indexable_text_file, iter_text_files
 
-    findings = scan_path(target, rule_yaml, timeout_seconds=timeout_seconds)
-    matches: list[dict] = []
-    for f in findings[: max(1, int(max_results))]:
-        rng = f.get("range") if isinstance(f, dict) else None
-        start = (rng or {}).get("start") if isinstance(rng, dict) else None
-        line = (start or {}).get("line") if isinstance(start, dict) else None
-        rel = str(f.get("file", ""))
-        text = str(redact_value(str(f.get("text", ""))))[:200]
-        matches.append({"file": rel, "line": (line + 1) if isinstance(line, int) else None, "text": text})
-    return {"ok": True, "count": len(matches), "lang": lang_norm, "matches": matches}
+    exact_scope: Path | None = None
+    if scope_rel is not None:
+        scoped_source = root / scope_rel
+        if _is_indexable_text_file(root, scoped_source):
+            exact_scope = scope_rel
+        else:
+            try:
+                validate_root_confined_directory(
+                    scoped_source,
+                    root=root,
+                    require_safe_permissions=True,
+                )
+            except OSError:
+                return {"ok": False, "reason": "path unavailable", "matches": []}
+
+    suffixes = _SG_LANG_SUFFIXES.get(lang_norm, set())
+    with tempfile.TemporaryDirectory(prefix="cb-astgrep-search-") as tmp:
+        mirror_root = Path(tmp) / "workspace"
+        mirror_root.mkdir(mode=0o700)
+        copied_files = 0
+        copied_bytes = 0
+        overflow = False
+        for source in iter_text_files(root):
+            try:
+                rel = source.relative_to(root)
+            except ValueError:
+                continue
+            if exact_scope is not None:
+                if rel != exact_scope:
+                    continue
+            elif scope_rel is not None and scope_rel not in rel.parents:
+                continue
+            if suffixes and source.suffix.casefold() not in suffixes:
+                continue
+            try:
+                content, state = read_root_confined_text(
+                    source,
+                    root=root,
+                    max_bytes=MAX_TEXT_BYTES,
+                    require_private=False,
+                    require_owner=True,
+                    reject_group_other_writable=True,
+                )
+            except (OSError, UnicodeDecodeError):
+                continue
+            encoded_size = len(content.encode("utf-8"))
+            if (
+                copied_files >= AST_MATERIALIZE_MAX_FILES
+                or copied_bytes + encoded_size > AST_MATERIALIZE_MAX_BYTES
+            ):
+                overflow = True
+                break
+            destination = mirror_root / rel
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            destination.write_text(content, encoding="utf-8")
+            if os.name != "nt":
+                destination.chmod(0o600)
+            copied_files += 1
+            copied_bytes += int(state.st_size)
+        if overflow:
+            return {"ok": False, "reason": "search scope too large", "matches": []}
+        if copied_files == 0:
+            return {"ok": True, "count": 0, "lang": lang_norm, "matches": []}
+        if exact_scope is not None:
+            target = mirror_root / exact_scope
+        elif scope_rel is not None:
+            target = mirror_root / scope_rel
+            target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        else:
+            target = mirror_root
+        findings = scan_path(target, rule_yaml, timeout_seconds=timeout)
+        matches: list[dict] = []
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            rel = _finding_repo_path(
+                finding.get("file"),
+                mirror_root=mirror_root,
+                exact_scope=exact_scope,
+            )
+            if rel is None:
+                continue
+            rng = finding.get("range") if isinstance(finding.get("range"), dict) else None
+            start = (rng or {}).get("start") if isinstance(rng, dict) else None
+            line = (start or {}).get("line") if isinstance(start, dict) else None
+            text = str(redact_value(str(finding.get("text", ""))))[:200]
+            matches.append(
+                {
+                    "file": rel,
+                    "line": (line + 1) if isinstance(line, int) and line >= 0 else None,
+                    "text": text,
+                }
+            )
+            if len(matches) >= result_limit:
+                break
+        return {"ok": True, "count": len(matches), "lang": lang_norm, "matches": matches}
 
 
 def extract_symbols_js(file_path: str) -> list[dict]:
@@ -247,59 +433,7 @@ severity: info
 message: class
 """
 
-    findings: list[dict] = []
-    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
-        rule_file = Path(tmp) / "rules.yml"
-        try:
-            rule_file.write_text(rule_yaml, encoding="utf-8")
-        except OSError:
-            return []
-
-        cmd = [
-            binary,
-            "scan",
-            "--rule",
-            str(rule_file),
-            "--json=stream",
-            str(p),
-        ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                timeout=10.0,
-                capture_output=True,
-                text=True,
-                check=False,
-                shell=False,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return []
-
-        # Parse best-effort: extract lineno from matched nodes
-        stdout = proc.stdout or ""
-        stripped = stdout.strip()
-        if not stripped:
-            return []
-
-        # Handle both NDJSON and JSON array formats
-        if stripped.startswith("["):
-            try:
-                data = json.loads(stripped)
-                if isinstance(data, list):
-                    findings = [d for d in data if isinstance(d, dict)]
-            except json.JSONDecodeError:
-                return []
-        else:
-            for line in stripped.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    if isinstance(obj, dict):
-                        findings.append(obj)
-                except json.JSONDecodeError:
-                    continue
+    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
 
     # Transform ast-grep findings into symbol records
     symbols: list[dict] = []
@@ -369,57 +503,7 @@ severity: info
 message: call
 """
 
-    findings: list[dict] = []
-    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
-        rule_file = Path(tmp) / "rules.yml"
-        try:
-            rule_file.write_text(rule_yaml, encoding="utf-8")
-        except OSError:
-            return []
-
-        cmd = [
-            binary,
-            "scan",
-            "--rule",
-            str(rule_file),
-            "--json=stream",
-            str(p),
-        ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                timeout=10.0,
-                capture_output=True,
-                text=True,
-                check=False,
-                shell=False,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return []
-
-        stdout = proc.stdout or ""
-        stripped = stdout.strip()
-        if not stripped:
-            return []
-
-        if stripped.startswith("["):
-            try:
-                data = json.loads(stripped)
-                if isinstance(data, list):
-                    findings = [d for d in data if isinstance(d, dict)]
-            except json.JSONDecodeError:
-                return []
-        else:
-            for line in stripped.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    if isinstance(obj, dict):
-                        findings.append(obj)
-                except json.JSONDecodeError:
-                    continue
+    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
 
     calls: list[dict] = []
     for finding in findings:
@@ -491,43 +575,7 @@ severity: info
 message: function
 """
 
-    findings: list[dict] = []
-    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
-        rule_file = Path(tmp) / "rules.yml"
-        try:
-            rule_file.write_text(rule_yaml, encoding="utf-8")
-        except OSError:
-            return []
-
-        cmd = [binary, "scan", "--rule", str(rule_file), "--json=stream", str(p)]
-        try:
-            proc = subprocess.run(
-                cmd, timeout=10.0, capture_output=True, text=True, check=False, shell=False
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return []
-
-        stdout = proc.stdout or ""
-        stripped = stdout.strip()
-        if not stripped:
-            return []
-
-        if stripped.startswith("["):
-            try:
-                data = json.loads(stripped)
-                findings = [d for d in data if isinstance(d, dict)]
-            except json.JSONDecodeError:
-                return []
-        else:
-            for line in stripped.splitlines():
-                line = line.strip()
-                if line:
-                    try:
-                        obj = json.loads(line)
-                        if isinstance(obj, dict):
-                            findings.append(obj)
-                    except json.JSONDecodeError:
-                        pass
+    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
 
     symbols: list[dict] = []
     for finding in findings:
@@ -581,43 +629,7 @@ severity: info
 message: call
 """
 
-    findings: list[dict] = []
-    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
-        rule_file = Path(tmp) / "rules.yml"
-        try:
-            rule_file.write_text(rule_yaml, encoding="utf-8")
-        except OSError:
-            return []
-
-        cmd = [binary, "scan", "--rule", str(rule_file), "--json=stream", str(p)]
-        try:
-            proc = subprocess.run(
-                cmd, timeout=10.0, capture_output=True, text=True, check=False, shell=False
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return []
-
-        stdout = proc.stdout or ""
-        stripped = stdout.strip()
-        if not stripped:
-            return []
-
-        if stripped.startswith("["):
-            try:
-                data = json.loads(stripped)
-                findings = [d for d in data if isinstance(d, dict)]
-            except json.JSONDecodeError:
-                return []
-        else:
-            for line in stripped.splitlines():
-                line = line.strip()
-                if line:
-                    try:
-                        obj = json.loads(line)
-                        if isinstance(obj, dict):
-                            findings.append(obj)
-                    except json.JSONDecodeError:
-                        pass
+    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
 
     calls: list[dict] = []
     for finding in findings:
@@ -667,43 +679,7 @@ severity: info
 message: function
 """
 
-    findings: list[dict] = []
-    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
-        rule_file = Path(tmp) / "rules.yml"
-        try:
-            rule_file.write_text(rule_yaml, encoding="utf-8")
-        except OSError:
-            return []
-
-        cmd = [binary, "scan", "--rule", str(rule_file), "--json=stream", str(p)]
-        try:
-            proc = subprocess.run(
-                cmd, timeout=10.0, capture_output=True, text=True, check=False, shell=False
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return []
-
-        stdout = proc.stdout or ""
-        stripped = stdout.strip()
-        if not stripped:
-            return []
-
-        if stripped.startswith("["):
-            try:
-                data = json.loads(stripped)
-                findings = [d for d in data if isinstance(d, dict)]
-            except json.JSONDecodeError:
-                return []
-        else:
-            for line in stripped.splitlines():
-                line = line.strip()
-                if line:
-                    try:
-                        obj = json.loads(line)
-                        if isinstance(obj, dict):
-                            findings.append(obj)
-                    except json.JSONDecodeError:
-                        pass
+    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
 
     symbols: list[dict] = []
     for finding in findings:
@@ -757,43 +733,7 @@ severity: info
 message: call
 """
 
-    findings: list[dict] = []
-    with tempfile.TemporaryDirectory(prefix="cb-astgrep-") as tmp:
-        rule_file = Path(tmp) / "rules.yml"
-        try:
-            rule_file.write_text(rule_yaml, encoding="utf-8")
-        except OSError:
-            return []
-
-        cmd = [binary, "scan", "--rule", str(rule_file), "--json=stream", str(p)]
-        try:
-            proc = subprocess.run(
-                cmd, timeout=10.0, capture_output=True, text=True, check=False, shell=False
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return []
-
-        stdout = proc.stdout or ""
-        stripped = stdout.strip()
-        if not stripped:
-            return []
-
-        if stripped.startswith("["):
-            try:
-                data = json.loads(stripped)
-                findings = [d for d in data if isinstance(d, dict)]
-            except json.JSONDecodeError:
-                return []
-        else:
-            for line in stripped.splitlines():
-                line = line.strip()
-                if line:
-                    try:
-                        obj = json.loads(line)
-                        if isinstance(obj, dict):
-                            findings.append(obj)
-                    except json.JSONDecodeError:
-                        pass
+    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
 
     calls: list[dict] = []
     for finding in findings:

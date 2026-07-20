@@ -498,9 +498,8 @@ def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
     recent: set[str] = set()
     for audit_file in audit_files:
-        try:
-            content = audit_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        content = _read_hook_state_text(root, audit_file)
+        if not content:
             continue
         for line in content.splitlines():
             line = line.strip()
@@ -576,9 +575,8 @@ def _cooldown_weights(
 
     latest: dict[str, datetime] = {}
     for audit_file in audit_files:
-        try:
-            content = audit_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        content = _read_hook_state_text(root, audit_file)
+        if not content:
             continue
         for line in content.splitlines():
             line = line.strip()
@@ -641,9 +639,8 @@ def _adaptive_half_life(root: Path, base_half_life: float) -> float:
     rejected = 0
     surfaced = 0
     for audit_file in audit_files:
-        try:
-            content = audit_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        content = _read_hook_state_text(root, audit_file)
+        if not content:
             continue
         for line in content.splitlines():
             line = line.strip()
@@ -740,9 +737,8 @@ def _adaptive_min_signal_from_satisfaction(root: Path, base: int) -> int:
     surfaced = 0
     acted = 0
     for audit_file in audit_files:
-        try:
-            content = audit_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        content = _read_hook_state_text(root, audit_file)
+        if not content:
             continue
         for line in content.splitlines():
             line = line.strip()
@@ -1087,25 +1083,22 @@ def _try_autonomous_accept(root: Path, trigger: str) -> None:
     from datetime import datetime, timedelta, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
     for af in audit_files:
-        try:
-            for line in af.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line or "skill.auto_accept" not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                ts = str(rec.get("ts") or "")
-                try:
-                    parsed = (datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
-                              if ts.endswith("Z") else datetime.fromisoformat(ts))
-                except ValueError:
-                    continue
-                if parsed >= cutoff:
-                    return  # already auto-accepted recently
-        except OSError:
-            continue
+        for line in _read_hook_state_text(root, af).splitlines():
+            line = line.strip()
+            if not line or "skill.auto_accept" not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = str(rec.get("ts") or "")
+            try:
+                parsed = (datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
+                          if ts.endswith("Z") else datetime.fromisoformat(ts))
+            except ValueError:
+                continue
+            if parsed >= cutoff:
+                return  # already auto-accepted recently
 
     # find strongest eligible candidate
     try:
@@ -1281,9 +1274,8 @@ def _satisfaction_summary_context_uncached(root: Path) -> str:
     acted_ids: set[str] = set()
     surfaced_records: list[tuple[datetime, str]] = []
     for audit_file in audit_files:
-        try:
-            content = audit_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        content = _read_hook_state_text(root, audit_file)
+        if not content:
             continue
         for line in content.splitlines():
             line = line.strip()
@@ -1394,9 +1386,8 @@ def _compact_meta_line(root: Path) -> str:
         surfaced = 0
         acted = 0
         for audit_file in audit_files:
-            try:
-                content = audit_file.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            content = _read_hook_state_text(root, audit_file)
+            if not content:
                 continue
             for line in content.splitlines():
                 line = line.strip()
@@ -2110,13 +2101,14 @@ def _failure_live_versions(root: Path) -> dict[str, str]:
     """Optional on-disk environment snapshot for the version-diff re-test. Fail-soft → {}."""
     path = root / ".ai" / "memory" / "env-versions.json"
     try:
-        if not path.exists() or path.stat().st_size > 64_000:
+        content = _read_hook_state_text(root, path, max_bytes=64_000)
+        if not content:
             return {}
         import json as _json
 
         from .redact import redact_value
 
-        data = _json.loads(path.read_text(encoding="utf-8"))
+        data = _json.loads(content)
         if not isinstance(data, dict):
             return {}
         return {str(k)[:40]: str(redact_value(str(v)))[:60] for k, v in list(data.items())[:64]}

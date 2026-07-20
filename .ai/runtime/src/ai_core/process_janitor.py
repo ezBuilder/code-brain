@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -19,6 +20,7 @@ from .redact import redact_value
 DEFAULT_TTL_SECONDS = 900
 REGISTRY_MAX_RECORDS = 100
 REGISTRY_MAX_BYTES = 1_000_000
+REGISTRY_MAX_FUTURE_SKEW_SECONDS = 300.0
 
 
 def registry_path(root: Path) -> Path:
@@ -29,18 +31,54 @@ def registry_lock_path(root: Path) -> Path:
     return root / ".ai" / "cache" / ".child-processes.lock"
 
 
+def _bounded_record(
+    *,
+    pid: int,
+    kind: Any,
+    command: Any,
+    created_at: float,
+    identity: Any,
+) -> dict[str, Any]:
+    command_parts = command if isinstance(command, (list, tuple)) else []
+    return {
+        "pid": int(pid),
+        "kind": str(kind or "")[:64],
+        "command": redact_value([str(part)[:240] for part in command_parts[:12]]),
+        "created_at": float(created_at),
+        "identity": str(identity or "")[:128] or None,
+    }
+
+
+def _coerce_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        pid = int(value.get("pid") or 0)
+        created_at = float(value.get("created_at"))
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0 or not math.isfinite(created_at):
+        return None
+    return _bounded_record(
+        pid=pid,
+        kind=value.get("kind"),
+        command=value.get("command"),
+        created_at=created_at,
+        identity=value.get("identity"),
+    )
+
+
 def register_child(root: Path, *, pid: int, kind: str, command: list[str]) -> None:
     if pid <= 0:
         return
     path = registry_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    record = {
-        "pid": int(pid),
-        "kind": str(kind)[:64],
-        "command": redact_value([str(part)[:240] for part in command[:12]]),
-        "created_at": time.time(),
-        "identity": _process_identity(pid),
-    }
+    record = _bounded_record(
+        pid=pid,
+        kind=kind,
+        command=command,
+        created_at=time.time(),
+        identity=_process_identity(pid),
+    )
     try:
         with private_file_lock(registry_lock_path(root), root=root):
             rows: list[dict[str, Any]] = []
@@ -58,8 +96,9 @@ def register_child(root: Path, *, pid: int, kind: str, command: list[str]) -> No
                         prior = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if isinstance(prior, dict):
-                        rows.append(redact_value(prior))
+                    bounded = _coerce_record(prior)
+                    if bounded is not None:
+                        rows.append(bounded)
             except (OSError, UnicodeDecodeError):
                 rows = []
             rows = rows[-(REGISTRY_MAX_RECORDS - 1) :]
@@ -87,8 +126,12 @@ def cleanup_children(root: Path, *, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> d
 def _cleanup_children_locked(root: Path, *, ttl_seconds: int) -> dict[str, Any]:
     path = registry_path(root)
     now = time.time()
-    checked = killed = alive = reused = unverified = malformed = 0
+    checked = killed = alive = reused = unverified = malformed = clock_skew = 0
     kept: list[dict[str, Any]] = []
+    try:
+        ttl = max(0.0, float(ttl_seconds))
+    except (TypeError, ValueError):
+        ttl = float(DEFAULT_TTL_SECONDS)
     try:
         text, _state = read_root_confined_text(
             path,
@@ -123,28 +166,50 @@ def _cleanup_children_locked(root: Path, *, ttl_seconds: int) -> dict[str, Any]:
         checked += 1
         if not _pid_alive(pid):
             continue
+        try:
+            created_at = float(record.get("created_at"))
+        except (TypeError, ValueError):
+            malformed += 1
+            continue
+        if not math.isfinite(created_at):
+            malformed += 1
+            continue
+        if created_at > now + REGISTRY_MAX_FUTURE_SKEW_SECONDS:
+            created_at = now
+            clock_skew += 1
         registered_identity = str(record.get("identity") or "")
         current_identity = _process_identity(pid)
         if not registered_identity or not current_identity:
             unverified += 1
             alive += 1
-            kept.append(record)
+            kept.append(
+                _bounded_record(
+                    pid=pid,
+                    kind=record.get("kind"),
+                    command=record.get("command"),
+                    created_at=created_at,
+                    identity=registered_identity,
+                )
+            )
             continue
         if current_identity != registered_identity:
             reused += 1
             continue
-        try:
-            created_at = float(record.get("created_at") or now)
-        except (TypeError, ValueError):
-            malformed += 1
-            continue
         age = now - created_at
-        if age >= ttl_seconds:
+        if age >= ttl:
             if _terminate_if_identity_matches(pid, registered_identity):
                 killed += 1
                 continue
         alive += 1
-        kept.append(record)
+        kept.append(
+            _bounded_record(
+                pid=pid,
+                kind=record.get("kind"),
+                command=record.get("command"),
+                created_at=created_at,
+                identity=registered_identity,
+            )
+        )
     try:
         atomic_write_private_text(
             path,
@@ -164,6 +229,7 @@ def _cleanup_children_locked(root: Path, *, ttl_seconds: int) -> dict[str, Any]:
         "reused": reused,
         "unverified": unverified,
         "malformed": malformed,
+        "clock_skew": clock_skew,
     }
 
 

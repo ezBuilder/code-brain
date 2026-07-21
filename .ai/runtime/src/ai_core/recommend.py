@@ -25,7 +25,6 @@ from .memory import (
     append_jsonl,
     audit_path,
     decisions_path,
-    jsonl_lock_path,
     now_iso,
     read_jsonl_all,
     read_jsonl_open_todos,
@@ -34,7 +33,6 @@ from .memory import (
     session_current_path,
     todos_path,
 )
-from .private_write import atomic_write_private_text, private_file_lock, read_root_confined_text
 from .portable import hyphen_encode_path
 from .redact import redact_value
 
@@ -255,29 +253,16 @@ def _write_bash_head_cache(
 ) -> None:
     cache_path = _bash_head_cache_path(root)
     try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
         payload: dict[str, Any] = {"counts": dict(counts)}
         if diversity is not None:
             payload["diversity"] = dict(diversity)
-        atomic_write_private_text(cache_path, json.dumps(payload), root=root)
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        import os as _os_atomic
+        _os_atomic.replace(tmp, cache_path)
     except OSError:
         pass
-
-
-def _read_bash_head_cache(root: Path) -> tuple[dict[str, Any], float] | None:
-    cache_path = _bash_head_cache_path(root)
-    try:
-        text, state = read_root_confined_text(
-            cache_path,
-            root=root,
-            max_bytes=1_000_000,
-            require_private=True,
-        )
-        payload = json.loads(text)
-    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return payload, float(state.st_mtime)
 
 
 def _spawn_bash_head_cache_rebuild(root: Path) -> None:
@@ -363,15 +348,19 @@ def _gather_bash_heads(root: Path) -> Counter[str]:
     """Stale-while-revalidate cache: use cache if present, schedule rebuild if stale or missing."""
     import time
 
-    cached = _read_bash_head_cache(root)
-    if cached is not None:
-        payload, cache_mtime = cached
-        counts_dict = payload.get("counts")
-        if isinstance(counts_dict, dict):
-            counts = Counter({str(k): int(v) for k, v in counts_dict.items() if isinstance(v, int)})
-            if time.time() - cache_mtime >= _BASH_HEAD_CACHE_TTL_SECONDS:
-                _spawn_bash_head_cache_rebuild(root)
-            return counts
+    cache_path = _bash_head_cache_path(root)
+    if cache_path.exists():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            counts_dict = payload.get("counts") if isinstance(payload, dict) else None
+            age = time.time() - cache_path.stat().st_mtime
+            if isinstance(counts_dict, dict):
+                counts = Counter({str(k): int(v) for k, v in counts_dict.items() if isinstance(v, int)})
+                if age >= _BASH_HEAD_CACHE_TTL_SECONDS:
+                    _spawn_bash_head_cache_rebuild(root)
+                return counts
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     _spawn_bash_head_cache_rebuild(root)
     return Counter()
 
@@ -383,11 +372,14 @@ def _gather_bash_head_diversity(root: Path) -> dict[str, int]:
     diversity gating fails open — we only suppress a runbook when we KNOW its tool is
     low-diversity, never on missing data. The cache is (re)built by _gather_bash_heads.
     """
-    cached = _read_bash_head_cache(root)
-    if cached is None:
+    cache_path = _bash_head_cache_path(root)
+    if not cache_path.exists():
         return {}
-    payload, _cache_mtime = cached
-    div = payload.get("diversity")
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    div = payload.get("diversity") if isinstance(payload, dict) else None
     if not isinstance(div, dict):
         return {}
     return {str(k): int(v) for k, v in div.items() if isinstance(v, int)}
@@ -858,61 +850,69 @@ def compact_skill_catalog(root: Path) -> dict[str, Any]:
     except (TypeError, ValueError):
         threshold_bytes = 256 * 1024
     path = catalog_path(root)
+    if not path.exists():
+        return {
+            "ok": True,
+            "before_lines": 0,
+            "after_lines": 0,
+            "saved_bytes": 0,
+            "skipped": "missing",
+        }
     try:
-        with private_file_lock(jsonl_lock_path(path), root=root):
-            try:
-                text, state = read_root_confined_text(
-                    path,
-                    root=root,
-                    max_bytes=50_000_000,
-                    require_private=False,
-                )
-            except FileNotFoundError:
-                return {
-                    "ok": True,
-                    "before_lines": 0,
-                    "after_lines": 0,
-                    "saved_bytes": 0,
-                    "skipped": "missing",
-                }
-            size_before = int(state.st_size)
-            if size_before < threshold_bytes:
-                return {
-                    "ok": True,
-                    "before_lines": 0,
-                    "after_lines": 0,
-                    "saved_bytes": 0,
-                    "skipped": "below_threshold",
-                }
-            latest_by_id: dict[str, dict[str, Any]] = {}
-            order: list[str] = []
-            before_lines = 0
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                before_lines += 1
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                rid = rec.get("id")
-                if not rid:
-                    continue
-                rid = str(rid)
-                if rid not in latest_by_id:
-                    order.append(rid)
-                latest_by_id[rid] = rec
-            compacted = "".join(
-                json.dumps(latest_by_id[rid], ensure_ascii=False, sort_keys=True) + "\n"
-                for rid in order
-            )
-            atomic_write_private_text(path, compacted, root=root)
-            size_after = len(compacted.encode("utf-8"))
+        size_before = path.stat().st_size
+    except OSError:
+        size_before = 0
+    if size_before < threshold_bytes:
+        return {
+            "ok": True,
+            "before_lines": 0,
+            "after_lines": 0,
+            "saved_bytes": 0,
+            "skipped": "below_threshold",
+        }
+    latest_by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    before_lines = 0
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        return {"ok": False, "reason": f"catalog_io_error:{exc}"}
+        return {"ok": False, "reason": f"read_error:{exc}"}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        before_lines += 1
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        rid = rec.get("id")
+        if not rid:
+            continue
+        rid = str(rid)
+        if rid not in latest_by_id:
+            order.append(rid)
+        latest_by_id[rid] = rec
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            for rid in order:
+                fh.write(json.dumps(latest_by_id[rid], ensure_ascii=False, sort_keys=True))
+                fh.write("\n")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return {"ok": False, "reason": f"write_error:{exc}"}
+    try:
+        size_after = path.stat().st_size
+    except OSError:
+        size_after = size_before
     after_lines = len(order)
     saved_bytes = max(size_before - size_after, 0)
     result = {
@@ -1004,18 +1004,11 @@ def _draft_body_for_codex_group(group: str, sources: list[str]) -> str:
 
 def list_catalog(root: Path) -> list[CatalogEntry]:
     path = catalog_path(root)
-    try:
-        text, _state = read_root_confined_text(
-            path,
-            root=root,
-            max_bytes=50_000_000,
-            require_private=False,
-        )
-    except (OSError, UnicodeDecodeError):
+    if not path.exists():
         return []
     out: list[CatalogEntry] = []
     seen: dict[str, CatalogEntry] = {}
-    for line in text.splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue

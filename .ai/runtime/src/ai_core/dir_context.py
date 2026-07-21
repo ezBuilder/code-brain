@@ -18,11 +18,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import stat
 from pathlib import Path
 from typing import Any
-
-from .private_write import atomic_write_private_text, read_root_confined_text
 
 CONTEXT_FILENAMES = ("AGENTS.md", "CLAUDE.md")
 MAX_DEPTH = 12
@@ -74,23 +71,11 @@ def find_context_files(root: Path, file_path: str, *, max_depth: int = MAX_DEPTH
         seen_dirs.add(key)
         for name in CONTEXT_FILENAMES:
             candidate = cur / name
-            try:
-                candidate_state = candidate.lstat()
-            except OSError:
-                continue
-            if not (stat.S_ISREG(candidate_state.st_mode) or stat.S_ISLNK(candidate_state.st_mode)):
-                continue
-            rp = _realpath(candidate)
-            try:
-                rp.relative_to(root_rp)
-                resolved_state = rp.lstat()
-            except (OSError, ValueError):
-                continue
-            if not stat.S_ISREG(resolved_state.st_mode) or stat.S_ISLNK(resolved_state.st_mode):
-                continue
-            if rp not in found:
-                found.append(rp)
-            break  # one root-confined context file per directory
+            if candidate.is_file():
+                rp = _realpath(candidate)
+                if rp not in found:
+                    found.append(rp)
+                break  # one context file per dir (CLAUDE.md often symlinks AGENTS.md)
         parent = cur.parent
         if parent == cur:
             break
@@ -105,26 +90,19 @@ def _seen_path(root: Path, sid: str) -> Path:
 
 def _load_seen(root: Path, sid: str) -> set[str]:
     try:
-        text, _state = read_root_confined_text(
-            _seen_path(root, sid),
-            root=root,
-            max_bytes=1_000_000,
-            require_private=True,
-        )
-        data = json.loads(text)
+        data = json.loads(_seen_path(root, sid).read_text(encoding="utf-8"))
         return set(data) if isinstance(data, list) else set()
-    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+    except Exception:
         return set()
 
 
 def _save_seen(root: Path, sid: str, seen: set[str]) -> None:
     path = _seen_path(root, sid)
     try:
-        atomic_write_private_text(
-            path,
-            json.dumps(sorted(seen)[-500:]),
-            root=root,
-        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(sorted(seen)[-500:]), encoding="utf-8")
+        tmp.replace(path)
     except OSError:
         pass
 
@@ -160,14 +138,8 @@ def directory_context_for_read(root: Path, payload: dict[str, Any], *,
         total = 0
         for f in fresh:
             try:
-                body, _state = read_root_confined_text(
-                    f,
-                    root=root,
-                    max_bytes=1_000_000,
-                    require_private=False,
-                )
-                body = body.strip()
-            except (OSError, UnicodeDecodeError):
+                body = f.read_text(encoding="utf-8").strip()
+            except OSError:
                 continue
             body = str(redact_value(body))[:_PER_FILE_CAP]
             try:

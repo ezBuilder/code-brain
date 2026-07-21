@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -168,155 +167,13 @@ def test_merge_into_target_rejects_corrupted_existing(tmp_path: Path) -> None:
         )
 
 
-def _run_bootstrap_with_fake_uv(
-    tmp_path: Path,
-    *,
-    install_dense: bool,
-    skip_doctor: bool = False,
-    skip_render: bool = False,
-) -> list[str]:
-    variant = (
-        f"{'dense' if install_dense else 'base'}-"
-        f"{'skip-doctor' if skip_doctor else 'doctor'}-"
-        f"{'skip-render' if skip_render else 'render'}"
-    )
-    target = tmp_path / variant
-    target.mkdir()
-    shutil.copy2(ROOT / "bootstrap-code-brain.sh", target / "bootstrap-code-brain.sh")
-    (target / ".ai" / "runtime").mkdir(parents=True)
-    scripts = target / "scripts"
-    scripts.mkdir()
-    for name in ("preflight.sh", "env-check.sh"):
-        script = scripts / name
-        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        script.chmod(0o755)
-
-    fake_bin = tmp_path / f"fake-bin-{variant}"
-    fake_bin.mkdir()
-    log = tmp_path / f"uv-{variant}.log"
-    uv = fake_bin / "uv"
-    uv.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$UV_LOG"\n', encoding="utf-8")
-    uv.chmod(0o755)
-
-    env = os.environ.copy()
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
-    env["UV_LOG"] = str(log)
-    if install_dense:
-        env["AI_INSTALL_DENSE"] = "1"
-    else:
-        env.pop("AI_INSTALL_DENSE", None)
-    command = ["bash", str(target / "bootstrap-code-brain.sh")]
-    if skip_doctor:
-        command.append("--skip-doctor")
-    if skip_render:
-        command.append("--skip-render")
-    subprocess.run(
-        command,
-        cwd=target,
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    return log.read_text(encoding="utf-8").splitlines()
-
-
-def test_bootstrap_installs_base_runtime_by_default(tmp_path: Path) -> None:
-    calls = _run_bootstrap_with_fake_uv(tmp_path, install_dense=False)
-    assert calls[0] == "sync --project .ai/runtime"
-
-
-def test_bootstrap_dense_dependencies_are_explicit_opt_in(tmp_path: Path) -> None:
-    calls = _run_bootstrap_with_fake_uv(tmp_path, install_dense=True)
-    assert calls[0] == "sync --project .ai/runtime --extra dense"
-
-
-def test_bootstrap_skip_doctor_keeps_render_but_avoids_duplicate_scan(tmp_path: Path) -> None:
-    calls = _run_bootstrap_with_fake_uv(tmp_path, install_dense=False, skip_doctor=True)
-    assert "run --project .ai/runtime ai render --manifest-only --json" in calls
-    assert all(" ai doctor " not in f" {call} " for call in calls)
-
-
-def test_bootstrap_skip_render_avoids_separate_render_process(tmp_path: Path) -> None:
-    calls = _run_bootstrap_with_fake_uv(
-        tmp_path,
-        install_dense=False,
-        skip_doctor=True,
-        skip_render=True,
-    )
-    assert all(" ai render " not in f" {call} " for call in calls)
-    assert all(" ai doctor " not in f" {call} " for call in calls)
-
-
-def _run_one_command_installer(tmp_path: Path, *, defer_runtime: bool) -> list[str]:
-    source = tmp_path / ("source-deferred" if defer_runtime else "source-default")
-    scripts = source / "scripts"
-    scripts.mkdir(parents=True)
-    shutil.copy2(ROOT / "scripts" / "install.sh", scripts / "install.sh")
-    fake_install_into = scripts / "install-into.sh"
-    fake_install_into.write_text(
-        """#!/usr/bin/env bash
-set -euo pipefail
-target="$2"
-printf 'install-into:%s:strict=%s:defer=%s\\n' \
-  "$1" "${AI_INSTALL_STRICT:-0}" "${AI_INSTALL_DEFER_RUNTIME:-0}" >> "$INSTALL_WRAPPER_LOG"
-mkdir -p "$target/.ai/bin"
-cat > "$target/.ai/bin/ai" <<'EOF'
-#!/usr/bin/env bash
-printf 'ai:%s\\n' "$*" >> "$INSTALL_WRAPPER_LOG"
-EOF
-chmod +x "$target/.ai/bin/ai"
-cat > "$target/bootstrap-code-brain.sh" <<'EOF'
-#!/usr/bin/env bash
-printf 'bootstrap\\n' >> "$INSTALL_WRAPPER_LOG"
-EOF
-chmod +x "$target/bootstrap-code-brain.sh"
-""",
-        encoding="utf-8",
-    )
-    fake_install_into.chmod(0o755)
-
-    target = tmp_path / ("target-deferred" if defer_runtime else "target-default")
-    target.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-    log = tmp_path / ("installer-deferred.log" if defer_runtime else "installer-default.log")
-    env = os.environ.copy()
-    env["INSTALL_WRAPPER_LOG"] = str(log)
-    env["CODE_BRAIN_INSTALL_GLOBAL"] = "0"
-    if defer_runtime:
-        env["AI_INSTALL_DEFER_RUNTIME"] = "1"
-    else:
-        env.pop("AI_INSTALL_DEFER_RUNTIME", None)
-    subprocess.run(
-        ["bash", str(scripts / "install.sh"), "--no-global", str(target)],
-        cwd=source,
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    return log.read_text(encoding="utf-8").splitlines()
-
-
-def test_one_command_installer_does_not_repeat_runtime_activation(tmp_path: Path) -> None:
-    calls = _run_one_command_installer(tmp_path, defer_runtime=False)
-    assert calls == ["install-into:install:strict=1:defer=0"]
-
-
-def test_one_command_installer_respects_deferred_runtime(tmp_path: Path) -> None:
-    calls = _run_one_command_installer(tmp_path, defer_runtime=True)
-    assert calls == ["install-into:install:strict=0:defer=1"]
-
-
 # ---------- install-into.sh integration ----------
 
 
-@pytest.fixture(scope="module")
-def install_into_target(tmp_path_factory: pytest.TempPathFactory) -> Path:
+@pytest.fixture
+def install_into_target(tmp_path: Path) -> Path:
     """Initialize a minimal target repo and run install-into.sh against it."""
-    target = tmp_path_factory.mktemp("mcp-install") / "victim"
+    target = tmp_path / "victim"
     target.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=target, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=target, check=True)
@@ -328,7 +185,6 @@ def install_into_target(tmp_path_factory: pytest.TempPathFactory) -> Path:
     script = ROOT / "scripts" / "install-into.sh"
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    env["AI_INSTALL_DEFER_RUNTIME"] = "1"
     res = subprocess.run(
         ["bash", str(script), "install", str(target)],
         cwd=ROOT,
@@ -393,95 +249,6 @@ def test_install_into_publishes_root_claude_md_with_response_defaults(install_in
     assert "Keep self-initiated progress/output under 10 words." in text
 
 
-def test_install_into_publishes_canonical_bootstrap(install_into_target: Path) -> None:
-    installed = install_into_target / "bootstrap-code-brain.sh"
-    assert installed.read_bytes() == (ROOT / "bootstrap-code-brain.sh").read_bytes()
-
-
-def test_install_into_deferred_runtime_does_not_activate(install_into_target: Path) -> None:
-    assert not (install_into_target / ".ai" / "runtime" / ".venv").exists()
-    assert not (install_into_target / ".ai" / "cache" / "code.sqlite").exists()
-
-
-def test_install_into_codex_config_is_byte_idempotent(
-    install_into_target: Path,
-    tmp_path: Path,
-) -> None:
-    target = shutil.copytree(install_into_target, tmp_path / "codex-idempotent", symlinks=True)
-    config = target / ".codex" / "config.toml"
-    before = config.read_bytes()
-
-    env = os.environ.copy()
-    env["AI_INSTALL_DEFER_RUNTIME"] = "1"
-    result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "install-into.sh"), "upgrade", str(target)],
-        cwd=ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-
-    assert result.returncode == 0, result.stderr[-1000:]
-    assert config.read_bytes() == before
-    text = before.decode("utf-8")
-    assert text.index("[features]") < text.index("[mcp_servers.code-brain]")
-    assert 'AI_CODE_BRAIN_PROFILE = "usage"' in text
-    assert 'AI_MCP_COMPACT_TOOLS = "1"' in text
-
-
-def test_install_into_refuses_untracked_managed_file(tmp_path: Path) -> None:
-    target = tmp_path / "victim-untracked-managed"
-    target.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-    managed = target / ".ai" / "AGENTS.md"
-    managed.parent.mkdir(parents=True)
-    original = "# User-owned .ai contract\n"
-    managed.write_text(original, encoding="utf-8")
-
-    env = os.environ.copy()
-    env["AI_INSTALL_DEFER_RUNTIME"] = "1"
-    result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "install-into.sh"), "install", str(target)],
-        cwd=ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-
-    assert result.returncode == 3
-    assert "refusing to overwrite existing untracked target file .ai/AGENTS.md" in result.stderr
-    assert managed.read_text(encoding="utf-8") == original
-
-
-def test_install_into_rejects_managed_symlink_escape(tmp_path: Path) -> None:
-    target = tmp_path / "victim-symlink-escape"
-    outside = tmp_path / "outside"
-    target.mkdir()
-    outside.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-    try:
-        (target / ".ai").symlink_to(outside, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"symlinks unavailable: {exc}")
-
-    env = os.environ.copy()
-    env["AI_INSTALL_DEFER_RUNTIME"] = "1"
-    result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "install-into.sh"), "install", str(target)],
-        cwd=ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-
-    assert result.returncode == 3
-    assert "target path escapes project root" in result.stderr
-    assert list(outside.iterdir()) == []
-
-
 def test_install_into_preserves_user_authored_agents_md(tmp_path: Path) -> None:
     """If the target already has a user-authored AGENTS.md (common in mature
     repos like Navio), install-into must NOT overwrite it. The forwarder is a
@@ -500,7 +267,6 @@ def test_install_into_preserves_user_authored_agents_md(tmp_path: Path) -> None:
 
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    env["AI_INSTALL_DEFER_RUNTIME"] = "1"
     res = subprocess.run(
         ["bash", str(ROOT / "scripts" / "install-into.sh"), "install", str(target)],
         cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,
@@ -525,7 +291,6 @@ def test_install_into_preserves_user_authored_claude_md(tmp_path: Path) -> None:
 
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    env["AI_INSTALL_DEFER_RUNTIME"] = "1"
     res = subprocess.run(
         ["bash", str(ROOT / "scripts" / "install-into.sh"), "install", str(target)],
         cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,
@@ -549,7 +314,6 @@ def test_install_into_replaces_old_claude_pointer_stub(tmp_path: Path) -> None:
 
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    env["AI_INSTALL_DEFER_RUNTIME"] = "1"
     res = subprocess.run(
         ["bash", str(ROOT / "scripts" / "install-into.sh"), "install", str(target)],
         cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,

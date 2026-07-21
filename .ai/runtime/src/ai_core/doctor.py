@@ -5,17 +5,14 @@ import json
 import os
 import shutil
 import sqlite3
-import stat
 import subprocess
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from .config import load_config
-from .preflight_proof import PROOF_MAX_AGE_SECONDS, PROOF_SCHEMA, environment_fingerprint
-from .private_write import read_root_confined_text, validate_root_confined_directory
-from .redact import contains_secret, redact_value
+from .redact import SECRET_PATTERNS
+from .redact import redact_value
 from .render import build_manifest
 from .trust import parse_simple_toml
 
@@ -27,47 +24,21 @@ class Check:
     detail: str
 
 
-def run_checks(
-    root: Path,
-    *,
-    precomputed_index_status: dict[str, object] | None = None,
-    precomputed_session_start_ms: int | None = None,
-    lightweight: bool = False,
-    update_scan_state: bool = True,
-) -> list[Check]:
-    index_check = (
-        check_index_freshness_from_status(precomputed_index_status)
-        if precomputed_index_status is not None
-        else check_index_freshness(root)
-    )
-    hot_path_check = check_hot_path_slo(
-        root,
-        session_start_ms=precomputed_session_start_ms,
-        sample_baseline=not lightweight,
-    )
-    diagnostics_check = (
-        Check("diagnostics_dry_run", True, "deferred: run doctor --strict for full diagnostics smoke")
-        if lightweight
-        else check_diagnostics(root)
-    )
+def run_checks(root: Path) -> list[Check]:
     checks = [
         check_layout(root),
         check_config(root),
         check_gitattributes(root),
         check_sqlite_features(),
-        index_check,
+        check_index_freshness(root),
         check_manifest(root),
         check_trust(root),
         check_jsonl(root),
         check_generated_artifacts_bounded(root),
         check_audit_index(root),
         check_audit_chain(root),
-        hot_path_check,
-        check_secret_scan(
-            root,
-            incremental=lightweight,
-            update_state=update_scan_state,
-        ),
+        check_hot_path_slo(root),
+        check_secret_scan(root),
         check_no_token_estimates(root),
         check_mcp_methods_registered(root),
         check_redaction_self_test(),
@@ -75,7 +46,7 @@ def run_checks(
         check_worker_singleton_lock(root),
         check_queue_lease_recovery(root),
         check_queue_age(root),
-        diagnostics_check,
+        check_diagnostics(root),
         check_skills_catalog(root),
         check_precall_rules(root),
         check_antigravity_artifacts(root),
@@ -303,28 +274,41 @@ def check_index_freshness(root: Path) -> Check:
     db = root / ".ai" / "cache" / "code.sqlite"
     if not db.exists():
         return Check("index_freshness", True, "not indexed")
-    from .search import index_hash_status
-
-    return check_index_freshness_from_status(index_hash_status(root))
-
-
-def check_index_freshness_from_status(status: dict[str, object]) -> Check:
-    reason = str(status.get("reason") or "unreadable")
-    if status.get("ok"):
-        return Check("index_freshness", True, f"ok indexed={status.get('indexed_files', 0)}")
-    if status.get("stale") is False:
-        return Check("index_freshness", True, f"ok indexed={status.get('indexed', 0)}")
-    if reason == "missing":
-        return Check("index_freshness", True, "not indexed")
-    if reason == "legacy_schema":
-        return Check("index_freshness", False, "legacy index schema; run ai index rebuild")
-    if reason == "unreadable":
-        return Check("index_freshness", False, str(status.get("detail") or "index unreadable"))
-    raw_changed = status.get("changed_paths") or []
-    changed = list(raw_changed) if isinstance(raw_changed, (list, tuple, set)) else []
-    if changed:
-        return Check("index_freshness", False, "stale: " + ", ".join(changed[:10]))
-    return Check("index_freshness", False, reason)
+    stale: list[str] = []
+    try:
+        with sqlite3.connect(db) as conn:
+            conn.row_factory = sqlite3.Row
+            columns = {row["name"] for row in conn.execute("pragma table_info(chunks)").fetchall()}
+            if "content" in columns or "summary" not in columns or not {"path", "sha256"}.issubset(columns):
+                return Check("index_freshness", False, "legacy index schema; run ai index rebuild")
+            rows = conn.execute("select path, sha256 from chunks order by path").fetchall()
+    except sqlite3.Error as exc:
+        return Check("index_freshness", False, f"index unreadable: {exc}")
+    seen: set[str] = set()
+    for row in rows:
+        rel_path = str(row["path"])
+        # Function-level chunks store "<file>:<qualname>"; file-level chunks
+        # cover freshness for the whole file. Skip the per-function rows so
+        # they don't appear as missing file paths.
+        if ":" in rel_path:
+            continue
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        path = root / rel_path
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            stale.append(rel_path)
+            continue
+        redacted = str(redact_value(content))
+        if hashlib.sha256(redacted.encode("utf-8")).hexdigest() != row["sha256"]:
+            stale.append(rel_path)
+        if len(stale) >= 10:
+            break
+    if stale:
+        return Check("index_freshness", False, "stale: " + ", ".join(stale))
+    return Check("index_freshness", True, f"ok indexed={len(rows)}")
 
 
 def check_manifest(root: Path) -> Check:
@@ -397,15 +381,11 @@ def check_generated_artifacts_bounded(root: Path) -> Check:
     return Check("generated_artifacts_bounded", True, f"ok checked={len(targets)}")
 
 
-def read_jsonl(path: Path, *, root: Path) -> list[dict[str, object]]:
+def read_jsonl(path: Path) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
-    text, _state = read_root_confined_text(
-        path,
-        root=root,
-        max_bytes=100_000_000,
-        require_private=False,
-    )
-    for line in text.splitlines():
+    if not path.exists():
+        return records
+    for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
             loaded = json.loads(line)
             if isinstance(loaded, dict):
@@ -421,19 +401,7 @@ def check_audit_index(root: Path) -> Check:
     audit_root = root / ".ai" / "memory" / "audit"
     index_path = root / ".ai" / "memory" / "audit-index.jsonl"
     bad: list[str] = []
-    try:
-        validate_root_confined_directory(audit_root, root=root)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        bad.append(f"audit-directory-untrusted:{exc}")
-    try:
-        index_records = read_jsonl(index_path, root=root)
-    except FileNotFoundError:
-        index_records = []
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        index_records = []
-        bad.append(f"audit-index-untrusted:{exc}")
+    index_records = read_jsonl(index_path)
     index_keys = {audit_key(record) for record in index_records}
 
     for record in index_records:
@@ -442,30 +410,13 @@ def check_audit_index(root: Path) -> Check:
             bad.append("audit-index:path")
             continue
         target = root / rel_path
-        try:
-            target_state = target.lstat()
-        except OSError:
-            target_state = None
-        if (
-            target_state is None
-            or not stat.S_ISREG(target_state.st_mode)
-            or stat.S_ISLNK(target_state.st_mode)
-            or target.parent != audit_root
-            or target.suffix != ".jsonl"
-        ):
+        if not target.exists() or target.parent != audit_root or target.suffix != ".jsonl":
             bad.append(rel_path)
 
     audit_keys: set[tuple[object, object, object, object]] = set()
-    from .memory import all_audit_files
-
-    for path in all_audit_files(root):
+    for path in sorted(audit_root.glob("*.jsonl")):
         rel_path = path.relative_to(root).as_posix()
-        try:
-            records = read_jsonl(path, root=root)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            bad.append(f"{rel_path}:untrusted:{exc}")
-            continue
-        for record in records:
+        for record in read_jsonl(path):
             key = audit_key(record, rel_path)
             audit_keys.add(key)
             if key not in index_keys:
@@ -481,31 +432,12 @@ def check_audit_chain(root: Path) -> Check:
     audit_root = root / ".ai" / "memory" / "audit"
     bad: list[str] = []
     chained = 0
-    try:
-        validate_root_confined_directory(audit_root, root=root)
-    except FileNotFoundError:
-        detail = "ok no chained lines yet"
-        return Check("audit_chain", True, detail)
-    except OSError as exc:
-        return Check("audit_chain", False, f"invalid: audit-directory-untrusted:{exc}")
 
-    from .memory import all_audit_files
-
-    for path in all_audit_files(root):
+    for path in sorted(audit_root.glob("*.jsonl")):
         previous_line: str | None = None
         previous_was_chained = False
         rel_path = path.relative_to(root).as_posix()
-        try:
-            text, _state = read_root_confined_text(
-                path,
-                root=root,
-                max_bytes=100_000_000,
-                require_private=False,
-            )
-        except (OSError, UnicodeDecodeError) as exc:
-            bad.append(f"{rel_path}:untrusted:{exc}")
-            continue
-        for line_no, line in enumerate(text.splitlines(), 1):
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
             try:
@@ -556,12 +488,7 @@ def check_audit_chain(root: Path) -> Check:
 SLO_GATE_HEADROOM = 3
 
 
-def check_hot_path_slo(
-    root: Path,
-    *,
-    session_start_ms: int | None = None,
-    sample_baseline: bool = True,
-) -> Check:
+def check_hot_path_slo(root: Path) -> Check:
     from .hooks import HOT_PATH_TARGET_MS, SESSION_START_TARGET_MS, handle_hook
 
     def best_elapsed_ms(hook: str, n: int) -> int:
@@ -573,75 +500,39 @@ def check_hot_path_slo(
         )
 
     samples = []
-    if sample_baseline:
-        for _ in range(10):
-            payload = handle_hook(root, "DoctorSLOBaseline", {"agent": "doctor", "dry": True})
-            samples.append(int(payload["elapsed_ms"]))
-    p95 = sorted(samples)[max(0, int(len(samples) * 0.95) - 1)] if samples else None
-    start_ms = (
-        max(0, int(session_start_ms))
-        if session_start_ms is not None
-        else best_elapsed_ms("SessionStart", 5)
-    )
+    for _ in range(10):
+        payload = handle_hook(root, "DoctorSLOBaseline", {"agent": "doctor", "dry": True})
+        samples.append(int(payload["elapsed_ms"]))
+    p95 = sorted(samples)[max(0, int(len(samples) * 0.95) - 1)] if samples else 0
+    start_ms = best_elapsed_ms("SessionStart", 5)
 
     ok = (
-        (p95 is None or p95 <= HOT_PATH_TARGET_MS * SLO_GATE_HEADROOM)
+        p95 <= HOT_PATH_TARGET_MS * SLO_GATE_HEADROOM
         and start_ms <= SESSION_START_TARGET_MS * SLO_GATE_HEADROOM
     )
     return Check(
         "hot_path_slo",
         ok,
-        f"p95_ms={p95 if p95 is not None else 'deferred'}, target_ms={HOT_PATH_TARGET_MS}, "
-        f"session_start_ms={start_ms}, "
+        f"p95_ms={p95}, target_ms={HOT_PATH_TARGET_MS}, session_start_ms={start_ms}, "
         f"session_start_target_ms={SESSION_START_TARGET_MS}",
     )
 
 
-def check_secret_scan(
-    root: Path,
-    *,
-    incremental: bool = False,
-    update_state: bool = True,
-) -> Check:
-    from .tracked_files import GitBaselineUnavailable
-
+def check_secret_scan(root: Path) -> Check:
     allowlist = read_secret_scan_allowlist(root)
     flagged: list[str] = []
     acknowledged: list[str] = []
-    try:
-        report = secret_scan_report(
-            root,
-            incremental=incremental,
-            update_state=update_state,
-        )
-    except GitBaselineUnavailable:
-        mode = "incremental" if incremental else "full"
-        return Check(
-            "secret_scan",
-            False,
-            f"Git tracked-file baseline unavailable; mode={mode}; remediation: restore Git access and rerun doctor",
-        )
-    for hit in report["hits"]:
+    for hit in secret_hits(root):
         (acknowledged if hit in allowlist else flagged).append(hit)
-    scan_detail = (
-        f"mode={report['mode']} baseline={report['baseline']} total={report['total']} "
-        f"reused={report['reused']} "
-        f"rescanned={report['rescanned']} unreadable={report['unreadable']} "
-        f"unstable={report['unstable']}"
-    )
     if flagged:
         detail = (
             f"flagged={len(flagged)} acknowledged={len(acknowledged)} "
-            f"allowlist=.ai/secret_scan_allowlist.txt: " + ", ".join(flagged[:10]) + f"; {scan_detail}"
+            f"allowlist=.ai/secret_scan_allowlist.txt: " + ", ".join(flagged[:10])
         )
         return Check("secret_scan", False, detail)
     if acknowledged:
-        return Check(
-            "secret_scan",
-            True,
-            f"ok (flagged=0 acknowledged={len(acknowledged)} via allowlist); {scan_detail}",
-        )
-    return Check("secret_scan", True, f"ok; {scan_detail}")
+        return Check("secret_scan", True, f"ok (flagged=0 acknowledged={len(acknowledged)} via allowlist)")
+    return Check("secret_scan", True, "ok")
 
 
 def read_secret_scan_allowlist(root: Path) -> set[str]:
@@ -724,7 +615,7 @@ REQUIRED_CODEX_PROMPT_FILES = (
 
 
 def check_mcp_methods_registered(root: Path) -> Check:
-    from .mcp_catalog_meta import MCP_METHOD_COUNT
+    from .mcp_server import MCP_METHODS
 
     mcp_config = root / ".mcp.json"
     if not mcp_config.exists():
@@ -748,6 +639,7 @@ def check_mcp_methods_registered(root: Path) -> Check:
         return Check("mcp_methods_registered", False, ".mcp.json code-brain command is not a managed ai-mcp entry")
     missing_slash = [path for path in REQUIRED_SLASH_COMMAND_FILES if not (root / path).exists()]
     missing_codex = [path for path in REQUIRED_CODEX_PROMPT_FILES if not (root / path).exists()]
+    method_count = len(MCP_METHODS)
     if missing_slash:
         return Check("mcp_methods_registered", False, "missing claude commands: " + ", ".join(missing_slash))
     if missing_codex:
@@ -755,7 +647,7 @@ def check_mcp_methods_registered(root: Path) -> Check:
     return Check(
         "mcp_methods_registered",
         True,
-        f"ok mcp_methods={MCP_METHOD_COUNT} claude_commands={len(REQUIRED_SLASH_COMMAND_FILES)} "
+        f"ok mcp_methods={method_count} claude_commands={len(REQUIRED_SLASH_COMMAND_FILES)} "
         f"codex_prompts={len(REQUIRED_CODEX_PROMPT_FILES)}",
     )
 
@@ -783,30 +675,10 @@ def check_redaction_self_test() -> Check:
     return Check("redaction_self_test", not leaked and "[REDACTED]" in text, "ok" if not leaked else "leaked: " + str(len(leaked)))
 
 
-def _root_confined_regular_file(root: Path, path: Path) -> bool:
-    try:
-        if path.is_symlink():
-            return False
-        state = path.stat()
-        if not stat.S_ISREG(state.st_mode):
-            return False
-        path.resolve().relative_to(root.resolve())
-    except (OSError, ValueError):
-        return False
-    return True
-
-
 def check_bootstrap_preflight(root: Path) -> Check:
     script = root / "scripts" / "preflight.sh"
-    if not _root_confined_regular_file(root, script):
-        return Check(
-            "bootstrap_preflight",
-            False,
-            "scripts/preflight.sh must be a root-confined regular file",
-        )
-    proof = _fresh_bootstrap_preflight_proof(root, script)
-    if proof is not None:
-        return proof
+    if not script.exists():
+        return Check("bootstrap_preflight", False, "scripts/preflight.sh missing")
     command = [str(script), "--check-only", "--json"]
     env = os.environ.copy()
     if os.name == "nt":
@@ -845,45 +717,6 @@ def check_bootstrap_preflight(root: Path) -> Check:
     except json.JSONDecodeError as exc:
         return Check("bootstrap_preflight", False, f"invalid json: {exc}")
     return Check("bootstrap_preflight", payload.get("ok") is True, "ok" if payload.get("ok") is True else "failed")
-
-
-def _fresh_bootstrap_preflight_proof(root: Path, script: Path) -> Check | None:
-    proof_path = root / ".ai" / "cache" / "preflight-proof.json"
-    try:
-        if not proof_path.is_file() or proof_path.is_symlink():
-            return None
-        resolved_root = root.resolve()
-        proof_path.resolve().relative_to(resolved_root)
-        proof_state = proof_path.stat()
-        if os.name != "nt":
-            if stat.S_IMODE(proof_state.st_mode) & 0o077:
-                return None
-            if hasattr(os, "geteuid") and proof_state.st_uid != os.geteuid():
-                return None
-        proof_text, proof_state = read_root_confined_text(
-            proof_path,
-            root=root,
-            max_bytes=65536,
-            require_private=True,
-        )
-        payload = json.loads(proof_text)
-        created_at = float(payload.get("created_at_unix", 0))
-        age = time.time() - created_at
-        if age < -5 or age > PROOF_MAX_AGE_SECONDS:
-            return None
-        if payload.get("schema") != PROOF_SCHEMA or payload.get("ok") is not True:
-            return None
-        expected_script = hashlib.sha256(script.read_bytes()).hexdigest()
-        if payload.get("preflight_sha256") != expected_script:
-            return None
-        expected_root = hashlib.sha256(str(resolved_root).encode("utf-8")).hexdigest()
-        if payload.get("root_fingerprint") != expected_root:
-            return None
-        if payload.get("environment_fingerprint") != environment_fingerprint(resolved_root):
-            return None
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
-    return Check("bootstrap_preflight", True, "ok (fresh bootstrap proof)")
 
 
 def check_worker_singleton_lock(root: Path) -> Check:
@@ -941,10 +774,7 @@ def check_diagnostics(root: Path) -> Check:
     try:
         from .obs import diagnostics
 
-        # Doctor only needs to prove that diagnostics can be assembled. Full
-        # Claude/Codex transcript scans belong to an explicit diagnostics or
-        # metrics request and can take seconds on a long-lived workstation.
-        payload = diagnostics(root, dry_run=True, include_doctor=False, include_usage=False)
+        payload = diagnostics(root, dry_run=True, include_doctor=False)
     except PermissionError as exc:
         # diagnostics walks metrics paths which may include files outside the
         # Code Brain managed tree (e.g. ~/.claude/projects/*.jsonl owned by a
@@ -996,28 +826,10 @@ SECRET_SCAN_IGNORED_SUFFIXES = {
 }
 
 
-class _SecretCandidateList(list[Path]):
-    def __init__(self, paths: list[Path], *, baseline: str) -> None:
-        super().__init__(paths)
-        self.baseline = baseline
-
-
-def _secret_scan_candidates(
-    root: Path,
-    *,
-    use_tracked_cache: bool = True,
-    update_tracked_cache: bool = True,
-) -> _SecretCandidateList:
-    candidates: list[Path] = []
-    baseline_paths = secret_scan_files(
-        root,
-        use_cache=use_tracked_cache,
-        update_cache=update_tracked_cache,
-    )
-    baseline = str(getattr(baseline_paths, "source", "provided"))
-    for path in baseline_paths:
+def secret_hits(root: Path) -> Iterable[str]:
+    for path in secret_scan_files(root):
         rel_parts = set(path.relative_to(root).parts)
-        if rel_parts & SECRET_SCAN_IGNORED_PARTS:
+        if path.is_dir() or rel_parts & SECRET_SCAN_IGNORED_PARTS:
             continue
         if path.name in SECRET_SCAN_IGNORED_NAMES:
             continue
@@ -1025,68 +837,37 @@ def _secret_scan_candidates(
             continue
         if path.suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".sqlite", ".db", ".rdb", ".zip", ".gz", ".tar"}:
             continue
-        try:
-            state = path.lstat()
-        except OSError:
-            # A tracked path can disappear or be replaced between the Git
-            # baseline read and candidate filtering. Preserve the existing
-            # fail-soft unreadable-file policy instead of aborting doctor.
-            continue
-        if not (stat.S_ISREG(state.st_mode) or stat.S_ISLNK(state.st_mode)):
-            continue
-        if state.st_size > 1_000_000:
+        if path.stat().st_size > 1_000_000:
             continue
         if path.name.endswith(".enc.yaml") or path.name.endswith(".enc.yml"):
             continue
-        candidates.append(path)
-    return _SecretCandidateList(candidates, baseline=baseline)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            # PermissionError happens in mixed-ownership repos (e.g. Phalanx
+            # has root-owned .pipeline_output/*.json that cc can't read). The
+            # secret scan can't inspect what it can't read; skip rather than
+            # aborting doctor with a fatal error.
+            continue
+        for pattern in SECRET_PATTERNS:
+            if pattern.search(text):
+                yield path.relative_to(root).as_posix()
+                break
 
 
-def secret_hits(
-    root: Path,
-    *,
-    incremental: bool = False,
-    update_state: bool = True,
-) -> Iterable[str]:
-    yield from secret_scan_report(
-        root,
-        incremental=incremental,
-        update_state=update_state,
-    )["hits"]
-
-
-def secret_scan_report(
-    root: Path,
-    *,
-    incremental: bool = False,
-    update_state: bool = True,
-) -> dict[str, object]:
-    from .scan_state import scan_paths_report
-
-    candidates = _secret_scan_candidates(
-        root,
-        use_tracked_cache=incremental,
-        update_tracked_cache=update_state,
-    )
-    report = scan_paths_report(
-        root,
-        candidates,
-        incremental=incremental,
-        update_state=update_state,
-    )
-    report["baseline"] = candidates.baseline
-    return report
-
-
-def secret_scan_files(
-    root: Path,
-    *,
-    use_cache: bool = True,
-    update_cache: bool = True,
-) -> list[Path]:
-    from .tracked_files import tracked_files
-
-    return tracked_files(root, use_cache=use_cache, update_cache=update_cache)
+def secret_scan_files(root: Path) -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return sorted(path for path in root.rglob("*") if path.is_file())
+    rels = [item.decode("utf-8") for item in result.stdout.split(b"\0") if item]
+    return sorted(path for rel in rels if (path := root / rel).is_file())
 
 
 def as_payload(checks: list[Check]) -> dict[str, object]:

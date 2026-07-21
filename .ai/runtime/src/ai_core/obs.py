@@ -37,23 +37,15 @@ def write_log(root: Path, level: str, event: str, payload: dict[str, Any]) -> di
     return {"ok": True, "path": path.relative_to(root).as_posix(), "record": record}
 
 
-def metrics(root: Path, *, include_usage: bool = True) -> dict[str, Any]:
+def metrics(root: Path) -> dict[str, Any]:
     from .worker.scheduler import queue_age_stats, recovery_status
     from .search import observability as search_observability
+    from .transcripts import claude_usage_summary, codex_usage_summary
 
     queue_root = root / ".ai" / "memory" / "queue"
     recovery = recovery_status(root)
     ages = queue_age_stats(root)
     search = search_observability(root)
-    if include_usage:
-        from .transcripts import claude_usage_summary, codex_usage_summary
-
-        usage: dict[str, Any] = {
-            "claude": _usage_totals_only(claude_usage_summary(root)),
-            "codex": codex_usage_summary(root),
-        }
-    else:
-        usage = {"skipped": True, "reason": "lightweight diagnostics smoke check"}
     return {
         "ok": True,
         "runtime_version": __version__,
@@ -74,7 +66,10 @@ def metrics(root: Path, *, include_usage: bool = True) -> dict[str, Any]:
             "indexed_bytes": search.get("indexed_bytes", 0),
         },
         "search": search,
-        "usage": usage,
+        "usage": {
+            "claude": _usage_totals_only(claude_usage_summary(root)),
+            "codex": codex_usage_summary(root),
+        },
     }
 
 
@@ -672,13 +667,7 @@ def slo_bench(root: Path, iterations: int = 10) -> dict[str, Any]:
     return {"ok": p95 <= 200, "iterations": iterations, "p95_ms": p95, "target_ms": 200, "samples_ms": elapsed}
 
 
-def diagnostics(
-    root: Path,
-    *,
-    dry_run: bool = False,
-    include_doctor: bool = True,
-    include_usage: bool = True,
-) -> dict[str, Any]:
+def diagnostics(root: Path, *, dry_run: bool = False, include_doctor: bool = True) -> dict[str, Any]:
     from .doctor import run_checks
     checks = as_payload(run_checks(root)) if include_doctor else {"ok": True, "checks": []}
     bundle = {
@@ -690,7 +679,7 @@ def diagnostics(
             "python": platform.python_version(),
         },
         "doctor": redact_value(checks),
-        "metrics": redact_value(metrics(root, include_usage=include_usage)),
+        "metrics": redact_value(metrics(root)),
     }
     if dry_run:
         return {"ok": True, "dry_run": True, "bundle": bundle}

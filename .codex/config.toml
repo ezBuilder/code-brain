@@ -17,4 +17,4 @@ hooks = true
 [mcp_servers.code-brain]
 command = ".ai/bin/ai-mcp"
 args = []
-env = { AI_CODE_BRAIN_PROFILE = "usage", AI_MCP_COMPACT_TOOLS = "1" }
+env = { AI_MCP_COMPACT_TOOLS = "1" }

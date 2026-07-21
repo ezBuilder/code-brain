@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -488,8 +485,6 @@ def test_bash_head_cache_reused_within_ttl(tmp_root: Path, monkeypatch):
     cache_path = _bash_head_cache_path(tmp_root)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text('{"counts": {"git": 42}}', encoding="utf-8")
-    if os.name != "nt":
-        cache_path.chmod(0o600)
 
     called: list[bool] = []
 
@@ -516,60 +511,6 @@ def test_bash_head_cache_miss_returns_empty_and_does_not_block(tmp_root: Path, m
     result = _gather_bash_heads(tmp_root)
     assert result == {}, "cache miss must not parse synchronously"
     assert spawned == [True], "background rebuild must be scheduled"
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Unix symlink and mode semantics")
-def test_bash_head_cache_rejects_symlink_and_public_injection(tmp_root: Path, monkeypatch):
-    import ai_core.recommend as recmod
-
-    cache = recmod._bash_head_cache_path(tmp_root)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    external = tmp_root / "external-bash-heads.json"
-    external.write_text('{"counts":{"injected":999}}', encoding="utf-8")
-    cache.symlink_to(external)
-    spawned: list[bool] = []
-    monkeypatch.setattr(recmod, "_spawn_bash_head_cache_rebuild", lambda *_: spawned.append(True))
-
-    assert recmod._gather_bash_heads(tmp_root) == {}
-    assert spawned == [True]
-    assert external.read_text(encoding="utf-8") == '{"counts":{"injected":999}}'
-
-    cache.unlink()
-    cache.write_text('{"counts":{"public":999}}', encoding="utf-8")
-    cache.chmod(0o644)
-    assert recmod._gather_bash_heads(tmp_root) == {}
-    assert spawned == [True, True]
-
-
-@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")
-def test_bash_head_cache_rejects_external_hardlink(tmp_root: Path, monkeypatch):
-    import ai_core.recommend as recmod
-
-    cache = recmod._bash_head_cache_path(tmp_root)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    external = tmp_root / "external-bash-heads.json"
-    external.write_text('{"counts":{"injected":999}}', encoding="utf-8")
-    if os.name != "nt":
-        external.chmod(0o600)
-    os.link(external, cache)
-    spawned: list[bool] = []
-    monkeypatch.setattr(recmod, "_spawn_bash_head_cache_rebuild", lambda *_: spawned.append(True))
-
-    assert recmod._gather_bash_heads(tmp_root) == {}
-    assert spawned == [True]
-    assert external.read_text(encoding="utf-8") == '{"counts":{"injected":999}}'
-
-
-def test_bash_head_cache_writer_creates_private_cache(tmp_root: Path) -> None:
-    import ai_core.recommend as recmod
-    from collections import Counter
-
-    recmod._write_bash_head_cache(tmp_root, Counter({"git": 7}), {"git": 2})
-    cache = recmod._bash_head_cache_path(tmp_root)
-    assert recmod._gather_bash_heads(tmp_root) == {"git": 7}
-    assert recmod._gather_bash_head_diversity(tmp_root) == {"git": 2}
-    if os.name != "nt":
-        assert stat.S_IMODE(cache.stat().st_mode) == 0o600
 
 
 def test_adaptive_threshold_actually_filters_section(tmp_root: Path, monkeypatch):
@@ -1426,75 +1367,6 @@ def test_catalog_compaction_skips_below_threshold(tmp_root: Path):
     assert result["ok"] is True
     assert result.get("skipped") == "below_threshold"
     assert result["after_lines"] == 0
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
-def test_catalog_reader_and_compactor_reject_external_symlink(tmp_root: Path, monkeypatch):
-    import ai_core.recommend as recmod
-
-    path = recmod.catalog_path(tmp_root)
-    path.parent.mkdir(parents=True)
-    external = tmp_root / "external-catalog.jsonl"
-    external.write_text('{"id":"external","slug":"injected"}\n', encoding="utf-8")
-    path.symlink_to(external)
-    monkeypatch.setenv("AI_CATALOG_COMPACT_THRESHOLD_BYTES", "0")
-
-    assert recmod.list_catalog(tmp_root) == []
-    result = recmod.compact_skill_catalog(tmp_root)
-
-    assert result["ok"] is False
-    assert external.read_text(encoding="utf-8") == '{"id":"external","slug":"injected"}\n'
-
-
-@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")
-def test_catalog_reader_and_compactor_reject_external_hardlink(tmp_root: Path, monkeypatch):
-    import ai_core.recommend as recmod
-
-    path = recmod.catalog_path(tmp_root)
-    path.parent.mkdir(parents=True)
-    external = tmp_root / "external-catalog.jsonl"
-    external.write_text('{"id":"external","slug":"injected"}\n', encoding="utf-8")
-    if os.name != "nt":
-        external.chmod(0o600)
-    os.link(external, path)
-    monkeypatch.setenv("AI_CATALOG_COMPACT_THRESHOLD_BYTES", "0")
-
-    assert recmod.list_catalog(tmp_root) == []
-    result = recmod.compact_skill_catalog(tmp_root)
-
-    assert result["ok"] is False
-    assert external.read_text(encoding="utf-8") == '{"id":"external","slug":"injected"}\n'
-
-
-def test_catalog_append_and_compaction_are_serialized_without_record_loss(
-    tmp_root: Path,
-    monkeypatch,
-) -> None:
-    import ai_core.recommend as recmod
-    from ai_core.memory import append_jsonl
-
-    path = recmod.catalog_path(tmp_root)
-    monkeypatch.setenv("AI_CATALOG_COMPACT_THRESHOLD_BYTES", "0")
-
-    def append(index: int) -> None:
-        append_jsonl(
-            path,
-            {"id": f"sk-{index:04d}", "slug": f"skill-{index}", "status": "pending"},
-        )
-
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        futures = [pool.submit(append, index) for index in range(50)]
-        futures.extend(pool.submit(recmod.compact_skill_catalog, tmp_root) for _ in range(5))
-        for future in futures:
-            future.result()
-
-    final = recmod.compact_skill_catalog(tmp_root)
-    entries = recmod.list_catalog(tmp_root)
-
-    assert final["ok"] is True
-    assert {entry.id for entry in entries} == {f"sk-{index:04d}" for index in range(50)}
-    if os.name != "nt":
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_e2e_autonomous_loop_full_cycle(tmp_root: Path, monkeypatch):

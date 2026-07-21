@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -127,9 +126,9 @@ def test_post_tool_use_failure_writes_audit(tmp_root: Path) -> None:
 # ---------- INSTALL-INTO.SH REGISTRATION OF P1 EVENTS ----------
 
 
-@pytest.fixture(scope="module")
-def install_into_target(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    target = tmp_path_factory.mktemp("hook-install") / "victim"
+@pytest.fixture
+def install_into_target(tmp_path: Path) -> Path:
+    target = tmp_path / "victim"
     target.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=target, check=True)
     subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=target, check=True)
@@ -140,7 +139,6 @@ def install_into_target(tmp_path_factory: pytest.TempPathFactory) -> Path:
     script = ROOT / "scripts" / "install-into.sh"
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    env["AI_INSTALL_DEFER_RUNTIME"] = "1"
     res = subprocess.run(
         ["bash", str(script), "install", str(target)],
         cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,
@@ -150,10 +148,10 @@ def install_into_target(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return target
 
 
-def test_upgrade_prunes_orphan_commands(install_into_target: Path, tmp_path: Path) -> None:
+def test_upgrade_prunes_orphan_commands(install_into_target: Path) -> None:
     """ai upgrade removes CB-managed commands no longer shipped (manifest-gated), while keeping
     currently-shipped commands AND user-authored files (never recorded in the manifest)."""
-    target = shutil.copytree(install_into_target, tmp_path / "upgrade-target", symlinks=True)
+    target = install_into_target
     prompts = target / ".codex" / "prompts"
     # Realistic state: orphans are NOT in the manifest (earlier upgrades rewrote it to current
     # source only). Prune must still catch them via the cb- namespace + retired-legacy list.
@@ -167,8 +165,7 @@ def test_upgrade_prunes_orphan_commands(install_into_target: Path, tmp_path: Pat
     assert shipped.is_file(), "precondition: cb-doctor is a shipped command"
     res = subprocess.run(
         ["bash", str(ROOT / "scripts" / "install-into.sh"), "upgrade", str(target)],
-        cwd=ROOT,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "AI_INSTALL_DEFER_RUNTIME": "1"},
+        cwd=ROOT, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         capture_output=True, text=True, timeout=300,
     )
     assert res.returncode == 0, res.stderr[-400:]

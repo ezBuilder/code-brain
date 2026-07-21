@@ -271,6 +271,8 @@ def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
         events_path, rotate_jsonl_tail, session_current_path,
     )
     from .audit_fold import fold_old_entries
+    from .loss_accounting import finalize_event, loss_event
+    from .private_write import atomic_write_private_text
 
     age_days = _env_float("AI_MEMORY_ARCHIVE_DAYS", 30.0)
     audit_fold_days = int(_env_float("AI_AUDIT_FOLD_DAYS", 30.0))
@@ -278,24 +280,52 @@ def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
 
     spath = session_current_path(root)
     rotated = False
+    session_before = spath.stat().st_size if spath.exists() else 0
+    session_after = session_before
+    session_errors: list[str] = []
     if spath.exists():
-        size = spath.stat().st_size
+        size = session_before
         if size >= int(_SESSION_NOTE_MAX_BYTES * 0.8):
-            if dry_run:
-                rotated = True
-            else:
-                try:
-                    raw = spath.read_bytes()
-                    tail = raw[-_SESSION_NOTE_KEEP_BYTES:]
-                    nl = tail.find(b"\n")
-                    if nl >= 0:
-                        tail = tail[nl + 1:]
-                    spath.write_bytes(b"# Current Session\n\n[rotated by page_out]\n" + tail)
+            try:
+                raw = spath.read_bytes()
+                tail = raw[-_SESSION_NOTE_KEEP_BYTES:]
+                nl = tail.find(b"\n")
+                if nl >= 0:
+                    tail = tail[nl + 1:]
+                replacement = b"# Current Session\n\n[rotated by page_out]\n" + tail
+                session_after = len(replacement)
+                if not dry_run:
+                    atomic_write_private_text(
+                        spath,
+                        replacement.decode("utf-8", errors="ignore"),
+                        root=root,
+                    )
+                    session_after = spath.stat().st_size
                     rotated = True
-                except OSError:
-                    pass
+                else:
+                    rotated = True
+            except OSError as exc:
+                session_errors.append(str(exc))
     result["session_rotated"] = rotated
-    result["session_size_after"] = spath.stat().st_size if spath.exists() else 0
+    result["session_size_after"] = session_after
+    result["session_loss"] = finalize_event(
+        root,
+        loss_event(
+            domain="session_rotation",
+            operation=".ai/memory/session-current.md",
+            applied=rotated and not dry_run,
+            dry_run=dry_run,
+            files_before=1 if spath.exists() else 0,
+            files_after=1 if spath.exists() else 0,
+            bytes_before=session_before,
+            bytes_after=session_after,
+            reasons={"size_limit": 1 if rotated else 0},
+            errors=session_errors,
+            examples=("session-current.md",) if rotated else (),
+        ),
+    )
+    if session_errors or result["session_loss"].get("accounting", {}).get("ok") is not True:
+        result["ok"] = False
 
     arch = archive_old_sessions(root, age_days=age_days, dry_run=dry_run)
     result["archived"] = arch

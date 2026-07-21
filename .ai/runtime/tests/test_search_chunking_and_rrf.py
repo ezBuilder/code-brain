@@ -277,7 +277,7 @@ def test_candidate_cache_invalidates_when_filter_policy_changes(
     assert calls["git"] == 1
 
 
-def test_strict_freshness_and_full_rebuild_bypass_forged_candidate_cache(tmp_path: Path) -> None:
+def test_freshness_and_full_rebuild_bypass_forged_candidate_cache(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _write(repo, "src/base.py", "BASE = 1\n")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -308,7 +308,9 @@ def test_strict_freshness_and_full_rebuild_bypass_forged_candidate_cache(tmp_pat
             ("src/new.py",),
         ).fetchone()[0]
 
-    assert "src/new.py" not in cached["changed_paths"]
+    # Bounded freshness probes no longer validate/use the candidate cache: the
+    # validation walk itself was unbounded and a forged cache could hide files.
+    assert "src/new.py" in cached["changed_paths"]
     assert "src/new.py" in strict["changed_paths"]
     assert indexed == 1
     assert added.is_file()
@@ -700,6 +702,41 @@ def test_targeted_incremental_does_not_delete_unrelated_function_chunks(tmp_path
     assert any("src/a.py" in item["path"] for item in keep["results"])
     changed = query(repo, "changed_func_v2")
     assert any("src/b.py" in item["path"] for item in changed["results"])
+
+
+def test_incremental_rebuild_vacuums_deleted_rows_and_reports_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    for index in range(30):
+        _write(repo, f"src/item_{index}.py", f"VALUE_{index} = {'x' * 2000!r}\n")
+    rebuild(repo)
+    for index in range(25):
+        (repo / f"src/item_{index}.py").unlink()
+
+    monkeypatch.setattr(search_mod, "INDEX_VACUUM_MIN_FREE_PAGES", 0)
+    monkeypatch.setattr(search_mod, "INDEX_VACUUM_FREE_RATIO", 0.0)
+    result = rebuild(repo, incremental=True)
+
+    assert result["ok"] is True
+    assert result["deleted"] == 25
+    assert result["storage"]["vacuumed"] is True
+    assert result["storage"]["free_pages"] == 0
+    assert result["storage"]["within_limit"] is True
+
+
+def test_rebuild_enforces_absolute_sqlite_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/large.py", "PAYLOAD = " + repr("z" * 50_000) + "\n")
+    monkeypatch.setattr(search_mod, "INDEX_MAX_BYTES", 1024)
+
+    result = rebuild(repo)
+
+    assert result["ok"] is False
+    assert result["error"] == "INDEX_SIZE_LIMIT"
+    assert result["storage"]["within_limit"] is False
+    assert result["storage"]["total_bytes"] > result["storage"]["max_bytes"]
 
 
 def test_chunk_meta_stores_function_metadata(tmp_path: Path) -> None:

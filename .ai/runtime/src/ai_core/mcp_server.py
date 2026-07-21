@@ -153,7 +153,20 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "ai_request_rebuild",
-        "description": "SQLite FTS5 코드 인덱스를 강제 재빌드. 쓰기성.",
+        "description": "SQLite FTS5 코드 인덱스를 bounded 정책으로 재빌드. 쓰기성. force=true는 search.indexing.enabled=false를 이 명시적 호출에서만 우회한다.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "default": False},
+                "incremental": {"type": "boolean", "default": False},
+                "single_flight": {"type": "boolean", "default": True},
+                "max_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+            },
+        },
+    },
+    {
+        "name": "ai_index_status",
+        "description": "인덱싱 활성화·자동 재빌드·상한·최근 progress/stall/orphan 상태와 SQLite 용량을 반환. 읽기전용.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -185,7 +198,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "sandbox_execute",
-        "description": "Run a shell command with compact output in the sandbox; 요약+exec_id를 반환하고 전체 출력은 디스크에 저장. 쓰기성. command는 argv 배열 또는 단일 셸 문자열 모두 허용한다. isolate_network는 IP/DNS를 차단하고 제공 불가 시 fail-closed, isolate_env는 자격증명 환경을 제거한다. 두 옵션은 독립적이며 강한 실행에는 함께 사용한다.",
+        "description": "Run a shell command in the sandbox with stdout/stderr streamed to disk instead of retained unbounded in RAM. Returns compact bounded output, exec_id, command_ok, peak_rss_kib, and structured termination evidence (including SIGKILL/OOM vs external execution-limit classification). 쓰기성. command는 argv 배열 또는 단일 셸 문자열 모두 허용한다. isolate_network는 IP/DNS를 차단하고 제공 불가 시 fail-closed, isolate_env는 자격증명 환경을 제거한다. 두 옵션은 독립적이며 강한 실행에는 함께 사용한다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -976,7 +989,17 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         from .stream_guard import scan_text
         return scan_text(str(args.get("text", "")), scope=str(args.get("scope", "tool") or "tool"))
     if name == "ai_request_rebuild":
-        return rebuild(root)
+        reject_ci_write("index")
+        return rebuild(
+            root,
+            force=bool(args.get("force", False)),
+            incremental=bool(args.get("incremental", False)),
+            single_flight=bool(args.get("single_flight", True)),
+            max_seconds=(int(args["max_seconds"]) if isinstance(args.get("max_seconds"), int) else None),
+        )
+    if name == "ai_index_status":
+        from .search import index_control_status
+        return index_control_status(root)
     if name == "obs_usage":
         return usage_report(root, include_sessions=bool(args.get("include_sessions", False)))
     if name == "obs_health_summary":

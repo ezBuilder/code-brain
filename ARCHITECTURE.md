@@ -41,7 +41,7 @@ Architecture snapshot for the Code Brain runtime. ai_core source, scripts, and G
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
 │  │  hooks.py    │  │ mcp_server.py│  │   cli.py     │  │  doctor.py   │    │
 │  │ handle_hook  │  │ handle_req   │  │ argparse     │  │ run_checks() │    │
-│  │ ≤200ms SLO   │  │ JSON-RPC 2.0 │  │ +reject_ci   │  │ 17 checks    │    │
+│  │ ≤200ms SLO   │  │ JSON-RPC 2.0 │  │ +reject_ci   │  │ strict gates │    │
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘    │
 │         │                 │                 │                 │            │
 │  ┌──────┴─────────────────┴─────────────────┴─────────────────┴───────┐    │
@@ -214,6 +214,7 @@ queue 디렉터리:
   .ai/cache/uv/                ← uv 의존성 캐시
   .ai/cache/diagnostics/       ← redacted bundle zip
   .ai/cache/upgrade/           ← rollback backup
+  .ai/cache/loss-accounting.json ← bounded cumulative files/bytes/records removed
   .ai/cache/remote-memory/     ← optional Cloudflare remote-memory pull cache
 
                      RELEASE ARTIFACTS (dist/, gitignored)
@@ -224,7 +225,7 @@ queue 디렉터리:
   dist/code-brain-X.Y.Z.sbom.json
   dist/code-brain-X.Y.Z.provenance.json
   dist/code-brain-X.Y.Z.release-notes.md
-  dist/release-gate.summary.json   ← schema v2 (Round 87, dep_advisory 포함)
+  dist/release-gate.summary.json   ← schema v4 (operational bounds + loss accounting)
   dist/dep-advisory.json           ← pip-audit advisory only
 ```
 
@@ -272,7 +273,7 @@ GitHub Actions (.github/workflows/release-gate.yml):
     summary-observe:  needs: parity
       • download both summaries
       • uv run python scripts/summary-parity.py UB MAC
-        (schema_version=2 강제, canonical subset 동치 단언)
+        (schema_version=3 강제, canonical artifact/operational subset 동치 단언)
 ```
 
 ## 7. 보안/정책 enforcement points

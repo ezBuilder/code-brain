@@ -3,11 +3,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
 from ai_core import mcp_server  # noqa: E402
 from ai_core.mcp_catalog_meta import MCP_METHOD_COUNT  # noqa: E402
+from ai_core.policy import PolicyDenied  # noqa: E402
 
 
 def test_lightweight_catalog_count_matches_server_tools() -> None:
@@ -35,6 +38,11 @@ def test_tools_list_response_shape(tmp_path: Path) -> None:
     assert "security_finding_list" in names
     assert "security_finding_update" in names
     assert "stream_guard_scan" in names
+    assert "ai_index_status" in names
+    rebuild_tool = next(t for t in tools if t["name"] == "ai_request_rebuild")
+    assert {"force", "incremental", "single_flight", "max_seconds"} <= set(
+        rebuild_tool["inputSchema"]["properties"]
+    )
     hashline_tool = next(t for t in tools if t["name"] == "code_read_hashline")
     assert "편집하기 전" in hashline_tool["description"]
     sandbox_tool = next(t for t in tools if t["name"] == "sandbox_execute")
@@ -168,3 +176,36 @@ def test_full_all_profile_resurfaces_hidden(tmp_path: Path, monkeypatch) -> None
     names = {t["name"] for t in resp["result"]["tools"]}
     assert "loopd_status" in names
     mcp_server._invalidate_tools_list_cache()
+
+
+def test_index_status_and_rebuild_mcp_honor_policy(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / ".ai" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "version: 1\nproject_name: mcp-index\nsearch:\n  retriever: bm25\n"
+        "  indexing:\n    enabled: false\n    auto_rebuild: false\n",
+        encoding="utf-8",
+    )
+    source = tmp_path / "src" / "main.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("MCP_INDEX_NEEDLE = True\n", encoding="utf-8")
+
+    status = mcp_server._dispatch_tool(tmp_path, "ai_index_status", {})
+    denied = mcp_server._dispatch_tool(tmp_path, "ai_request_rebuild", {})
+    forced = mcp_server._dispatch_tool(
+        tmp_path,
+        "ai_request_rebuild",
+        {"force": True, "single_flight": False, "max_seconds": 30},
+    )
+
+    assert status["ok"] is True
+    assert status["policy"]["enabled"] is False
+    assert denied["ok"] is False
+    assert denied["error"] == "INDEXING_DISABLED"
+    assert forced["ok"] is True
+    assert forced["committed"] is True
+
+    monkeypatch.setenv("AI_CI", "1")
+    with pytest.raises(PolicyDenied) as captured:
+        mcp_server._dispatch_tool(tmp_path, "ai_request_rebuild", {"force": True})
+    assert "CI" in str(captured.value).upper()

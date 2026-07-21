@@ -30,6 +30,7 @@ def load_summary(path: Path) -> dict[str, Any]:
 def canonical(payload: dict[str, Any]) -> dict[str, Any]:
     artifacts = payload.get("release_artifacts", {})
     dep_advisory = payload.get("dep_advisory", {})
+    operational = payload.get("operational_bounds", {})
     checks = payload.get("checks", [])
     check_map = {}
     if isinstance(checks, list):
@@ -56,6 +57,72 @@ def canonical(payload: dict[str, Any]) -> dict[str, Any]:
                     )
                     if subkey in entry
                 }
+    operational_subset: dict[str, Any] = {
+        "ok": None,
+        "doctor_groups": {},
+        "transcripts": {},
+        "sandbox": {},
+        "runner": {},
+        "loss_accounting": {},
+    }
+    if isinstance(operational, dict):
+        operational_subset["ok"] = operational.get("ok")
+        doctor_groups = operational.get("doctor_groups")
+        if isinstance(doctor_groups, dict):
+            operational_subset["doctor_groups"] = {
+                name: {
+                    "ok": item.get("ok"),
+                    "missing": sorted(str(value) for value in item.get("missing", []) if isinstance(value, str)),
+                    "failed": sorted(
+                        str(value.get("name"))
+                        for value in item.get("failed", [])
+                        if isinstance(value, dict) and isinstance(value.get("name"), str)
+                    ),
+                }
+                for name, item in sorted(doctor_groups.items())
+                if isinstance(name, str) and isinstance(item, dict)
+            }
+        transcripts = operational.get("transcripts")
+        if isinstance(transcripts, dict):
+            agents = transcripts.get("agents")
+            operational_subset["transcripts"] = {
+                "ok": transcripts.get("ok"),
+                "skipped": transcripts.get("skipped"),
+                "agents": {
+                    name: {
+                        "ok": item.get("ok"),
+                        "bounded": item.get("bounded"),
+                        "policy": item.get("policy") if isinstance(item.get("policy"), dict) else {},
+                    }
+                    for name, item in sorted(agents.items())
+                    if isinstance(name, str) and isinstance(item, dict)
+                }
+                if isinstance(agents, dict)
+                else {},
+            }
+        sandbox = operational.get("sandbox")
+        if isinstance(sandbox, dict):
+            operational_subset["sandbox"] = {
+                "ok": sandbox.get("ok"),
+                "bounded": sandbox.get("bounded"),
+            }
+        runner = operational.get("runner")
+        if isinstance(runner, dict):
+            operational_subset["runner"] = {
+                "ok": runner.get("ok"),
+                "bounded": runner.get("bounded"),
+                "observed": runner.get("observed"),
+                "killed_9": runner.get("killed_9"),
+                "transport_restart": runner.get("transport_restart"),
+            }
+        loss_accounting = operational.get("loss_accounting")
+        if isinstance(loss_accounting, dict):
+            policy = loss_accounting.get("policy")
+            operational_subset["loss_accounting"] = {
+                "ok": loss_accounting.get("ok"),
+                "bounded": loss_accounting.get("bounded"),
+                "policy": policy if isinstance(policy, dict) else {},
+            }
     return {
         "schema_version": payload.get("schema_version"),
         "git_sha": payload.get("git_sha"),
@@ -65,6 +132,7 @@ def canonical(payload: dict[str, Any]) -> dict[str, Any]:
             key: dep_advisory.get(key) if isinstance(dep_advisory, dict) else None
             for key in ("finding_count", "mode", "skipped")
         },
+        "operational_bounds": operational_subset,
         "checks": dict(sorted(check_map.items())),
     }
 
@@ -73,7 +141,15 @@ def compare(left: dict[str, Any], right: dict[str, Any]) -> list[dict[str, Any]]
     left_canonical = canonical(left)
     right_canonical = canonical(right)
     mismatches = []
-    for field in ("schema_version", "git_sha", "release_ready", "release_artifacts", "dep_advisory", "checks"):
+    for field in (
+        "schema_version",
+        "git_sha",
+        "release_ready",
+        "release_artifacts",
+        "dep_advisory",
+        "operational_bounds",
+        "checks",
+    ):
         if left_canonical.get(field) != right_canonical.get(field):
             mismatches.append({"field": field, "left": left_canonical.get(field), "right": right_canonical.get(field)})
     return mismatches

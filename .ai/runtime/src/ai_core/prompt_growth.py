@@ -16,10 +16,15 @@ Hard guarantees:
 from __future__ import annotations
 
 import json
+import os
+import stat
+import time
 from pathlib import Path
 from typing import Any
 
+from .loss_accounting import finalize_event, loss_event
 from .memory import append_audit, append_jsonl, now_iso, read_jsonl_all, rotate_jsonl_tail
+from .private_write import atomic_write_private_text, read_root_confined_text
 
 
 _ALLOWED_RULE_SOURCES = frozenset({
@@ -62,6 +67,8 @@ EVAL_REGRESS_TOL = 0.0       # eval pass-rate may drop at most this much before 
 PROMPT_GROWTH_MAX_BYTES = 512_000
 PROMPT_GROWTH_KEEP = 2000
 PROMPT_GROWTH_VERSION_KEEP = 30
+PROMPT_VERSION_SCAN_MAX_CANDIDATES = 10_000
+PROMPT_VERSION_SCAN_MAX_SECONDS = 1.0
 LEARNED_HEADER = "# Learned project rules (auto-grown by Code Brain; do not edit by hand)"
 BREVITY_RULE_TEXT = (
     "Self-initiated progress/output <=10 words. Answers to user questions concise by default. "
@@ -113,19 +120,152 @@ def rotate_logs(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
 def prune_versions(root: Path, *, keep: int | None = None, dry_run: bool = False) -> dict[str, Any]:
     vdir = root.joinpath(*VERSIONS_PARTS)
     if not vdir.is_dir():
-        return {"ok": True, "pruned": [], "kept": 0, "dry_run": dry_run}
-    versions = sorted(path for path in vdir.glob("*.json") if path.is_file())
+        loss = finalize_event(
+            root,
+            loss_event(
+                domain="prompt_growth_versions",
+                operation=".ai/memory/prompt_growth/versions",
+                applied=False,
+                dry_run=dry_run,
+            ),
+        )
+        return {"ok": True, "pruned": [], "kept": 0, "dry_run": dry_run, "loss": loss}
+    versions: list[tuple[Path, os.stat_result]] = []
+    scan_errors: list[str] = []
+    started = time.monotonic()
+    deadline = started + max(0.05, float(PROMPT_VERSION_SCAN_MAX_SECONDS))
+    candidates_scanned = 0
+    complete = True
+    try:
+        entries = os.scandir(vdir)
+    except OSError as exc:
+        entries = None
+        scan_errors.append(f"list:{exc}")
+        complete = False
+    if entries is not None:
+        try:
+            with entries:
+                for entry in entries:
+                    if candidates_scanned >= max(1, int(PROMPT_VERSION_SCAN_MAX_CANDIDATES)):
+                        scan_errors.append("scan:candidate_limit")
+                        complete = False
+                        break
+                    if time.monotonic() >= deadline:
+                        scan_errors.append("scan:time_limit")
+                        complete = False
+                        break
+                    candidates_scanned += 1
+                    if not entry.name.endswith(".json"):
+                        continue
+                    path = Path(entry.path)
+                    try:
+                        state = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        scan_errors.append(f"{path.name}:stat:{exc}")
+                        complete = False
+                        continue
+                    if stat.S_ISLNK(state.st_mode):
+                        scan_errors.append(f"{path.name}:unsafe-symlink")
+                        complete = False
+                        continue
+                    if not stat.S_ISREG(state.st_mode):
+                        scan_errors.append(f"{path.name}:not-regular")
+                        complete = False
+                        continue
+                    if int(getattr(state, "st_nlink", 1)) != 1:
+                        scan_errors.append(f"{path.name}:unsafe-hardlink")
+                        complete = False
+                        continue
+                    versions.append((path, state))
+        except OSError as exc:
+            scan_errors.append(f"scan:{exc}")
+            complete = False
+    versions.sort(key=lambda item: item[0].name)
+    scan = {
+        "bounded": True,
+        "complete": complete,
+        "candidates_scanned": candidates_scanned,
+        "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+        "policy": {
+            "max_candidates": int(PROMPT_VERSION_SCAN_MAX_CANDIDATES),
+            "max_seconds": float(PROMPT_VERSION_SCAN_MAX_SECONDS),
+        },
+    }
+    before_bytes = sum(int(state.st_size) for _path, state in versions)
+    if not complete or scan_errors:
+        loss = finalize_event(
+            root,
+            loss_event(
+                domain="prompt_growth_versions",
+                operation=".ai/memory/prompt_growth/versions",
+                applied=False,
+                dry_run=dry_run,
+                files_before=len(versions),
+                files_after=len(versions),
+                bytes_before=before_bytes,
+                bytes_after=before_bytes,
+                errors=scan_errors or ("scan_incomplete",),
+            ),
+        )
+        return {
+            "ok": False,
+            "pruned": [],
+            "kept": len(versions),
+            "dry_run": dry_run,
+            "errors": scan_errors or ["scan_incomplete"],
+            "scan": scan,
+            "loss": loss,
+        }
     keep_count = max(0, int(PROMPT_GROWTH_VERSION_KEEP if keep is None else keep))
     remove = versions if keep_count == 0 else versions[:-keep_count]
     pruned: list[str] = []
-    for path in remove:
-        pruned.append(path.name)
-        if not dry_run:
-            try:
+    errors: list[str] = list(scan_errors)
+    removed_bytes = 0
+    for path, expected in remove:
+        try:
+            current = path.lstat()
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or int(getattr(current, "st_nlink", 1)) != 1
+                or int(current.st_dev) != int(expected.st_dev)
+                or int(current.st_ino) != int(expected.st_ino)
+            ):
+                errors.append(f"{path.name}:changed-before-delete")
+                continue
+            if not dry_run:
                 path.unlink()
-            except OSError:
-                pass
-    return {"ok": True, "pruned": pruned, "kept": len(versions) - len(remove), "dry_run": dry_run}
+            pruned.append(path.name)
+            removed_bytes += int(expected.st_size)
+        except OSError as exc:
+            errors.append(f"{path.name}:delete:{exc}")
+    after_count = len(versions) - len(pruned)
+    after_bytes = max(0, int(before_bytes) - int(removed_bytes))
+    loss = finalize_event(
+        root,
+        loss_event(
+            domain="prompt_growth_versions",
+            operation=".ai/memory/prompt_growth/versions",
+            applied=not dry_run and bool(pruned) and not errors,
+            dry_run=dry_run,
+            files_before=len(versions),
+            files_after=after_count,
+            bytes_before=before_bytes,
+            bytes_after=after_bytes,
+            reasons={"version_limit": len(pruned)},
+            errors=errors,
+            examples=pruned,
+        ),
+    )
+    return {
+        "ok": not errors and loss.get("accounting", {}).get("ok") is True,
+        "pruned": pruned,
+        "kept": after_count,
+        "dry_run": dry_run,
+        "errors": errors,
+        "scan": scan,
+        "loss": loss,
+    }
 
 
 # --- 1. capture (called from Stop hook; append-only, never raises) ---
@@ -222,22 +362,68 @@ def _active_rules(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return rules if isinstance(rules, dict) else {}
 
 
-def _render_learned(root: Path, state: dict[str, Any]) -> None:
+def _render_learned(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     rules = _active_rules(state)
     live = [r for r in rules.values() if r.get("status") in {"active", "kept"}]
     path = learned_path(root)
     if not live:
-        # remove the file entirely when nothing should be injected (clean rollback)
+        # Remove the derived learned prompt only after no-follow validation and
+        # preserve exact deletion evidence in the shared loss snapshot.
+        before_bytes = 0
         try:
-            path.unlink()
+            current = path.lstat()
         except FileNotFoundError:
-            pass
-        return
+            event = finalize_event(
+                root,
+                loss_event(
+                    domain="prompt_growth_render",
+                    operation=".ai/memory/learned_prompt.md",
+                    applied=False,
+                ),
+            )
+            return {"ok": event.get("accounting", {}).get("ok") is True, "removed": False, "loss": event}
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or int(getattr(current, "st_nlink", 1)) != 1
+        ):
+            raise OSError("learned prompt removal target is not a private regular file")
+        before_bytes = int(current.st_size)
+        # Revalidate the directory entry immediately before unlink.
+        again = path.lstat()
+        if int(again.st_dev) != int(current.st_dev) or int(again.st_ino) != int(current.st_ino):
+            raise OSError("learned prompt changed before removal")
+        path.unlink()
+        event = finalize_event(
+            root,
+            loss_event(
+                domain="prompt_growth_render",
+                operation=".ai/memory/learned_prompt.md",
+                applied=True,
+                files_before=1,
+                files_after=0,
+                bytes_before=before_bytes,
+                bytes_after=0,
+                records_before=len(rules),
+                records_after=0,
+                reasons={"no_active_rules": 1},
+                examples=("learned_prompt.md",),
+            ),
+        )
+        if event.get("accounting", {}).get("ok") is not True:
+            raise OSError("learned prompt removal accounting failed")
+        return {"ok": True, "removed": True, "loss": event}
     lines = [LEARNED_HEADER, ""]
     for rule in sorted(live, key=lambda r: str(r.get("applied_at", ""))):
         lines.append(f"- {rule['text']}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    rendered = "\n".join(lines) + "\n"
+    # Reject external links before replacing a pre-existing generated prompt.
+    try:
+        read_root_confined_text(path, root=root, max_bytes=1_000_000, require_private=True)
+    except FileNotFoundError:
+        pass
+    atomic_write_private_text(path, rendered, root=root)
+    return {"ok": True, "removed": False, "bytes_written": len(rendered.encode("utf-8"))}
 
 
 def _snapshot_version(root: Path, state: dict[str, Any], reason: str) -> None:

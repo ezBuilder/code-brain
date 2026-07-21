@@ -29,6 +29,7 @@ trap 'rm -f "$PACKAGE_OUTPUT" "$REPORT_OUTPUT"' EXIT
 ./bootstrap.sh
 ./scripts/smoke.sh
 ./scripts/docs-check.sh
+uv run --project .ai/runtime python scripts/stress-bounds.py --files 2000 --iterations 5 >/dev/null
 ./scripts/package.sh >"$PACKAGE_OUTPUT"
 ARCHIVE="$(head -n 1 "$PACKAGE_OUTPUT")"
 if [[ -z "$ARCHIVE" || ! -f "$ARCHIVE" ]]; then
@@ -54,9 +55,19 @@ from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 artifacts = payload.get("release_artifacts", {})
+operational = payload.get("operational_bounds", {})
 if payload.get("release_ready") is not True:
     print("release gate failed: release_ready is not true", file=sys.stderr)
-    print(json.dumps({"release_ready": payload.get("release_ready"), "release_artifacts": artifacts}, indent=2), file=sys.stderr)
+    print(json.dumps({"release_ready": payload.get("release_ready"), "release_artifacts": artifacts, "operational_bounds": operational}, indent=2), file=sys.stderr)
+    raise SystemExit(1)
+if operational.get("ok") is not True:
+    print("release gate failed: operational bounds are not healthy", file=sys.stderr)
+    print(json.dumps(operational, indent=2), file=sys.stderr)
+    raise SystemExit(1)
+runner = operational.get("runner", {})
+if runner.get("observed") is not True:
+    print("release gate failed: observed test-runner evidence is missing", file=sys.stderr)
+    print(json.dumps(runner, indent=2), file=sys.stderr)
     raise SystemExit(1)
 if artifacts.get("all_current") is not True:
     print("release gate failed: release artifacts are not current", file=sys.stderr)

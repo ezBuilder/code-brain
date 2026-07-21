@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .loss_accounting import finalize_event, loss_event
 from .portable import lock_exclusive_blocking, unlock
 from .private_write import (
     append_private_text,
@@ -18,6 +21,16 @@ from .private_write import (
 from .redact import redact_value
 
 _AUDIT_THREAD_LOCK = threading.RLock()
+
+# Audit logs are operational state, not an unlimited archive. Keep each
+# yearly file bounded and retain only a small rolling year window.
+AUDIT_MAX_BYTES = 16_000_000
+AUDIT_KEEP_BYTES = 12_000_000
+AUDIT_RETENTION_YEARS = 3
+AUDIT_PAYLOAD_MAX_BYTES = 64_000
+AUDIT_PAYLOAD_PREVIEW_BYTES = 16_000
+AUDIT_RETENTION_SCAN_MAX_CANDIDATES = 1024
+AUDIT_RETENTION_SCAN_MAX_SECONDS = 1.0
 
 
 def now_iso() -> str:
@@ -424,6 +437,7 @@ def close_todo(
 
 _SESSION_NOTE_MAX_BYTES = 102400
 _SESSION_NOTE_KEEP_BYTES = 51200
+_SESSION_NOTE_READ_MAX_BYTES = 16_000_000
 
 
 def append_session_note(root: Path, *, text: str) -> dict[str, Any]:
@@ -432,38 +446,79 @@ def append_session_note(root: Path, *, text: str) -> dict[str, Any]:
     if not text_clean:
         return {"ok": False, "reason": "empty_text"}
     path = session_current_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
     line = f"- [{now_iso()}] {text_clean[:1024]}\n"
-    if not path.exists():
-        path.write_text("# Current Session\n\n", encoding="utf-8")
-    else:
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
-        if size > _SESSION_NOTE_MAX_BYTES:
+    rotation_loss: dict[str, Any] | None = None
+    lock_path = path.with_name(".session-current.lock")
+    try:
+        with private_file_lock(lock_path, root=root):
+            before_bytes = 0
             try:
-                raw = path.read_bytes()
+                existing, _state = read_root_confined_text(
+                    path,
+                    root=root,
+                    max_bytes=_SESSION_NOTE_READ_MAX_BYTES,
+                    require_private=True,
+                )
+                before_bytes = len(existing.encode("utf-8"))
+            except FileNotFoundError:
+                existing = "# Current Session\n\n"
+                atomic_write_private_text(path, existing, root=root)
+                before_bytes = len(existing.encode("utf-8"))
+            if before_bytes > _SESSION_NOTE_MAX_BYTES:
+                raw = existing.encode("utf-8")
                 tail = raw[-_SESSION_NOTE_KEEP_BYTES:]
                 nl = tail.find(b"\n")
                 if nl >= 0:
                     tail = tail[nl + 1:]
-                path.write_bytes(b"# Current Session\n\n[rotated]\n" + tail)
-            except OSError:
-                pass
-    with path.open("a", encoding="utf-8") as handle:
-        _lock_exclusive(handle)
-        try:
-            handle.write(line)
-        finally:
-            _unlock(handle)
+                replacement = b"# Current Session\n\n[rotated]\n" + tail
+                replacement_text = replacement.decode("utf-8", errors="ignore")
+                atomic_write_private_text(path, replacement_text, root=root)
+                after_rotation_bytes = len(replacement_text.encode("utf-8"))
+                rotation_loss = finalize_event(
+                    root,
+                    loss_event(
+                        domain="session_rotation",
+                        operation=".ai/memory/session-current.md",
+                        applied=True,
+                        files_before=1,
+                        files_after=1,
+                        bytes_before=before_bytes,
+                        bytes_after=after_rotation_bytes,
+                        reasons={"size_limit": 1},
+                        examples=("session-current.md",),
+                    ),
+                )
+            append_private_text(path, line, root=root)
+    except (OSError, PermissionError) as exc:
+        return {
+            "ok": False,
+            "reason": "session_note_write_failed",
+            "error": str(exc)[:200],
+            "path": str(path.relative_to(root)),
+        }
     append_audit(root, action="memory.session_append", category="memory", payload={"bytes": len(line)})
-    return {"ok": True, "appended_bytes": len(line.encode("utf-8")), "path": str(path.relative_to(root))}
+    accounting_ok = (
+        rotation_loss is None
+        or rotation_loss.get("accounting", {}).get("ok") is True
+    )
+    return {
+        "ok": accounting_ok,
+        "appended_bytes": len(line.encode("utf-8")),
+        "path": str(path.relative_to(root)),
+        "rotation_loss": rotation_loss,
+        "reason": None if accounting_ok else "loss_accounting_failed",
+    }
 
 
 def audit_path(root: Path, *, at: datetime | None = None) -> Path:
     effective = at or datetime.now(timezone.utc)
     return root / ".ai" / "memory" / "audit" / f"{effective.year}.jsonl"
+
+
+def audit_maintenance_lock_path(root: Path) -> Path:
+    # Keep the lock outside audit/ so rebuild can safely ignore a malicious or
+    # broken audit-directory symlink and still repair the standalone index.
+    return root / ".ai" / "memory" / ".audit-maintenance.lock"
 
 
 def all_audit_files(root: Path) -> list[Path]:
@@ -493,40 +548,400 @@ def all_audit_files(root: Path) -> list[Path]:
     return files
 
 
+def _json_line(record: dict[str, Any]) -> str:
+    return json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _bounded_audit_payload(payload: dict[str, Any]) -> Any:
+    redacted = redact_value(payload)
+    encoded = _json_line({"payload": redacted}).encode("utf-8")
+    if len(encoded) <= AUDIT_PAYLOAD_MAX_BYTES:
+        return redacted
+    preview = encoded[: max(0, int(AUDIT_PAYLOAD_PREVIEW_BYTES))].decode("utf-8", errors="ignore")
+    return {
+        "truncated": True,
+        "original_bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "preview": preview,
+    }
+
+
+def _chained_line(record: dict[str, Any], previous_line: str | None) -> str:
+    chained = dict(record)
+    chained["prev_sha"] = line_sha(previous_line) if previous_line is not None else None
+    return _json_line(chained)
+
+
+def _record_ts(raw_line: str) -> str | None:
+    try:
+        loaded = json.loads(raw_line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    value = loaded.get("ts")
+    return value if isinstance(value, str) else None
+
+
+def _render_rechained(lines: list[str], checkpoint: dict[str, Any]) -> str:
+    rendered: list[str] = []
+    previous: str | None = None
+    for item in [checkpoint, *lines]:
+        if isinstance(item, str):
+            try:
+                loaded = json.loads(item)
+            except json.JSONDecodeError:
+                rendered.append(item)
+                previous = item
+                continue
+            if not isinstance(loaded, dict):
+                rendered.append(item)
+                previous = item
+                continue
+            record = loaded
+        else:
+            record = item
+        line = _chained_line(record, previous)
+        rendered.append(line)
+        previous = line
+    return "\n".join(rendered) + "\n"
+
+
+def _compact_audit_text(
+    text: str,
+    *,
+    path: Path,
+    timestamp: datetime,
+    reserve_bytes: int,
+) -> tuple[str, dict[str, Any] | None]:
+    before = len(text.encode("utf-8"))
+    cap = max(1024, int(AUDIT_MAX_BYTES))
+    if before + max(0, int(reserve_bytes)) <= cap:
+        return text, None
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    source_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    tail_budget = max(
+        0,
+        min(
+            max(0, int(AUDIT_KEEP_BYTES)),
+            cap - max(0, int(reserve_bytes)) - 1024,
+        ),
+    )
+    selected_reversed: list[str] = []
+    selected_bytes = 0
+    for line in reversed(lines):
+        line_bytes = len((line + "\n").encode("utf-8"))
+        if selected_reversed and selected_bytes + line_bytes > tail_budget:
+            break
+        if line_bytes > tail_budget and not selected_reversed:
+            break
+        selected_reversed.append(line)
+        selected_bytes += line_bytes
+    selected = list(reversed(selected_reversed))
+
+    def build_checkpoint(retained: list[str]) -> dict[str, Any]:
+        dropped_count = len(lines) - len(retained)
+        dropped = lines[:dropped_count]
+        return {
+            "ts": timestamp.isoformat().replace("+00:00", "Z"),
+            "monotonic_ns": time.monotonic_ns(),
+            "action": "audit.retention_compact",
+            "category": "audit",
+            "payload": {
+                "path": path.name,
+                "bytes_before": before,
+                "source_sha256": source_sha,
+                "dropped_records": dropped_count,
+                "retained_records": len(retained),
+                "first_dropped_ts": _record_ts(dropped[0]) if dropped else None,
+                "last_dropped_ts": _record_ts(dropped[-1]) if dropped else None,
+            },
+        }
+
+    checkpoint = build_checkpoint(selected)
+    replacement = _render_rechained(selected, checkpoint)
+    while selected and len(replacement.encode("utf-8")) + reserve_bytes > cap:
+        selected.pop(0)
+        checkpoint = build_checkpoint(selected)
+        replacement = _render_rechained(selected, checkpoint)
+
+    return replacement, {
+        "bytes_before": before,
+        "bytes_after": len(replacement.encode("utf-8")),
+        "dropped_records": len(lines) - len(selected),
+        "retained_records": len(selected),
+    }
+
+
+def _prune_expired_audit_files(
+    root: Path,
+    *,
+    current_year: int,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+    keep_years = max(1, int(AUDIT_RETENTION_YEARS))
+    oldest_year = current_year - keep_years + 1
+    removed: list[dict[str, Any]] = []
+    errors: list[str] = []
+    directory = audit_path(root).parent
+    policy = {
+        "max_candidates": int(AUDIT_RETENTION_SCAN_MAX_CANDIDATES),
+        "max_seconds": float(AUDIT_RETENTION_SCAN_MAX_SECONDS),
+    }
+    if not directory.exists():
+        return [], [], {
+            "bounded": True,
+            "complete": True,
+            "candidates_scanned": 0,
+            "files_before": 0,
+            "files_after": 0,
+            "bytes_before": 0,
+            "bytes_after": 0,
+            "policy": policy,
+        }
+
+    started = time.monotonic()
+    deadline = started + max(0.05, float(AUDIT_RETENTION_SCAN_MAX_SECONDS))
+    candidates_scanned = 0
+    files: list[tuple[Path, os.stat_result]] = []
+    complete = True
+    try:
+        entries = os.scandir(directory)
+    except OSError as exc:
+        return [], [f"list:{exc}"], {
+            "bounded": True,
+            "complete": False,
+            "candidates_scanned": 0,
+            "files_before": 0,
+            "files_after": 0,
+            "bytes_before": 0,
+            "bytes_after": 0,
+            "policy": policy,
+        }
+    try:
+        with entries:
+            for entry in entries:
+                if candidates_scanned >= max(1, int(AUDIT_RETENTION_SCAN_MAX_CANDIDATES)):
+                    errors.append("scan:candidate_limit")
+                    complete = False
+                    break
+                if time.monotonic() >= deadline:
+                    errors.append("scan:time_limit")
+                    complete = False
+                    break
+                candidates_scanned += 1
+                if not entry.name.endswith(".jsonl"):
+                    continue
+                path = Path(entry.path)
+                try:
+                    state = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    errors.append(f"{entry.name}:stat:{exc}")
+                    complete = False
+                    continue
+                if stat.S_ISLNK(state.st_mode):
+                    errors.append(f"{entry.name}:unsafe-symlink")
+                    complete = False
+                    continue
+                if not stat.S_ISREG(state.st_mode):
+                    errors.append(f"{entry.name}:not-regular")
+                    complete = False
+                    continue
+                if int(getattr(state, "st_nlink", 1)) != 1:
+                    errors.append(f"{entry.name}:unsafe-hardlink")
+                    complete = False
+                    continue
+                files.append((path, state))
+    except OSError as exc:
+        errors.append(f"scan:{exc}")
+        complete = False
+
+    before_files = len(files)
+    before_bytes = sum(int(state.st_size) for _path, state in files)
+    elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+    if not complete or errors:
+        return [], errors or ["scan_incomplete"], {
+            "bounded": True,
+            "complete": False,
+            "candidates_scanned": candidates_scanned,
+            "files_before": before_files,
+            "files_after": before_files,
+            "bytes_before": before_bytes,
+            "bytes_after": before_bytes,
+            "elapsed_ms": elapsed_ms,
+            "policy": policy,
+        }
+
+    for path, expected in sorted(files, key=lambda item: item[0].name):
+        stem = path.stem
+        if len(stem) < 4 or not stem[:4].isdigit() or int(stem[:4]) >= oldest_year:
+            continue
+        try:
+            current = path.lstat()
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or int(getattr(current, "st_nlink", 1)) != 1
+                or int(current.st_dev) != int(expected.st_dev)
+                or int(current.st_ino) != int(expected.st_ino)
+            ):
+                errors.append(f"{path.name}:changed-before-delete")
+                continue
+            path.unlink()
+            removed.append({"path": path.name, "bytes": int(expected.st_size)})
+        except OSError as exc:
+            errors.append(f"{path.name}:{exc}")
+    removed_bytes = sum(int(item["bytes"]) for item in removed)
+    return removed, errors, {
+        "bounded": True,
+        "complete": True,
+        "candidates_scanned": candidates_scanned,
+        "files_before": before_files,
+        "files_after": max(0, before_files - len(removed)),
+        "bytes_before": before_bytes,
+        "bytes_after": max(0, before_bytes - removed_bytes),
+        "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+        "policy": policy,
+    }
+
+
 def append_audit(root: Path, *, action: str, category: str, payload: dict[str, Any]) -> dict[str, Any]:
     timestamp = datetime.now(timezone.utc)
     path = audit_path(root, at=timestamp)
     with _AUDIT_THREAD_LOCK:
-        with private_file_lock(jsonl_lock_path(path), root=root):
-            try:
-                text, _state = read_root_confined_text(
-                    path,
-                    root=root,
-                    max_bytes=100_000_000,
-                    require_private=False,
+        with private_file_lock(audit_maintenance_lock_path(root), root=root):
+            removed_files, retention_errors, retention_scan = _prune_expired_audit_files(
+                root,
+                current_year=timestamp.year,
+            )
+            maintenance_losses: list[dict[str, Any]] = []
+            if removed_files or retention_errors:
+                maintenance_losses.append(
+                    finalize_event(
+                        root,
+                        loss_event(
+                            domain="audit_retention",
+                            operation=".ai/memory/audit",
+                            applied=bool(removed_files) and not retention_errors,
+                            files_before=int(retention_scan.get("files_before") or 0),
+                            files_after=int(retention_scan.get("files_after") or 0),
+                            bytes_before=int(retention_scan.get("bytes_before") or 0),
+                            bytes_after=int(retention_scan.get("bytes_after") or 0),
+                            reasons={"age_limit": len(removed_files)},
+                            errors=retention_errors,
+                            examples=(item.get("path") for item in removed_files),
+                        ),
+                    )
                 )
-            except FileNotFoundError:
-                text = ""
-            previous_lines = [line for line in text.splitlines() if line.strip()]
-            prev_sha = line_sha(previous_lines[-1]) if previous_lines else None
-            record = {
+            bounded_payload = _bounded_audit_payload(payload)
+            if isinstance(bounded_payload, dict) and bounded_payload.get("truncated") is True:
+                original_bytes = int(bounded_payload.get("original_bytes") or 0)
+                retained_bytes = len(_json_line({"payload": bounded_payload}).encode("utf-8"))
+                maintenance_losses.append(
+                    finalize_event(
+                        root,
+                        loss_event(
+                            domain="payload_truncation",
+                            operation=f"audit:{action}"[:240],
+                            applied=True,
+                            bytes_before=original_bytes,
+                            bytes_after=retained_bytes,
+                            records_before=1,
+                            records_after=1,
+                            reasons={"payload_limit": 1},
+                            examples=(action,),
+                        ),
+                    )
+                )
+            base_record = {
                 "ts": timestamp.isoformat().replace("+00:00", "Z"),
                 "monotonic_ns": time.monotonic_ns(),
                 "action": action,
                 "category": category,
-                "payload": redact_value(payload),
-                "prev_sha": prev_sha,
+                "payload": bounded_payload,
             }
-            line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            append_private_text(path, line + "\n", root=root)
-    append_jsonl(
-        root / ".ai" / "memory" / "audit-index.jsonl",
-        {"ts": record["ts"], "category": category, "action": action, "path": path.relative_to(root).as_posix()},
-    )
+            maintenance_record: dict[str, Any] | None = None
+            if removed_files or retention_errors:
+                maintenance_record = {
+                    "ts": base_record["ts"],
+                    "monotonic_ns": time.monotonic_ns(),
+                    "action": "audit.retention_prune",
+                    "category": "audit",
+                    "payload": _bounded_audit_payload(
+                        {
+                            "retention_years": max(1, int(AUDIT_RETENTION_YEARS)),
+                            "removed_files": removed_files,
+                            "errors": retention_errors,
+                            "scan": retention_scan,
+                        }
+                    ),
+                }
+            reserve_records = [record for record in (maintenance_record, base_record) if record is not None]
+            reserve_bytes = sum(len(_chained_line(record, "0" * 64).encode("utf-8")) + 1 for record in reserve_records)
+            compacted = False
+            with private_file_lock(jsonl_lock_path(path), root=root):
+                try:
+                    text, _state = read_root_confined_text(
+                        path,
+                        root=root,
+                        max_bytes=max(100_000_000, int(AUDIT_MAX_BYTES) * 8),
+                        require_private=False,
+                    )
+                except FileNotFoundError:
+                    text = ""
+                replacement, compact_result = _compact_audit_text(
+                    text,
+                    path=path,
+                    timestamp=timestamp,
+                    reserve_bytes=reserve_bytes,
+                )
+                if compact_result is not None:
+                    atomic_write_private_text(path, replacement, root=root)
+                    text = replacement
+                    compacted = True
+                    dropped_records = int(compact_result.get("dropped_records") or 0)
+                    retained_records = int(compact_result.get("retained_records") or 0)
+                    maintenance_losses.append(
+                        finalize_event(
+                            root,
+                            loss_event(
+                                domain="audit_compaction",
+                                operation=path.relative_to(root).as_posix(),
+                                applied=True,
+                                files_before=1,
+                                files_after=1,
+                                bytes_before=int(compact_result.get("bytes_before") or 0),
+                                bytes_after=int(compact_result.get("bytes_after") or 0),
+                                records_before=dropped_records + retained_records,
+                                records_after=retained_records,
+                                reasons={"size_limit": dropped_records},
+                                examples=(path.name,),
+                            ),
+                        )
+                    )
+                previous_lines = [line for line in text.splitlines() if line.strip()]
+                previous_line = previous_lines[-1] if previous_lines else None
+                appended_lines: list[str] = []
+                for pending in reserve_records:
+                    line = _chained_line(pending, previous_line)
+                    appended_lines.append(line)
+                    previous_line = line
+                append_private_text(path, "\n".join(appended_lines) + "\n", root=root)
+                record = json.loads(appended_lines[-1])
+                if maintenance_losses:
+                    record["_maintenance"] = {"losses": maintenance_losses}
+
+            if compacted or removed_files or retention_errors:
+                _rebuild_audit_index_locked(root)
+            else:
+                append_jsonl(
+                    root / ".ai" / "memory" / "audit-index.jsonl",
+                    {"ts": record["ts"], "category": category, "action": action, "path": path.relative_to(root).as_posix()},
+                )
     return record
 
 
-def rebuild_audit_index(root: Path) -> dict[str, Any]:
+def _rebuild_audit_index_locked(root: Path) -> dict[str, Any]:
     audit_root = root / ".ai" / "memory" / "audit"
     index_path = root / ".ai" / "memory" / "audit-index.jsonl"
     rows: list[dict[str, Any]] = []
@@ -574,6 +989,12 @@ def rebuild_audit_index(root: Path) -> dict[str, Any]:
     if skipped:
         result["skipped"] = skipped
     return result
+
+
+def rebuild_audit_index(root: Path) -> dict[str, Any]:
+    with _AUDIT_THREAD_LOCK:
+        with private_file_lock(audit_maintenance_lock_path(root), root=root):
+            return _rebuild_audit_index_locked(root)
 
 
 def read_jsonl_tail(path: Path, limit: int) -> list[dict[str, Any]]:
@@ -680,6 +1101,39 @@ def rotate_jsonl_tail(
     root = state_root_for_path(path)
     rel = path.as_posix()
     try:
+        operation = path.relative_to(root).as_posix()
+    except ValueError:
+        operation = path.name
+
+    def with_loss(
+        payload: dict[str, Any],
+        *,
+        before_bytes: int = 0,
+        after_bytes: int = 0,
+        before_records: int = 0,
+        after_records: int = 0,
+        errors: list[str] | tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        event = finalize_event(
+            root,
+            loss_event(
+                domain="jsonl_rotation",
+                operation=operation,
+                applied=bool(payload.get("ok")) and not dry_run,
+                dry_run=dry_run,
+                files_before=1 if payload.get("exists") else 0,
+                files_after=1 if payload.get("exists") else 0,
+                bytes_before=before_bytes,
+                bytes_after=after_bytes,
+                records_before=before_records,
+                records_after=after_records,
+                reasons={"size_limit": max(0, before_records - after_records)},
+                errors=errors,
+                examples=(operation,),
+            ),
+        )
+        return {**payload, "loss": event}
+    try:
         text, state = read_root_confined_text(
             path,
             root=root,
@@ -688,11 +1142,21 @@ def rotate_jsonl_tail(
         )
         before = int(state.st_size)
     except FileNotFoundError:
-        return {"ok": True, "path": rel, "exists": False, "rotated": False, "bytes_before": 0, "bytes_after": 0}
+        return with_loss({"ok": True, "path": rel, "exists": False, "rotated": False, "bytes_before": 0, "bytes_after": 0})
     except (OSError, UnicodeDecodeError) as exc:
-        return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": str(exc)}
+        return with_loss(
+            {"ok": False, "path": rel, "exists": True, "rotated": False, "error": str(exc)},
+            errors=(str(exc),),
+        )
     if before <= max_bytes:
-        return {"ok": True, "path": rel, "exists": True, "rotated": False, "bytes_before": before, "bytes_after": before}
+        line_count = len(text.splitlines())
+        return with_loss(
+            {"ok": True, "path": rel, "exists": True, "rotated": False, "bytes_before": before, "bytes_after": before},
+            before_bytes=before,
+            after_bytes=before,
+            before_records=line_count,
+            after_records=line_count,
+        )
 
     try:
         with private_file_lock(jsonl_lock_path(path), root=root):
@@ -706,14 +1170,15 @@ def rotate_jsonl_tail(
             )
             before = int(state.st_size)
             if before <= max_bytes:
-                return {
+                line_count = len(text.splitlines())
+                return with_loss({
                     "ok": True,
                     "path": rel,
                     "exists": True,
                     "rotated": False,
                     "bytes_before": before,
                     "bytes_after": before,
-                }
+                }, before_bytes=before, after_bytes=before, before_records=line_count, after_records=line_count)
             lines = text.splitlines()
             tail = lines[-max(1, int(keep_lines)):]
             kept_reversed: list[str] = []
@@ -734,7 +1199,7 @@ def rotate_jsonl_tail(
             after = len(replacement.encode("utf-8"))
             if not dry_run:
                 atomic_write_private_text(path, replacement, root=root)
-            return {
+            return with_loss({
                 "ok": True,
                 "path": rel,
                 "exists": True,
@@ -744,9 +1209,14 @@ def rotate_jsonl_tail(
                 "bytes_after": after,
                 "lines_before": len(lines),
                 "lines_after": len(kept),
-            }
+            }, before_bytes=before, after_bytes=after, before_records=len(lines), after_records=len(kept))
     except OSError as exc:
-        return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": str(exc)}
+        return with_loss(
+            {"ok": False, "path": rel, "exists": True, "rotated": False, "error": str(exc)},
+            before_bytes=before if "before" in locals() else 0,
+            after_bytes=before if "before" in locals() else 0,
+            errors=(str(exc),),
+        )
 
 
 EVENTS_MAX_BYTES = 4_000_000  # events.jsonl is hook telemetry mined only for RECENT command
@@ -784,15 +1254,43 @@ def _maybe_rotate_events(path: Path) -> None:
 
 
 def append_event(root: Path, event: dict[str, Any]) -> dict[str, Any]:
+    bounded_payload = _bounded_event_payload(event)
     record = {
         "ts": now_iso(),
         "kind": event.get("hook", event.get("kind", "unknown")),
         "agent": event.get("agent", "unknown"),
         "agent_session_id": event.get("agent_session_id"),
-        "payload": _bounded_event_payload(event),
+        "payload": bounded_payload,
     }
     path = events_path(root)
     append_jsonl(path, record)
-    _maybe_rotate_events(path)
+    rotation = rotate_jsonl_tail(path, max_bytes=EVENTS_MAX_BYTES, keep_lines=EVENTS_KEEP)
+    losses: list[dict[str, Any]] = []
+    if isinstance(bounded_payload, dict) and bounded_payload.get("truncated") is True:
+        original_bytes = int(bounded_payload.get("original_bytes") or 0)
+        retained_bytes = len(
+            json.dumps(bounded_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        losses.append(
+            finalize_event(
+                root,
+                loss_event(
+                    domain="payload_truncation",
+                    operation=f"event:{record['kind']}"[:240],
+                    applied=True,
+                    bytes_before=original_bytes,
+                    bytes_after=retained_bytes,
+                    records_before=1,
+                    records_after=1,
+                    reasons={"payload_limit": 1},
+                    examples=(record["kind"],),
+                ),
+            )
+        )
+    rotation_loss = rotation.get("loss") if isinstance(rotation, dict) else None
+    if isinstance(rotation_loss, dict):
+        losses.append(rotation_loss)
+    if losses:
+        record["_maintenance"] = {"losses": losses}
     append_audit(root, action="event.append", category="memory", payload={"kind": record["kind"], "agent": record["agent"]})
     return record

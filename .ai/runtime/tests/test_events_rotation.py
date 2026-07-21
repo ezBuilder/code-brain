@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from ai_core import memory
+from ai_core.loss_accounting import summary as loss_summary
 
 
 def _events_path(root: Path) -> Path:
@@ -45,8 +46,15 @@ def test_append_event_truncates_single_huge_payload(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(memory, "EVENT_PAYLOAD_MAX_BYTES", 600)
     monkeypatch.setattr(memory, "EVENT_PAYLOAD_PREVIEW_CHARS", 120)
     monkeypatch.setattr(memory, "EVENTS_MAX_BYTES", 10_000)
-    memory.append_event(tmp_path, {"hook": "PreToolUse", "blob": "x" * 5000})
+    returned = memory.append_event(tmp_path, {"hook": "PreToolUse", "blob": "x" * 5000})
     record = json.loads(_events_path(tmp_path).read_text(encoding="utf-8").splitlines()[-1])
     assert record["payload"]["truncated"] is True
     assert record["payload"]["original_bytes"] > 600
     assert len(record["payload"]["preview"]) <= 120
+    loss = next(
+        item
+        for item in returned["_maintenance"]["losses"]
+        if item["domain"] == "payload_truncation"
+    )
+    assert loss["bytes"]["removed"] > 0
+    assert loss_summary(tmp_path)["domains"]["payload_truncation"]["removed_bytes"] > 0

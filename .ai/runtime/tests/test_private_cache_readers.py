@@ -104,7 +104,10 @@ def test_snapshot_reader_and_pruner_ignore_external_symlinks(tmp_path: Path) -> 
     snapshot.symlink_to(external)
 
     assert read_latest_snapshot(tmp_path) is None
-    assert prune_snapshots(tmp_path, older_than_days=0) == {"ok": True, "removed": 0, "kept": 0}
+    result = prune_snapshots(tmp_path, older_than_days=0)
+    assert result["ok"] is False
+    assert result["removed"] == 0
+    assert any("unsafe-resume-symlink" in item for item in result["errors"])
     assert snapshot.is_symlink()
     assert external.read_text(encoding="utf-8") == '{"session_id":"external"}'
 

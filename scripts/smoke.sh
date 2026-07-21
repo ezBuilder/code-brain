@@ -45,11 +45,11 @@ printf '{"reason":"smoke"}' | uv run --project .ai/runtime ai inbox request --ga
 APPROVAL_ID="$(uv run --project .ai/runtime python -c 'import json,sys; print(json.load(open(sys.argv[1]))["approval"]["approval_id"])' "$APPROVAL_OUTPUT")"
 uv run --project .ai/runtime ai inbox approve "$APPROVAL_ID" --json >/dev/null
 printf '{"summary":"smoke"}' | uv run --project .ai/runtime ai notify enqueue --channel stdout --json >/dev/null
-uv run --project .ai/runtime ai obs metrics --json >/dev/null
-uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
+uv run --project .ai/runtime ai obs metrics --skip-usage --json >/dev/null
+uv run --project .ai/runtime ai diagnostics bundle --dry-run --skip-usage --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai index rebuild --json >/dev/null
-uv run --project .ai/runtime ai report status --json >/dev/null
+uv run --project .ai/runtime ai report status --skip-usage --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
 if ./scripts/package.sh >"$PACKAGE_OUTPUT" 2>"$PACKAGE_ERROR"; then
   echo "smoke failed: package script unexpectedly succeeded without git metadata" >&2
@@ -61,7 +61,7 @@ if ! grep -Fq "package failed: git HEAD unavailable" "$PACKAGE_ERROR"; then
   exit 1
 fi
 
-CI=true uv run --project .ai/runtime ai obs metrics --json >/dev/null
+CI=true uv run --project .ai/runtime ai obs metrics --skip-usage --json >/dev/null
 if CI=true uv run --project .ai/runtime ai render >/dev/null 2>&1; then
   echo "expected CI render write rejection" >&2
   exit 1

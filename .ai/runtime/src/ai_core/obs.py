@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import platform
-import shutil
+import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -11,8 +13,30 @@ from typing import Any
 
 from . import __version__
 from .doctor import as_payload
-from .memory import all_audit_files
+from .loss_accounting import finalize_event, loss_event
+from .memory import all_audit_files, append_jsonl, rotate_jsonl_tail
 from .redact import redact_value
+from .retention import prune_directory, retention_status
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+LOG_RETENTION_DAYS = _env_int("AI_LOG_RETENTION_DAYS", 14)
+LOG_MAX_FILES = _env_int("AI_LOG_MAX_FILES", 14)
+LOG_MAX_BYTES = _env_int("AI_LOG_MAX_BYTES", 32_000_000, minimum=1024)
+LOG_FILE_MAX_BYTES = _env_int("AI_LOG_FILE_MAX_BYTES", 4_000_000, minimum=1024)
+LOG_KEEP_LINES = _env_int("AI_LOG_KEEP_LINES", 5000, minimum=1)
+LOG_PAYLOAD_MAX_BYTES = _env_int("AI_LOG_PAYLOAD_MAX_BYTES", 32_000, minimum=256)
+
+DIAGNOSTICS_RETENTION_DAYS = _env_int("AI_DIAGNOSTICS_RETENTION_DAYS", 30)
+DIAGNOSTICS_MAX_FILES = _env_int("AI_DIAGNOSTICS_MAX_FILES", 20, minimum=1)
+DIAGNOSTICS_MAX_BYTES = _env_int("AI_DIAGNOSTICS_MAX_BYTES", 100_000_000, minimum=1024)
 
 
 def now_iso() -> str:
@@ -24,20 +48,89 @@ def log_path(root: Path) -> Path:
     return root / ".ai" / "cache" / "logs" / f"{stamp}.jsonl"
 
 
+def _bounded_log_payload(payload: dict[str, Any]) -> Any:
+    cleaned = redact_value(payload)
+    encoded = json.dumps(cleaned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) <= LOG_PAYLOAD_MAX_BYTES:
+        return cleaned
+    preview = encoded[: max(0, LOG_PAYLOAD_MAX_BYTES // 2)].decode("utf-8", errors="ignore")
+    return {
+        "truncated": True,
+        "original_bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "preview": preview,
+    }
+
+
+def logs_retention_status(root: Path) -> dict[str, Any]:
+    return retention_status(
+        root,
+        root / ".ai" / "cache" / "logs",
+        suffixes=(".jsonl",),
+        keep_days=LOG_RETENTION_DAYS,
+        max_files=LOG_MAX_FILES,
+        max_bytes=LOG_MAX_BYTES,
+    )
+
+
+def prune_logs(root: Path, *, keep_days: int | None = None) -> dict[str, Any]:
+    effective_days = LOG_RETENTION_DAYS if keep_days is None else keep_days
+    return prune_directory(
+        root,
+        root / ".ai" / "cache" / "logs",
+        suffixes=(".jsonl",),
+        keep_days=effective_days,
+        max_files=LOG_MAX_FILES,
+        max_bytes=LOG_MAX_BYTES,
+        preserve=(log_path(root),),
+        accounting_domain="logs_retention",
+    )
+
+
 def write_log(root: Path, level: str, event: str, payload: dict[str, Any]) -> dict[str, Any]:
+    bounded_payload = _bounded_log_payload(payload)
     record = {
         "ts": now_iso(),
         "level": level,
         "event": event,
-        "payload": redact_value(payload),
+        "payload": bounded_payload,
     }
     path = log_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.open("a", encoding="utf-8").write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-    return {"ok": True, "path": path.relative_to(root).as_posix(), "record": record}
+    append_jsonl(path, record)
+    rotation = rotate_jsonl_tail(path, max_bytes=LOG_FILE_MAX_BYTES, keep_lines=LOG_KEEP_LINES)
+    retention = prune_logs(root)
+    payload_loss: dict[str, Any] | None = None
+    if isinstance(bounded_payload, dict) and bounded_payload.get("truncated") is True:
+        original_bytes = int(bounded_payload.get("original_bytes") or 0)
+        retained_bytes = len(
+            json.dumps(bounded_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        payload_loss = finalize_event(
+            root,
+            loss_event(
+                domain="payload_truncation",
+                operation=f"log:{event}"[:240],
+                applied=True,
+                bytes_before=original_bytes,
+                bytes_after=retained_bytes,
+                records_before=1,
+                records_after=1,
+                reasons={"payload_limit": 1},
+                examples=(event,),
+            ),
+        )
+    return {
+        "ok": bool(rotation.get("ok")) and bool(retention.get("ok")),
+        "path": path.relative_to(root).as_posix(),
+        "record": record,
+        "rotation": rotation,
+        "retention": retention,
+        "payload_loss": payload_loss,
+    }
 
 
 def metrics(root: Path, *, include_usage: bool = True) -> dict[str, Any]:
+    from .resource_diag import system_memory_snapshot
     from .worker.scheduler import queue_age_stats, recovery_status
     from .search import observability as search_observability
 
@@ -50,7 +143,7 @@ def metrics(root: Path, *, include_usage: bool = True) -> dict[str, Any]:
 
         usage: dict[str, Any] = {
             "claude": _usage_totals_only(claude_usage_summary(root)),
-            "codex": codex_usage_summary(root),
+            "codex": _usage_totals_only(codex_usage_summary(root)),
         }
     else:
         usage = {"skipped": True, "reason": "lightweight diagnostics smoke check"}
@@ -74,6 +167,7 @@ def metrics(root: Path, *, include_usage: bool = True) -> dict[str, Any]:
             "indexed_bytes": search.get("indexed_bytes", 0),
         },
         "search": search,
+        "resources": system_memory_snapshot(),
         "usage": usage,
     }
 
@@ -305,6 +399,8 @@ def _usage_totals_only(payload: dict[str, Any]) -> dict[str, Any]:
     compact = {
         "ok": payload.get("ok"),
         "source": payload.get("source"),
+        "complete": payload.get("complete", True),
+        "partial": payload.get("partial", False),
         "sessions_scanned": payload.get("sessions_scanned", 0),
         "sessions_matched": payload.get("sessions_matched", 0),
         "messages": payload.get("messages", 0),
@@ -315,6 +411,8 @@ def _usage_totals_only(payload: dict[str, Any]) -> dict[str, Any]:
         # shape stability; codex-side semantics will be wired separately.
         "cache_metrics": _cache_hit_metrics(tokens),
     }
+    if isinstance(payload.get("scan"), dict):
+        compact["scan"] = payload["scan"]
     for key in ("user_messages", "agent_messages", "turns"):
         if key in payload:
             compact[key] = payload.get(key, 0)
@@ -327,6 +425,7 @@ def _int(value: Any) -> int:
 
 def health_summary(root: Path) -> dict[str, Any]:
     from .doctor import run_checks
+    from .resource_diag import system_memory_snapshot
     from .worker.lock import lock_status
     from .worker.scheduler import QUEUE_PENDING_AGE_STALE_SECONDS, QUEUE_PROCESSING_AGE_STALE_SECONDS, status as queue_status
 
@@ -367,6 +466,7 @@ def health_summary(root: Path) -> dict[str, Any]:
         },
         "release_artifacts": release_artifact_summary(root),
         "index": index_summary(root),
+        "resources": system_memory_snapshot(),
         "surfacing": _surfacing_summary(root),
         "layers": _advanced_layers_summary(root),
     }
@@ -696,30 +796,61 @@ def diagnostics(
         return {"ok": True, "dry_run": True, "bundle": bundle}
     diag_root = root / ".ai" / "cache" / "diagnostics"
     diag_root.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    json_path = diag_root / f"diagnostics-{stamp}.json"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    json_name = f"diagnostics-{stamp}.json"
     zip_path = diag_root / f"diagnostics-{stamp}.zip"
-    json_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(json_path, json_path.name)
-    return {"ok": True, "dry_run": False, "path": zip_path.relative_to(root).as_posix(), "retention_days": 30}
+    encoded = (json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=".diagnostics.", suffix=".zip.tmp", dir=diag_root)
+    os.close(fd)
+    temporary = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(json_name, encoded)
+        os.replace(temporary, zip_path)
+        if os.name != "nt":
+            zip_path.chmod(0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+    retention = prune_diagnostics(root, preserve=(zip_path,))
+    return {
+        "ok": bool(retention.get("ok")),
+        "dry_run": False,
+        "path": zip_path.relative_to(root).as_posix(),
+        "retention_days": DIAGNOSTICS_RETENTION_DAYS,
+        "retention": retention,
+    }
 
 
-def prune_diagnostics(root: Path, *, keep_days: int = 30) -> dict[str, Any]:
-    cutoff = time.time() - keep_days * 86400
-    removed = 0
-    diag_root = root / ".ai" / "cache" / "diagnostics"
-    if not diag_root.exists():
-        return {"ok": True, "removed": 0}
-    for path in diag_root.iterdir():
-        if path.is_file() and path.stat().st_mtime < cutoff:
-            path.unlink()
-            removed += 1
-    for path in diag_root.iterdir():
-        if path.is_dir() and path.stat().st_mtime < cutoff:
-            shutil.rmtree(path)
-            removed += 1
-    return {"ok": True, "removed": removed}
+def diagnostics_retention_status(root: Path) -> dict[str, Any]:
+    return retention_status(
+        root,
+        root / ".ai" / "cache" / "diagnostics",
+        prefixes=("diagnostics-",),
+        suffixes=(".zip", ".json"),
+        keep_days=DIAGNOSTICS_RETENTION_DAYS,
+        max_files=DIAGNOSTICS_MAX_FILES,
+        max_bytes=DIAGNOSTICS_MAX_BYTES,
+    )
+
+
+def prune_diagnostics(
+    root: Path,
+    *,
+    keep_days: int | None = None,
+    preserve: tuple[Path, ...] = (),
+) -> dict[str, Any]:
+    effective_days = DIAGNOSTICS_RETENTION_DAYS if keep_days is None else keep_days
+    return prune_directory(
+        root,
+        root / ".ai" / "cache" / "diagnostics",
+        prefixes=("diagnostics-",),
+        suffixes=(".zip", ".json"),
+        keep_days=effective_days,
+        max_files=DIAGNOSTICS_MAX_FILES,
+        max_bytes=DIAGNOSTICS_MAX_BYTES,
+        preserve=preserve,
+        accounting_domain="diagnostics_retention",
+    )
 
 
 def mem_eval_summary(root: Path, *, window_days: int = 7) -> dict[str, Any]:

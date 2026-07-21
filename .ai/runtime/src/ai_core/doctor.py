@@ -55,11 +55,15 @@ def run_checks(
         check_config(root),
         check_gitattributes(root),
         check_sqlite_features(),
+        check_index_control(root),
         index_check,
+        check_index_storage(root),
         check_manifest(root),
         check_trust(root),
         check_jsonl(root),
         check_generated_artifacts_bounded(root),
+        check_runtime_retention(root),
+        check_loss_accounting(root),
         check_audit_index(root),
         check_audit_chain(root),
         hot_path_check,
@@ -300,6 +304,17 @@ def check_sqlite_features() -> Check:
 
 
 def check_index_freshness(root: Path) -> Check:
+    from .index_control import policy as index_policy
+
+    effective_policy = index_policy(root)
+    if effective_policy.get("ok") is not True:
+        return Check(
+            "index_freshness",
+            False,
+            "invalid index policy: " + "; ".join(str(item) for item in effective_policy.get("errors", [])[:5]),
+        )
+    if effective_policy.get("enabled") is not True:
+        return Check("index_freshness", True, "disabled by operator policy; freshness scan skipped")
     db = root / ".ai" / "cache" / "code.sqlite"
     if not db.exists():
         return Check("index_freshness", True, "not indexed")
@@ -308,7 +323,78 @@ def check_index_freshness(root: Path) -> Check:
     return check_index_freshness_from_status(index_hash_status(root))
 
 
+def check_index_control(root: Path) -> Check:
+    try:
+        from .index_control import policy as index_policy, progress_status
+
+        effective_policy = index_policy(root)
+        progress = progress_status(root, effective_policy=effective_policy)
+    except (OSError, ValueError) as exc:
+        return Check("index_control", False, f"unreadable: {exc}")
+    if effective_policy.get("ok") is not True:
+        return Check(
+            "index_control",
+            False,
+            "invalid policy: " + "; ".join(str(item) for item in effective_policy.get("errors", [])[:5]),
+        )
+    if progress.get("ok") is not True:
+        return Check(
+            "index_control",
+            False,
+            "progress unhealthy: "
+            f"state={progress.get('state')} reason={progress.get('reason')} "
+            f"stalled={progress.get('stalled')} orphaned={progress.get('orphaned')}",
+        )
+    mode = "disabled" if effective_policy.get("enabled") is not True else "enabled"
+    progress_detail = str(progress.get("state"))
+    if progress.get("suppressed_by_policy"):
+        progress_detail += "(historical-suppressed)"
+    return Check(
+        "index_control",
+        True,
+        f"{mode}; auto_rebuild={bool(effective_policy.get('auto_rebuild'))}; "
+        f"max_files={effective_policy.get('max_files')}; "
+        f"max_source_bytes={effective_policy.get('max_source_bytes')}; "
+        f"max_seconds={effective_policy.get('max_seconds')}; progress={progress_detail}",
+    )
+
+
+def check_index_storage(root: Path) -> Check:
+    try:
+        from .search import index_storage
+
+        storage = index_storage(root)
+    except (OSError, sqlite3.Error) as exc:
+        return Check("index_storage", False, f"unreadable: {exc}")
+    if not storage.get("exists"):
+        return Check("index_storage", True, "not indexed")
+    total = int(storage.get("total_bytes") or 0)
+    maximum = int(storage.get("max_bytes") or 0)
+    if not storage.get("within_limit"):
+        return Check(
+            "index_storage",
+            False,
+            f"oversized: total={total}>{maximum}; run `ai index rebuild --json` or raise AI_INDEX_MAX_BYTES",
+        )
+    return Check(
+        "index_storage",
+        True,
+        f"ok total={total}/{maximum} free_ratio={storage.get('free_ratio', 0.0)}",
+    )
+
+
 def check_index_freshness_from_status(status: dict[str, object]) -> Check:
+    raw_policy = status.get("policy")
+    if isinstance(raw_policy, dict):
+        if raw_policy.get("ok") is not True:
+            return Check(
+                "index_freshness",
+                False,
+                "invalid index policy: "
+                + "; ".join(str(item) for item in raw_policy.get("errors", [])[:5]),
+            )
+        if raw_policy.get("enabled") is not True:
+            return Check("index_freshness", True, "disabled by operator policy; freshness scan skipped")
     reason = str(status.get("reason") or "unreadable")
     if status.get("ok"):
         return Check("index_freshness", True, f"ok indexed={status.get('indexed_files', 0)}")
@@ -320,6 +406,10 @@ def check_index_freshness_from_status(status: dict[str, object]) -> Check:
         return Check("index_freshness", False, "legacy index schema; run ai index rebuild")
     if reason == "unreadable":
         return Check("index_freshness", False, str(status.get("detail") or "index unreadable"))
+    if reason == "index_scan_limit":
+        return Check("index_freshness", False, str(status.get("detail") or "bounded scan limit exceeded"))
+    if reason == "index_policy_invalid":
+        return Check("index_freshness", False, str(status.get("detail") or "invalid index policy"))
     raw_changed = status.get("changed_paths") or []
     changed = list(raw_changed) if isinstance(raw_changed, (list, tuple, set)) else []
     if changed:
@@ -371,7 +461,15 @@ def check_jsonl(root: Path) -> Check:
 
 def check_generated_artifacts_bounded(root: Path) -> Check:
     from .evidence import EVIDENCE_MAX_BYTES, evidence_path
-    from .memory import _SESSION_NOTE_MAX_BYTES, EVENTS_MAX_BYTES, events_path, session_current_path
+    from .memory import (
+        _SESSION_NOTE_MAX_BYTES,
+        AUDIT_MAX_BYTES,
+        AUDIT_RETENTION_YEARS,
+        EVENTS_MAX_BYTES,
+        all_audit_files,
+        events_path,
+        session_current_path,
+    )
     from .prompt_growth import PROMPT_GROWTH_MAX_BYTES, log_path
 
     targets = (
@@ -388,13 +486,86 @@ def check_generated_artifacts_bounded(root: Path) -> Check:
             continue
         if size > cap:
             oversized.append(f"{path.relative_to(root).as_posix()}={size}>{cap}")
+    audit_files = all_audit_files(root)
+    for path in audit_files:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > AUDIT_MAX_BYTES:
+            oversized.append(f"{path.relative_to(root).as_posix()}={size}>{AUDIT_MAX_BYTES}")
+    year_files = {
+        int(path.stem[:4])
+        for path in audit_files
+        if len(path.stem) >= 4 and path.stem[:4].isdigit()
+    }
+    if len(year_files) > max(1, int(AUDIT_RETENTION_YEARS)):
+        oversized.append(
+            f"audit_years={len(year_files)}>{max(1, int(AUDIT_RETENTION_YEARS))}"
+        )
     if oversized:
         return Check(
             "generated_artifacts_bounded",
             False,
             "oversized: " + ", ".join(oversized[:8]) + "; run ai memory page-out --json",
         )
-    return Check("generated_artifacts_bounded", True, f"ok checked={len(targets)}")
+    return Check("generated_artifacts_bounded", True, f"ok checked={len(targets) + len(audit_files)}")
+
+
+def check_runtime_retention(root: Path) -> Check:
+    try:
+        from .obs import diagnostics_retention_status, logs_retention_status
+        from .upgrade import upgrade_backup_retention_status
+
+        statuses = {
+            "logs": logs_retention_status(root),
+            "diagnostics": diagnostics_retention_status(root),
+            "upgrade": upgrade_backup_retention_status(root),
+        }
+    except (OSError, ValueError) as exc:
+        return Check("runtime_retention", False, f"unreadable: {exc}")
+    failed = [
+        f"{name}:{','.join(str(item) for item in status.get('violations', []))}"
+        for name, status in statuses.items()
+        if not status.get("ok")
+    ]
+    if failed:
+        return Check(
+            "runtime_retention",
+            False,
+            "invalid: " + "; ".join(failed) + "; run diagnostics prune and remove stale upgrade backups",
+        )
+    detail = ", ".join(
+        f"{name}={status.get('count', 0)}/{status.get('bytes', 0)}B"
+        for name, status in statuses.items()
+    )
+    return Check("runtime_retention", True, "ok " + detail)
+
+
+def check_loss_accounting(root: Path) -> Check:
+    try:
+        from .loss_accounting import summary
+
+        payload = summary(root)
+    except (OSError, ValueError) as exc:
+        return Check("loss_accounting", False, f"unreadable: {exc}")
+    if payload.get("ok") is not True or payload.get("bounded") is not True:
+        return Check(
+            "loss_accounting",
+            False,
+            str(payload.get("reason") or "loss accounting invalid")[:500],
+        )
+    totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
+    return Check(
+        "loss_accounting",
+        True,
+        "ok "
+        f"events={totals.get('events', 0)} "
+        f"files={totals.get('removed_files', 0)} "
+        f"bytes={totals.get('removed_bytes', 0)} "
+        f"records={totals.get('removed_records', 0)} "
+        f"error_events={totals.get('error_events', 0)}",
+    )
 
 
 def read_jsonl(path: Path, *, root: Path) -> list[dict[str, object]]:

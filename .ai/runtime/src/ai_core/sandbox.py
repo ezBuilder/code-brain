@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import heapq
 import json
 import os
 import secrets
+import signal
 import shutil
+import stat
 import subprocess
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .loss_accounting import finalize_event, loss_event
 from .policy import is_ci
 from .redact import redact_value
+from .resource_diag import classify_termination, process_tree_rss_kib, system_memory_snapshot
 
 _SANDBOX_DIR = (".ai", "cache", "sandbox")
 _SUMMARY_BUDGET_BYTES = 4096
@@ -23,7 +30,86 @@ _FETCH_GREP_CAP = 200
 _COMPACT_MAX_LINES = 20
 _COMPACT_MAX_BYTES = 1024
 _MAX_TIMEOUT_SECONDS = 900
+
+
+def _bounded_env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _bounded_env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+_CAPTURE_MAX_BYTES = _bounded_env_int(
+    "AI_SANDBOX_CAPTURE_MAX_BYTES",
+    4_000_000,
+    minimum=64_000,
+    maximum=64_000_000,
+)
+_SOURCE_CAPTURE_MAX_BYTES = max(
+    _CAPTURE_MAX_BYTES,
+    _bounded_env_int(
+        "AI_SANDBOX_SOURCE_MAX_BYTES",
+        64_000_000,
+        minimum=1_000_000,
+        maximum=1_000_000_000,
+    ),
+)
+_MONITOR_INTERVAL_SECONDS = 0.10
+_RSS_SAMPLE_INTERVAL_SECONDS = 0.50
+_TERMINATE_GRACE_SECONDS = 1.0
 _EXEC_ID_HEX = frozenset("0123456789abcdef")
+_META_MAX_BYTES = _bounded_env_int(
+    "AI_SANDBOX_META_MAX_BYTES",
+    512_000,
+    minimum=16_000,
+    maximum=8_000_000,
+)
+_META_DIAGNOSTICS_LIMIT = _bounded_env_int(
+    "AI_SANDBOX_DIAGNOSTICS_MAX_FILES",
+    100,
+    minimum=1,
+    maximum=10_000,
+)
+_META_CANDIDATE_LIMIT = _bounded_env_int(
+    "AI_SANDBOX_DIAGNOSTICS_MAX_CANDIDATES",
+    4000,
+    minimum=1,
+    maximum=200_000,
+)
+_META_SCAN_MAX_BYTES = _bounded_env_int(
+    "AI_SANDBOX_DIAGNOSTICS_MAX_BYTES",
+    16_000_000,
+    minimum=64_000,
+    maximum=1_000_000_000,
+)
+_META_SCAN_MAX_SECONDS = _bounded_env_float(
+    "AI_SANDBOX_DIAGNOSTICS_MAX_SECONDS",
+    1.0,
+    minimum=0.05,
+    maximum=60.0,
+)
+_META_DIAGNOSTIC_EXAMPLES = 10
+_PRUNE_MAX_CANDIDATES = _bounded_env_int(
+    "AI_SANDBOX_PRUNE_MAX_CANDIDATES",
+    20_000,
+    minimum=1,
+    maximum=1_000_000,
+)
+_PRUNE_MAX_SECONDS = _bounded_env_float(
+    "AI_SANDBOX_PRUNE_MAX_SECONDS",
+    2.0,
+    minimum=0.05,
+    maximum=60.0,
+)
 
 # --- Opt-in execution isolation (PRD §12.2.1: real sandbox layer for Stage 2 auto-run) ---
 # macOS sandbox profile: deny IP network (egress/ingress) + raw IP sockets + mount changes.
@@ -189,20 +275,122 @@ def _trim_first_lines(first_lines: list[str], last_lines: list[str]) -> list[str
     return trimmed
 
 
-def _read_meta(path: Path) -> dict[str, Any] | None:
-    if path.is_symlink():
-        return None
+def _read_meta_bounded(
+    path: Path,
+    *,
+    expected: os.stat_result | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        raw = path.read_text(encoding="utf-8")
+        descriptor = os.open(path, flags)
     except OSError:
-        return None
+        return None, "open_error"
     try:
-        loaded = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            return None, "not_regular"
+        if int(getattr(opened, "st_nlink", 1)) != 1:
+            return None, "unsafe_hardlink"
+        if expected is not None and (
+            int(opened.st_dev) != int(expected.st_dev)
+            or int(opened.st_ino) != int(expected.st_ino)
+            or int(opened.st_mtime_ns) != int(expected.st_mtime_ns)
+            or int(opened.st_size) != int(expected.st_size)
+        ):
+            return None, "changed_before_read"
+        if int(opened.st_size) > _META_MAX_BYTES:
+            return None, "metadata_too_large"
+        raw = os.read(descriptor, _META_MAX_BYTES + 1)
+        if len(raw) > _META_MAX_BYTES:
+            return None, "metadata_too_large"
+        final = os.fstat(descriptor)
+        if (
+            int(final.st_dev) != int(opened.st_dev)
+            or int(final.st_ino) != int(opened.st_ino)
+            or int(final.st_mtime_ns) != int(opened.st_mtime_ns)
+            or int(final.st_size) != int(opened.st_size)
+        ):
+            return None, "changed_during_read"
+    finally:
+        os.close(descriptor)
+    try:
+        loaded = json.loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "invalid_json"
     if not isinstance(loaded, dict):
-        return None
+        return None, "not_object"
+    return loaded, None
+
+
+def _read_meta(path: Path) -> dict[str, Any] | None:
+    loaded, _reason = _read_meta_bounded(path)
     return loaded
+
+
+def _collect_latest_meta_candidates(
+    sandbox_dir: Path,
+    *,
+    limit: int,
+    started: float,
+) -> tuple[list[tuple[Path, os.stat_result]], dict[str, Any]]:
+    deadline = started + float(_META_SCAN_MAX_SECONDS)
+    candidate_limit = max(1, int(_META_CANDIDATE_LIMIT))
+    heap: list[tuple[int, str, Path, os.stat_result]] = []
+    skip_counts: dict[str, int] = {}
+    discovered = 0
+    complete = True
+
+    def skip(reason: str, count: int = 1) -> None:
+        nonlocal complete
+        skip_counts[reason] = skip_counts.get(reason, 0) + max(1, int(count))
+        complete = False
+
+    try:
+        with os.scandir(sandbox_dir) as entries:
+            for entry in entries:
+                if time.monotonic() >= deadline:
+                    skip("discovery_time_limit")
+                    break
+                if not entry.name.endswith(".meta.json"):
+                    continue
+                discovered += 1
+                try:
+                    state = entry.stat(follow_symlinks=False)
+                except OSError:
+                    skip("stat_error")
+                    continue
+                if stat.S_ISLNK(state.st_mode):
+                    skip("unsafe_symlink")
+                    continue
+                if not stat.S_ISREG(state.st_mode):
+                    skip("not_regular")
+                    continue
+                if int(getattr(state, "st_nlink", 1)) != 1:
+                    skip("unsafe_hardlink")
+                    continue
+                if int(state.st_size) > _META_MAX_BYTES:
+                    skip("metadata_too_large")
+                    continue
+                path = Path(entry.path)
+                item = (int(state.st_mtime_ns), entry.name, path, state)
+                if len(heap) < candidate_limit:
+                    heapq.heappush(heap, item)
+                elif item[:2] > heap[0][:2]:
+                    heapq.heapreplace(heap, item)
+                    skip("candidate_limit")
+                else:
+                    skip("candidate_limit")
+    except OSError:
+        skip("directory_scan_error")
+
+    selected = [(item[2], item[3]) for item in sorted(heap, reverse=True)[: max(0, int(limit))]]
+    return selected, {
+        "complete": complete,
+        "discovered": discovered,
+        "selected": len(selected),
+        "skip_counts": dict(sorted(skip_counts.items())),
+        "deadline": deadline,
+    }
 
 
 def _maybe_audit(root: Path, payload: dict[str, Any]) -> None:
@@ -214,6 +402,75 @@ def _maybe_audit(root: Path, payload: dict[str, Any]) -> None:
         append_event(root, payload)
     except Exception:
         # Audit append must never break execute path.
+        pass
+
+
+def _capture_size(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def _read_bounded_capture(path: Path, *, budget: int) -> tuple[str, int, bool]:
+    source_bytes = _capture_size(path)
+    if source_bytes <= 0 or budget <= 0:
+        return "", source_bytes, source_bytes > 0
+    try:
+        with path.open("rb") as handle:
+            if source_bytes <= budget:
+                raw = handle.read(budget)
+                return raw.decode("utf-8", errors="replace"), source_bytes, False
+            marker = f"\n...[capture truncated: {source_bytes - budget} bytes omitted]...\n".encode("utf-8")
+            usable = max(0, budget - len(marker))
+            head_size = usable * 3 // 4
+            tail_size = usable - head_size
+            head = handle.read(head_size)
+            if tail_size:
+                handle.seek(max(0, source_bytes - tail_size))
+                tail = handle.read(tail_size)
+            else:
+                tail = b""
+            raw = head + marker + tail
+            return raw.decode("utf-8", errors="replace"), source_bytes, True
+    except OSError:
+        return "", source_bytes, source_bytes > 0
+
+
+def _retained_source_bytes(*, source_bytes: int, budget: int, truncated: bool) -> int:
+    source = max(0, int(source_bytes))
+    bounded_budget = max(0, int(budget))
+    if not truncated:
+        return min(source, bounded_budget)
+    if source <= 0 or bounded_budget <= 0:
+        return 0
+    marker = f"\n...[capture truncated: {source - bounded_budget} bytes omitted]...\n".encode("utf-8")
+    return min(source, max(0, bounded_budget - len(marker)))
+
+
+def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        if os.name != "nt":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except (OSError, ProcessLookupError):
+        return
+    try:
+        proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name != "nt":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (OSError, ProcessLookupError):
+        return
+    try:
+        proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
         pass
 
 
@@ -292,29 +549,119 @@ def execute(
                 {"ok": False, "reason": "invalid_extra_env_vars", "error": str(exc), "exec_id": exec_id}
             )
 
+    stdout_fd, stdout_name = tempfile.mkstemp(prefix=f".{exec_id}.", suffix=".stdout.tmp", dir=sandbox_dir)
+    stderr_fd, stderr_name = tempfile.mkstemp(prefix=f".{exec_id}.", suffix=".stderr.tmp", dir=sandbox_dir)
+    stdout_capture = Path(stdout_name)
+    stderr_capture = Path(stderr_name)
+    before_memory = system_memory_snapshot()
+    started = time.monotonic()
+    timed_out = False
+    output_limit_exceeded = False
+    returncode: int | None = None
+    peak_rss_kib: int | None = None
+    start_error: str | None = None
     try:
-        completed = subprocess.run(
-            run_argv,
-            cwd=work_cwd,
-            capture_output=True,
-            text=True,
-            timeout=bounded_timeout,
-            check=False,
-            env=child_env,
-        )
-    except subprocess.TimeoutExpired:
-        return redact_value({"ok": False, "reason": "timeout", "exec_id": exec_id})
-    except FileNotFoundError:
-        return redact_value({"ok": False, "reason": "command_not_found", "exec_id": exec_id})
+        with os.fdopen(stdout_fd, "wb") as stdout_handle, os.fdopen(stderr_fd, "wb") as stderr_handle:
+            stdout_fd = stderr_fd = -1
+            try:
+                proc = subprocess.Popen(
+                    run_argv,
+                    cwd=work_cwd,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    env=child_env,
+                    start_new_session=os.name != "nt",
+                )
+            except FileNotFoundError:
+                start_error = "command_not_found"
+            except OSError:
+                start_error = "command_start_failed"
 
-    stdout = completed.stdout or ""
-    stderr = completed.stderr or ""
+            if start_error is None:
+                deadline = started + bounded_timeout
+                next_rss_sample = started
+                while True:
+                    now = time.monotonic()
+                    if now >= next_rss_sample:
+                        observed_rss = process_tree_rss_kib(proc.pid)
+                        if observed_rss is not None:
+                            peak_rss_kib = max(peak_rss_kib or 0, observed_rss)
+                        next_rss_sample = now + _RSS_SAMPLE_INTERVAL_SECONDS
+                    if _capture_size(stdout_capture) + _capture_size(stderr_capture) > _SOURCE_CAPTURE_MAX_BYTES:
+                        output_limit_exceeded = True
+                        _terminate_process(proc)
+                        returncode = proc.poll()
+                        break
+                    remaining = deadline - now
+                    if remaining <= 0:
+                        timed_out = True
+                        _terminate_process(proc)
+                        returncode = proc.poll()
+                        break
+                    try:
+                        returncode = proc.wait(timeout=min(_MONITOR_INTERVAL_SECONDS, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+    finally:
+        if stdout_fd >= 0:
+            os.close(stdout_fd)
+        if stderr_fd >= 0:
+            os.close(stderr_fd)
+
+    if start_error is not None:
+        stdout_capture.unlink(missing_ok=True)
+        stderr_capture.unlink(missing_ok=True)
+        return redact_value({"ok": False, "reason": start_error, "exec_id": exec_id})
+
+    elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+    after_memory = system_memory_snapshot()
+    stdout_source_bytes = _capture_size(stdout_capture)
+    stderr_source_bytes = _capture_size(stderr_capture)
+    if stdout_source_bytes + stderr_source_bytes > _SOURCE_CAPTURE_MAX_BYTES:
+        output_limit_exceeded = True
+    capture_budget = min(_CAPTURE_MAX_BYTES, _SOURCE_CAPTURE_MAX_BYTES)
+    if stdout_source_bytes == 0:
+        stderr_budget = capture_budget
+    elif stderr_source_bytes == 0:
+        stderr_budget = 0
+    else:
+        stderr_budget = min(stderr_source_bytes, max(256_000, capture_budget // 3), capture_budget)
+    stdout_budget = max(0, capture_budget - stderr_budget)
+    stdout, _stdout_bytes, stdout_truncated = _read_bounded_capture(stdout_capture, budget=stdout_budget)
+    stderr, _stderr_bytes, stderr_truncated = _read_bounded_capture(stderr_capture, budget=stderr_budget)
+    stdout_capture.unlink(missing_ok=True)
+    stderr_capture.unlink(missing_ok=True)
     combined = stdout
     if stderr:
         combined = f"{stdout}{stderr}" if stdout.endswith("\n") or not stdout else f"{stdout}\n{stderr}"
 
     redacted_combined = redact_value(combined)
     redacted_stderr = redact_value(stderr)
+    termination = classify_termination(
+        returncode=returncode,
+        timed_out=timed_out,
+        before=before_memory,
+        after=after_memory,
+        peak_rss_kib=peak_rss_kib,
+        stderr=stderr,
+    )
+    if output_limit_exceeded:
+        termination = {
+            "classification": "output_limit_exceeded",
+            "confidence": "high",
+            "returncode": returncode,
+            "signal": termination.get("signal"),
+            "signal_number": termination.get("signal_number"),
+            "shell_mapped": termination.get("shell_mapped", False),
+            "evidence": [
+                f"source_total_bytes={stdout_source_bytes + stderr_source_bytes}",
+                f"source_capture_max_bytes={_SOURCE_CAPTURE_MAX_BYTES}",
+            ],
+            "recommendations": [
+                "reduce command verbosity or redirect expected bulk output to a bounded project artifact",
+            ],
+        }
 
     out_path = sandbox_dir / f"{exec_id}.txt"
     try:
@@ -326,6 +673,32 @@ def execute(
     total_lines = len(all_lines)
     total_bytes = len(redacted_combined.encode("utf-8"))
     stderr_bytes = len(redacted_stderr.encode("utf-8"))
+    source_total_bytes = stdout_source_bytes + stderr_source_bytes
+    retained_source_bytes = _retained_source_bytes(
+        source_bytes=stdout_source_bytes,
+        budget=stdout_budget,
+        truncated=stdout_truncated,
+    ) + _retained_source_bytes(
+        source_bytes=stderr_source_bytes,
+        budget=stderr_budget,
+        truncated=stderr_truncated,
+    )
+    capture_loss = finalize_event(
+        root,
+        loss_event(
+            domain="sandbox_capture",
+            operation=exec_id,
+            applied=source_total_bytes > retained_source_bytes,
+            bytes_before=source_total_bytes,
+            bytes_after=retained_source_bytes,
+            reasons={
+                "capture_budget": 1 if stdout_truncated or stderr_truncated else 0,
+                "source_limit": 1 if output_limit_exceeded else 0,
+            },
+            examples=(exec_id,),
+        ),
+    )
+    accounting_ok = capture_loss.get("accounting", {}).get("ok") is True
 
     first_lines = all_lines[:_FIRST_LINES_DEFAULT]
     last_lines = all_lines[-_LAST_LINES_DEFAULT:] if total_lines > _FIRST_LINES_DEFAULT else []
@@ -341,15 +714,25 @@ def execute(
 
     meta = {
         "exec_id": exec_id,
-        "command": list(cmd_argv),
+        "command": redact_value(list(cmd_argv)),
         "cwd": work_cwd,
-        "exit_code": completed.returncode,
+        "exit_code": returncode,
+        "command_ok": returncode == 0 and not timed_out and not output_limit_exceeded,
         "total_bytes": total_bytes,
+        "source_total_bytes": source_total_bytes,
+        "retained_source_bytes": retained_source_bytes,
         "total_lines": total_lines,
         "created_at": created_at,
         "stderr_bytes": stderr_bytes,
         "isolate_network": isolate_network,
         "isolate_env": isolate_env,
+        "elapsed_ms": elapsed_ms,
+        "peak_rss_kib": peak_rss_kib,
+        "output_truncated": stdout_truncated or stderr_truncated,
+        "capture_loss": capture_loss,
+        "termination": termination,
+        "memory_before": before_memory,
+        "memory_after": after_memory,
     }
     meta_path = sandbox_dir / f"{exec_id}.meta.json"
     try:
@@ -362,16 +745,30 @@ def execute(
     # first_lines/last_lines split. Saves model-side tokens for small results.
     is_compact = total_lines <= _COMPACT_MAX_LINES and total_bytes <= _COMPACT_MAX_BYTES
     summary: dict[str, Any] = {
-        "ok": True,
+        "ok": not timed_out and not output_limit_exceeded and accounting_ok,
         "exec_id": exec_id,
-        "exit_code": completed.returncode,
+        "exit_code": returncode,
+        "command_ok": returncode == 0 and not timed_out and not output_limit_exceeded,
         "total_bytes": total_bytes,
+        "source_total_bytes": source_total_bytes,
+        "retained_source_bytes": retained_source_bytes,
         "total_lines": total_lines,
         "stderr_tail": stderr_tail,
         "created_at": created_at,
         "isolate_network": isolate_network,
         "isolate_env": isolate_env,
+        "elapsed_ms": elapsed_ms,
+        "peak_rss_kib": peak_rss_kib,
+        "output_truncated": stdout_truncated or stderr_truncated,
+        "capture_loss": capture_loss,
+        "termination": termination,
     }
+    if timed_out:
+        summary["reason"] = "timeout"
+    elif output_limit_exceeded:
+        summary["reason"] = "output_limit_exceeded"
+    elif not accounting_ok:
+        summary["reason"] = "loss_accounting_failed"
     if is_compact:
         summary["output"] = redacted_combined
     else:
@@ -383,7 +780,9 @@ def execute(
         {
             "hook": "sandbox.execute",
             "exec_id": exec_id,
-            "exit_code": completed.returncode,
+            "exit_code": returncode,
+            "termination": termination["classification"],
+            "peak_rss_kib": peak_rss_kib,
             "total_bytes": total_bytes,
         },
     )
@@ -485,6 +884,178 @@ def fetch(
     return redact_value(result)
 
 
+def _execution_diagnostics_empty(*, ok: bool, reason: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": ok,
+        "bounded": True,
+        "complete": ok,
+        "partial": not ok,
+        "metas_discovered": 0,
+        "metas_scanned": 0,
+        "bytes_scanned": 0,
+        "command_failures": 0,
+        "max_peak_rss_kib": 0,
+        "classifications": {},
+        "killed_9": {
+            "sigkill_total": 0,
+            "oom_confirmed": 0,
+            "memory_limit": 0,
+            "host_memory_pressure": 0,
+            "external_execution_limit": 0,
+        },
+        "skip_counts": {},
+        "examples": [],
+        "policy": {
+            "max_meta_bytes": int(_META_MAX_BYTES),
+            "max_files": int(_META_DIAGNOSTICS_LIMIT),
+            "max_candidates": int(_META_CANDIDATE_LIMIT),
+            "max_scan_bytes": int(_META_SCAN_MAX_BYTES),
+            "max_scan_seconds": float(_META_SCAN_MAX_SECONDS),
+        },
+    }
+    if reason is not None:
+        payload["reason"] = reason
+    return payload
+
+
+def execution_diagnostics(root: Path) -> dict[str, Any]:
+    """Return a bounded summary of recent sandbox executions and SIGKILL evidence.
+
+    The cache can contain years of command metadata. Discovery uses a fixed-size
+    newest-first heap; metadata reads have per-file, aggregate-byte and wall-clock
+    limits. A partial scan is explicit but remains usable for release diagnostics.
+    """
+    started = time.monotonic()
+    try:
+        sandbox_dir = _validated_sandbox_dir(root, create=False)
+    except (OSError, PermissionError):
+        return redact_value(_execution_diagnostics_empty(ok=False, reason="invalid_sandbox_path"))
+    if not sandbox_dir.exists():
+        return redact_value(_execution_diagnostics_empty(ok=True))
+
+    candidates, scan = _collect_latest_meta_candidates(
+        sandbox_dir,
+        limit=int(_META_DIAGNOSTICS_LIMIT),
+        started=started,
+    )
+    skip_counts = dict(scan["skip_counts"])
+    classifications: dict[str, int] = {}
+    examples: list[dict[str, Any]] = []
+    bytes_scanned = 0
+    metas_scanned = 0
+    command_failures = 0
+    max_peak_rss_kib = 0
+    sigkill_total = 0
+    oom_confirmed = 0
+    memory_limit = 0
+    host_memory_pressure = 0
+    external_execution_limit = 0
+    complete = bool(scan["complete"])
+
+    def skip(reason: str) -> None:
+        nonlocal complete
+        skip_counts[reason] = skip_counts.get(reason, 0) + 1
+        complete = False
+
+    for meta_path, expected in candidates:
+        if time.monotonic() >= float(scan["deadline"]):
+            skip("read_time_limit")
+            break
+        size = max(0, int(expected.st_size))
+        if bytes_scanned + size > int(_META_SCAN_MAX_BYTES):
+            skip("aggregate_byte_limit")
+            break
+        meta, _reason = _read_meta_bounded(meta_path, expected=expected)
+        if meta is None:
+            skip(reason or "metadata_read_error")
+            continue
+        bytes_scanned += size
+        metas_scanned += 1
+
+        termination = meta.get("termination")
+        if not isinstance(termination, dict):
+            termination = {}
+        classification = str(termination.get("classification") or "unknown")
+        classifications[classification] = classifications.get(classification, 0) + 1
+        command_ok = meta.get("command_ok") is True
+        if not command_ok:
+            command_failures += 1
+        peak = meta.get("peak_rss_kib")
+        if isinstance(peak, int) and peak > max_peak_rss_kib:
+            max_peak_rss_kib = peak
+
+        signal_name = termination.get("signal")
+        if signal_name == "SIGKILL":
+            sigkill_total += 1
+            if classification == "cgroup_oom_kill_confirmed":
+                oom_confirmed += 1
+            elif classification in {"cgroup_memory_limit_confirmed", "cgroup_memory_limit_likely"}:
+                memory_limit += 1
+            elif classification == "host_memory_pressure_likely":
+                host_memory_pressure += 1
+            elif classification == "external_sigkill_or_execution_limit":
+                external_execution_limit += 1
+
+        if not command_ok and len(examples) < _META_DIAGNOSTIC_EXAMPLES:
+            examples.append(
+                {
+                    "exec_id": meta.get("exec_id"),
+                    "created_at": meta.get("created_at"),
+                    "exit_code": meta.get("exit_code"),
+                    "classification": classification,
+                    "signal": signal_name,
+                    "peak_rss_kib": peak if isinstance(peak, int) else None,
+                    "source_total_bytes": meta.get("source_total_bytes"),
+                }
+            )
+
+    integrity_reasons = {
+        "stat_error",
+        "unsafe_symlink",
+        "not_regular",
+        "unsafe_hardlink",
+        "metadata_too_large",
+        "directory_scan_error",
+        "open_error",
+        "changed_before_read",
+        "changed_during_read",
+        "invalid_json",
+        "not_object",
+        "metadata_read_error",
+    }
+    integrity_failures = sum(skip_counts.get(reason, 0) for reason in integrity_reasons)
+    result = {
+        "ok": integrity_failures == 0,
+        "bounded": True,
+        "complete": complete,
+        "partial": not complete,
+        "metas_discovered": int(scan["discovered"]),
+        "metas_scanned": metas_scanned,
+        "bytes_scanned": bytes_scanned,
+        "command_failures": command_failures,
+        "max_peak_rss_kib": max_peak_rss_kib,
+        "classifications": dict(sorted(classifications.items())),
+        "killed_9": {
+            "sigkill_total": sigkill_total,
+            "oom_confirmed": oom_confirmed,
+            "memory_limit": memory_limit,
+            "host_memory_pressure": host_memory_pressure,
+            "external_execution_limit": external_execution_limit,
+        },
+        "skip_counts": dict(sorted(skip_counts.items())),
+        "examples": examples,
+        "policy": {
+            "max_meta_bytes": int(_META_MAX_BYTES),
+            "max_files": int(_META_DIAGNOSTICS_LIMIT),
+            "max_candidates": int(_META_CANDIDATE_LIMIT),
+            "max_scan_bytes": int(_META_SCAN_MAX_BYTES),
+            "max_scan_seconds": float(_META_SCAN_MAX_SECONDS),
+        },
+        "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+    }
+    return redact_value(result)
+
+
 def list_executions(root: Path, *, limit: int = 20) -> dict[str, Any]:
     try:
         sandbox_dir = _validated_sandbox_dir(root, create=False)
@@ -493,15 +1064,21 @@ def list_executions(root: Path, *, limit: int = 20) -> dict[str, Any]:
     if not sandbox_dir.exists():
         return redact_value({"ok": True, "count": 0, "items": []})
 
+    bounded_limit = max(0, min(int(limit), int(_META_DIAGNOSTICS_LIMIT)))
+    candidates, scan = _collect_latest_meta_candidates(
+        sandbox_dir,
+        limit=bounded_limit,
+        started=time.monotonic(),
+    )
     metas: list[dict[str, Any]] = []
-    for meta_path in sandbox_dir.glob("*.meta.json"):
-        meta = _read_meta(meta_path)
+    for meta_path, expected in candidates:
+        meta, reason = _read_meta_bounded(meta_path, expected=expected)
         if meta is None:
             continue
         metas.append(meta)
 
     metas.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
-    metas = metas[: max(0, int(limit))]
+    metas = metas[:bounded_limit]
 
     items = []
     for meta in metas:
@@ -521,26 +1098,181 @@ def list_executions(root: Path, *, limit: int = 20) -> dict[str, Any]:
             }
         )
 
-    return redact_value({"ok": True, "count": len(items), "items": items})
+    return redact_value(
+        {
+            "ok": True,
+            "count": len(items),
+            "items": items,
+            "complete": bool(scan["complete"]),
+            "skip_counts": scan["skip_counts"],
+        }
+    )
 
 
 def prune(root: Path, *, older_than_seconds: int = 86400) -> dict[str, Any]:
+    def inventory(directory: Path) -> dict[str, Any]:
+        started = time.monotonic()
+        deadline = started + float(_PRUNE_MAX_SECONDS)
+        count = 0
+        total = 0
+        scanned = 0
+        meta_paths: list[Path] = []
+        inventory_errors: list[str] = []
+        complete = True
+        try:
+            entries = os.scandir(directory)
+        except OSError as exc:
+            return {
+                "complete": False,
+                "files": 0,
+                "bytes": 0,
+                "meta_paths": [],
+                "errors": [f"list:{exc}"],
+                "candidates_scanned": 0,
+                "elapsed_ms": 0,
+            }
+        try:
+            with entries:
+                for entry in entries:
+                    if scanned >= int(_PRUNE_MAX_CANDIDATES):
+                        inventory_errors.append("scan:candidate_limit")
+                        complete = False
+                        break
+                    if time.monotonic() >= deadline:
+                        inventory_errors.append("scan:time_limit")
+                        complete = False
+                        break
+                    scanned += 1
+                    path = Path(entry.path)
+                    try:
+                        state = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        inventory_errors.append(f"{entry.name}:stat:{exc}")
+                        complete = False
+                        continue
+                    if stat.S_ISLNK(state.st_mode):
+                        inventory_errors.append(f"{entry.name}:unsafe-symlink")
+                        complete = False
+                        continue
+                    if not stat.S_ISREG(state.st_mode):
+                        inventory_errors.append(f"{entry.name}:not-regular")
+                        complete = False
+                        continue
+                    if int(getattr(state, "st_nlink", 1)) != 1:
+                        inventory_errors.append(f"{entry.name}:unsafe-hardlink")
+                        complete = False
+                        continue
+                    count += 1
+                    total += int(state.st_size)
+                    if entry.name.endswith(".meta.json"):
+                        meta_paths.append(path)
+        except OSError as exc:
+            inventory_errors.append(f"scan:{exc}")
+            complete = False
+        return {
+            "complete": complete,
+            "files": count,
+            "bytes": total,
+            "meta_paths": sorted(meta_paths, key=lambda item: item.name),
+            "errors": inventory_errors,
+            "candidates_scanned": scanned,
+            "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+            "policy": {
+                "max_candidates": int(_PRUNE_MAX_CANDIDATES),
+                "max_seconds": float(_PRUNE_MAX_SECONDS),
+            },
+        }
+
+    def finish(
+        payload: dict[str, Any],
+        *,
+        before: tuple[int, int],
+        after: tuple[int, int],
+        errors: list[str] | None = None,
+        examples: list[str] | None = None,
+    ) -> dict[str, Any]:
+        error_items = list(errors or [])
+        example_items = list(examples or [])
+        loss = finalize_event(
+            root,
+            loss_event(
+                domain="sandbox_prune",
+                operation=".ai/cache/sandbox",
+                applied=not error_items and payload.get("ok") is True,
+                files_before=before[0],
+                files_after=after[0],
+                bytes_before=before[1],
+                bytes_after=after[1],
+                reasons={"age_limit": max(0, before[0] - after[0])},
+                errors=error_items,
+                examples=example_items,
+            ),
+        )
+        result = {**payload, "errors": error_items, "loss": loss}
+        if loss.get("accounting", {}).get("ok") is not True:
+            result["ok"] = False
+        return redact_value(result)
+
     try:
         sandbox_dir = _validated_sandbox_dir(root, create=False)
-    except (OSError, PermissionError):
-        return redact_value({"ok": False, "reason": "invalid_sandbox_path", "removed_count": 0, "kept_count": 0})
+    except (OSError, PermissionError) as exc:
+        return finish(
+            {"ok": False, "reason": "invalid_sandbox_path", "removed_count": 0, "kept_count": 0},
+            before=(0, 0),
+            after=(0, 0),
+            errors=[str(exc)],
+        )
     if not sandbox_dir.exists():
-        return redact_value({"ok": True, "removed_count": 0, "kept_count": 0})
+        return finish(
+            {"ok": True, "removed_count": 0, "kept_count": 0},
+            before=(0, 0),
+            after=(0, 0),
+        )
 
+    before_inventory = inventory(sandbox_dir)
+    before_totals = (
+        int(before_inventory["files"]),
+        int(before_inventory["bytes"]),
+    )
+    if before_inventory.get("complete") is not True or before_inventory.get("errors"):
+        errors = list(before_inventory.get("errors") or ["scan_incomplete"])
+        return finish(
+            {
+                "ok": False,
+                "reason": "scan_incomplete",
+                "removed_count": 0,
+                "kept_count": len(before_inventory.get("meta_paths") or []),
+                "scan": before_inventory,
+            },
+            before=before_totals,
+            after=before_totals,
+            errors=errors,
+        )
     now = datetime.now(timezone.utc)
     threshold = float(older_than_seconds)
     removed = 0
     kept = 0
+    errors: list[str] = []
+    removed_examples: list[str] = []
+    delete_plan: list[
+        tuple[
+            Path,
+            os.stat_result,
+            Path,
+            os.stat_result | None,
+            str,
+        ]
+    ] = []
 
-    for meta_path in list(sandbox_dir.glob("*.meta.json")):
+    for meta_path in before_inventory["meta_paths"]:
         meta = _read_meta(meta_path)
         if meta is None:
-            kept += 1
+            errors.append(f"{meta_path.name}:invalid-metadata")
+            continue
+        try:
+            meta_state = meta_path.lstat()
+        except OSError as exc:
+            errors.append(f"{meta_path.name}:stat:{exc}")
             continue
         created_at = meta.get("created_at")
         age_seconds: float | None = None
@@ -551,33 +1283,108 @@ def prune(root: Path, *, older_than_seconds: int = 86400) -> dict[str, Any]:
             except ValueError:
                 age_seconds = None
         if age_seconds is None:
-            try:
-                mtime = meta_path.stat().st_mtime
-                age_seconds = now.timestamp() - mtime
-            except OSError:
-                age_seconds = None
+            errors.append(f"{meta_path.name}:invalid-created-at")
+            continue
 
         if age_seconds is not None and age_seconds >= threshold:
             exec_id = meta.get("exec_id") or meta_path.stem.replace(".meta", "")
             if not _valid_exec_id(exec_id):
-                kept += 1
+                errors.append(f"{meta_path.name}:invalid-exec-id")
                 continue
             try:
                 txt_path = _artifact_path(root, exec_id, ".txt")
             except (OSError, PermissionError, ValueError):
-                kept += 1
+                errors.append(f"{meta_path.name}:invalid-artifact")
                 continue
+            txt_state: os.stat_result | None = None
             try:
-                meta_path.unlink()
-            except OSError:
-                pass
-            try:
-                if txt_path.exists():
-                    txt_path.unlink()
-            except OSError:
-                pass
-            removed += 1
+                txt_state = txt_path.lstat()
+                if (
+                    stat.S_ISLNK(txt_state.st_mode)
+                    or not stat.S_ISREG(txt_state.st_mode)
+                    or int(getattr(txt_state, "st_nlink", 1)) != 1
+                ):
+                    errors.append(f"{txt_path.name}:unsafe-artifact")
+                    continue
+            except FileNotFoundError:
+                txt_state = None
+            except OSError as exc:
+                errors.append(f"{txt_path.name}:stat:{exc}")
+                continue
+            delete_plan.append((meta_path, meta_state, txt_path, txt_state, str(exec_id)))
         else:
             kept += 1
 
-    return redact_value({"ok": True, "removed_count": removed, "kept_count": kept})
+    if errors:
+        return finish(
+            {
+                "ok": False,
+                "reason": "preflight_failed",
+                "removed_count": 0,
+                "kept_count": len(before_inventory.get("meta_paths") or []),
+                "scan": before_inventory,
+            },
+            before=before_totals,
+            after=before_totals,
+            errors=errors,
+        )
+
+    for meta_path, expected_meta, txt_path, expected_txt, exec_id in delete_plan:
+        try:
+            current_meta = meta_path.lstat()
+            if (
+                stat.S_ISLNK(current_meta.st_mode)
+                or not stat.S_ISREG(current_meta.st_mode)
+                or int(getattr(current_meta, "st_nlink", 1)) != 1
+                or int(current_meta.st_dev) != int(expected_meta.st_dev)
+                or int(current_meta.st_ino) != int(expected_meta.st_ino)
+            ):
+                errors.append(f"{meta_path.name}:changed-before-delete")
+                kept += 1
+                continue
+            if expected_txt is not None:
+                current_txt = txt_path.lstat()
+                if (
+                    stat.S_ISLNK(current_txt.st_mode)
+                    or not stat.S_ISREG(current_txt.st_mode)
+                    or int(getattr(current_txt, "st_nlink", 1)) != 1
+                    or int(current_txt.st_dev) != int(expected_txt.st_dev)
+                    or int(current_txt.st_ino) != int(expected_txt.st_ino)
+                ):
+                    errors.append(f"{txt_path.name}:changed-before-delete")
+                    kept += 1
+                    continue
+            meta_path.unlink()
+        except OSError as exc:
+            errors.append(f"{meta_path.name}:delete:{exc}")
+            kept += 1
+            continue
+        if expected_txt is not None:
+            try:
+                txt_path.unlink()
+            except OSError as exc:
+                errors.append(f"{txt_path.name}:delete:{exc}")
+        removed += 1
+        removed_examples.append(exec_id)
+
+    after_inventory = inventory(sandbox_dir)
+    after_totals = (
+        int(after_inventory["files"]),
+        int(after_inventory["bytes"]),
+    )
+    errors.extend(str(item) for item in after_inventory.get("errors") or [])
+    return finish(
+        {
+            "ok": not errors and after_inventory.get("complete") is True,
+            "removed_count": removed,
+            "kept_count": kept,
+            "scan": {
+                "before": before_inventory,
+                "after": after_inventory,
+            },
+        },
+        before=before_totals,
+        after=after_totals,
+        errors=errors,
+        examples=removed_examples,
+    )

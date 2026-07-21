@@ -21,6 +21,8 @@ from ai_core.session_resume import (  # noqa: E402
     read_latest_snapshot,
     write_snapshot,
 )
+from ai_core import session_resume as session_resume_mod  # noqa: E402
+from ai_core.loss_accounting import summary as loss_summary  # noqa: E402
 
 
 def _memory(root: Path) -> Path:
@@ -284,10 +286,43 @@ def test_prune_snapshots_deletes_old_kept_recent(tmp_path: Path) -> None:
     assert res["ok"] is True
     assert res["removed"] == 1
     assert res["kept"] == 1
+    assert res["removed_bytes"] > 0
+    assert res["loss"]["files"]["removed"] == 1
+    assert res["loss"]["bytes"]["removed"] == res["removed_bytes"]
+    assert res["loss"]["accounting"]["recorded"] is True
+    assert loss_summary(tmp_path)["domains"]["resume_retention"]["removed_files"] == 1
     assert (base / "recent" / "resume.json").is_file()
     assert not (base / "ancient" / "resume.json").exists()
     # session directory itself must remain (we delete the file, not the dir)
     assert (base / "ancient").is_dir()
+
+
+def test_prune_snapshots_scan_limit_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _memory(tmp_path)
+    session_ids = ["old-a", "old-b", "old-c"]
+    old_ts = time.time() - 30 * 86400
+    for session_id in session_ids:
+        write_snapshot(tmp_path, session_id=session_id, agent="claude")
+        snap = tmp_path / ".ai" / "memory" / "sessions" / session_id / "resume.json"
+        os.utime(snap, (old_ts, old_ts))
+    monkeypatch.setattr(session_resume_mod, "RESUME_PRUNE_MAX_CANDIDATES", 1)
+
+    result = prune_snapshots(tmp_path, older_than_days=14)
+
+    assert result["ok"] is False
+    assert result["removed"] == 0
+    assert result["scan"]["complete"] is False
+    assert "scan:candidate_limit" in result["errors"]
+    assert all(
+        (tmp_path / ".ai" / "memory" / "sessions" / session_id / "resume.json").exists()
+        for session_id in session_ids
+    )
+    accounting = loss_summary(tmp_path)["domains"]["resume_retention"]
+    assert accounting["removed_files"] == 0
+    assert accounting["error_events"] == 1
 
 
 # ---- P1/P2: handoff + cross-machine provenance ----
@@ -366,11 +401,16 @@ def test_handoff_survives_size_cap(tmp_path: Path, monkeypatch) -> None:
     )
     sr.write_handoff(tmp_path, goal="KEEPME", next_step="KEEP_NEXT")
     monkeypatch.setattr(sr, "RESUME_MAX_BYTES", 600)  # force shrinking
-    sr.write_snapshot(tmp_path, session_id="s-cap", agent="codex")
+    result = sr.write_snapshot(tmp_path, session_id="s-cap", agent="codex")
     snap = _read_snapshot(tmp_path, "s-cap")
     assert snap["handoff"]["goal"] == "KEEPME"  # protected from the cap
     # a bulky droppable field was sacrificed instead
     assert "session_tail" not in snap or "todos_open" not in snap
+    assert result["compaction"]["compacted"] is True
+    assert result["truncation_loss"] is not None
+    assert result["truncation_loss"]["bytes"]["removed"] > 0
+    accounting = loss_summary(tmp_path)["domains"]["resume_snapshot_truncation"]
+    assert accounting["removed_bytes"] == result["truncation_loss"]["bytes"]["removed"]
 
 
 def test_snapshot_exposes_context_budget_metadata(tmp_path: Path) -> None:
@@ -425,6 +465,24 @@ def test_budget_shrink_compacts_oversized_protected_values_to_hard_cap() -> None
 
     assert sr._payload_size(shrunk) <= 512
     assert {"handoff", "rubric", "verdict", "blockers"}.issubset(shrunk)
+
+
+def test_budget_shrink_report_lists_dropped_and_compacted_fields() -> None:
+    import ai_core.session_resume as sr
+
+    payload = {
+        "handoff": {"goal": "g" * 5000},
+        "session_tail": "drop" * 1000,
+        "todos_open": [{"title": "drop" * 500}],
+    }
+
+    shrunk, report = sr._shrink_to_fit_report(payload, 300)
+
+    assert sr._payload_size(shrunk) <= 300
+    assert report["compacted"] is True
+    assert report["bytes_before"] > report["bytes_after"]
+    assert set(report["dropped_fields"]) & {"session_tail", "todos_open"}
+    assert report["compacted_fields"].get("handoff", 0) > 0
 
 
 def test_write_snapshot_hard_caps_extreme_session_id(

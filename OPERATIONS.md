@@ -111,6 +111,8 @@ If a source file changes after indexing, local query paths auto-refresh before s
 
 `ai session start --rebuild auto` (default during `make session-start`) performs the same refresh implicitly when the index is stale at session boundary.
 
+The same session boundary enforces workspace storage retention: `.ai/tmp` is limited to 512MB/256 top-level entries with seven-day retention, `.ai/outputs` is limited to 1GB/512 top-level entries, and total `.ai` usage is limited to 2GB. Oldest untracked scratch entries are reclaimed before untracked outputs. Git-tracked entries and `.keep`-pinned entries are never removed; an unreclaimable overage is surfaced by `doctor --strict`.
+
 Large project cache checks:
 
 ```bash

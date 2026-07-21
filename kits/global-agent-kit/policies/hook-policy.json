@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "hard_deny": {
     "commands": [
       "\\brm\\s+-rf\\s+(/|~|\\*|\\.)",
@@ -12,9 +12,10 @@
       "\\bkubectl\\s+delete\\b",
       "\\bterraform\\s+destroy\\b",
       "\\bpulumi\\s+destroy\\b",
-      "\\bgit\\s+branch\\s+(-D|--delete\\s+--force)\\b",
+      "\\bgit(?:\\s+-C\\s+\\S+)?\\s+branch\\b[^\\n;&|]*(?:-d|-D|--delete)\\b[^\\n;&|]*(?<![A-Za-z0-9._/-])(?:refs/heads/)?(?:main|master|develop|development|trunk|prod|production|staging)(?![A-Za-z0-9._/-])",
       "\\bgit\\s+push\\b.*(--force\\b|--force-with-lease|\\s-f\\b)",
-      "\\bgit\\s+push\\b.*--delete\\b",
+      "\\bgit(?:\\s+-C\\s+\\S+)?\\s+push\\b[^\\n;&|]*(?:--delete|-d)\\b[^\\n;&|]*(?<![A-Za-z0-9._/-])(?:refs/heads/)?(?:main|master|develop|development|trunk|prod|production|staging)(?![A-Za-z0-9._/-])",
+      "\\bgit(?:\\s+-C\\s+\\S+)?\\s+push\\b[^\\n;&|]*(?<!\\S):(?:refs/heads/)?(?:main|master|develop|development|trunk|prod|production|staging)(?![A-Za-z0-9._/-])",
       "\\bgit\\s+filter-branch\\b",
       "\\bgit\\s+filter-repo\\b",
       "\\bgit\\s+update-ref\\s+-d\\b",

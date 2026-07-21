@@ -15,7 +15,7 @@ from . import __version__
 from .memory import append_audit
 from .private_write import atomic_write_private_text
 from .render import build_manifest, render
-from .storage_lifecycle import prune_upgrade_backups
+from .storage_lifecycle import enforce_workspace_storage, prune_upgrade_backups
 from .worker.ipc import PROTOCOL_VERSION
 
 DEFAULT_REPO_URL = "https://github.com/ezBuilder/code-brain.git"
@@ -109,6 +109,7 @@ def upgrade_apply(root: Path, *, target_version: str, dry_run: bool = False) -> 
     render(root)
     append_audit(root, action="upgrade.apply", category="upgrade", payload={"target_version": target_version, "backup_path": result["backup_path"]})
     result["retention"] = prune_upgrade_backups(root)
+    result["storage"] = enforce_workspace_storage(root)
     return result
 
 

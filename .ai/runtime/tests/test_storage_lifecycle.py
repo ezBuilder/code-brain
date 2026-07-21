@@ -121,6 +121,168 @@ def test_doctor_reports_storage_policy_violations(tmp_path: Path, monkeypatch) -
     assert "expired" in result.detail
 
 
+def _workspace_storage_fixture(monkeypatch) -> None:
+    monkeypatch.setattr(storage_lifecycle, "_tracked_top_entries", lambda _root, _directory: (set(), True))
+
+
+def test_workspace_storage_prunes_tmp_by_age_and_size(tmp_path: Path, monkeypatch) -> None:
+    _workspace_storage_fixture(monkeypatch)
+    monkeypatch.setattr(storage_lifecycle, "TMP_RETENTION_DAYS", 1)
+    monkeypatch.setattr(storage_lifecycle, "TMP_MAX_ENTRIES", 3)
+    monkeypatch.setattr(storage_lifecycle, "TMP_MAX_TOTAL_BYTES", 250)
+    monkeypatch.setattr(storage_lifecycle, "OUTPUT_MAX_TOTAL_BYTES", 10_000)
+    monkeypatch.setattr(storage_lifecycle, "AI_MAX_TOTAL_BYTES", 20_000)
+
+    tmp = tmp_path / ".ai" / "tmp"
+    tmp.mkdir(parents=True)
+    old = tmp / "old.bin"
+    recent_a = tmp / "recent-a.bin"
+    recent_b = tmp / "recent-b.bin"
+    old.write_bytes(b"o" * 100)
+    recent_a.write_bytes(b"a" * 100)
+    recent_b.write_bytes(b"b" * 100)
+    os.utime(old, (1, 1))
+
+    result = storage_lifecycle.enforce_workspace_storage(tmp_path)
+
+    assert result["ok"] is True
+    assert not old.exists()
+    assert recent_a.exists()
+    assert recent_b.exists()
+    assert result["status"]["tmp_bytes"] <= 250
+
+
+def test_workspace_storage_prunes_oldest_unpinned_output_and_preserves_tracked(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        storage_lifecycle,
+        "_tracked_top_entries",
+        lambda _root, directory: ({"tracked.bin"}, True) if directory.name == "outputs" else (set(), True),
+    )
+    monkeypatch.setattr(storage_lifecycle, "TMP_MAX_TOTAL_BYTES", 10_000)
+    monkeypatch.setattr(storage_lifecycle, "OUTPUT_MAX_ENTRIES", 3)
+    monkeypatch.setattr(storage_lifecycle, "OUTPUT_MAX_TOTAL_BYTES", 250)
+    monkeypatch.setattr(storage_lifecycle, "AI_MAX_TOTAL_BYTES", 20_000)
+
+    outputs = tmp_path / ".ai" / "outputs"
+    outputs.mkdir(parents=True)
+    old = outputs / "old.bin"
+    new = outputs / "new.bin"
+    tracked = outputs / "tracked.bin"
+    old.write_bytes(b"o" * 100)
+    new.write_bytes(b"n" * 100)
+    tracked.write_bytes(b"t" * 100)
+    os.utime(old, (1, 1))
+
+    result = storage_lifecycle.enforce_workspace_storage(tmp_path)
+
+    assert result["ok"] is True
+    assert not old.exists()
+    assert new.exists()
+    assert tracked.exists()
+    assert result["status"]["output_bytes"] <= 250
+
+
+def test_workspace_storage_preserves_companion_keep_marker_across_runs(tmp_path: Path, monkeypatch) -> None:
+    _workspace_storage_fixture(monkeypatch)
+    monkeypatch.setattr(storage_lifecycle, "TMP_MAX_TOTAL_BYTES", 10_000)
+    monkeypatch.setattr(storage_lifecycle, "OUTPUT_MAX_ENTRIES", 2)
+    monkeypatch.setattr(storage_lifecycle, "OUTPUT_MAX_TOTAL_BYTES", 150)
+    monkeypatch.setattr(storage_lifecycle, "AI_MAX_TOTAL_BYTES", 20_000)
+
+    outputs = tmp_path / ".ai" / "outputs"
+    outputs.mkdir(parents=True)
+    artifact = outputs / "artifact.bin"
+    marker = outputs / "artifact.bin.keep"
+    expendable = outputs / "expendable.bin"
+    artifact.write_bytes(b"a" * 100)
+    marker.write_text("")
+    expendable.write_bytes(b"x" * 100)
+    os.utime(marker, (1, 1))
+
+    first = storage_lifecycle.enforce_workspace_storage(tmp_path)
+    second = storage_lifecycle.enforce_workspace_storage(tmp_path)
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert artifact.exists()
+    assert marker.exists()
+    assert not expendable.exists()
+
+
+def test_workspace_storage_total_quota_reclaims_tmp_before_outputs(tmp_path: Path, monkeypatch) -> None:
+    _workspace_storage_fixture(monkeypatch)
+    monkeypatch.setattr(storage_lifecycle, "TMP_RETENTION_DAYS", 3650)
+    monkeypatch.setattr(storage_lifecycle, "TMP_MAX_TOTAL_BYTES", 10_000)
+    monkeypatch.setattr(storage_lifecycle, "OUTPUT_MAX_TOTAL_BYTES", 10_000)
+    monkeypatch.setattr(storage_lifecycle, "AI_MAX_TOTAL_BYTES", 300)
+
+    tmp = tmp_path / ".ai" / "tmp"
+    outputs = tmp_path / ".ai" / "outputs"
+    tmp.mkdir(parents=True)
+    outputs.mkdir(parents=True)
+    scratch = tmp / "scratch.bin"
+    artifact = outputs / "artifact.bin"
+    scratch.write_bytes(b"s" * 200)
+    artifact.write_bytes(b"a" * 200)
+    os.utime(scratch, (1, 1))
+
+    result = storage_lifecycle.enforce_workspace_storage(tmp_path)
+
+    assert result["ok"] is True
+    assert not scratch.exists()
+    assert artifact.exists()
+    assert result["status"]["ai_bytes"] <= 300
+
+
+def test_workspace_storage_unlinks_symlink_without_touching_target(tmp_path: Path, monkeypatch) -> None:
+    _workspace_storage_fixture(monkeypatch)
+    monkeypatch.setattr(storage_lifecycle, "TMP_RETENTION_DAYS", 0)
+    monkeypatch.setattr(storage_lifecycle, "TMP_MAX_ENTRIES", 0)
+    monkeypatch.setattr(storage_lifecycle, "TMP_MAX_TOTAL_BYTES", 0)
+    monkeypatch.setattr(storage_lifecycle, "OUTPUT_MAX_TOTAL_BYTES", 10_000)
+    monkeypatch.setattr(storage_lifecycle, "AI_MAX_TOTAL_BYTES", 20_000)
+
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"keep")
+    tmp = tmp_path / ".ai" / "tmp"
+    tmp.mkdir(parents=True)
+    link = tmp / "outside-link"
+    link.symlink_to(outside)
+
+    storage_lifecycle.enforce_workspace_storage(tmp_path)
+
+    assert not link.exists()
+    assert outside.read_bytes() == b"keep"
+
+
+def test_doctor_reports_workspace_total_quota_without_deleting(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(storage_lifecycle, "TMP_MAX_TOTAL_BYTES", 100)
+    monkeypatch.setattr(storage_lifecycle, "AI_MAX_TOTAL_BYTES", 100)
+    tmp = tmp_path / ".ai" / "tmp"
+    tmp.mkdir(parents=True)
+    oversized = tmp / "oversized.bin"
+    oversized.write_bytes(b"x" * 200)
+
+    result = doctor.check_storage_limits(tmp_path)
+
+    assert result.ok is False
+    assert ".ai/tmp:total-bytes" in result.detail
+    assert oversized.exists()
+
+
+def test_doctor_reports_workspace_top_level_entry_limit(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(storage_lifecycle, "TMP_MAX_ENTRIES", 1)
+    tmp = tmp_path / ".ai" / "tmp"
+    tmp.mkdir(parents=True)
+    (tmp / "one").write_text("1")
+    (tmp / "two").write_text("2")
+
+    result = doctor.check_storage_limits(tmp_path)
+
+    assert result.ok is False
+    assert ".ai/tmp:file-count" in result.detail
+
+
 def test_github_upgrade_uses_single_low_memory_activation() -> None:
     root = Path(__file__).resolve().parents[3]
     bootstrap = (root / "bootstrap-code-brain.sh").read_text()

@@ -15,6 +15,7 @@
 
 - `rm -rf /`, `rm -rf ~`, `rm -rf .`, `rm -rf *`
 - `git reset --hard`, `git clean -fd`
+- `main`, `master`, `develop`, `development`, `trunk`, `prod`, `production`, `staging` 브랜치 삭제
 - DB drop/reset, destructive migration reset
 - `kubectl delete`, `terraform destroy`
 - 민감 파일 직접 읽기 또는 출력
@@ -26,6 +27,7 @@
 - 인증, 권한, 결제, 데이터 삭제 로직 변경
 - 패키지 설치, 제거, 버전 변경
 - 커밋, 푸시, 머지, 리베이스, GitHub repo 생성
+- 비보호 worktree/session/feature/scratch 브랜치 삭제는 정상 정리 작업으로 허용한다.
 - 배포, workflow dispatch, production 서비스 변경
 - production secret, OAuth app, API key, webhook 설정 변경
 

@@ -458,15 +458,21 @@ def check_jsonl(root: Path) -> Check:
 def check_storage_limits(root: Path) -> Check:
     from .search import INDEX_DB_MAX_BYTES, INDEX_SIDECAR_MAX_BYTES, db_path
     from .storage_lifecycle import (
+        AI_MAX_TOTAL_BYTES,
         DIAGNOSTIC_MAX_FILES,
         DIAGNOSTIC_MAX_TOTAL_BYTES,
         DIAGNOSTIC_RETENTION_DAYS,
         LOG_MAX_FILES,
         LOG_MAX_TOTAL_BYTES,
         LOG_RETENTION_DAYS,
+        OUTPUT_MAX_ENTRIES,
+        OUTPUT_MAX_TOTAL_BYTES,
+        TMP_MAX_ENTRIES,
+        TMP_MAX_TOTAL_BYTES,
         UPGRADE_BACKUP_MAX_FILES,
         UPGRADE_BACKUP_MAX_TOTAL_BYTES,
         UPGRADE_BACKUP_RETENTION_DAYS,
+        workspace_storage_status,
     )
 
     bad: list[str] = []
@@ -526,7 +532,24 @@ def check_storage_limits(root: Path) -> Check:
             bad.append(f"{directory.relative_to(root).as_posix()}:file-count")
         if total > max_total:
             bad.append(f"{directory.relative_to(root).as_posix()}:total-bytes")
-    return Check("storage_limits", not bad, f"ok checked={checked}" if not bad else "invalid: " + ", ".join(bad[:10]))
+    workspace = workspace_storage_status(root)
+    if not workspace["complete"] or workspace["errors"]:
+        bad.append(".ai:scan-incomplete")
+    if int(workspace["tmp_bytes"]) > TMP_MAX_TOTAL_BYTES:
+        bad.append(".ai/tmp:total-bytes")
+    if int(workspace["tmp_top_entries"]) > TMP_MAX_ENTRIES:
+        bad.append(".ai/tmp:file-count")
+    if int(workspace["output_bytes"]) > OUTPUT_MAX_TOTAL_BYTES:
+        bad.append(".ai/outputs:total-bytes")
+    if int(workspace["output_top_entries"]) > OUTPUT_MAX_ENTRIES:
+        bad.append(".ai/outputs:file-count")
+    if int(workspace["ai_bytes"]) > AI_MAX_TOTAL_BYTES:
+        bad.append(".ai:total-bytes")
+    detail = (
+        f"ok checked={checked} ai_bytes={workspace['ai_bytes']} tmp_bytes={workspace['tmp_bytes']} "
+        f"output_bytes={workspace['output_bytes']}"
+    )
+    return Check("storage_limits", not bad, detail if not bad else "invalid: " + ", ".join(bad[:10]))
 
 
 def check_generated_artifacts_bounded(root: Path) -> Check:

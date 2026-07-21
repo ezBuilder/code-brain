@@ -220,7 +220,12 @@ Generated artifact caps:
 .ai/memory/evidence.jsonl            4MB cap
 .ai/memory/session-current.md        100KB cap
 .ai/cache/sandbox/                   pruned after Stop/SessionEnd
+.ai/tmp/                            512MB cap, 7-day retention, 256 top-level entries
+.ai/outputs/                        1GB cap, 512 top-level entries
+.ai/                                2GB total cap
 ```
+
+Session start and upgrades prune the oldest untracked entries when these limits are exceeded. A tracked top-level entry, a directory containing `.keep`, or an item with a sibling `<name>.keep` is preserved. If pinned or tracked data alone exceeds a cap, cleanup fails closed and `doctor --strict` reports the overage instead of deleting it.
 
 Manual cleanup:
 
@@ -230,7 +235,7 @@ Manual cleanup:
 .ai/bin/ai audit rebuild-index --json
 ```
 
-`doctor --strict` fails `generated_artifacts_bounded` if the capped files grow past limits.
+`doctor --strict` fails `generated_artifacts_bounded` or `storage_limits` if capped files or directories grow past limits.
 
 ## Security And Public Repo Hygiene
 

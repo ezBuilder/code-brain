@@ -11,6 +11,7 @@ from .memory import rebuild_audit_index
 from .policy import is_ci
 from .render import render as render_project
 from .search import context_pack, db_path, index_hash_status, rebuild
+from .storage_lifecycle import enforce_workspace_storage, workspace_storage_status
 
 
 def index_status(
@@ -74,6 +75,11 @@ def start_session(
     limit: int = 5,
     context_budget_mode: str = "balanced",
 ) -> dict[str, Any]:
+    storage_payload = (
+        workspace_storage_status(root)
+        if dry_run or is_ci()
+        else enforce_workspace_storage(root)
+    )
     db_existed_before = db_path(root).exists()
     before = index_status(
         root,
@@ -140,6 +146,7 @@ def start_session(
         "index": index_payload,
         "hook": hook_payload,
         "doctor": doctor_payload,
+        "storage": storage_payload,
     }
     if audit_index_payload is not None:
         payload["audit_index"] = audit_index_payload

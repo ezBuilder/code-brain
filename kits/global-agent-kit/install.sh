@@ -282,10 +282,17 @@ merged = dict(current)
 
 permissions = dict(current.get("permissions", {}))
 incoming_permissions = incoming.get("permissions", {})
+retired_permission_denies = {
+    "Bash(git branch -D *)",
+    "Bash(git push * --delete *)",
+}
 for key in ("deny", "ask", "allow"):
     values = []
     seen = set()
-    for item in permissions.get(key, []) + incoming_permissions.get(key, []):
+    current_values = permissions.get(key, [])
+    if key == "deny":
+        current_values = [item for item in current_values if item not in retired_permission_denies]
+    for item in current_values + incoming_permissions.get(key, []):
         if item not in seen:
             seen.add(item)
             values.append(item)

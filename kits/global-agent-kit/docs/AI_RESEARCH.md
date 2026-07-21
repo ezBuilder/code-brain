@@ -9,6 +9,7 @@ Claude Code:
 - 전역/프로젝트 settings는 `~/.claude/settings.json`, `.claude/settings.json`, `.claude/settings.local.json` 계층으로 동작한다.
 - settings는 Managed, command line, Local, Project, User 순서로 적용되며 permission rule은 merge 동작을 한다.
 - hooks는 `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `SessionStart` 등 이벤트에 연결할 수 있고 MCP tool matcher도 지원한다.
+- `PreToolUse` command hooks receive the full Bash command on stdin and may deny a specific call; exit `0` with no decision leaves normal permission flow intact, so semantic target checks should replace broad branch-deletion patterns.
 - 최신 hook 표면에는 `PermissionDenied`, `PostToolUseFailure`, `PostToolBatch`, `TaskCreated`처럼 진단/관찰에 유용한 이벤트가 포함된다.
 - slash command에는 `/agents`, `/doctor`, `/mcp`, `/memory`, `/permissions`, `/cost` 등이 포함되므로 이 키트의 `doctor`와 하네스는 Claude 내장 진단 흐름과 충돌하지 않게 shell script로 제공한다.
 - hook script 경로는 프로젝트나 플러그인 기준 placeholder를 쓸 수 있으나, user-level 설치 자산은 installer가 절대 경로로 고정해야 한다.
@@ -34,6 +35,7 @@ Codex CLI:
 - 반복 하네스 실행으로 백업이 무한 증가하지 않게 기본 20개만 보존한다.
 - 기존 Claude user settings는 덮어쓰기보다 permissions/hooks를 병합한다.
 - Claude hooks는 user-level 설치 후에도 동작하도록 `~/.claude/hooks/` 절대 경로로 변환한다.
+- Branch deletion hard-deny is scoped to exact long-lived protected names; worktree/session/feature cleanup remains available and is covered by install smoke tests.
 - 실제 credential, OAuth, MCP token, production secret은 자동 설정하지 않는다.
 - Claude/Codex 공통 규칙은 짧게 유지하고, 조사 근거와 운영 정책은 `docs/AI_*.md`에 둔다.
 

@@ -191,6 +191,10 @@ cat >"$tmp_home/.claude/settings.json" <<'JSON'
 {
   "autoMemoryEnabled": true,
   "permissions": {
+    "deny": [
+      "Bash(git branch -D *)",
+      "Bash(git push * --delete *)"
+    ],
     "ask": [
       "Bash(custom deploy *)"
     ]
@@ -259,8 +263,10 @@ if "Bash(custom deploy *)" not in ask:
     raise SystemExit("installer did not preserve existing permission ask rules")
 
 deny = perms.get("deny", [])
-if "Bash(git branch -D *)" not in deny or "Bash(git push * --force*)" not in deny:
-    raise SystemExit("installer did not merge permission deny rules")
+if "Bash(git push * --force*)" not in deny:
+    raise SystemExit("installer did not preserve force-push deny rules")
+if "Bash(git branch -D *)" in deny or "Bash(git push * --delete *)" in deny:
+    raise SystemExit("broad branch-deletion deny rules must be handled semantically by the hook")
 
 if perms.get("defaultMode") != "bypassPermissions":
     raise SystemExit("installer did not carry the bypassPermissions default mode")
@@ -287,6 +293,44 @@ required = {
 missing = sorted(required - set(commands))
 if missing:
     raise SystemExit(f"installer did not rewrite hook commands: {missing}")
+PY
+
+python3 - "$tmp_home/.claude/hooks/block-dangerous.sh" <<'PY'
+import json
+import subprocess
+import sys
+
+hook = sys.argv[1]
+
+
+def decision(command: str) -> str:
+    payload = json.dumps({"tool_input": {"command": command}})
+    result = subprocess.run([hook], input=payload, text=True, capture_output=True, check=True)
+    if not result.stdout.strip():
+        return "allow"
+    body = json.loads(result.stdout)
+    return body["hookSpecificOutput"]["permissionDecision"]
+
+
+for command in (
+    "git branch -d c2c/session/lease123/project",
+    "git branch -D claude/scratch-work",
+    "git push origin --delete codex/tmp-cleanup",
+    "git push --delete origin feature/finished",
+    "git branch -d main-backup",
+):
+    if decision(command) != "allow":
+        raise SystemExit(f"scratch branch deletion was blocked: {command}")
+
+for command in (
+    "git branch -d develop",
+    "git branch -D refs/heads/main",
+    "git -C repo branch --delete master",
+    "git push origin --delete production",
+    "git push origin :staging",
+):
+    if decision(command) != "deny":
+        raise SystemExit(f"protected branch deletion was allowed: {command}")
 PY
 
 echo "validate ok"

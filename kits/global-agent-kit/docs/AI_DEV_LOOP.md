@@ -27,6 +27,7 @@
 | Code Brain Delivery Loop | staged delivery workflow pattern | 조건부 채택 | 계획/리뷰/QA/릴리스 점검을 필요할 때만 호출하고 항상 켜지는 훅으로 만들지 않는다. |
 | Codex Skills/MCP prompts | Codex skill and MCP prompt patterns | 조건부 채택 | 문서/선택형 project-local prompt만 채택하고 OAuth/token 기반 전역 MCP 자동 등록은 거부한다. |
 | Codex doctor Python fallback | Codex config diagnostics + macOS Python baseline | 채택 | macOS 기본 Python 3.9에서도 설치된 3.12/3.11을 찾아 TOML 진단을 통과시킨다. |
+| Protected-branch semantic guard | Claude Code PreToolUse hook contract | 채택 | 영구 브랜치는 계속 차단하면서 worktree/session 쓰레기 브랜치 삭제 오탐을 제거한다. |
 
 ## 다음 후보
 

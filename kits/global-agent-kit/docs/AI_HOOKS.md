@@ -13,7 +13,7 @@ Hook-first plan for Claude Code and Codex-adjacent workflows.
 
 | Hook | Event | 목적 | 실패 기준 |
 | --- | --- | --- | --- |
-| `block-dangerous.sh` | `PreToolUse:Bash` | destructive commands require explicit user approval | broad Bash denial or bypass guidance |
+| `block-dangerous.sh` | `PreToolUse:Bash` | hard-block protected branch deletion and other irreversible commands | blocking non-protected worktree/session branch cleanup or bypass guidance |
 | `protect-secrets.sh` | `PreToolUse:Read/Edit/Write` | real secrets and credential files are not read or changed | `.env`, keys, tokens, certs exposed |
 | `session-context.sh` | `SessionStart` | concise kit usage context injection | long context, stale commands, hidden policy changes |
 
@@ -30,5 +30,6 @@ Hook-first plan for Claude Code and Codex-adjacent workflows.
 
 - `make validate` must check required docs, hook files, command files, shell syntax, JSON syntax, and smoke install wiring.
 - New hook or loop scripts must be listed in `scripts/validate.sh` with `bash -n`.
+- Branch-deletion tests must prove exact protected names are denied while similarly named and worktree/session branches remain allowed.
 - `make doctor` must confirm installed global hook commands are wired to their installed absolute paths.
 - `./scripts/dev-loop.sh --once` must prove adopted candidates remain documented before running validation.

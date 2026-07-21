@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+import struct
 import stat
 import subprocess
 import sys
@@ -14,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
 from ai_core import search as search_mod  # noqa: E402
+from ai_core import embedding as embedding_mod  # noqa: E402
+from ai_core.index_control import policy as index_policy  # noqa: E402
 from ai_core.search import (  # noqa: E402
     SCHEMA_VERSION,
     _compute_rrf_k,
@@ -39,9 +42,35 @@ def _write(repo: Path, rel: str, content: str) -> Path:
     return path
 
 
-def test_schema_version_is_eight() -> None:
-    """Schema v8 enables row-level FTS delete for true incremental updates."""
-    assert SCHEMA_VERSION == 8
+def _store_embedding(repo: Path, rel: str, values: list[float], *, raw: bytes | None = None) -> None:
+    payload = raw if raw is not None else struct.pack(f"<{len(values)}f", *values)
+    with connect(repo) as conn:
+        row = conn.execute("select id from chunks where path = ?", (rel,)).fetchone()
+        assert row is not None
+        conn.execute(
+            """
+            update embeddings_vec0
+            set disabled_reason = 'active', vector = ?, model_name = ?, vector_dim = ?
+            where chunk_id = ?
+            """,
+            (payload, embedding_mod.MODEL_NAME, len(values), int(row["id"])),
+        )
+        conn.commit()
+
+
+def test_schema_version_is_eleven() -> None:
+    """Schema v9 records source paths/ranges for lazily restored function chunks."""
+    assert SCHEMA_VERSION == 11
+
+
+def test_index_policy_uses_bounded_defaults_when_config_is_absent(tmp_path: Path) -> None:
+    result = index_policy(tmp_path)
+
+    assert result["ok"] is True
+    assert result["enabled"] is True
+    assert result["auto_rebuild"] is True
+    assert result["errors"] == []
+    assert set(result["sources"].values()) == {"default"}
 
 
 def test_escape_fts_query_splits_natural_language_punctuation() -> None:
@@ -49,6 +78,17 @@ def test_escape_fts_query_splits_natural_language_punctuation() -> None:
     assert escaped == (
         '"How" OR "does" OR "reciprocal" OR "fusion" OR "work" OR "fail" OR "closed"'
     )
+
+
+def test_result_scope_recognizes_function_chunk_path() -> None:
+    assert search_mod._result_scope(
+        "src/service.py:Worker.run",
+        "function Worker.run (10-20)",
+    ) == "src/service.py › Worker.run"
+    assert search_mod._result_scope(
+        "src/service.py::legacy_symbol",
+        "legacy",
+    ) == "src/service.py › legacy_symbol"
 
 
 def test_auto_refresh_does_not_rebuild_for_mtime_only_drift(
@@ -702,6 +742,112 @@ def test_targeted_incremental_does_not_delete_unrelated_function_chunks(tmp_path
     assert any("src/b.py" in item["path"] for item in changed["results"])
 
 
+def test_targeted_incremental_atomically_replaces_symbols_calls_and_references(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "pkg/a.py", "def helper():\n    return 1\n")
+    _write(repo, "pkg/b.py", "def other():\n    return 2\n")
+    _write(
+        repo,
+        "consumer.py",
+        "from pkg.a import helper as h\n\ndef run():\n    callback = h\n    return h()\n",
+    )
+    rebuild(repo)
+
+    with connect(repo) as conn:
+        before = conn.execute(
+            "select kind, lexical_name, target from code_references where path = ? order by lineno, column",
+            ("consumer.py",),
+        ).fetchall()
+    assert [(row["kind"], row["lexical_name"], row["target"]) for row in before] == [
+        ("import_binding", "h", "pkg.a.helper"),
+        ("name_read", "h", "pkg.a.helper"),
+        ("call", "h", "pkg.a.helper"),
+    ]
+
+    _write(
+        repo,
+        "consumer.py",
+        "from pkg.b import other as o\n\ndef run_v2():\n    callback = o\n    return o()\n",
+    )
+    result = rebuild(repo, incremental=True, paths={"consumer.py"})
+
+    assert result["ok"] is True
+    assert result["targeted"] is True
+    with connect(repo) as conn:
+        old_references = conn.execute(
+            "select count(*) from code_references where path = ? and target = ?",
+            ("consumer.py", "pkg.a.helper"),
+        ).fetchone()[0]
+        new_references = conn.execute(
+            "select kind, lexical_name, target from code_references where path = ? order by lineno, column",
+            ("consumer.py",),
+        ).fetchall()
+        symbols = conn.execute(
+            "select qualname from code_symbols where path = ? order by qualname",
+            ("consumer.py",),
+        ).fetchall()
+        calls = conn.execute(
+            "select caller, lexical_callee, target from code_calls where path = ?",
+            ("consumer.py",),
+        ).fetchall()
+    assert old_references == 0
+    assert [(row["kind"], row["lexical_name"], row["target"]) for row in new_references] == [
+        ("import_binding", "o", "pkg.b.other"),
+        ("name_read", "o", "pkg.b.other"),
+        ("call", "o", "pkg.b.other"),
+    ]
+    assert [row["qualname"] for row in symbols] == ["run_v2"]
+    assert [(row["caller"], row["lexical_callee"], row["target"]) for row in calls] == [
+        ("run_v2", "o", "pkg.b.other")
+    ]
+
+    (repo / "consumer.py").unlink()
+    deleted = rebuild(repo, incremental=True, paths={"consumer.py"})
+    assert deleted["ok"] is True
+    assert deleted["deleted"] == 1
+    with connect(repo) as conn:
+        for table in ("code_symbols", "code_calls", "code_references"):
+            assert conn.execute(
+                f"select count(*) from {table} where path = ?",
+                ("consumer.py",),
+            ).fetchone()[0] == 0
+
+
+def test_incremental_rebuild_vacuums_deleted_rows_and_reports_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    for index in range(30):
+        _write(repo, f"src/item_{index}.py", f"VALUE_{index} = {'x' * 2000!r}\n")
+    rebuild(repo)
+    for index in range(25):
+        (repo / f"src/item_{index}.py").unlink()
+
+    monkeypatch.setattr(search_mod, "INDEX_VACUUM_MIN_FREE_PAGES", 0)
+    monkeypatch.setattr(search_mod, "INDEX_VACUUM_FREE_RATIO", 0.0)
+    result = rebuild(repo, incremental=True)
+
+    assert result["ok"] is True
+    assert result["deleted"] == 25
+    assert result["storage"]["vacuumed"] is True
+    assert result["storage"]["free_pages"] == 0
+    assert result["storage"]["within_limit"] is True
+
+
+def test_rebuild_enforces_absolute_sqlite_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/large.py", "PAYLOAD = " + repr("z" * 50_000) + "\n")
+    monkeypatch.setattr(search_mod, "INDEX_MAX_BYTES", 1024)
+
+    result = rebuild(repo)
+
+    assert result["ok"] is False
+    assert result["error"] == "INDEX_SIZE_LIMIT"
+    assert result["storage"]["within_limit"] is False
+    assert result["storage"]["total_bytes"] > result["storage"]["max_bytes"]
+
+
 def test_chunk_meta_stores_function_metadata(tmp_path: Path) -> None:
     """T2: chunk_meta stores qualname and line numbers for function chunks."""
     repo = _make_repo(tmp_path)
@@ -711,7 +857,7 @@ def test_chunk_meta_stores_function_metadata(tmp_path: Path) -> None:
     with connect(repo) as conn:
         # Check that function chunks have metadata
         rows = conn.execute(
-            "select id, path, qualname, start_line, end_line, kind from chunks "
+            "select id, path, source_path, qualname, start_line, end_line, kind from chunks "
             "join chunk_meta on chunks.id = chunk_meta.chunk_id "
             "where chunks.path like '%:my_func' and chunk_meta.kind = 'function'"
         ).fetchall()
@@ -719,6 +865,187 @@ def test_chunk_meta_stores_function_metadata(tmp_path: Path) -> None:
         if rows:
             row = rows[0]
             assert row["qualname"] == "my_func"
+            assert row["source_path"] == "src/test.py"
             assert row["start_line"] >= 1
             assert row["end_line"] >= row["start_line"]
             assert row["kind"] == "function"
+
+
+def test_query_returns_function_chunk_with_provenance_and_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _write(
+        repo,
+        "src/service.py",
+        "class Worker:\n    def run(self):\n        return 'NeedleFunctionToken'\n",
+    )
+    monkeypatch.setenv("AI_SEARCH_DENSE", "0")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    rebuild(repo)
+
+    result = query(repo, "NeedleFunctionToken", limit=10)
+
+    function_result = next(
+        item for item in result["results"] if item["path"] == "src/service.py:Worker.run"
+    )
+    assert function_result["source_path"] == "src/service.py"
+    assert function_result["scope"] == "src/service.py › Worker.run"
+    assert "NeedleFunctionToken" in function_result["snippet"]
+    assert not function_result["snippet"].startswith("[stale index:")
+    assert function_result["provenance"]["processor"] == "code-brain-local"
+    with connect(repo) as conn:
+        row = conn.execute(
+            "select processor from provenance where path = ?",
+            ("src/service.py:Worker.run",),
+        ).fetchone()
+    assert row is not None and row["processor"] == "code-brain-local"
+
+
+def test_function_chunks_persist_only_redacted_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    raw_marker = "SensitiveFunctionMarker"
+
+    def fake_redact(value):
+        return str(value).replace(raw_marker, "MASKED_VALUE")
+
+    monkeypatch.setattr(search_mod, "redact_value", fake_redact)
+    monkeypatch.setenv("AI_SEARCH_DENSE", "0")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    _write(
+        repo,
+        "src/secure.py",
+        f"def reveal():\n    return {raw_marker!r}\n",
+    )
+    rebuild(repo)
+
+    raw_result = query(repo, raw_marker, limit=10)
+    masked_result = query(repo, "MASKED_VALUE", limit=10)
+    function_result = next(
+        item for item in masked_result["results"] if item["path"] == "src/secure.py:reveal"
+    )
+
+    assert raw_result["results"] == []
+    assert "MASKED_VALUE" in function_result["snippet"]
+    assert raw_marker not in function_result["snippet"]
+    with connect(repo) as conn:
+        raw_fts_hits = conn.execute(
+            "select count(*) from chunks_fts where chunks_fts match ?",
+            (search_mod.escape_fts_query(raw_marker),),
+        ).fetchone()[0]
+    assert raw_fts_hits == 0
+
+
+def test_function_chunk_lazy_snippet_detects_changed_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    source = _write(
+        repo,
+        "src/stale_function.py",
+        "def stale_function():\n    return 'StaleFunctionNeedle'\n",
+    )
+    monkeypatch.setenv("AI_SEARCH_DENSE", "0")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    monkeypatch.setenv("AI_SEARCH_AUTO_REFRESH", "0")
+    rebuild(repo)
+    source.write_text(
+        "def stale_function():\n    return 'changed-after-index'\n",
+        encoding="utf-8",
+    )
+
+    result = query(repo, "StaleFunctionNeedle", limit=10)
+    function_result = next(
+        item
+        for item in result["results"]
+        if item["path"] == "src/stale_function.py:stale_function"
+    )
+
+    assert function_result["source_path"] == "src/stale_function.py"
+    assert function_result["snippet"].startswith("[stale index: source changed")
+
+
+def test_dense_global_scan_recovers_lexical_miss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/semantic.py", "vehicle mobility abstraction\n")
+    _write(repo, "src/noise.py", "database transaction locking\n")
+    monkeypatch.setenv("AI_SEARCH_DENSE", "0")
+    rebuild(repo)
+    _store_embedding(repo, "src/semantic.py", [1.0, 0.0])
+    _store_embedding(repo, "src/noise.py", [0.0, 1.0])
+    monkeypatch.setattr(embedding_mod, "is_active_for", lambda _root: True)
+    monkeypatch.setattr(embedding_mod, "embed", lambda _text, _root: [1.0, 0.0])
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    monkeypatch.setenv("AI_SEARCH_RERANK", "0")
+
+    result = query(repo, "motorcar", limit=2)
+
+    assert result["results"][0]["path"] == "src/semantic.py"
+    assert result["retrieval_policy"] == "bm25+dense-global"
+    assert result["dense_retrieval"]["scope"] == "all_vectors"
+    assert result["dense_retrieval"]["scanned_rows"] == 2
+    assert result["dense_retrieval"]["partial"] is False
+    observation = result["retrieval_observation"]
+    assert observation["operation"] == "code.search"
+    assert observation["query"]["raw_included"] is False
+    assert observation["sources"]["dense"] == 2
+    assert observation["results"]["returned"] == 2
+
+
+def test_dense_scan_row_cap_degrades_to_lexical_shortlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/target.py", "LexicalNeedle vehicle abstraction\n")
+    _write(repo, "src/noise.py", "database transaction locking\n")
+    monkeypatch.setenv("AI_SEARCH_DENSE", "0")
+    rebuild(repo)
+    _store_embedding(repo, "src/target.py", [1.0, 0.0])
+    _store_embedding(repo, "src/noise.py", [0.0, 1.0])
+    monkeypatch.setattr(embedding_mod, "is_active_for", lambda _root: True)
+    monkeypatch.setattr(embedding_mod, "embed", lambda _text, _root: [1.0, 0.0])
+    monkeypatch.setenv("AI_SEARCH_DENSE_SCAN_MAX_ROWS", "1")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    monkeypatch.setenv("AI_SEARCH_RERANK", "0")
+
+    result = query(repo, "LexicalNeedle", limit=2)
+
+    assert result["results"][0]["path"] == "src/target.py"
+    assert result["retrieval_policy"] == "bm25+dense-shortlist"
+    assert result["dense_retrieval"]["scope"] == "bm25_candidates"
+    assert result["dense_retrieval"]["reason"] == "global_scan_row_limit"
+    assert result["dense_retrieval"]["partial"] is True
+    assert result["retrieval_observation"]["outcome"] == "partial"
+    assert result["retrieval_observation"]["fallback"] == ["dense-shortlist"]
+
+
+def test_dense_scan_skips_corrupt_vectors_and_falls_back_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/semantic.py", "vehicle mobility abstraction\n")
+    monkeypatch.setenv("AI_SEARCH_DENSE", "0")
+    rebuild(repo)
+    _store_embedding(repo, "src/semantic.py", [0.0, 0.0], raw=b"bad")
+    monkeypatch.setattr(embedding_mod, "is_active_for", lambda _root: True)
+    monkeypatch.setattr(embedding_mod, "embed", lambda _text, _root: [1.0, 0.0])
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    monkeypatch.setenv("AI_SEARCH_RERANK", "0")
+
+    result = query(repo, "motorcar", limit=2)
+
+    assert result["results"] == []
+    assert result["retrieval_policy"] == "bm25"
+    assert result["dense_retrieval"]["corrupt_vectors"] == 1
+    assert result["dense_retrieval"]["reason"] == "no_valid_vectors"
+    assert result["dense_rerank"] is False

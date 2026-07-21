@@ -50,10 +50,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\pat
 Le succès se termine par :
 
 ```text
-[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.
+[code-brain] installed. Code Brain files, memory, search, MCP, and hook definitions are ready in <project>.
+[code-brain] Codex action required: trust this project, run /hooks, and approve the discovered Code Brain hooks.
+[code-brain] After install or hook changes, Codex may require reapproval before project hooks run.
 ```
 
-Ouvrez une nouvelle session Claude/Codex/Antigravity après l'installation.
+Ouvrez une nouvelle session Claude/Codex/Antigravity après l'installation. Pour Codex, terminez d'abord l'approbation ci-dessous.
+
+## Approbation Obligatoire des Hooks Codex
+
+**Enregistrer les hooks ne les active pas.** L'installeur écrit `.codex/hooks.json` et active `features.hooks = true`, mais Codex n'exécute les hooks de commande du projet qu'après avoir approuvé le projet et les définitions de hooks détectées.
+
+1. Ouvrez le dépôt cible dans Codex et marquez le projet comme fiable.
+2. Exécutez `/hooks` dans Codex ou ouvrez l'interface de revue des Hooks.
+3. Examinez et approuvez les hooks Code Brain détectés.
+4. Ouvrez une nouvelle session Codex afin que `SessionStart` et les autres hooks approuvés s'exécutent dès le démarrage.
+
+Avant l'approbation, l'injection de mémoire de session, le routage automatique des commandes, la rédaction des sorties, l'audit et la continuation du hook Stop peuvent sembler inactifs même si les fichiers sont correctement installés. Si une installation ou une mise à niveau modifie une définition de hook, Codex peut demander une nouvelle approbation ; vérifiez `/hooks`. Cette étape est distincte de la politique d'approbation des commandes et n'exige ni `approval_policy = "never"` ni un accès shell sans restriction.
 
 ## Mise à niveau depuis GitHub
 
@@ -70,7 +83,7 @@ cd /path/to/project
 /cb-upgrade
 ```
 
-Après une mise à niveau réussie, ouvrez une nouvelle session d'agent afin que les nouveaux hooks, la configuration MCP, `AGENTS.md` et `CLAUDE.md` soient chargés.
+Après une mise à niveau réussie, si Codex demande une nouvelle approbation, vérifiez `/hooks`, puis ouvrez une nouvelle session pour charger les hooks approuvés, la configuration MCP, `AGENTS.md` et `CLAUDE.md`.
 
 Pour un amorçage initial sans conserver de clone local :
 
@@ -164,7 +177,7 @@ Pour un README public, mettez en avant ces contrôles reproductibles. N'ajoutez 
 .ai/                         runtime, memory structure, hooks, MCP shim
 .mcp.json                    Claude Code MCP
 .codex/config.toml           Codex MCP profile usage
-.codex/hooks.json            Codex hooks
+.codex/hooks.json            Codex hooks (confiance du projet + approbation /hooks requises)
 .claude/settings.json        Claude Code hooks
 .claude/commands/            slash commands
 .codex/prompts/              Codex prompts

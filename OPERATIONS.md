@@ -49,6 +49,12 @@ make uninstall-from TARGET=/path/to/project
 
 The installer records managed files in `.ai/generated/install-manifest.json`, refuses to overwrite unrelated existing files, preserves target `.ai/memory/` during upgrades, rebuilds the audit index, installs git pull/checkout hooks, and runs a forced session rebuild once. It does not commit `.ai/cache/` or `.ai/runtime/.venv/`; each Mac/VPS regenerates those local artifacts after `git pull`.
 
+### Codex Hook Activation Gate
+
+Codex hook registration is not activation. The installer writes `.codex/hooks.json`, sets `[features].hooks = true`, and records `codex_hook_activation_required=true` plus `codex_hook_review_command=/hooks` in the install manifest. The operator must still open the target repository in Codex, trust the project, run `/hooks` (or use the Hooks review UI), approve the discovered Code Brain hooks, and then start a new Codex session.
+
+Until this approval is complete, `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, and related Code Brain behavior may not execute. Installation or upgrade can change hook definitions and trigger reapproval. This host-controlled approval cannot be safely bypassed by the installer and is separate from `approval_policy`; do not set `approval_policy = "never"` merely to activate Code Brain hooks. The `PermissionRequest` hook records approval requests for audit purposes; it does not silently grant unrestricted commands.
+
 The default install keeps the runtime dependency-light and uses BM25 search. Provision the optional ONNX dense-search dependencies only when required:
 
 ```bash
@@ -56,7 +62,15 @@ AI_INSTALL_DENSE=1 ./scripts/install-into.sh install /path/to/project
 AI_INSTALL_DENSE=1 ./scripts/install-into.sh upgrade /path/to/project
 ```
 
-Dense search remains separately controlled at runtime by `AI_SEARCH_DENSE`; missing optional dependencies degrade safely to BM25.
+Dense search remains separately controlled at runtime by `AI_SEARCH_DENSE`; missing optional dependencies degrade safely to BM25. When active, Code Brain retrieves semantic candidates independently of BM25 and fuses both rankings with RRF, so lexical misses can be recovered. The default exact vector scan is bounded to 10,000 compatible rows and 500 ms; larger indexes automatically degrade to dense scoring of the BM25 shortlist instead of performing an unbounded full scan. Operators may tune the bounded limits with `AI_SEARCH_DENSE_SCAN_MAX_ROWS`, `AI_SEARCH_DENSE_SCAN_MAX_MS`, and `AI_SEARCH_DENSE_MAX_CANDIDATES`. Query responses expose the effective scope, partial status, vector counts, and corrupt-vector skips under `dense_retrieval`.
+
+Durable-memory recall is also bounded. `memory recall` and the MCP `memory_recall` tool read only the newest configured tail from decisions, lessons, and procedures, normalize camelCase/snake_case/path/Unicode identifiers, filter expired or retired records, and return provenance, temporal validity, relation edges, duplicate-suppression counts, and per-store completeness under `scan`. Defaults are 10,000 records and 8 MB per store with a 1,000-candidate heap. Tune them with `AI_MEMORY_RECALL_MAX_RECORDS`, `AI_MEMORY_RECALL_MAX_BYTES`, `AI_MEMORY_RECALL_MAX_CANDIDATES`, and `AI_MEMORY_RECALL_DUPLICATE_SIMILARITY`. A truncated store is reported as `scan.partial=true`; it is never silently described as a complete lifetime search.
+
+Context packs use deterministic active compression rather than only truncating the tail. The packer normalizes query identifiers, orders candidates by protected signal, negative evidence, query coverage, provenance, and canonical path, removes exact/near-duplicate snippets at a mode-specific threshold, and drops ordinary candidates before handoff/rubric/verdict/blocker or failure/counterexample evidence. `context_budget` reports schema version, query coverage, redundancy/result/byte prune counts, protected and negative-evidence preservation, provenance retention, input/output bytes, saved bytes, and savings ratio. `over_budget_to_preserve=true` means the configured byte ceiling was intentionally exceeded rather than silently discarding protected evidence.
+
+Code search, durable-memory recall, and context compression all return a bounded `retrieval_observation` object using the `codebrain.retrieval.v1` semantic convention. It records operation, outcome, duration, returned/candidate counts, partial state, effective policy, fallbacks, source counts, resource limits, and operation-specific quality signals. The observation never repeats the raw query: it stores only UTF-8 byte/character/token counts and a SHA-256 fingerprint. Nested mappings, sequences, strings, and depth are capped before exposure. `ai obs metrics`, diagnostics bundles, status reports, and `health_summary` expose the configured runtime bounds for all three operations under `retrieval`; health fails closed when any production retrieval path loses its declared bound.
+
+Code navigation uses a precise-first, syntactic-fallback contract. When `multilspy` and a language server answer successfully, `code_find_references` and `code_goto_definition` return `backend=lsp`, `precision=precise`, and `complete=true`. Otherwise an existing `.ai/cache/code.sqlite` schema-v11 index is opened read-only and queried without creating or mutating an index. Python call edges preserve the compatible lexical `callee` while also storing `lexical_callee`, best-effort fully qualified `target`, `resolution`, and bounded `confidence`; supported resolutions include import/from-import aliases, relative imports, same-file symbols, and `self`/`cls` members. The v11 `code_references` index additionally stores calls, non-call name reads, attribute reads, and import bindings with lexical scope and exact start/end line-column ranges. Changed-path indexing deletes and recreates symbols, calls, and references in the same SQLite transaction, so stale references cannot survive a successful incremental update. Reference queries expose bounded result completeness plus definition-candidate and ambiguity diagnostics instead of silently picking one same-named definition. Fallback responses declare `backend=syntactic_codegraph`, `precision=syntactic`, `complete=false`, the exact fallback reason, and whether `code_references` or the legacy `code_calls` projection supplied results. If no index exists, navigation retains the explicit unavailable response and does not create one implicitly.
 
 For package images, CI fixtures, or other staged provisioning, defer the expensive local runtime activation while still writing every managed file and the install manifest:
 
@@ -131,11 +145,12 @@ Run the full gate before tagging, shipping an archive, or handing a build to ano
 make env-check
 make preflight
 make lint
+make stress-bounds
 make release-gate
 uv run --project .ai/runtime ai report release-notes
 ```
 
-The release gate runs environment checks, fresh-clone preflight, `uv.lock` drift verification, bootstrap, tests, smoke flows in a temporary copy, package creation, install verification, package reproducibility check, rollback drill, bootstrap idempotency drill, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
+The release gate runs environment checks, fresh-clone preflight, `uv.lock` drift verification, bootstrap, tests, smoke flows in a temporary copy, bounded transcript/sandbox stress verification, package creation, install verification, package reproducibility check, rollback drill, bootstrap idempotency drill, doctor, docs examples, and release status reporting. It fails if tracked source becomes dirty.
 It starts with `scripts/env-check.sh`, which reports bash, git, make, uv, uv-managed Python, and optional PowerShell status as JSON.
 It also starts with `scripts/preflight.sh --check-only`, which verifies repo layout, required tools, Python version, conditional encrypted-secret tooling, conditional Git LFS tooling, and cache permission posture.
 Bootstrap records that successful result in `.ai/cache/preflight-proof.json`. The proof is mode `0600`, root-confined, and bound to the preflight script hash, repository root, PATH/tool binary states, runtime Python, encrypted-secret requirements, Git attributes, bootstrap files, cache permissions, and relevant environment variables. Doctor may reuse an unchanged proof for up to one hour; any fingerprint, ownership, permission, symlink, path-confinement, or age mismatch forces the real preflight command to run again.
@@ -148,7 +163,9 @@ It runs `scripts/bootstrap-idempotency.sh` in a temporary git copy and fails if 
 Use `scripts/verify-artifacts.sh` when you need to validate downloaded release artifacts before running package code.
 CI uses the same Makefile targets as local release verification; write-heavy smoke/docs flows run only inside temporary repositories with CI policy explicitly cleared.
 `.github/workflows/release-gate.yml` runs the full release gate with read-only repository permissions, verifies CI write rejection, uploads `dist/release-gate.summary.json`, `dist/dep-advisory.json`, plus release artifacts for retention, and uses `summary-observe` with `scripts/summary-parity.py` to compare canonical summary fields across supported CI operating systems.
-Release gate summary schema is locked by `RELEASE_GATE_SUMMARY_SCHEMA_VERSION`; `scripts/summary-parity.py` rejects missing, extra, or wrong-version summary fields before comparing cross-OS content. Schema v2 includes `dep_advisory.finding_count`, `mode`, `generated_at`, and `skipped`; parity compares stable advisory fields while ignoring per-run advisory timestamps.
+Release gate summary schema is locked by `RELEASE_GATE_SUMMARY_SCHEMA_VERSION`; `scripts/summary-parity.py` rejects missing, extra, or wrong-version summary fields before comparing cross-OS content. Schema v3 includes `dep_advisory.finding_count`, `mode`, `generated_at`, and `skipped`, plus `operational_bounds` for audit, SQLite, diagnostics, retention/backup, bounded Claude/Codex transcript scans, bounded sandbox/SIGKILL diagnostics, and observed test-runner anomalies. `release_ready` now requires these operational bounds to be healthy. Parity compares stable advisory and operational contract fields while ignoring per-run timestamps, counters, and elapsed times. Smoke and documentation checks use `--skip-usage` so they never scan external Claude/Codex transcript stores.
+`scripts/run-observed.py` streams child output without whole-output buffering, retains only a redacted 64KB tail and SHA-256 digest, and atomically records the latest result under diagnostics retention. It bounds oversized argv with a redacted preview plus SHA-256, samples process-tree peak RSS, captures host/cgroup memory snapshots before and after execution, and persists the structured termination classification. Spawn failures are persisted as `spawn_error` with exit 127; output/wait observer failures terminate the isolated child process group, stop the RSS sampler in a bounded `finally` path, persist `observer_failure`, and return exit 70. Operators may set `--timeout-seconds` to enforce an explicit finite deadline: the observer marks `timed_out`, terminates the complete POSIX process group, preserves partial output and resource evidence, classifies the result as `timeout`, and exits 124. Managed observers install temporary `SIGINT`/`SIGTERM` handlers in the main thread. An external cancellation is relayed to the isolated child process group, escalated to `SIGKILL` only after the bounded grace period, recorded as `observer_interrupted`, and returned as shell-compatible exit 130/143; the original handlers are restored before return. POSIX cleanup checks the whole process group rather than only the session leader, so a descendant that ignores the first signal is still killed after the grace period even when its parent has already exited. Failure to prove group cleanup is recorded as `observer_failure` with exit 70 instead of reporting a clean timeout or interruption. Deliberate timeout/interruption escalation is not misreported as unexplained `Killed: 9`. Bootstrap, `make test`, and `scripts/ci-local.sh` use `scripts/run-observed-command.sh`; setting `AI_RUNNER_TIMEOUT_SECONDS` applies the same validated deadline to all three, while an unset or empty value preserves the default unlimited runtime. RSS sampling failures remain explicit in `rss_sample_errors` without changing an otherwise successful child result. It detects actual SIGKILL/exit 137, `Killed: 9`, `RUN_NOT_FOUND`, and transport restart/reset/reconnect/disconnect markers. The release gate generates a fresh one-use evidence token, stores only its SHA-256 in schema-v5 runner diagnostics, strips the raw token from the observed child environment, and requires the final successful `bootstrap-pytest` observation to match that token and have parent-signal observation enabled. Missing, stale, or interrupt-unsafe successful observations therefore cannot satisfy the release gate.
+`scripts/stress-bounds.py` creates isolated high-cardinality sandbox, Claude, and Codex stores, repeatedly scans them under deliberately tight file/candidate/byte/time policies, asserts explicit partial diagnostics, preserves synthetic `Killed: 9` evidence, and enforces a traced-memory ceiling. The same isolated run repeatedly injects log, diagnostics, and rollback-backup files and proves their file/byte footprints plateau under retention, compacts the audit log, detects and repairs an injected hash-chain break, verifies repair idempotency, deletes indexed source rows, proves WAL checkpoint/vacuum reclamation and no-change stability, and verifies SQLite absolute-size violation detection followed by policy recovery. The default `make stress-bounds` profile uses 5,000 files per store and 10 iterations; the release gate uses a 2,000-file, 5-iteration profile on every supported CI operating system.
 
 ## Install From Archive
 
@@ -290,9 +307,9 @@ uv run --project .ai/runtime ai secrets status --json
 
 Do not commit plaintext secrets. The doctor secret scan treats tracked source secrets as a blocker.
 
-### FTS5 Tokenizer (schema_version=3)
+### Search Index Schema v9
 
-`.ai/cache/code.sqlite` `chunks_fts` is created with `tokenize="porter unicode61 remove_diacritics 2"` so that searches match inflected forms (`run` ↔ `running`/`runs`) and accent-stripped variants (`café` ↔ `cafe`). Legacy v2 caches are auto-detected by `init_schema` and rebuilt on first call. Operator action required only if `ai obs search` returns no hits where prior versions did — run `ai index rebuild` once.
+`.ai/cache/code.sqlite` `chunks_fts` retains `tokenize="porter unicode61 remove_diacritics 2"` so searches match inflected forms (`run` ↔ `running`/`runs`) and accent-stripped variants (`café` ↔ `cafe`). Schema v9 adds an explicit source path and line range to every chunk. Function-level result IDs remain `path:symbol`, while lazy snippets are reconstructed from the corresponding source-file slice and verified against that slice's SHA-256. Function boundaries are parsed from the original source, but only the redacted slice is written to FTS, metadata, and hashes. Query and observability paths reject older schemas without modifying the database; run `ai index rebuild` once to migrate a v8-or-earlier cache.
 
 ### Shell Sandbox (token-cost guard)
 
@@ -353,13 +370,15 @@ Generate a local bundle for incident handoff:
 uv run --project .ai/runtime ai diagnostics bundle --json
 ```
 
-Prune old bundles:
+Bundles are pruned automatically after every successful write. The default policy is 30 days, 20 files, and 100 MB total. A bundle is written directly as a private zip, so an uncompressed duplicate JSON file is not retained. Manual pruning remains available:
 
 ```bash
 uv run --project .ai/runtime ai diagnostics prune --keep-days 30 --json
 ```
 
-Diagnostics payloads are redacted and written under `.ai/cache/diagnostics/`. Share the generated zip only after checking that the receiving party is authorized for repository metadata.
+Diagnostics payloads are redacted and written under `.ai/cache/diagnostics/`. Share the generated zip only after checking that the receiving party is authorized for repository metadata. Override the automatic bounds with `AI_DIAGNOSTICS_RETENTION_DAYS`, `AI_DIAGNOSTICS_MAX_FILES`, and `AI_DIAGNOSTICS_MAX_BYTES`.
+
+Daily operational logs under `.ai/cache/logs/` are also bounded automatically: 14 days, 14 files, 32 MB total, and 4 MB per active daily JSONL file by default. Oversized event payloads are replaced with a checksum and bounded preview. Overrides use `AI_LOG_RETENTION_DAYS`, `AI_LOG_MAX_FILES`, `AI_LOG_MAX_BYTES`, `AI_LOG_FILE_MAX_BYTES`, and `AI_LOG_PAYLOAD_MAX_BYTES`.
 
 ## Upgrade And Rollback
 
@@ -377,6 +396,8 @@ make rollback-drill
 ```
 
 The drill copies the repository to a temporary directory, verifies `upgrade apply --dry-run` does not create a backup, creates a rollback backup in the copy, simulates manifest drift, restores through `upgrade rollback`, and runs strict doctor in the copy. It must leave the original worktree clean.
+
+Every successful `upgrade apply` creates a private rollback backup and then automatically enforces the default backup policy: 90 days, 10 files, and 20 MB total. The backup created for the current upgrade is always preserved during that pass. Override these limits with `AI_UPGRADE_BACKUP_RETENTION_DAYS`, `AI_UPGRADE_BACKUP_MAX_FILES`, and `AI_UPGRADE_BACKUP_MAX_BYTES`. `doctor --strict` fails when logs, diagnostics, or rollback backups exceed their active policy or contain unsafe matching symlinks/hardlinks.
 
 Apply only after the plan is compatible:
 
@@ -461,7 +482,7 @@ The doctor check `mcp_methods_registered` enforces that:
 
 ### PreToolUse Auto-Routing (Claude/Codex)
 
-`.claude/settings.json` (Claude Code) and `.codex/hooks.json` (Codex CLI) register `PreToolUse` hooks that intercept `Bash` tool calls before they execute — this is Code Brain's "auto-routing" of long-output shell commands. `precall.evaluate` decides whether the command would dump large output into the model's context window.
+`.claude/settings.json` (Claude Code) and `.codex/hooks.json` (Codex CLI) register `PreToolUse` hooks that intercept `Bash` tool calls before they execute — this is Code Brain's "auto-routing" of long-output shell commands. In Codex, the project and hook definitions must first be approved through `/hooks`. `precall.evaluate` decides whether the command would dump large output into the model's context window.
 
 Intercepted patterns (denied with redirect message):
 - `grep -r` / `grep -R` / `grep -rn` (recursive grep)
@@ -477,6 +498,14 @@ Allowed (passes through to Bash):
 - Compound commands with `&&`, `||`, `;` (conservative — too complex to analyze)
 
 When intercepted, the hook returns `decision: "block"` with a reason instructing the agent to retry via `ai exec run -- <original>` or MCP `sandbox_execute`. The agent normally re-issues the call against Code Brain's sandbox, which stores full output to `.ai/cache/sandbox/<exec_id>.txt` and returns only a short summary (first 30 + last 5 lines, ≤4 KB) to the context window.
+
+Sandbox execution streams stdout and stderr to private temporary files instead of buffering the full child output in the runtime process. The retained combined artifact is hard-bounded to 4 MB; larger output keeps a head/tail sample and reports `source_total_bytes` plus `output_truncated=true`. A child that emits more than 64 MB in one execution is terminated with `termination.classification=output_limit_exceeded`, preventing a runaway command from consuming the disk. Override these two bounds with `AI_SANDBOX_CAPTURE_MAX_BYTES` and `AI_SANDBOX_SOURCE_MAX_BYTES`; invalid or extreme values are clamped. Every completed execution records `peak_rss_kib`, host/current-cgroup memory snapshots, `command_ok`, and a structured `termination` object in `.ai/cache/sandbox/<exec_id>.meta.json`.
+
+`Killed: 9` or exit `137` alone is not proof of an out-of-memory failure. Inspect `termination.classification`: `cgroup_oom_kill_confirmed` requires an observed `memory.events:oom_kill` increase; `cgroup_memory_limit_likely` or `host_memory_pressure_likely` is evidence-based but not conclusive; `external_sigkill_or_execution_limit` means no kernel OOM evidence was observed and the process may have been killed by an external runner, administrator, or execution quota. Use `peak_rss_kib`, `memory_before`, and `memory_after` from the meta artifact before changing worker parallelism or memory limits.
+
+Claude and Codex transcript usage scans are read-only and bounded. Code Brain scans newest sessions first and defaults to 64 MB per file, 2 MB per JSONL line, 256 MB total, 1,000 parsed sessions, 4,000 candidates, 8 seconds, and 100,000 Claude request-deduplication keys per session. Unsafe symlinks, files that change before or during reading, and exhausted hard budgets skip the affected file without deleting it. A malformed or oversized individual line is consumed in bounded chunks and omitted while later token counters remain usable; the session is reported through `sessions_partial` and `warning_counts`. Any omission sets `complete=false`, `partial=true`, and exposes exact skip/warning counts, byte totals, policy, and bounded examples so token totals never claim completeness silently. Override the limits with `AI_TRANSCRIPT_MAX_FILE_BYTES`, `AI_TRANSCRIPT_MAX_LINE_BYTES`, `AI_TRANSCRIPT_MAX_SCAN_BYTES`, `AI_TRANSCRIPT_MAX_SESSIONS`, `AI_TRANSCRIPT_MAX_CANDIDATES`, `AI_TRANSCRIPT_MAX_SCAN_SECONDS`, and `AI_TRANSCRIPT_MAX_DEDUPE_KEYS`.
+
+Use `ai obs metrics --skip-usage --json` or `ai diagnostics bundle --skip-usage --json` for health probes and documentation/CI smoke checks that do not require token accounting. This bypasses external transcript discovery entirely; normal metrics and support bundles keep bounded usage collection enabled by default.
 
 Disable: remove the `PreToolUse` block from `.claude/settings.json` (Claude Code) or the `PreToolUse` key from `.codex/hooks.json` (Codex CLI). The `precall` heuristic itself stays loaded but never fires without hook registration.
 

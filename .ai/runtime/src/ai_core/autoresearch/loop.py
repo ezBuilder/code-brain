@@ -232,8 +232,13 @@ def record(project_root, session_id, *, cost_spent=0.0) -> dict:
 
     iter_no = state["iters_used"] + 1
     metric = None
-    if not res.get("ok"):
-        decision, reason = "crash", res.get("reason", "run_failed")
+    command_ok = res.get("command_ok")
+    if command_ok is None:
+        command_ok = res.get("exit_code") == 0
+    if not res.get("ok") or not command_ok:
+        termination = res.get("termination") if isinstance(res.get("termination"), dict) else {}
+        decision = "crash"
+        reason = str(termination.get("classification") or res.get("reason") or "run_failed")
     else:
         exec_id = res.get("exec_id")
         text = sandbox.read_output(proj, exec_id) if exec_id else None
@@ -284,6 +289,9 @@ def record(project_root, session_id, *, cost_spent=0.0) -> dict:
         "cost_used": state["cost_used"],
         "should_continue": should_continue,
         "exec_id": res.get("exec_id"),
+        "termination": res.get("termination"),
+        "peak_rss_kib": res.get("peak_rss_kib"),
+        "output_truncated": bool(res.get("output_truncated", False)),
     }
 
 

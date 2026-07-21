@@ -9,6 +9,25 @@ for script in scripts/*.sh; do
   bash -n "$script"
 done
 
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *)
+    missing_executable=0
+    while IFS= read -r -d '' entry; do
+      metadata="${entry%%$'\t'*}"
+      path="${entry#*$'\t'}"
+      mode="${metadata%% *}"
+      if [[ "$mode" == "100755" && ! -x "$path" ]]; then
+        echo "tracked executable is not executable in the working tree: $path" >&2
+        missing_executable=1
+      fi
+    done < <(git ls-files -s -z)
+    if [[ "$missing_executable" -ne 0 ]]; then
+      exit 1
+    fi
+    ;;
+esac
+
 ./scripts/env-check.sh >/dev/null
 uv run --project .ai/runtime python -m compileall -q .ai/runtime/src .ai/runtime/tests
 

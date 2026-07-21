@@ -29,11 +29,12 @@ echo "── [1/2] doctor job  (make quick) ──"
 make quick || fail "make quick (doctor job)"
 
 echo "── [2/2] windows-runtime job  (portability pytest subset) ──"
-uv run --project .ai/runtime python -m pytest \
-  .ai/runtime/tests/test_cli.py \
-  .ai/runtime/tests/test_mcp_config_and_antigravity.py \
-  .ai/runtime/tests/test_recommend.py \
-  -k "$WIN_K" --tb=short -q || fail "windows-portability pytest subset"
+./scripts/run-observed-command.sh ci-local-windows-runtime -- \
+  uv run --project .ai/runtime python -m pytest \
+    .ai/runtime/tests/test_cli.py \
+    .ai/runtime/tests/test_mcp_config_and_antigravity.py \
+    .ai/runtime/tests/test_recommend.py \
+    -k "$WIN_K" --tb=short -q || fail "windows-portability pytest subset"
 
 if [[ "${1:-}" == "--full" ]]; then
   echo "── [3/3] release-gate job  (needs a clean working tree) ──"

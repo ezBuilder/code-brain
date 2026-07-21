@@ -6,7 +6,7 @@
           {
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PermissionRequest",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" PermissionRequest\"",
-            "statusMessage": "Checking Code Brain approval policy",
+            "statusMessage": "Recording Code Brain approval request",
             "type": "command"
           }
         ],

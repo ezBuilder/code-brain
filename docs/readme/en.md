@@ -14,10 +14,12 @@ cd code-brain
 bash scripts/install.sh /path/to/project
 ```
 
+Codex activation is a required manual step: trust the target project, run `/hooks`, review and approve the discovered Code Brain hooks, then open a new Codex session. Writing `.codex/hooks.json` and enabling `features.hooks = true` registers hooks but does not activate them. Hook changes during an upgrade may require approval again.
+
 Upgrade an installed project:
 
 ```bash
 .ai/bin/ai upgrade latest --json
 ```
 
-Inside an agent session, run `/cb-upgrade`, then open a new session.
+Inside an agent session, run `/cb-upgrade`, review `/hooks` again if Codex requests reapproval, then open a new session.

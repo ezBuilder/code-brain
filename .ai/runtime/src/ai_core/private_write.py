@@ -432,6 +432,112 @@ def read_root_confined_text(
     )
 
 
+def read_root_confined_tail_text(
+    path: Path,
+    *,
+    root: Path | None = None,
+    max_bytes: int = 1_000_000,
+    require_private: bool = True,
+) -> tuple[str, os.stat_result, dict[str, int | bool]]:
+    """Read a bounded UTF-8 tail without following links or splitting a line.
+
+    The read is pinned to the size observed from the opened descriptor, so a
+    concurrent append cannot turn a bounded recall/status operation into an
+    unbounded stream. When the file is larger than ``max_bytes``, the partial
+    first line is discarded and ``partial`` is reported explicitly.
+    """
+    path = Path(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_context = (
+        _open_confined_parent_fd(path, root=Path(root), create=False)
+        if root is not None and os.name != "nt"
+        else None
+    )
+    if parent_context is not None:
+        with parent_context as parent_fd:
+            try:
+                fd = os.open(path.name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                _raise_confined_path_error(exc)
+            return _read_open_tail_text_fd(
+                fd,
+                max_bytes=max_bytes,
+                require_private=require_private,
+            )
+    _require_root_confined_parent(path, root)
+    if path.is_symlink():
+        raise OSError("refusing to read through symlink")
+    fd = os.open(path, flags)
+    return _read_open_tail_text_fd(
+        fd,
+        max_bytes=max_bytes,
+        require_private=require_private,
+    )
+
+
+def _read_open_tail_text_fd(
+    fd: int,
+    *,
+    max_bytes: int,
+    require_private: bool,
+) -> tuple[str, os.stat_result, dict[str, int | bool]]:
+    try:
+        state = os.fstat(fd)
+        if not stat.S_ISREG(state.st_mode):
+            raise OSError("private read target is not a regular file")
+        _require_single_link(state)
+        if require_private and os.name != "nt":
+            if stat.S_IMODE(state.st_mode) & 0o077:
+                raise PermissionError("private read target has group/other permissions")
+            if hasattr(os, "geteuid") and state.st_uid != os.geteuid():
+                raise PermissionError("private read target owner mismatch")
+
+        limit = max(0, int(max_bytes))
+        file_bytes = max(0, int(state.st_size))
+        start = max(0, file_bytes - limit)
+        os.lseek(fd, start, os.SEEK_SET)
+        remaining = file_bytes - start
+        chunks: list[bytes] = []
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        dropped_partial_line_bytes = 0
+        if start > 0:
+            newline = raw.find(b"\n")
+            if newline < 0:
+                dropped_partial_line_bytes = len(raw)
+                raw = b""
+            else:
+                dropped_partial_line_bytes = newline + 1
+                raw = raw[newline + 1 :]
+        final_state = os.fstat(fd)
+        source_changed = (
+            int(final_state.st_dev) != int(state.st_dev)
+            or int(final_state.st_ino) != int(state.st_ino)
+            or int(final_state.st_size) != file_bytes
+        )
+        metadata: dict[str, int | bool] = {
+            "file_bytes": file_bytes,
+            "bytes_read": sum(len(chunk) for chunk in chunks),
+            "bytes_returned": len(raw),
+            "omitted_prefix_bytes": start + dropped_partial_line_bytes,
+            "dropped_partial_line_bytes": dropped_partial_line_bytes,
+            "source_changed": source_changed,
+            "partial": bool(start > 0 or source_changed),
+        }
+        return raw.decode("utf-8"), state, metadata
+    finally:
+        os.close(fd)
+
+
 def _read_open_text_fd(
     fd: int,
     *,

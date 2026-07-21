@@ -50,10 +50,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\pat
 Success ends with:
 
 ```text
-[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.
+[code-brain] installed. Code Brain files, memory, search, MCP, and hook definitions are ready in <project>.
+[code-brain] Codex action required: trust this project, run /hooks, and approve the discovered Code Brain hooks.
+[code-brain] After install or hook changes, Codex may require reapproval before project hooks run.
 ```
 
-Open a new Claude/Codex/Antigravity session after install.
+Open a new Claude/Codex/Antigravity session after install. For Codex, complete the approval steps below first.
+
+## Required Codex Hook Approval
+
+**Hook registration is not hook activation.** The installer writes `.codex/hooks.json` and enables `features.hooks = true`, but Codex does not execute project command hooks until the project and the discovered hook definitions are trusted.
+
+1. Open the target repository in Codex and trust the project.
+2. Run `/hooks` in Codex, or open the Codex Hooks review UI.
+3. Review and approve the discovered Code Brain hooks.
+4. Open a new Codex session so `SessionStart` and the other approved hooks run from session start.
+
+Until approval is complete, Code Brain's session memory injection, command auto-routing, tool-output redaction, audit capture, and Stop-hook continuation may appear inactive even though the files were installed correctly. If an install or upgrade changes a hook definition, Codex may request approval again; review `/hooks` and reapprove it. This is separate from Codex command approval policy and does **not** require setting `approval_policy = "never"` or granting unrestricted shell access.
 
 ## Upgrade From GitHub
 
@@ -70,7 +83,7 @@ Inside an agent session, run:
 /cb-upgrade
 ```
 
-After a successful upgrade, open a new agent session so new hooks, MCP config, `AGENTS.md`, and `CLAUDE.md` are loaded.
+After a successful upgrade, review `/hooks` again if Codex requests reapproval, then open a new agent session so approved hooks, MCP config, `AGENTS.md`, and `CLAUDE.md` are loaded.
 
 For first-time bootstrap without keeping a local clone:
 
@@ -164,7 +177,7 @@ For a public README, lead with these reproducible checks. Add benchmark numbers 
 .ai/                         runtime, memory structure, hooks, MCP shim
 .mcp.json                    Claude Code MCP
 .codex/config.toml           Codex MCP profile usage
-.codex/hooks.json            Codex hooks
+.codex/hooks.json            Codex hooks (requires project trust + /hooks approval)
 .claude/settings.json        Claude Code hooks
 .claude/commands/            slash commands
 .codex/prompts/              Codex prompts

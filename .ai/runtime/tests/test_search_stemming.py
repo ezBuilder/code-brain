@@ -43,14 +43,14 @@ def _write(repo: Path, rel: str, content: str) -> Path:
     return path
 
 
-def test_schema_version_is_eight(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 8
+def test_schema_version_is_eleven(tmp_path: Path) -> None:
+    assert SCHEMA_VERSION == 11
     repo = _make_repo(tmp_path)
     _write(repo, "doc.md", "hello world\n")
     rebuild(repo)
     with connect(repo) as conn:
         version = int(conn.execute("pragma user_version").fetchone()[0])
-    assert version == 8
+    assert version == 11
 
 
 def test_porter_stemming_matches_inflected_forms(tmp_path: Path) -> None:
@@ -127,7 +127,7 @@ def test_legacy_v2_cache_auto_migrates_to_current_schema(tmp_path: Path) -> None
         assert version_before == 2
         init_schema(conn, migrate_legacy=True)
         version_after = int(conn.execute("pragma user_version").fetchone()[0])
-        assert version_after == 8
+        assert version_after == 11
 
         tables = {
             row[0]
@@ -341,6 +341,22 @@ def test_context_budget_preserves_protected_signals_beyond_aggressive_limit() ->
     assert "doc-4.md" in paths
     assert "handoff rubric verdict blockers" in payload["additionalContext"]
     assert payload["context_budget"]["protected_signals"] == ["handoff", "rubric", "verdict", "blockers"]
+
+
+def test_context_pack_overfetches_bounded_candidates_before_compression(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    repo = _make_repo(tmp_path)
+    for idx in range(8):
+        suffix = " verdict protected evidence" if idx == 7 else " ordinary result"
+        _write(repo, f"doc-{idx}.md", f"sharedneedle{suffix}\n")
+    rebuild(repo)
+
+    pack = context_pack(repo, "sharedneedle protected evidence", limit=2, mode="balanced")
+
+    assert "doc-7.md" in {item["path"] for item in pack["results"]}
+    assert pack["context_budget"]["requested_limit"] == 2
+    assert pack["context_budget"]["candidate_limit"] == 8
+    assert pack["context_budget"]["considered_results"] > 2
 
 
 def test_rg_fallback_helper_returns_empty_when_disabled(tmp_path: Path, monkeypatch) -> None:

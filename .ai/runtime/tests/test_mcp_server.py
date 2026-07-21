@@ -79,6 +79,35 @@ def test_sandbox_execute_rejects_invalid_extra_env_name(tmp_path: Path) -> None:
         raise AssertionError("invalid environment name must fail closed")
 
 
+def test_record_decision_exposes_relations_and_expiry(tmp_path: Path, monkeypatch) -> None:
+    tool = next(t for t in mcp_server.TOOLS if t["name"] == "record_decision")
+    properties = tool["inputSchema"]["properties"]
+    assert {"contradicts", "derives_from", "expires_at"} <= set(properties)
+
+    captured: dict = {}
+
+    def fake_append_decision(root: Path, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(mcp_server, "append_decision", fake_append_decision)
+    result = mcp_server._dispatch_tool(
+        tmp_path,
+        "record_decision",
+        {
+            "text": "Prefer bounded hybrid retrieval",
+            "contradicts": "dec-1a2b3c4d",
+            "derives_from": "dec-5e6f7a8b",
+            "expires_at": "2027-01-01T00:00:00Z",
+        },
+    )
+
+    assert result == {"ok": True}
+    assert captured["contradicts"] == "dec-1a2b3c4d"
+    assert captured["derives_from"] == "dec-5e6f7a8b"
+    assert captured["expires_at"] == "2027-01-01T00:00:00Z"
+
+
 def test_tools_list_response_cached(tmp_path: Path, monkeypatch) -> None:
     """tools/list payload is built once per process and reused across calls."""
     mcp_server._invalidate_tools_list_cache()

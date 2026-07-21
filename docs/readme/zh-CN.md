@@ -50,10 +50,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\pat
 成功时以如下内容结束：
 
 ```text
-[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.
+[code-brain] installed. Code Brain files, memory, search, MCP, and hook definitions are ready in <project>.
+[code-brain] Codex action required: trust this project, run /hooks, and approve the discovered Code Brain hooks.
+[code-brain] After install or hook changes, Codex may require reapproval before project hooks run.
 ```
 
-安装后请打开一个新的 Claude/Codex/Antigravity 会话。
+安装后请打开一个新的 Claude/Codex/Antigravity 会话。对于 Codex，请先完成下面的审批步骤。
+
+## 必须批准 Codex Hook 信任
+
+**注册 hook 不等于启用 hook。** 即使安装程序写入 `.codex/hooks.json` 并设置 `features.hooks = true`，在 Codex 信任该项目和检测到的 hook 定义之前，也不会执行项目命令 hook。
+
+1. 在 Codex 中打开目标仓库并信任该项目。
+2. 在 Codex 中运行 `/hooks`，或打开 Hooks 审核界面。
+3. 审核并批准检测到的 Code Brain hooks。
+4. 打开新的 Codex 会话，让 `SessionStart` 等已批准 hooks 从会话开始运行。
+
+批准前，即使文件已正确安装，会话记忆注入、命令自动路由、工具输出脱敏、审计记录和 Stop hook 续跑也可能看起来没有生效。安装或升级改变 hook 定义后，Codex 可能要求重新批准；请再次检查 `/hooks`。该步骤与 Codex 的命令审批策略不同，不需要设置 `approval_policy = "never"`，也不需要授予无限制 shell 权限。
 
 ## 从 GitHub 升级
 
@@ -70,7 +83,7 @@ cd /path/to/project
 /cb-upgrade
 ```
 
-升级成功后，请打开一个新的代理会话，以便加载新的 hook、MCP 配置、`AGENTS.md` 和 `CLAUDE.md`。
+升级成功后，如果 Codex 要求重新批准，请先在 `/hooks` 中完成批准，再打开新的代理会话，以加载已批准 hooks、MCP 配置、`AGENTS.md` 和 `CLAUDE.md`。
 
 如需在不保留本地克隆的情况下首次引导：
 
@@ -164,7 +177,7 @@ uv run --project .ai/runtime python -m pytest .ai/runtime/tests/test_cli.py -k "
 .ai/                         runtime, memory structure, hooks, MCP shim
 .mcp.json                    Claude Code MCP
 .codex/config.toml           Codex MCP profile usage
-.codex/hooks.json            Codex hooks
+.codex/hooks.json            Codex hooks（需要项目信任和 /hooks 批准）
 .claude/settings.json        Claude Code hooks
 .claude/commands/            slash commands
 .codex/prompts/              Codex prompts

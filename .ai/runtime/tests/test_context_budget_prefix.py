@@ -99,3 +99,9 @@ def test_fail_soft_missing_keys() -> None:
         limit=5,
     )
     assert out["additionalContext"] == again["additionalContext"]
+
+
+def test_requested_limit_caps_ordinary_results_even_below_mode_cap() -> None:
+    out = apply_context_budget(_base_results(), mode="aggressive", limit=1)
+    assert len(out["results"]) == 1
+    assert out["context_budget"]["ordinary_result_cap"] == 1

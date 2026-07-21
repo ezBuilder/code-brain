@@ -272,7 +272,7 @@ GitHub Actions (.github/workflows/release-gate.yml):
     summary-observe:  needs: parity
       • download both summaries
       • uv run python scripts/summary-parity.py UB MAC
-        (schema_version=2 강제, canonical subset 동치 단언)
+        (schema_version=3 강제, canonical artifact/operational subset 동치 단언)
 ```
 
 ## 7. 보안/정책 enforcement points
@@ -328,4 +328,4 @@ Round 87  summary schema v2 + dep_advisory      (report.py + parity 갱신)
 Round 88  session auto-start                    (session.py + cli session start)
 ```
 
-MVP 미구현 영역(embeddings, vector search, L3 LSP precision adapters, daemon lifecycle)은 의도적으로 backlog gating — 다이어그램에서 제외.
+현재 검색 계층은 FTS5 BM25와 선택적 ONNX 임베딩 후보를 독립 수집해 RRF로 결합하며, 전역 벡터 스캔 상한 초과 시 lexical shortlist 재정렬로 강등된다. Durable-memory recall은 bounded JSONL tail, 식별자 인식 토큰화, temporal validity, provenance, 관계 edge, 중복 억제를 사용한다. 코드 검색·메모리 회상·컨텍스트 압축은 공통 `codebrain.retrieval.v1` 관측 envelope로 duration/candidates/partial/fallback/limits/quality를 반환하며, 질의 원문 대신 길이와 SHA-256 지문만 계측한다. 코드 탐색은 language-server precise 결과를 우선하고, unavailable/failure 시 schema-v11 AST graph의 import alias·relative import·same-file·self/cls resolution provenance와 call/name/attribute/import-binding reference ranges를 사용하는 read-only syntactic fallback으로 강등한다. 증분 인덱싱은 한 트랜잭션에서 symbols/calls/references를 교체하며, 동일 이름 정의가 여럿이면 ambiguity를 명시한다. 남은 backlog는 대규모 인덱스용 ANN backend, 다언어 precise-navigation adapter 확대, daemon lifecycle 고도화다.

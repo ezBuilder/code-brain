@@ -18,9 +18,12 @@ regressions in agent-facing behavior that unit tests cannot — e.g.
 |---|---|---|
 | `decision_logging` | record_decision fires on user lock-in phrases | audit + transcript |
 | `precall_routing` | PreToolUse blocks long-output Bash; allows safe one-shots | audit |
-| `context_budget` | result caps, byte truncation, and protected-signal retention | production function |
+| `context_budget` | query coverage, redundancy pruning, byte savings, and protected/negative-evidence retention | production function |
 | `tool_discovery` | natural-language intents retrieve the correct MCP tool within a bounded rank | production function |
 | `autoresearch_retrieval` | production FTS ranking preserves Recall@K, MRR, and NDCG@K smoke baselines | temporary production index |
+| `code_retrieval` | production code search preserves file-level Recall@K, MRR, NDCG@K, and p95 latency | temporary production index |
+| `code_navigation` | import aliases, non-call references, ambiguity diagnostics, definitions, workspace symbols, and call traces preserve deterministic navigation qrels | temporary production index |
+| `memory_retrieval` | durable-memory recall preserves identifier, temporal, and procedural qrels | temporary memory stores |
 | `skill_drift` | installed skills' body-sha256 matches catalog | `ai skills list` |
 | `precall_overrides` | user override ratio stays below auto-disable threshold | audit |
 
@@ -34,7 +37,8 @@ uv run --project .ai/runtime python .ai/evals/run.py --all --wired --json
 Eval runs are read-only and never write to `.ai/memory/`.
 
 `make eval` is the strict complete gate for the currently supported axes:
-`precall_routing`, `context_budget`, `tool_discovery`, and `autoresearch_retrieval`.
+`precall_routing`, `context_budget`, `tool_discovery`, `autoresearch_retrieval`,
+`code_retrieval`, `code_navigation`, and `memory_retrieval`.
 Retrieval cases write only throwaway indexes under the system temporary directory;
 they never touch repo memory or the real index. `--all --wired` also reports planned
 axes, but unsupported axes remain explicitly `skipped`; they are never counted
@@ -43,7 +47,8 @@ as passing. Add `--require-complete` when skipped cases must fail the command.
 ## Status
 
 The offline runner currently wires `precall_routing`, `context_budget`,
-`tool_discovery`, and `autoresearch_retrieval` to their production implementations.
+`tool_discovery`, `autoresearch_retrieval`, `code_retrieval`, `code_navigation`, and
+`memory_retrieval` to their production implementations.
 `decision_logging` remains unsupported until
 there is a real prompt-to-memory production path to exercise; its cases stay
 visible as skipped work rather than producing synthetic success.

@@ -52,12 +52,78 @@ def test_execute_handles_timeout(tmp_path: Path) -> None:
     result = sandbox.execute(tmp_path, command=["sleep", "5"], timeout=1)
     assert result["ok"] is False
     assert result["reason"] == "timeout"
+    assert result["termination"]["classification"] == "timeout"
+    assert result["elapsed_ms"] >= 900
 
 
 def test_execute_handles_command_not_found(tmp_path: Path) -> None:
     result = sandbox.execute(tmp_path, command=["this-command-does-not-exist-xyz"])
     assert result["ok"] is False
     assert result["reason"] == "command_not_found"
+    sandbox_dir = tmp_path / ".ai" / "cache" / "sandbox"
+    assert list(sandbox_dir.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal return codes")
+def test_execute_classifies_sigkill_and_persists_evidence(tmp_path: Path) -> None:
+    result = sandbox.execute(tmp_path, command=["bash", "-c", "kill -9 $$"])
+
+    assert result["ok"] is True
+    assert result["command_ok"] is False
+    assert result["exit_code"] == -9
+    assert result["termination"]["signal"] == "SIGKILL"
+    assert result["termination"]["classification"] in {
+        "cgroup_oom_kill_confirmed",
+        "cgroup_memory_limit_confirmed",
+        "cgroup_memory_limit_likely",
+        "host_memory_pressure_likely",
+        "external_sigkill_or_execution_limit",
+    }
+    meta_path = tmp_path / ".ai" / "cache" / "sandbox" / f"{result['exec_id']}.meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["termination"]["signal"] == "SIGKILL"
+    assert "memory_before" in meta
+    assert "memory_after" in meta
+
+
+def test_execute_streams_and_caps_large_output(tmp_path: Path) -> None:
+    source_bytes = sandbox._CAPTURE_MAX_BYTES + 1_000_000
+    result = sandbox.execute(
+        tmp_path,
+        command=[sys.executable, "-c", f"import sys; sys.stdout.write('x' * {source_bytes})"],
+    )
+
+    assert result["ok"] is True
+    assert result["command_ok"] is True
+    assert result["source_total_bytes"] == source_bytes
+    assert result["output_truncated"] is True
+    assert result["total_bytes"] <= sandbox._CAPTURE_MAX_BYTES + 256
+    out_path = tmp_path / ".ai" / "cache" / "sandbox" / f"{result['exec_id']}.txt"
+    assert out_path.stat().st_size <= sandbox._CAPTURE_MAX_BYTES + 256
+
+
+def test_execute_stops_unbounded_output_at_source_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "_SOURCE_CAPTURE_MAX_BYTES", 1_000_000)
+    result = sandbox.execute(
+        tmp_path,
+        command=[
+            sys.executable,
+            "-c",
+            "import sys; chunk='x'*65536\nwhile True: sys.stdout.write(chunk); sys.stdout.flush()",
+        ],
+        timeout=10,
+    )
+
+    assert result["ok"] is False
+    assert result["command_ok"] is False
+    assert result["reason"] == "output_limit_exceeded"
+    assert result["termination"]["classification"] == "output_limit_exceeded"
+    assert result["source_total_bytes"] > 1_000_000
+    out_path = tmp_path / ".ai" / "cache" / "sandbox" / f"{result['exec_id']}.txt"
+    assert out_path.stat().st_size <= 1_000_256
 
 
 def test_execute_rejects_cwd_outside_repo(tmp_path: Path) -> None:
@@ -181,6 +247,67 @@ def test_list_executions_orders_newest_first(tmp_path: Path) -> None:
     assert listing["items"][-1]["exec_id"] == ids[0]
     # command_summary is present and trimmed.
     assert "echo" in listing["items"][0]["command_summary"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal return codes")
+def test_execution_diagnostics_classifies_recent_sigkill(tmp_path: Path) -> None:
+    normal = sandbox.execute(tmp_path, command=["echo", "healthy"])
+    killed = sandbox.execute(tmp_path, command=["bash", "-c", "kill -9 $$"])
+    assert normal["command_ok"] is True
+    assert killed["command_ok"] is False
+
+    diagnostics = sandbox.execution_diagnostics(tmp_path)
+    assert diagnostics["ok"] is True
+    assert diagnostics["bounded"] is True
+    assert diagnostics["metas_scanned"] == 2
+    assert diagnostics["command_failures"] == 1
+    assert diagnostics["killed_9"]["sigkill_total"] == 1
+    assert sum(diagnostics["killed_9"].values()) >= 2
+    assert diagnostics["examples"][0]["signal"] == "SIGKILL"
+
+
+def test_execution_diagnostics_is_fixed_size_and_explicitly_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "_META_CANDIDATE_LIMIT", 2)
+    monkeypatch.setattr(sandbox, "_META_DIAGNOSTICS_LIMIT", 2)
+    for index in range(5):
+        result = sandbox.execute(tmp_path, command=["echo", str(index)])
+        assert result["command_ok"] is True
+
+    diagnostics = sandbox.execution_diagnostics(tmp_path)
+    assert diagnostics["ok"] is True
+    assert diagnostics["bounded"] is True
+    assert diagnostics["complete"] is False
+    assert diagnostics["partial"] is True
+    assert diagnostics["metas_discovered"] == 5
+    assert diagnostics["metas_scanned"] == 2
+    assert diagnostics["skip_counts"]["candidate_limit"] == 3
+
+
+def test_execution_diagnostics_rejects_oversized_or_symlink_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "_META_MAX_BYTES", 128)
+    sandbox_dir = tmp_path / ".ai" / "cache" / "sandbox"
+    sandbox_dir.mkdir(parents=True)
+    (sandbox_dir / "0123456789abcdef.meta.json").write_text(
+        json.dumps({"exec_id": "0123456789abcdef", "padding": "x" * 256}),
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    (sandbox_dir / "fedcba9876543210.meta.json").symlink_to(outside)
+
+    diagnostics = sandbox.execution_diagnostics(tmp_path)
+    assert diagnostics["ok"] is False
+    assert diagnostics["bounded"] is True
+    assert diagnostics["partial"] is True
+    assert diagnostics["metas_scanned"] == 0
+    assert diagnostics["skip_counts"]["metadata_too_large"] == 1
+    assert diagnostics["skip_counts"]["unsafe_symlink"] == 1
 
 
 def test_prune_removes_old_executions(tmp_path: Path) -> None:

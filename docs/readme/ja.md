@@ -50,10 +50,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\pat
 成功すると次で終わります:
 
 ```text
-[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.
+[code-brain] installed. Code Brain files, memory, search, MCP, and hook definitions are ready in <project>.
+[code-brain] Codex action required: trust this project, run /hooks, and approve the discovered Code Brain hooks.
+[code-brain] After install or hook changes, Codex may require reapproval before project hooks run.
 ```
 
-インストール後は、新しい Claude/Codex/Antigravity セッションを開いてください。
+インストール後は、新しい Claude/Codex/Antigravity セッションを開いてください。Codex では先に以下の承認手順を完了してください。
+
+## Codex フックの信頼承認が必要
+
+**フックの登録と有効化は別です。** インストーラが `.codex/hooks.json` を作成し `features.hooks = true` を設定しても、Codex がプロジェクトと検出されたフック定義を信頼するまでは、プロジェクトのコマンドフックは実行されません。
+
+1. Codex で対象リポジトリを開き、プロジェクトを信頼します。
+2. Codex で `/hooks` を実行するか、Hooks のレビュー画面を開きます。
+3. 検出された Code Brain フックを確認して承認します。
+4. 新しい Codex セッションを開き、`SessionStart` から承認済みフックを実行させます。
+
+承認前は、ファイルが正しくインストールされていても、セッションメモリ注入、コマンド自動ルーティング、ツール出力の秘匿化、監査記録、Stop フック継続が動作していないように見える場合があります。インストールやアップグレードでフック定義が変わると再承認が必要になることがあるため、`/hooks` を再確認してください。これは Codex のコマンド承認ポリシーとは別であり、`approval_policy = "never"` や無制限のシェル権限は不要です。
 
 ## GitHub からのアップグレード
 
@@ -70,7 +83,7 @@ cd /path/to/project
 /cb-upgrade
 ```
 
-アップグレードが成功したら、新しいフック、MCP 設定、`AGENTS.md`、`CLAUDE.md` がロードされるよう、新しいエージェントセッションを開いてください。
+アップグレード後に Codex が再承認を求めた場合は `/hooks` で承認し直し、その後、新しいエージェントセッションを開いて承認済みフック、MCP 設定、`AGENTS.md`、`CLAUDE.md` をロードしてください。
 
 ローカルクローンを保持せずに初回ブートストラップする場合:
 
@@ -164,7 +177,7 @@ uv run --project .ai/runtime python -m pytest .ai/runtime/tests/test_cli.py -k "
 .ai/                         runtime, memory structure, hooks, MCP shim
 .mcp.json                    Claude Code MCP
 .codex/config.toml           Codex MCP profile usage
-.codex/hooks.json            Codex hooks
+.codex/hooks.json            Codex hooks (プロジェクト信頼 + /hooks 承認が必要)
 .claude/settings.json        Claude Code hooks
 .claude/commands/            slash commands
 .codex/prompts/              Codex prompts

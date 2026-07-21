@@ -333,6 +333,10 @@ payload = {
     "source_repo_url": source_repo_url,
     "upgrade_channel": "github" if source_repo_url else "local",
     "upgrade_command": ".ai/bin/ai upgrade latest --json",
+    "codex_hook_activation_required": True,
+    "codex_project_trust_required": True,
+    "codex_hook_review_command": "/hooks",
+    "codex_hook_reapproval_after_changes": True,
 }
 print(json.dumps(payload, indent=2, sort_keys=True))
 ' "$TARGET_ROOT" "$SOURCE_ROOT" >"$(manifest_path)" < <(managed_files)
@@ -783,7 +787,7 @@ managed_codex_hooks = {
     "SubagentStop": H("SubagentStop", msg="Recording Code Brain subagent stop"),
     "PreCompact": H("PreCompact", msg="Saving Code Brain compact snapshot"),
     "PostCompact": H("PostCompact", msg="Recording Code Brain compact completion"),
-    "PermissionRequest": H("PermissionRequest", matcher="Bash|Shell|exec_command|functions.exec_command|run_command|ask_permission", msg="Checking Code Brain approval policy"),
+    "PermissionRequest": H("PermissionRequest", matcher="Bash|Shell|exec_command|functions.exec_command|run_command|ask_permission", msg="Recording Code Brain approval request"),
 }
 if dst.exists():
     try:
@@ -1288,6 +1292,7 @@ case "$ACTION" in
     install_or_upgrade
     echo "code-brain installed: $TARGET_ROOT"
     echo "next: cd '$TARGET_ROOT' && .ai/bin/ai session start --agent codex --json"
+    echo "codex activation: trust the project, run /hooks, and approve the discovered Code Brain hooks"
     ;;
   upgrade)
     if [[ ! -f "$(manifest_path)" ]] && ! legacy_code_brain_install; then
@@ -1296,6 +1301,7 @@ case "$ACTION" in
     fi
     install_or_upgrade
     echo "code-brain upgraded: $TARGET_ROOT"
+    echo "codex activation: review /hooks and reapprove Code Brain hooks if Codex requests it"
     ;;
   uninstall)
     uninstall

@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from ai_core.doctor import check_audit_chain, check_audit_index
+from ai_core import memory
+from ai_core.loss_accounting import summary as loss_summary
 from ai_core.memory import append_audit, audit_path, rebuild_audit_index
 
 
@@ -87,6 +89,111 @@ def test_concurrent_audit_append_and_index_rebuild_preserve_chain_and_rows(tmp_p
     assert result["indexed"] == 40
     assert len(rows) == 40
     assert check_audit_chain(tmp_path).ok is True
+
+
+def test_append_audit_compacts_automatically_and_repairs_index(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(memory, "AUDIT_MAX_BYTES", 2400)
+    monkeypatch.setattr(memory, "AUDIT_KEEP_BYTES", 900)
+
+    for index in range(40):
+        append_audit(
+            tmp_path,
+            action="test.compact",
+            category="test",
+            payload={"index": index, "value": "x" * 120},
+        )
+
+    path = audit_path(tmp_path)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert path.stat().st_size <= memory.AUDIT_MAX_BYTES
+    assert rows[-1]["payload"]["index"] == 39
+    assert any(row.get("action") == "audit.retention_compact" for row in rows)
+    assert check_audit_chain(tmp_path).ok is True
+    assert check_audit_index(tmp_path).ok is True
+    accounting = loss_summary(tmp_path)
+    assert accounting["domains"]["audit_compaction"]["removed_records"] > 0
+    assert accounting["domains"]["audit_compaction"]["removed_bytes"] > 0
+
+
+def test_append_audit_prunes_expired_years_and_records_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(memory, "AUDIT_RETENTION_YEARS", 1)
+    old_path = tmp_path / ".ai" / "memory" / "audit" / "2001.jsonl"
+    old_path.parent.mkdir(parents=True)
+    old_path.write_text('{"ts":"2001-01-01T00:00:00Z","action":"old","category":"test"}\n', encoding="utf-8")
+    rebuild_audit_index(tmp_path)
+
+    append_audit(tmp_path, action="test.current", category="test", payload={})
+
+    assert not old_path.exists()
+    current_rows = [
+        json.loads(line)
+        for line in audit_path(tmp_path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [row["action"] for row in current_rows][-2:] == ["audit.retention_prune", "test.current"]
+    assert check_audit_chain(tmp_path).ok is True
+    assert check_audit_index(tmp_path).ok is True
+    accounting = loss_summary(tmp_path)
+    assert accounting["domains"]["audit_retention"]["removed_files"] == 1
+    assert accounting["domains"]["audit_retention"]["reasons"]["age_limit"] == 1
+
+
+def test_append_audit_retention_scan_limit_fails_closed_without_deleting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(memory, "AUDIT_RETENTION_YEARS", 1)
+    monkeypatch.setattr(memory, "AUDIT_RETENTION_SCAN_MAX_CANDIDATES", 1)
+    audit_dir = tmp_path / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True)
+    old_paths = []
+    for year in (1999, 2000, 2001):
+        path = audit_dir / f"{year}.jsonl"
+        path.write_text(
+            json.dumps({"ts": f"{year}-01-01T00:00:00Z", "action": "old", "category": "test"}) + "\n",
+            encoding="utf-8",
+        )
+        old_paths.append(path)
+
+    record = append_audit(tmp_path, action="test.current", category="test", payload={})
+
+    assert all(path.exists() for path in old_paths)
+    retention_loss = next(
+        item
+        for item in record["_maintenance"]["losses"]
+        if item["domain"] == "audit_retention"
+    )
+    assert retention_loss["files"]["removed"] == 0
+    assert retention_loss["error_count"] >= 1
+    assert retention_loss["accounting"]["recorded"] is True
+    accounting = loss_summary(tmp_path)["domains"]["audit_retention"]
+    assert accounting["removed_files"] == 0
+    assert accounting["applied_events"] == 0
+    assert accounting["error_events"] == 1
+
+
+def test_append_audit_bounds_oversized_payload(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(memory, "AUDIT_PAYLOAD_MAX_BYTES", 300)
+    monkeypatch.setattr(memory, "AUDIT_PAYLOAD_PREVIEW_BYTES", 80)
+
+    record = append_audit(
+        tmp_path,
+        action="test.large-payload",
+        category="test",
+        payload={"blob": "z" * 10_000},
+    )
+
+    assert record["payload"]["truncated"] is True
+    assert record["payload"]["original_bytes"] > 300
+    assert len(record["payload"]["preview"].encode("utf-8")) <= 80
+    payload_loss = next(
+        item
+        for item in record["_maintenance"]["losses"]
+        if item["domain"] == "payload_truncation"
+    )
+    assert payload_loss["bytes"]["removed"] > 0
+    assert payload_loss["reasons"] == {"payload_limit": 1}
+    assert loss_summary(tmp_path)["domains"]["payload_truncation"]["events"] == 1
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")

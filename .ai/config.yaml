@@ -20,6 +20,15 @@ cache:
   sqlite_path: .ai/cache/code.sqlite
 search:
   retriever: bm25
+  indexing:
+    enabled: true
+    auto_rebuild: true
+    max_files: 200000
+    max_candidates: 400000
+    max_candidate_bytes: 64000000
+    max_source_bytes: 1000000000
+    max_seconds: 300
+    stall_seconds: 30
 manifest:
   path: .ai/generated/manifest.json
 autoresearch:

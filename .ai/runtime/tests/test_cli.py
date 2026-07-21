@@ -145,6 +145,43 @@ def init_public_source_repo(repo: Path) -> None:
     subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
 
 
+def operational_bounds_fixture() -> dict[str, object]:
+    return {
+        "ok": True,
+        "doctor_groups": {
+            "audit": {"ok": True, "required_checks": [], "missing": [], "failed": []},
+            "sqlite": {"ok": True, "required_checks": [], "missing": [], "failed": []},
+            "retention_backup": {"ok": True, "required_checks": [], "missing": [], "failed": []},
+            "diagnostics": {"ok": True, "required_checks": [], "missing": [], "failed": []},
+        },
+        "transcripts": {"ok": True, "skipped": True, "reason": "test fixture", "agents": {}},
+        "sandbox": {"ok": True, "bounded": True},
+        "loss_accounting": {
+            "ok": True,
+            "bounded": True,
+            "observed": False,
+            "reason": "no_loss_events",
+            "policy": {"max_bytes": 64000, "max_domains": 32},
+            "totals": {
+                "events": 0,
+                "applied_events": 0,
+                "removed_files": 0,
+                "removed_bytes": 0,
+                "removed_records": 0,
+                "error_events": 0,
+            },
+            "domains": {},
+        },
+        "runner": {
+            "ok": True,
+            "bounded": True,
+            "observed": True,
+            "killed_9": False,
+            "transport_restart": False,
+        },
+    }
+
+
 def test_version_json() -> None:
     result = run_ai("--json", "version")
     assert result.returncode == 0, result.stderr
@@ -194,6 +231,7 @@ def test_release_gate_summary_schema_and_redaction(monkeypatch) -> None:
             "release_notes": {"path": "/Users/builder/workspace/code-brain/dist/code-brain-0.6.3.release-notes.md"},
         },
         "doctor": {"checks": [{"name": "layout", "ok": True, "detail": "ok"}]},
+        "operational_bounds": operational_bounds_fixture(),
     }
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     summary = release_gate_summary(ROOT, git_sha="deadbeef", status=status)
@@ -207,12 +245,27 @@ def test_release_gate_summary_schema_and_redaction(monkeypatch) -> None:
 
 
 def test_release_gate_summary_command_json() -> None:
-    result = run_ai("report", "release-gate-summary", "--git-sha", "deadbeef", "--json")
+    result = run_ai("report", "release-gate-summary", "--git-sha", "deadbeef", "--skip-usage", "--json")
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["git_sha"] == "deadbeef"
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 4
     assert set(payload["dep_advisory"]) == {"finding_count", "mode", "generated_at", "skipped"}
+    assert payload["operational_bounds"]["transcripts"]["skipped"] is True
+    assert payload["operational_bounds"]["sandbox"]["bounded"] is True
+    assert payload["operational_bounds"]["runner"]["bounded"] is True
+    assert payload["operational_bounds"]["loss_accounting"]["bounded"] is True
+
+
+def test_report_status_skip_usage_bypasses_external_transcripts() -> None:
+    result = run_ai("report", "status", "--skip-usage", "--json")
+    assert result.returncode in {0, 1}, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["metrics"]["usage"]["skipped"] is True
+    transcripts = payload["operational_bounds"]["transcripts"]
+    assert transcripts["ok"] is True
+    assert transcripts["skipped"] is True
+    assert transcripts["agents"] == {}
 
 
 def test_release_gate_summary_schema_guard_rejects_drift() -> None:
@@ -226,6 +279,7 @@ def test_release_gate_summary_schema_guard_rejects_drift() -> None:
         "release_ready": True,
         "release_artifacts": {},
         "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
+        "operational_bounds": operational_bounds_fixture(),
         "checks": [],
     }
     assert_release_gate_summary_schema(payload)
@@ -265,6 +319,53 @@ def test_release_gate_workflow_invariants() -> None:
     assert "gh pr" not in workflow
     assert "git push" not in workflow
     assert "GITHUB_TOKEN" not in workflow
+
+
+def test_stress_bounds_release_gate_integration_invariants() -> None:
+    script = (ROOT / "scripts" / "stress-bounds.py").read_text(encoding="utf-8")
+    release_gate = (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    docs_check = (ROOT / "scripts" / "docs-check.sh").read_text(encoding="utf-8")
+    operations = (ROOT / "OPERATIONS.md").read_text(encoding="utf-8")
+    assert "tracemalloc" in script
+    assert "execution_diagnostics" in script
+    assert "claude_usage_summary" in script
+    assert "codex_usage_summary" in script
+    assert "killed_9" in script
+    assert "scripts/stress-bounds.py --files 2000 --iterations 5" in release_gate
+    assert release_gate.find("scripts/stress-bounds.py") < release_gate.find("./scripts/package.sh")
+    assert "stress-bounds:" in makefile
+    assert "make -n stress-bounds" in docs_check
+    assert "make stress-bounds" in operations
+
+
+def test_stress_bounds_small_profile_passes() -> None:
+    result = subprocess.run(
+        [
+            PYTHON,
+            "scripts/stress-bounds.py",
+            "--files",
+            "80",
+            "--iterations",
+            "2",
+            "--json",
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["files_per_store"] == 80
+    assert payload["tracemalloc_peak_mib"] < 64
+    assert payload["sandbox"]["metas_scanned"] == 32
+    assert payload["sandbox"]["killed_9"]["sigkill_total"] == 1
+    assert payload["claude"]["candidate_limit_skips"] == 16
+    assert payload["codex"]["candidate_limit_skips"] == 16
 
 
 def test_dep_advisory_offline_skip_emits_schema(tmp_path: Path) -> None:
@@ -311,6 +412,7 @@ def test_dep_advisory_findings_do_not_fail_gate(tmp_path: Path) -> None:
         ]
     }
     env = os.environ.copy()
+    env["CODE_BRAIN_DEP_ADVISORY_OFFLINE"] = "1"
     env["CODE_BRAIN_DEP_ADVISORY_RAW"] = json.dumps(raw)
     result = subprocess.run(
         [bash, "scripts/dep-advisory.sh"],
@@ -353,6 +455,15 @@ def test_obs_usage_compact_by_default() -> None:
     usage = payload["actual_token_usage"]
     assert "sessions" not in usage["claude"]
     assert "sessions" not in usage["codex"]
+
+
+def test_obs_loss_accounting_empty_is_bounded() -> None:
+    result = run_ai("obs", "loss-accounting", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["bounded"] is True
+    assert isinstance(payload["totals"]["removed_bytes"], int)
 
 
 def test_obs_usage_include_sessions_opt_in() -> None:
@@ -414,13 +525,14 @@ def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_pa
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
     payload = {
-        "schema_version": 2,
+        "schema_version": 4,
         "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
         "ci": True,
         "release_ready": True,
         "release_artifacts": {"all_present": True, "all_valid": True, "all_current": True},
         "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
+        "operational_bounds": operational_bounds_fixture(),
         "checks": [{"name": "layout", "ok": True, "detail": "ok"}],
     }
     left.write_text(json.dumps(payload), encoding="utf-8")
@@ -431,17 +543,55 @@ def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_pa
     assert json.loads(result.stdout) == {"mismatches": [], "ok": True}
 
 
+def test_summary_parity_ignores_loss_counter_and_timestamp_differences(tmp_path: Path) -> None:
+    left = tmp_path / "left-loss.json"
+    right = tmp_path / "right-loss.json"
+    payload = {
+        "schema_version": 4,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "git_sha": "abc123",
+        "ci": True,
+        "release_ready": True,
+        "release_artifacts": {"all_present": True, "all_valid": True, "all_current": True},
+        "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
+        "operational_bounds": operational_bounds_fixture(),
+        "checks": [{"name": "layout", "ok": True, "detail": "ok"}],
+    }
+    changed = json.loads(json.dumps(payload))
+    changed_loss = changed["operational_bounds"]["loss_accounting"]
+    changed_loss["observed"] = True
+    changed_loss["reason"] = None
+    changed_loss["updated_at"] = "2026-01-01T00:05:00Z"
+    changed_loss["totals"]["events"] = 99
+    changed_loss["totals"]["removed_bytes"] = 123456
+    changed_loss["domains"] = {"sandbox_capture": {"events": 99}}
+    left.write_text(json.dumps(payload), encoding="utf-8")
+    right.write_text(json.dumps(changed), encoding="utf-8")
+
+    result = subprocess.run(
+        ["python", "scripts/summary-parity.py", str(left), str(right), "--json"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert json.loads(result.stdout) == {"mismatches": [], "ok": True}
+
+
 def test_summary_parity_release_ready_mismatch_fails(tmp_path: Path) -> None:
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
     base = {
-        "schema_version": 2,
+        "schema_version": 4,
         "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
         "ci": True,
         "release_ready": True,
         "release_artifacts": {},
         "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
+        "operational_bounds": operational_bounds_fixture(),
         "checks": [],
     }
     left.write_text(json.dumps(base), encoding="utf-8")
@@ -458,13 +608,14 @@ def test_summary_parity_check_set_mismatch_fails(tmp_path: Path) -> None:
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
     base = {
-        "schema_version": 2,
+        "schema_version": 4,
         "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
         "ci": True,
         "release_ready": True,
         "release_artifacts": {},
         "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
+        "operational_bounds": operational_bounds_fixture(),
         "checks": [{"name": "layout", "ok": True}, {"name": "queue_age", "ok": True}],
     }
     left.write_text(json.dumps(base), encoding="utf-8")
@@ -481,13 +632,14 @@ def test_summary_parity_missing_or_invalid_file_returns_two(tmp_path: Path) -> N
     left.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 4,
                 "generated_at": "2026-01-01T00:00:00Z",
                 "git_sha": "abc123",
                 "ci": True,
                 "release_ready": True,
                 "release_artifacts": {},
                 "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
+                "operational_bounds": operational_bounds_fixture(),
                 "checks": [],
             }
         ),
@@ -506,13 +658,14 @@ def test_summary_parity_schema_drift_returns_two(tmp_path: Path) -> None:
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
     payload = {
-        "schema_version": 2,
+        "schema_version": 4,
         "generated_at": "2026-01-01T00:00:00Z",
         "git_sha": "abc123",
         "ci": True,
         "release_ready": True,
         "release_artifacts": {},
         "dep_advisory": {"finding_count": 0, "mode": "advisory", "generated_at": "2026-01-01T00:00:00Z", "skipped": None},
+        "operational_bounds": operational_bounds_fixture(),
         "checks": [],
     }
     left.write_text(json.dumps(dict(payload, unexpected=True)), encoding="utf-8")
@@ -2733,6 +2886,7 @@ def test_obs_log_metrics_slo_and_diagnostics(tmp_path: Path) -> None:
     assert bundle_result.returncode == 0, bundle_result.stdout + bundle_result.stderr
     bundle_path = repo / json.loads(bundle_result.stdout)["path"]
     assert bundle_path.exists()
+    assert list(bundle_path.parent.glob("diagnostics-*.json")) == []
     with zipfile.ZipFile(bundle_path) as archive:
         names = archive.namelist()
         assert len(names) == 1
@@ -2741,7 +2895,51 @@ def test_obs_log_metrics_slo_and_diagnostics(tmp_path: Path) -> None:
         assert not any(name.endswith(".enc.yaml") or name.endswith(".enc.yml") for name in names)
         bundle = json.loads(archive.read(names[0]).decode("utf-8"))
     assert set(bundle) == {"created_at", "doctor", "metrics", "platform", "runtime_version"}
-    assert set(bundle["metrics"]) == {"cache", "ok", "queue", "runtime_version", "search", "usage"}
+    assert set(bundle["metrics"]) == {
+        "cache",
+        "ok",
+        "queue",
+        "resources",
+        "runtime_version",
+        "search",
+        "usage",
+    }
+
+
+def test_lightweight_metrics_and_diagnostics_skip_external_transcripts(
+    tmp_path: Path,
+) -> None:
+    repo = copy_repo(tmp_path)
+    claude_home = tmp_path / "claude-home"
+    transcript = claude_home / "projects" / "project" / "huge.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_bytes(b"x" * 2_000_000)
+    env = {
+        "CLAUDE_HOME": str(claude_home),
+        "CODEX_HOME": str(tmp_path / "codex-home"),
+        "AI_TRANSCRIPT_MAX_FILE_BYTES": "1000000",
+    }
+
+    metrics_result = run_ai("obs", "metrics", "--skip-usage", "--json", cwd=repo, env=env)
+    assert metrics_result.returncode == 0, metrics_result.stdout + metrics_result.stderr
+    metrics_payload = json.loads(metrics_result.stdout)
+    assert metrics_payload["usage"] == {
+        "skipped": True,
+        "reason": "lightweight diagnostics smoke check",
+    }
+
+    diagnostics_result = run_ai(
+        "diagnostics",
+        "bundle",
+        "--dry-run",
+        "--skip-usage",
+        "--json",
+        cwd=repo,
+        env=env,
+    )
+    assert diagnostics_result.returncode == 0, diagnostics_result.stdout + diagnostics_result.stderr
+    diagnostics_payload = json.loads(diagnostics_result.stdout)
+    assert diagnostics_payload["bundle"]["metrics"]["usage"]["skipped"] is True
 
 
 def test_ci_diagnostics_write_rejected_but_dry_run_allowed(tmp_path: Path) -> None:
@@ -2789,6 +2987,44 @@ def test_upgrade_dry_run_does_not_mutate_or_create_backup(tmp_path: Path) -> Non
     assert hashlib.sha256(manifest.read_bytes()).hexdigest() == before
     assert manifest.stat().st_mtime_ns == before_mtime
     assert not (repo / ".ai" / "cache" / "upgrade").exists()
+
+
+def test_diagnostics_and_upgrade_backups_auto_prune(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    diagnostics_env = {"AI_DIAGNOSTICS_MAX_FILES": "2"}
+    for _ in range(4):
+        result = run_ai("diagnostics", "bundle", "--json", cwd=repo, env=diagnostics_env)
+        assert result.returncode == 0, result.stdout + result.stderr
+    diagnostic_files = sorted((repo / ".ai" / "cache" / "diagnostics").glob("diagnostics-*.zip"))
+    assert len(diagnostic_files) == 2
+    assert list((repo / ".ai" / "cache" / "diagnostics").glob("diagnostics-*.json")) == []
+
+    upgrade_env = {"AI_UPGRADE_BACKUP_MAX_FILES": "2"}
+    latest_backup = ""
+    for patch in range(4):
+        result = run_ai(
+            "upgrade",
+            "apply",
+            "--target-version",
+            f"0.1.{patch + 1}",
+            "--json",
+            cwd=repo,
+            env=upgrade_env,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        latest_backup = json.loads(result.stdout)["backup_path"]
+    backup_files = sorted((repo / ".ai" / "cache" / "upgrade").glob("rollback-*.json"))
+    assert len(backup_files) == 2
+    assert (repo / latest_backup).exists()
+    rollback_result = run_ai(
+        "upgrade",
+        "rollback",
+        "--backup-path",
+        latest_backup,
+        "--json",
+        cwd=repo,
+    )
+    assert rollback_result.returncode == 0, rollback_result.stdout + rollback_result.stderr
 
 
 def test_rollback_overwrites_manifest_drift(tmp_path: Path) -> None:
@@ -2841,7 +3077,9 @@ def test_bootstrap_idempotency_integration_invariants() -> None:
     assert "CI=true GITHUB_ACTIONS=true ./bootstrap.sh" in script
     assert "git status --short" in script
     assert "manifest_sha" in script
-    assert "env -u CI -u GITHUB_ACTIONS -u GITLAB_CI -u AI_CI uv run" in bootstrap
+    assert "scripts/run-observed.py --label bootstrap-pytest" in bootstrap
+    assert "env -u CI -u GITHUB_ACTIONS -u GITLAB_CI -u AI_CI" in bootstrap
+    assert "uv run --project .ai/runtime python -m pytest .ai/runtime/tests" in bootstrap
     assert "./scripts/bootstrap-idempotency.sh >/dev/null" in release_gate
     assert "bootstrap-idempotency:" in makefile
     assert "make -n bootstrap-idempotency" in docs_check
@@ -3098,6 +3336,67 @@ def test_obs_search_refresh_stale_rebuilds_and_exits_zero(tmp_path: Path) -> Non
     assert refresh_result.returncode == 0, refresh_result.stdout + refresh_result.stderr
     payload = json.loads(refresh_result.stdout)
     assert payload["query"].get("stale_results", []) == []
+
+
+def test_index_cli_status_disable_force_and_exit_codes(tmp_path: Path) -> None:
+    repo = tmp_path / "index-policy-repo"
+    config = repo / ".ai" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "version: 1\nproject_name: index-cli\nsearch:\n  retriever: bm25\n"
+        "  indexing:\n    enabled: false\n    auto_rebuild: false\n",
+        encoding="utf-8",
+    )
+    source = repo / "src" / "main.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("CLI_INDEX_NEEDLE = True\n", encoding="utf-8")
+
+    status = run_ai("index", "status", "--json", cwd=repo)
+    denied = run_ai("index", "rebuild", "--json", cwd=repo)
+    forced = run_ai("index", "rebuild", "--force", "--max-seconds", "30", "--json", cwd=repo)
+
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert json.loads(status.stdout)["policy"]["enabled"] is False
+    assert denied.returncode == 1, denied.stdout + denied.stderr
+    assert json.loads(denied.stdout)["error"] == "INDEXING_DISABLED"
+    assert forced.returncode == 0, forced.stdout + forced.stderr
+    forced_payload = json.loads(forced.stdout)
+    assert forced_payload["ok"] is True
+    assert forced_payload["committed"] is True
+
+    invalid = run_ai("index", "rebuild", "--force", "--max-seconds", "0", "--json", cwd=repo)
+    assert invalid.returncode == 1
+    assert json.loads(invalid.stdout)["error"] == "INDEX_POLICY_INVALID"
+
+
+def test_obs_refresh_stale_propagates_disabled_rebuild_failure(tmp_path: Path) -> None:
+    repo = tmp_path / "disabled-refresh-repo"
+    config = repo / ".ai" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "version: 1\nproject_name: disabled-refresh\nsearch:\n  retriever: bm25\n"
+        "  indexing:\n    enabled: false\n    auto_rebuild: false\n",
+        encoding="utf-8",
+    )
+    source = repo / "src" / "main.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("DISABLED_REFRESH_NEEDLE = True\n", encoding="utf-8")
+
+    result = run_ai(
+        "obs",
+        "search",
+        "--refresh-stale",
+        "--query",
+        "DISABLED_REFRESH_NEEDLE",
+        "--json",
+        cwd=repo,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "INDEX_REFRESH_FAILED"
+    assert payload["rebuild"]["error"] == "INDEXING_DISABLED"
+    assert not (repo / ".ai" / "cache" / "code.sqlite").exists()
 
 
 def test_secret_scan_allowlist_acknowledges_known_paths(tmp_path: Path) -> None:
@@ -3399,6 +3698,30 @@ def test_exec_run_cli_returns_nonzero_for_fail_closed_isolation_error(tmp_path: 
     assert payload["ok"] is False
     assert payload["reason"] == "invalid_extra_env_vars"
     assert "must_not_leak" not in result.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal return codes")
+def test_exec_run_cli_propagates_sigkill_failure_with_evidence(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".ai").mkdir()
+    (repo / ".ai" / "config.yaml").write_text("project_name: sandbox-sigkill-test\n", encoding="utf-8")
+
+    result = run_ai("exec", "run", "--json", "--", "bash", "-c", "kill -9 $$", cwd=repo)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["command_ok"] is False
+    assert payload["exit_code"] == -9
+    assert payload["termination"]["signal"] == "SIGKILL"
+    assert payload["termination"]["classification"] in {
+        "cgroup_oom_kill_confirmed",
+        "cgroup_memory_limit_confirmed",
+        "cgroup_memory_limit_likely",
+        "host_memory_pressure_likely",
+        "external_sigkill_or_execution_limit",
+    }
 
 
 def test_iter_text_files_skips_memory_and_cache(tmp_path: Path) -> None:

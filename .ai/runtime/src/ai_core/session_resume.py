@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_core.context_budget import PROTECTED_SIGNALS, policy as context_budget_policy
+from ai_core.loss_accounting import finalize_event, loss_event
 from ai_core.private_write import (
     atomic_write_private_text,
     ensure_root_confined_directory,
@@ -33,6 +34,8 @@ from ai_core.private_write import (
 from ai_core.redact import redact_value
 
 RESUME_RETENTION_DAYS = 14
+RESUME_PRUNE_MAX_CANDIDATES = 20_000
+RESUME_PRUNE_MAX_SECONDS = 2.0
 try:
     RESUME_MAX_BYTES = max(512, min(8192, int(os.environ.get("AI_RESUME_MAX_BYTES", "4096"))))
 except (ValueError, TypeError):
@@ -217,26 +220,50 @@ def _shrink_value_once(value: Any) -> tuple[Any, bool]:
     return value, False
 
 
-def _shrink_to_fit(payload: dict[str, Any], cap: int) -> dict[str, Any]:
+def _shrink_to_fit_report(payload: dict[str, Any], cap: int) -> tuple[dict[str, Any], dict[str, Any]]:
     cap = int(cap)
     if cap <= 0:
         raise ValueError("snapshot byte cap must be positive")
     result = json.loads(json.dumps(payload, ensure_ascii=False))
-    if _payload_size(result) <= cap:
-        return result
+    before_bytes = _payload_size(result)
+    dropped_fields: list[str] = []
+    compacted_fields: dict[str, int] = {}
+    if before_bytes <= cap:
+        return result, {
+            "compacted": False,
+            "bytes_before": before_bytes,
+            "bytes_after": before_bytes,
+            "dropped_fields": [],
+            "compacted_fields": {},
+        }
     for field in (*_DROP_ORDER, *_SECONDARY_DROP_ORDER):
         if field in _PROTECTED_FIELDS:
             continue
         if field in result:
             result.pop(field, None)
+            dropped_fields.append(field)
             if _payload_size(result) <= cap:
-                return result
+                after_bytes = _payload_size(result)
+                return result, {
+                    "compacted": True,
+                    "bytes_before": before_bytes,
+                    "bytes_after": after_bytes,
+                    "dropped_fields": dropped_fields,
+                    "compacted_fields": compacted_fields,
+                }
 
     # Protected signals remain present, but their values may be compacted when
     # the protected content alone would otherwise violate the hard byte cap.
     for _attempt in range(512):
         if _payload_size(result) <= cap:
-            return result
+            after_bytes = _payload_size(result)
+            return result, {
+                "compacted": True,
+                "bytes_before": before_bytes,
+                "bytes_after": after_bytes,
+                "dropped_fields": dropped_fields,
+                "compacted_fields": compacted_fields,
+            }
         candidates = [field for field in _PROTECTED_FIELDS if field in result]
         if not candidates:
             break
@@ -245,6 +272,7 @@ def _shrink_to_fit(payload: dict[str, Any], cap: int) -> dict[str, Any]:
         if not changed:
             break
         result[field] = shrunk
+        compacted_fields[field] = compacted_fields.get(field, 0) + 1
 
     # Last-resort compaction of non-protected identity strings. The full
     # session identifier is already represented by session_id_sha256 when it
@@ -255,12 +283,25 @@ def _shrink_to_fit(payload: dict[str, Any], cap: int) -> dict[str, Any]:
             if not changed:
                 break
             result[field] = shrunk
+            compacted_fields[field] = compacted_fields.get(field, 0) + 1
 
     if _payload_size(result) > cap:
         raise ValueError(
             f"resume snapshot cannot fit hard byte cap: {_payload_size(result)} > {cap}"
         )
-    return result
+    after_bytes = _payload_size(result)
+    return result, {
+        "compacted": before_bytes != after_bytes,
+        "bytes_before": before_bytes,
+        "bytes_after": after_bytes,
+        "dropped_fields": dropped_fields,
+        "compacted_fields": compacted_fields,
+    }
+
+
+def _shrink_to_fit(payload: dict[str, Any], cap: int) -> dict[str, Any]:
+    """Backward-compatible payload-only wrapper used by existing callers/tests."""
+    return _shrink_to_fit_report(payload, cap)[0]
 
 
 def _bounded_utf8_prefix(value: str, max_bytes: int) -> str:
@@ -541,7 +582,7 @@ def write_snapshot(
     payload = redact_value(payload)
 
     # Enforce hard size cap by dropping fields in priority order.
-    payload = _shrink_to_fit(payload, int(budget["max_bytes"]))
+    payload, compaction = _shrink_to_fit_report(payload, int(budget["max_bytes"]))
 
     data = _snapshot_json(payload)
     encoded = data.encode("utf-8")
@@ -552,8 +593,46 @@ def write_snapshot(
         )
 
     atomic_write_private_text(target, data, root=root)
+    truncation_loss: dict[str, Any] | None = None
+    if compaction.get("compacted") is True:
+        reasons: dict[str, int] = {}
+        for field in compaction.get("dropped_fields") or []:
+            reasons[f"drop:{str(field)[:48]}"] = 1
+        for field, count in (compaction.get("compacted_fields") or {}).items():
+            reasons[f"shrink:{str(field)[:48]}"] = int(count)
+        truncation_loss = finalize_event(
+            root,
+            loss_event(
+                domain="resume_snapshot_truncation",
+                operation=str(target.relative_to(root)),
+                applied=True,
+                files_before=1,
+                files_after=1,
+                bytes_before=int(compaction.get("bytes_before") or len(encoded)),
+                bytes_after=int(compaction.get("bytes_after") or len(encoded)),
+                records_before=len(payload) + len(compaction.get("dropped_fields") or []),
+                records_after=len(payload),
+                reasons=reasons or {"hard_byte_cap": 1},
+                examples=compaction.get("dropped_fields") or compaction.get("compacted_fields", {}).keys(),
+            ),
+        )
+        if truncation_loss.get("accounting", {}).get("ok") is not True:
+            return {
+                "ok": False,
+                "reason": "loss_accounting_failed",
+                "path": str(target),
+                "bytes_written": len(encoded),
+                "compaction": compaction,
+                "truncation_loss": truncation_loss,
+            }
 
-    return {"ok": True, "path": str(target), "bytes_written": len(encoded)}
+    return {
+        "ok": True,
+        "path": str(target),
+        "bytes_written": len(encoded),
+        "compaction": compaction,
+        "truncation_loss": truncation_loss,
+    }
 
 
 def read_latest_snapshot(
@@ -625,39 +704,210 @@ def prune_snapshots(
 
     root = Path(root)
     base = root / ".ai" / "memory" / "sessions"
+    operation = ".ai/memory/sessions"
+
+    def finish(
+        *,
+        ok: bool,
+        removed: int,
+        kept: int,
+        removed_bytes: int,
+        before_files: int,
+        before_bytes: int,
+        errors: list[str],
+        scan: dict[str, Any],
+    ) -> dict[str, Any]:
+        loss = finalize_event(
+            root,
+            loss_event(
+                domain="resume_retention",
+                operation=operation,
+                applied=ok and removed > 0,
+                files_before=before_files,
+                files_after=max(0, before_files - removed),
+                bytes_before=before_bytes,
+                bytes_after=max(0, before_bytes - removed_bytes),
+                reasons={"age_limit": removed},
+                errors=errors,
+            ),
+        )
+        accounting_ok = loss.get("accounting", {}).get("ok") is True
+        return {
+            "ok": bool(ok and accounting_ok),
+            "removed": removed,
+            "kept": kept,
+            "removed_bytes": removed_bytes,
+            "errors": errors,
+            "scan": scan,
+            "loss": loss,
+        }
+
+    policy = {
+        "max_candidates": int(RESUME_PRUNE_MAX_CANDIDATES),
+        "max_seconds": float(RESUME_PRUNE_MAX_SECONDS),
+    }
     try:
         base_state = base.lstat()
-    except OSError:
-        return {"ok": True, "removed": 0, "kept": 0}
+    except FileNotFoundError:
+        return finish(
+            ok=True,
+            removed=0,
+            kept=0,
+            removed_bytes=0,
+            before_files=0,
+            before_bytes=0,
+            errors=[],
+            scan={"bounded": True, "complete": True, "candidates_scanned": 0, "policy": policy},
+        )
+    except OSError as exc:
+        return finish(
+            ok=False,
+            removed=0,
+            kept=0,
+            removed_bytes=0,
+            before_files=0,
+            before_bytes=0,
+            errors=[f"base:stat:{exc}"],
+            scan={"bounded": True, "complete": False, "candidates_scanned": 0, "policy": policy},
+        )
     if not stat_module.S_ISDIR(base_state.st_mode) or stat_module.S_ISLNK(base_state.st_mode):
-        return {"ok": True, "removed": 0, "kept": 0}
+        return finish(
+            ok=False,
+            removed=0,
+            kept=0,
+            removed_bytes=0,
+            before_files=0,
+            before_bytes=0,
+            errors=["base:unsafe-directory"],
+            scan={"bounded": True, "complete": False, "candidates_scanned": 0, "policy": policy},
+        )
 
     cutoff = time.time() - max(0, int(older_than_days)) * 86400
+    started = time.monotonic()
+    deadline = started + max(0.05, float(RESUME_PRUNE_MAX_SECONDS))
+    candidates_scanned = 0
+    snapshots: list[tuple[Path, os.stat_result, Path, os.stat_result]] = []
+    errors: list[str] = []
+    complete = True
+    try:
+        entries = os.scandir(base)
+    except OSError as exc:
+        entries = None
+        errors.append(f"base:list:{exc}")
+        complete = False
+    if entries is not None:
+        try:
+            with entries:
+                for entry in entries:
+                    if candidates_scanned >= max(1, int(RESUME_PRUNE_MAX_CANDIDATES)):
+                        errors.append("scan:candidate_limit")
+                        complete = False
+                        break
+                    if time.monotonic() >= deadline:
+                        errors.append("scan:time_limit")
+                        complete = False
+                        break
+                    candidates_scanned += 1
+                    session_dir = Path(entry.path)
+                    try:
+                        session_state = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        errors.append(f"{entry.name}:stat:{exc}")
+                        complete = False
+                        continue
+                    if stat_module.S_ISLNK(session_state.st_mode):
+                        errors.append(f"{entry.name}:unsafe-symlink")
+                        complete = False
+                        continue
+                    if not stat_module.S_ISDIR(session_state.st_mode):
+                        if entry.name.startswith("."):
+                            continue
+                        errors.append(f"{entry.name}:not-directory")
+                        complete = False
+                        continue
+                    snap = session_dir / "resume.json"
+                    try:
+                        snap_state = snap.lstat()
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        errors.append(f"{entry.name}:resume-stat:{exc}")
+                        complete = False
+                        continue
+                    if stat_module.S_ISLNK(snap_state.st_mode):
+                        errors.append(f"{entry.name}:unsafe-resume-symlink")
+                        complete = False
+                        continue
+                    if not stat_module.S_ISREG(snap_state.st_mode):
+                        errors.append(f"{entry.name}:resume-not-regular")
+                        complete = False
+                        continue
+                    if int(getattr(snap_state, "st_nlink", 1)) != 1:
+                        errors.append(f"{entry.name}:unsafe-resume-hardlink")
+                        complete = False
+                        continue
+                    snapshots.append((session_dir, session_state, snap, snap_state))
+        except OSError as exc:
+            errors.append(f"scan:{exc}")
+            complete = False
+
+    scan = {
+        "bounded": True,
+        "complete": complete,
+        "candidates_scanned": candidates_scanned,
+        "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+        "policy": policy,
+    }
+    before_files = len(snapshots)
+    before_bytes = sum(int(snap_state.st_size) for _dir, _dir_state, _snap, snap_state in snapshots)
+    if not complete or errors:
+        return finish(
+            ok=False,
+            removed=0,
+            kept=before_files,
+            removed_bytes=0,
+            before_files=before_files,
+            before_bytes=before_bytes,
+            errors=errors or ["scan_incomplete"],
+            scan=scan,
+        )
+
     removed = 0
-    kept = 0
-    for session_dir in base.iterdir():
+    removed_bytes = 0
+    for session_dir, expected_dir, snap, expected_snap in snapshots:
+        if expected_snap.st_mtime >= cutoff:
+            continue
         try:
-            session_state = session_dir.lstat()
-        except OSError:
-            continue
-        if not stat_module.S_ISDIR(session_state.st_mode) or stat_module.S_ISLNK(session_state.st_mode):
-            continue
-        snap = session_dir / "resume.json"
-        try:
-            snap_state = snap.lstat()
-        except OSError:
-            continue
-        if not stat_module.S_ISREG(snap_state.st_mode) or stat_module.S_ISLNK(snap_state.st_mode):
-            continue
-        if snap_state.st_mtime < cutoff:
-            try:
-                snap.unlink()
-                removed += 1
-            except OSError:
-                kept += 1
-        else:
-            kept += 1
-    return {"ok": True, "removed": removed, "kept": kept}
+            current_dir = session_dir.lstat()
+            current_snap = snap.lstat()
+            if (
+                stat_module.S_ISLNK(current_dir.st_mode)
+                or not stat_module.S_ISDIR(current_dir.st_mode)
+                or int(current_dir.st_dev) != int(expected_dir.st_dev)
+                or int(current_dir.st_ino) != int(expected_dir.st_ino)
+                or stat_module.S_ISLNK(current_snap.st_mode)
+                or not stat_module.S_ISREG(current_snap.st_mode)
+                or int(getattr(current_snap, "st_nlink", 1)) != 1
+                or int(current_snap.st_dev) != int(expected_snap.st_dev)
+                or int(current_snap.st_ino) != int(expected_snap.st_ino)
+            ):
+                errors.append(f"{session_dir.name}:changed-before-delete")
+                continue
+            snap.unlink()
+            removed += 1
+            removed_bytes += int(expected_snap.st_size)
+        except OSError as exc:
+            errors.append(f"{session_dir.name}:delete:{exc}")
+    return finish(
+        ok=not errors,
+        removed=removed,
+        kept=max(0, before_files - removed),
+        removed_bytes=removed_bytes,
+        before_files=before_files,
+        before_bytes=before_bytes,
+        errors=errors,
+        scan=scan,
+    )
 
 
 __all__ = [

@@ -24,7 +24,9 @@ OUT="dist/dep-advisory.json"
 RAW_OUTPUT="$(mktemp)"
 trap 'rm -f "$RAW_OUTPUT"' EXIT
 
-if [[ "${CODE_BRAIN_DEP_ADVISORY_OFFLINE:-}" == "1" ]]; then
+if [[ -n "${CODE_BRAIN_DEP_ADVISORY_RAW:-}" ]]; then
+  printf '%s\n' "$CODE_BRAIN_DEP_ADVISORY_RAW" >"$RAW_OUTPUT"
+elif [[ "${CODE_BRAIN_DEP_ADVISORY_OFFLINE:-}" == "1" ]]; then
   py - "$OUT" <<'PY'
 import json
 import sys
@@ -44,10 +46,6 @@ Path(sys.argv[1]).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n
 print("dep-advisory ok (offline-skipped)")
 PY
   exit 0
-fi
-
-if [[ -n "${CODE_BRAIN_DEP_ADVISORY_RAW:-}" ]]; then
-  printf '%s\n' "$CODE_BRAIN_DEP_ADVISORY_RAW" >"$RAW_OUTPUT"
 else
   if ! command -v uv >/dev/null 2>&1; then
     py - "$OUT" <<'PY'

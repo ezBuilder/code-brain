@@ -51,6 +51,10 @@ for needle in \
   "make lock-check" \
   "make session-start" \
   "ai obs search --refresh-stale" \
+  "ai index status --json" \
+  "search.indexing" \
+  "INDEX_SCAN_LIMIT" \
+  "index-progress.json" \
   "secret_scan_allowlist.txt" \
   "no_token_estimates" \
   "ai exec run" \
@@ -83,6 +87,11 @@ for needle in \
   "uv lock --check --project .ai/runtime" \
   "make lint" \
   "make release-gate" \
+  "make stress-bounds" \
+  "scripts/stress-bounds.py" \
+  "ai obs loss-accounting --json" \
+  "loss-accounting.json" \
+  "removed_records" \
   "make clean-all" \
   "bootstrap.ps1" \
   "bootstrap-idempotency.sh" \
@@ -96,21 +105,23 @@ do
 done
 
 uv run --project .ai/runtime ai version >/dev/null
+uv run --project .ai/runtime ai index status --json >/dev/null
 uv run --project .ai/runtime ai index rebuild --json >/dev/null
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
-uv run --project .ai/runtime ai report status --json >/dev/null
-uv run --project .ai/runtime ai obs metrics --json >/dev/null
+uv run --project .ai/runtime ai report status --skip-usage --json >/dev/null
+uv run --project .ai/runtime ai obs metrics --skip-usage --json >/dev/null
 uv run --project .ai/runtime ai obs health-summary --json >/dev/null
+uv run --project .ai/runtime ai obs loss-accounting --json >/dev/null
 uv run --project .ai/runtime ai obs slo --json >/dev/null
 uv run --project .ai/runtime ai queue status --json >/dev/null
 uv run --project .ai/runtime ai queue dead --json --limit 1 >/dev/null
-uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
+uv run --project .ai/runtime ai diagnostics bundle --dry-run --skip-usage --json >/dev/null
 uv run --project .ai/runtime ai upgrade plan --target-version 0.1.1 --json >/dev/null
 uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json >/dev/null
 uv run --project .ai/runtime ai report release-notes >/dev/null
-uv run --project .ai/runtime ai report release-gate-summary --git-sha "$(git rev-parse HEAD)" --json >/dev/null
-uv run --project .ai/runtime python -c 'from ai_core.report import RELEASE_GATE_SUMMARY_SCHEMA_VERSION; assert RELEASE_GATE_SUMMARY_SCHEMA_VERSION == 2'
-uv run --project .ai/runtime python -c 'from ai_core.report import release_gate_summary; from pathlib import Path; s=release_gate_summary(Path(".")); assert set(s["dep_advisory"]) == {"finding_count", "mode", "generated_at", "skipped"}'
+uv run --project .ai/runtime ai report release-gate-summary --git-sha "$(git rev-parse HEAD)" --skip-usage --json >/dev/null
+uv run --project .ai/runtime python -c 'from ai_core.report import RELEASE_GATE_SUMMARY_SCHEMA_VERSION; assert RELEASE_GATE_SUMMARY_SCHEMA_VERSION == 4'
+uv run --project .ai/runtime python -c 'from ai_core.report import release_gate_summary; from pathlib import Path; s=release_gate_summary(Path("."), include_usage=False); assert set(s["dep_advisory"]) == {"finding_count", "mode", "generated_at", "skipped"}; assert set(s["operational_bounds"]) == {"ok", "doctor_groups", "transcripts", "sandbox", "runner", "loss_accounting"}; assert s["operational_bounds"]["sandbox"]["bounded"] is True; assert s["operational_bounds"]["runner"]["bounded"] is True; assert s["operational_bounds"]["loss_accounting"]["bounded"] is True'
 uv run --project .ai/runtime python -c 'from ai_core.doctor import check_audit_chain; from pathlib import Path; r=check_audit_chain(Path(".")); assert r.ok'
 CODE_BRAIN_DEP_ADVISORY_OFFLINE=1 ./scripts/dep-advisory.sh >/dev/null
 ./scripts/env-check.sh >/dev/null
@@ -126,6 +137,7 @@ make -n upgrade-in TARGET=/tmp/code-brain-docs-target >/dev/null
 make -n uninstall-from TARGET=/tmp/code-brain-docs-target >/dev/null
 make -n lint >/dev/null
 make -n quick >/dev/null
+make -n stress-bounds >/dev/null
 make -n package >/dev/null
 make -n verify-artifacts >/dev/null
 make -n install-check >/dev/null
@@ -138,9 +150,9 @@ make -n clean-cache >/dev/null
 make -n clean-artifacts >/dev/null
 make -n clean-all >/dev/null
 
-CI=true uv run --project .ai/runtime ai obs metrics --json >/dev/null
+CI=true uv run --project .ai/runtime ai obs metrics --skip-usage --json >/dev/null
 CI=true uv run --project .ai/runtime ai obs health-summary --json >/dev/null
-CI=true uv run --project .ai/runtime ai diagnostics bundle --dry-run --json >/dev/null
+CI=true uv run --project .ai/runtime ai diagnostics bundle --dry-run --skip-usage --json >/dev/null
 
 set +e
 CI=true uv run --project .ai/runtime ai worker stop --force --json >/tmp/code-brain-worker-stop-ci.out 2>/tmp/code-brain-worker-stop-ci.err
@@ -182,7 +194,7 @@ uv run --project .ai/runtime ai render --json >/dev/null
 ./scripts/preflight.sh --check-only --json >/dev/null
 uv run --project .ai/runtime ai queue recover-expired --json >/dev/null
 uv run --project .ai/runtime ai queue archive-dead --older-than-days 30 --json >/dev/null
-uv run --project .ai/runtime ai diagnostics bundle --json >/dev/null
+uv run --project .ai/runtime ai diagnostics bundle --skip-usage --json >/dev/null
 uv run --project .ai/runtime ai diagnostics prune --keep-days 30 --json >/dev/null
 
 echo "docs check ok"

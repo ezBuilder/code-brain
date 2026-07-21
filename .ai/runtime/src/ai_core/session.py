@@ -6,6 +6,7 @@ from typing import Any
 
 from .doctor import as_payload, run_checks
 from .hooks import handle_hook
+from .index_control import policy as index_policy
 from .context_budget import policy as context_budget_policy
 from .memory import rebuild_audit_index
 from .policy import is_ci
@@ -20,6 +21,7 @@ def index_status(
     refresh_metadata: bool = False,
 ) -> dict[str, Any]:
     path = db_path(root)
+    effective_policy = index_policy(root)
     exists = path.exists()
     indexed = 0
     if exists:
@@ -32,7 +34,17 @@ def index_status(
     reason = "current"
     freshness_detail = ""
     changed_paths: list[str] = []
-    if not exists:
+    if effective_policy.get("ok") is not True:
+        stale = True
+        reason = "index_policy_invalid"
+        freshness_detail = "; ".join(
+            str(item) for item in effective_policy.get("errors", [])[:5]
+        )
+    elif effective_policy.get("enabled") is not True:
+        stale = False
+        reason = "indexing_disabled"
+        freshness_detail = "freshness scan disabled by operator policy"
+    elif not exists:
         reason = "missing"
     elif indexed == 0:
         reason = "empty"
@@ -58,6 +70,7 @@ def index_status(
         "reason": reason,
         "freshness_detail": freshness_detail,
         "changed_paths": changed_paths,
+        "policy": effective_policy,
     }
 
 
@@ -80,26 +93,45 @@ def start_session(
         use_metadata=not strict,
         refresh_metadata=not strict and not is_ci(),
     )
-    should_rebuild = rebuild_mode == "always" or (rebuild_mode == "auto" and before["stale"])
+    effective_policy = before.get("policy")
+    if not isinstance(effective_policy, dict):
+        effective_policy = index_policy(root)
+    requested_rebuild = rebuild_mode == "always" or (rebuild_mode == "auto" and before["stale"])
+    policy_allows_rebuild = bool(
+        effective_policy.get("ok")
+        and effective_policy.get("enabled")
+        and (rebuild_mode == "always" or effective_policy.get("auto_rebuild"))
+    )
+    should_rebuild = requested_rebuild and policy_allows_rebuild
     index_payload: dict[str, Any] = {
         "rebuilt": False,
         "dry_run": dry_run,
         "reason": before["reason"],
         "before": before,
+        "policy": effective_policy,
     }
+    if requested_rebuild and not should_rebuild:
+        if effective_policy.get("ok") is not True:
+            index_payload["skipped"] = "index_policy_invalid"
+            index_payload["errors"] = effective_policy.get("errors", [])
+        elif effective_policy.get("enabled") is not True:
+            index_payload["skipped"] = "indexing_disabled"
+        else:
+            index_payload["skipped"] = "auto_rebuild_disabled"
     if should_rebuild and not dry_run:
         rebuilt = rebuild(root)
         index_payload.update(
             {
-                "rebuilt": True,
+                "rebuilt": rebuilt.get("ok") is True and not rebuilt.get("skipped"),
                 "result": rebuilt,
-                "after": index_status(
-                    root,
-                    use_metadata=not strict,
-                    refresh_metadata=not strict and not is_ci(),
-                ),
             }
         )
+        if index_payload["rebuilt"]:
+            index_payload["after"] = index_status(
+                root,
+                use_metadata=not strict,
+                refresh_metadata=not strict and not is_ci(),
+            )
     elif should_rebuild:
         index_payload["would_rebuild"] = True
     else:
@@ -133,8 +165,14 @@ def start_session(
             update_scan_state=not dry_run and not is_ci(),
         )
     )
+    rebuild_result = index_payload.get("result")
+    index_failed = bool(
+        (isinstance(rebuild_result, dict) and rebuild_result.get("ok") is not True)
+        or index_payload.get("skipped") == "index_policy_invalid"
+    )
+    base_ok = bool(doctor_payload.get("ok")) if strict else bool(hook_payload.get("ok"))
     payload: dict[str, Any] = {
-        "ok": bool(doctor_payload.get("ok")) if strict else bool(hook_payload.get("ok")),
+        "ok": bool(base_ok and not index_failed),
         "agent": agent,
         "context_budget": context_budget_policy(context_budget_mode),
         "index": index_payload,

@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from ai_core import hooks
 from ai_core import prompt_growth as pg
 from ai_core import self_improve as si
+from ai_core.loss_accounting import summary as loss_summary
 
 
 def _seed(tmp_path: Path) -> Path:
@@ -32,6 +36,41 @@ def test_no_growth_when_concise(tmp_path: Path) -> None:
         pg.tick(root, output_chars=40, cooldown=5)
     assert not pg.learned_path(root).exists()
     assert pg.learned_prompt_text(root) == ""
+
+
+def test_render_learned_removal_is_accounted(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    path = pg.learned_path(root)
+    path.write_text("# Learned project rules\n\n- obsolete\n", encoding="utf-8")
+    if os.name != "nt":
+        path.chmod(0o600)
+    before = path.stat().st_size
+
+    result = pg._render_learned(root, {"rules": {}})
+
+    assert result["ok"] is True
+    assert result["removed"] is True
+    assert not path.exists()
+    assert result["loss"]["files"]["removed"] == 1
+    assert result["loss"]["bytes"]["removed"] == before
+    accounting = loss_summary(root)["domains"]["prompt_growth_render"]
+    assert accounting["removed_files"] == 1
+    assert accounting["removed_bytes"] == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
+def test_render_learned_refuses_external_symlink(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    external = tmp_path / "external-learned.md"
+    external.write_text("external\n", encoding="utf-8")
+    path = pg.learned_path(root)
+    path.symlink_to(external)
+
+    with pytest.raises(OSError):
+        pg._render_learned(root, {"rules": {}})
+
+    assert path.is_symlink()
+    assert external.read_text(encoding="utf-8") == "external\n"
 
 
 def test_cooldown_limits_growth_frequency(tmp_path: Path) -> None:
@@ -117,6 +156,55 @@ def test_prompt_growth_prunes_version_snapshots(tmp_path: Path, monkeypatch) -> 
         "20260101000006.json",
         "20260101000007.json",
     ]
+    assert result["loss"]["files"]["removed"] == 5
+    assert result["loss"]["reasons"] == {"version_limit": 5}
+    assert loss_summary(root)["domains"]["prompt_growth_versions"]["removed_files"] == 5
+
+
+def test_version_prune_scan_limit_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _seed(tmp_path)
+    vdir = root.joinpath(*pg.VERSIONS_PARTS)
+    vdir.mkdir(parents=True)
+    paths = []
+    for index in range(3):
+        path = vdir / f"2026010100000{index}.json"
+        path.write_text("{}\n", encoding="utf-8")
+        paths.append(path)
+    monkeypatch.setattr(pg, "PROMPT_VERSION_SCAN_MAX_CANDIDATES", 1)
+
+    result = pg.prune_versions(root, keep=0)
+
+    assert result["ok"] is False
+    assert result["pruned"] == []
+    assert result["scan"]["complete"] is False
+    assert all(path.exists() for path in paths)
+    accounting = loss_summary(root)["domains"]["prompt_growth_versions"]
+    assert accounting["removed_files"] == 0
+    assert accounting["error_events"] == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
+def test_version_prune_unsafe_entry_blocks_all_deletes(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    vdir = root.joinpath(*pg.VERSIONS_PARTS)
+    vdir.mkdir(parents=True)
+    safe = vdir / "20260101000001.json"
+    safe.write_text("{}\n", encoding="utf-8")
+    external = tmp_path / "external.json"
+    external.write_text('{"external":true}\n', encoding="utf-8")
+    linked = vdir / "20260101000002.json"
+    linked.symlink_to(external)
+
+    result = pg.prune_versions(root, keep=0)
+
+    assert result["ok"] is False
+    assert result["pruned"] == []
+    assert safe.exists()
+    assert linked.is_symlink()
+    assert external.read_text(encoding="utf-8") == '{"external":true}\n'
 
 
 # --- eval_loop <-> ratchet fitness coupling (GEPA) ---

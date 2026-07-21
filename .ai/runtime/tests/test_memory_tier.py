@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
 from ai_core import memory_tier as mt  # noqa: E402
 from ai_core.memory import append_audit, append_decision, append_todo, close_todo  # noqa: E402
+from ai_core.loss_accounting import summary as loss_summary  # noqa: E402
 
 
 @pytest.fixture
@@ -100,6 +101,27 @@ def test_page_out_dry_run_idempotent(tmp_root: Path):
     assert (sessions_dir / "old-sess").exists()  # still there
     assert payload["archived"]["dry_run"] is True
     assert "old-sess" in payload["archived"]["moved"]  # would move
+
+
+def test_page_out_session_rotation_accounts_removed_bytes(tmp_root: Path):
+    from ai_core.memory import _SESSION_NOTE_MAX_BYTES, session_current_path
+    from ai_core.memory_tier import page_out
+
+    path = session_current_path(tmp_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "# Current Session\n\n" + "line\n" * int(_SESSION_NOTE_MAX_BYTES // 4),
+        encoding="utf-8",
+    )
+    before = path.stat().st_size
+
+    payload = page_out(tmp_root, dry_run=False)
+
+    assert payload["session_rotated"] is True
+    assert payload["session_size_after"] < before
+    assert payload["session_loss"]["bytes"]["removed"] == before - path.stat().st_size
+    assert payload["session_loss"]["accounting"]["recorded"] is True
+    assert loss_summary(tmp_root)["domains"]["session_rotation"]["removed_bytes"] == before - path.stat().st_size
 
 
 def test_page_out_actually_archives_old_sessions(tmp_root: Path):
@@ -217,6 +239,7 @@ def test_page_out_rotates_volatile_logs(tmp_root: Path, monkeypatch):
 
     payload = page_out(tmp_root, dry_run=False)
     assert payload["volatile_logs"]["events"]["rotated"] is True
+    assert payload["volatile_logs"]["events"]["loss"]["records"]["removed"] > 0
     assert events.stat().st_size <= 900
     assert prompt.stat().st_size <= 900
     assert evid.stat().st_size <= 900

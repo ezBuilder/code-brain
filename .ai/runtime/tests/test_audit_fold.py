@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,7 +24,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from ai_core import audit_fold as audit_fold_mod
 from ai_core.audit_fold import fold_old_entries
+from ai_core.loss_accounting import summary as loss_summary
 
 
 @pytest.fixture
@@ -107,6 +110,12 @@ class TestMixedAge:
         assert result["folded_days"] >= 1  # At least one date folded
         assert result["removed_entries"] == 2
         assert result["added_fold_records"] >= 1
+        assert result["loss"]["records"]["removed"] == (
+            result["removed_entries"] - result["added_fold_records"]
+        )
+        assert result["loss"]["accounting"]["recorded"] is True
+        accounting = loss_summary(audit_root)
+        assert accounting["domains"]["audit_fold"]["removed_records"] == result["loss"]["records"]["removed"]
 
         # Verify file contains recent + fold records
         content = audit_file.read_text(encoding="utf-8")
@@ -175,6 +184,9 @@ class TestDryRun:
         assert result["dry_run"] is True
         assert result["folded_days"] >= 1  # Would fold
         assert result["removed_entries"] == 1  # Would remove
+        assert result["loss"]["dry_run"] is True
+        assert result["loss"]["accounting"]["recorded"] is False
+        assert not (audit_root / ".ai" / "cache" / "loss-accounting.json").exists()
 
         # File unchanged
         content = audit_file.read_text(encoding="utf-8")
@@ -314,3 +326,52 @@ class TestDisabledFolding:
 
         # File unchanged
         assert audit_file.read_text(encoding="utf-8") == original
+
+
+def test_fold_inventory_limit_fails_closed_without_rewrite(
+    audit_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit_dir = audit_root / ".ai" / "memory" / "audit"
+    originals: dict[Path, str] = {}
+    for index in range(3):
+        path = audit_dir / f"202{index}.jsonl"
+        content = _make_audit_entry(f"old.{index}", _past_iso(90)) + "\n"
+        path.write_text(content, encoding="utf-8")
+        if os.name != "nt":
+            path.chmod(0o600)
+        originals[path] = content
+    monkeypatch.setattr(audit_fold_mod, "AUDIT_FOLD_MAX_FILES", 1)
+
+    result = fold_old_entries(audit_root, days=30)
+
+    assert result["ok"] is False
+    assert result["files_touched"] == []
+    assert result["scan"]["complete"] is False
+    assert "scan:file_limit" in result["errors"]
+    for path, content in originals.items():
+        assert path.read_text(encoding="utf-8") == content
+    accounting = loss_summary(audit_root)["domains"]["audit_fold"]
+    assert accounting["removed_records"] == 0
+    assert accounting["error_events"] == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
+def test_fold_unsafe_symlink_blocks_all_rewrites(audit_root: Path) -> None:
+    audit_dir = audit_root / ".ai" / "memory" / "audit"
+    safe = audit_dir / "2026.jsonl"
+    original = _make_audit_entry("old.safe", _past_iso(90)) + "\n"
+    safe.write_text(original, encoding="utf-8")
+    safe.chmod(0o600)
+    external = audit_root / "external-audit.jsonl"
+    external.write_text(_make_audit_entry("external", _past_iso(90)) + "\n", encoding="utf-8")
+    linked = audit_dir / "2025.jsonl"
+    linked.symlink_to(external)
+
+    result = fold_old_entries(audit_root, days=30)
+
+    assert result["ok"] is False
+    assert result["files_touched"] == []
+    assert safe.read_text(encoding="utf-8") == original
+    assert linked.is_symlink()
+    assert "external" in external.read_text(encoding="utf-8")

@@ -272,7 +272,7 @@ GitHub Actions (.github/workflows/release-gate.yml):
     summary-observe:  needs: parity
       • download both summaries
       • uv run python scripts/summary-parity.py UB MAC
-        (schema_version=2 강제, canonical subset 동치 단언)
+        (schema_version=3 강제, canonical artifact/operational subset 동치 단언)
 ```
 
 ## 7. 보안/정책 enforcement points

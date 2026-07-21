@@ -702,6 +702,76 @@ def test_targeted_incremental_does_not_delete_unrelated_function_chunks(tmp_path
     assert any("src/b.py" in item["path"] for item in changed["results"])
 
 
+def test_incremental_rebuild_vacuums_deleted_rows_and_reports_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    for index in range(30):
+        _write(repo, f"src/item_{index}.py", f"VALUE_{index} = {'x' * 2000!r}\n")
+    rebuild(repo)
+    for index in range(25):
+        (repo / f"src/item_{index}.py").unlink()
+
+    monkeypatch.setattr(search_mod, "INDEX_VACUUM_MIN_FREE_PAGES", 0)
+    monkeypatch.setattr(search_mod, "INDEX_VACUUM_FREE_RATIO", 0.0)
+    result = rebuild(repo, incremental=True)
+
+    assert result["ok"] is True
+    assert result["deleted"] == 25
+    assert result["storage"]["vacuumed"] is True
+    assert result["storage"]["free_pages"] == 0
+    assert result["storage"]["within_limit"] is True
+
+
+def test_rebuild_enforces_absolute_sqlite_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _make_repo(tmp_path)
+    with connect(repo) as conn:
+        search_mod.init_schema(conn)
+        conn.commit()
+    baseline = search_mod.index_storage(repo)["total_bytes"]
+    _write(repo, "src/large.py", "PAYLOAD = " + repr("z" * 500_000) + "\n")
+    monkeypatch.setattr(search_mod, "INDEX_MAX_BYTES", baseline + 50_000)
+
+    result = rebuild(repo)
+
+    assert result["ok"] is False
+    assert result["error"] == "INDEX_SIZE_LIMIT"
+    assert result["committed"] is False
+    assert result["storage"]["within_limit"] is True
+    with connect(repo) as conn:
+        assert conn.execute("select count(*) from chunks").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+def test_size_limited_rebuild_rolls_back_and_preserves_previous_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    incremental: bool,
+) -> None:
+    repo = _make_repo(tmp_path)
+    source = _write(repo, "src/main.py", "OldIndexNeedle = True\n")
+    initial = rebuild(repo)
+    assert initial["ok"] is True
+    baseline = search_mod.index_storage(repo)["total_bytes"]
+    source.write_text("NewIndexNeedle = " + repr("x" * 500_000) + "\n", encoding="utf-8")
+    monkeypatch.setattr(search_mod, "INDEX_MAX_BYTES", baseline + 50_000)
+    monkeypatch.setenv("AI_SEARCH_AUTO_REFRESH", "0")
+
+    result = (
+        rebuild(repo, incremental=True, paths={"src/main.py"})
+        if incremental
+        else rebuild(repo)
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "INDEX_SIZE_LIMIT"
+    assert result["committed"] is False
+    assert result["storage"]["within_limit"] is True
+    assert any(item["path"] == "src/main.py" for item in query(repo, "OldIndexNeedle")["results"])
+    assert query(repo, "NewIndexNeedle")["results"] == []
+
+
 def test_chunk_meta_stores_function_metadata(tmp_path: Path) -> None:
     """T2: chunk_meta stores qualname and line numbers for function chunks."""
     repo = _make_repo(tmp_path)

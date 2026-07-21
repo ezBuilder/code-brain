@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .memory import (
+    AUDIT_LINE_MAX_BYTES,
+    AUDIT_MAX_BYTES,
     all_audit_files,
     append_event,
     audit_path,
@@ -16,7 +18,11 @@ from .memory import (
     read_text_tail as _read_text_tail,
 )
 from .policy import is_ci
-from .private_write import atomic_write_private_text, read_root_confined_text
+from .private_write import (
+    atomic_write_private_text,
+    open_root_confined_binary,
+    read_root_confined_text,
+)
 from .redact import redact_value
 
 import os as _os
@@ -97,6 +103,7 @@ def normalize_agent(payload: dict[str, Any]) -> str:
 DELTA_NOTICE_SHORT = "cb-ctx: Δ"
 DELTA_NOTICE_VERBOSE = "Code Brain context unchanged since last injection (delta-skipped)."
 SKILL_RECOMMENDATION_DISABLE_VALUES = {"0", "false", "no", "off"}
+AUTONOMOUS_ACCEPT_AUDIT_MAX_RECORDS = 250_000
 _ENV_ENABLE_VALUES = {"1", "true", "yes", "on"}
 _RECOMMENDATION_OPT_IN_ENVS = {
     "AI_SKILL_RECOMMENDATIONS",
@@ -1059,6 +1066,62 @@ def _skill_recommendation_context(root: Path, hook_name: str, payload: dict[str,
     )
 
 
+def _parse_audit_timestamp(value: object):
+    from datetime import datetime, timezone
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _autonomous_accept_on_cooldown(root: Path, *, cutoff) -> bool:
+    """Return True when cooldown is active or audit trust cannot be established."""
+    scanned = 0
+    for audit_file in reversed(all_audit_files(root)):
+        try:
+            with open_root_confined_binary(
+                audit_file,
+                root=root,
+                max_bytes=AUDIT_MAX_BYTES,
+                require_private=False,
+            ) as (handle, _state):
+                while True:
+                    raw = handle.readline(int(AUDIT_LINE_MAX_BYTES) + 1)
+                    if not raw:
+                        break
+                    if len(raw) > int(AUDIT_LINE_MAX_BYTES):
+                        return True
+                    if not raw.strip():
+                        continue
+                    scanned += 1
+                    if scanned > int(AUTONOMOUS_ACCEPT_AUDIT_MAX_RECORDS):
+                        return True
+                    if b"skill.auto_accept" not in raw:
+                        continue
+                    try:
+                        line = raw.decode("utf-8", errors="strict")
+                        record = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        return True
+                    if not isinstance(record, dict) or record.get("action") != "skill.auto_accept":
+                        continue
+                    parsed = _parse_audit_timestamp(record.get("ts"))
+                    if parsed is None:
+                        return True
+                    if parsed >= cutoff:
+                        return True
+        except OSError:
+            return True
+    return False
+
+
 def _try_autonomous_accept(root: Path, trigger: str) -> None:
     """T36: opt-in (AI_AUTONOMOUS_ACCEPT=1). Accept at most one strongest-signal
     pending skill candidate per Stop hook. Seeds the accept_ratio KPI that
@@ -1082,30 +1145,10 @@ def _try_autonomous_accept(root: Path, trigger: str) -> None:
     except (TypeError, ValueError):
         min_strength = 30
 
-    # cooldown check via audit
-    audit_files = all_audit_files(root)
     from datetime import datetime, timedelta, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
-    for af in audit_files:
-        try:
-            for line in af.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line or "skill.auto_accept" not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                ts = str(rec.get("ts") or "")
-                try:
-                    parsed = (datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
-                              if ts.endswith("Z") else datetime.fromisoformat(ts))
-                except ValueError:
-                    continue
-                if parsed >= cutoff:
-                    return  # already auto-accepted recently
-        except OSError:
-            continue
+    if _autonomous_accept_on_cooldown(root, cutoff=cutoff):
+        return
 
     # find strongest eligible candidate
     try:

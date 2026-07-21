@@ -338,13 +338,8 @@ def _gather_procedural_hints(root: Path) -> list[dict[str, Any]]:
     if not proc_path.exists():
         return []
 
-    try:
-        records = read_jsonl_all(proc_path)
-    except Exception:
-        return []
-
     hints: list[dict[str, Any]] = []
-    for rec in records[-50:]:  # Latest 50
+    for rec in read_jsonl_tail(proc_path, 50):
         if not isinstance(rec, dict):
             continue
         trigger = str(rec.get("trigger") or "").strip()

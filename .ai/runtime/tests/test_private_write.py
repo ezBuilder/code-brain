@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,43 @@ def test_atomic_private_write_cleans_temporary_file_on_replace_failure(
     assert list(tmp_path.glob(".state.json.*.tmp")) == []
 
 
+def test_atomic_private_lines_streams_content_and_reports_bytes(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    path = root / ".ai" / "cache" / "stream.jsonl"
+
+    written = private_write.atomic_write_private_lines(
+        path,
+        (f'{{"index":{index}}}\n' for index in range(100)),
+        root=root,
+        max_bytes=100_000,
+    )
+
+    content = path.read_text(encoding="utf-8")
+    assert content.startswith('{"index":0}\n')
+    assert content.endswith('{"index":99}\n')
+    assert written == len(content.encode("utf-8"))
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_atomic_private_lines_size_limit_preserves_existing_file(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    path = root / ".ai" / "cache" / "stream.jsonl"
+    private_write.atomic_write_private_text(path, "existing\n", root=root)
+
+    with pytest.raises(private_write.PrivateWriteSizeLimit) as error:
+        private_write.atomic_write_private_lines(
+            path,
+            ("x" * 100 + "\n" for _ in range(10)),
+            root=root,
+            max_bytes=150,
+        )
+
+    assert error.value.current > error.value.maximum
+    assert path.read_text(encoding="utf-8") == "existing\n"
+    assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
+
+
 def test_private_append_creates_private_file_and_preserves_records(tmp_path: Path) -> None:
     path = tmp_path / "registry.jsonl"
 
@@ -94,6 +132,69 @@ def test_private_append_retries_partial_os_writes(
 
     assert calls["count"] > 1
     assert path.read_text(encoding="utf-8") == "complete-record\n"
+
+
+def test_private_append_size_limit_preserves_existing_file(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    path = root / ".ai" / "memory" / "state.jsonl"
+    private_write.atomic_write_private_text(path, "one\n", root=root)
+    maximum = len("one\ntwo\n".encode("utf-8")) - 1
+
+    with pytest.raises(private_write.PrivateWriteSizeLimit) as error:
+        private_write.append_private_text(
+            path,
+            "two\n",
+            root=root,
+            max_bytes=maximum,
+        )
+
+    assert error.value.current == len("one\ntwo\n".encode("utf-8"))
+    assert error.value.maximum == maximum
+    assert path.read_text(encoding="utf-8") == "one\n"
+
+
+def test_private_append_exact_size_limit_succeeds(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    path = root / ".ai" / "memory" / "state.jsonl"
+    private_write.atomic_write_private_text(path, "one\n", root=root)
+    expected = len("one\ntwo\n".encode("utf-8"))
+
+    final_size = private_write.append_private_text(
+        path,
+        "two\n",
+        root=root,
+        max_bytes=expected,
+    )
+
+    assert final_size == expected
+    assert path.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+def test_private_append_concurrency_never_crosses_size_limit(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    path = root / ".ai" / "memory" / "state.jsonl"
+    maximum = 1024
+
+    def append(index: int) -> bool:
+        try:
+            private_write.append_private_text(
+                path,
+                f"{index:04d}:" + ("x" * 20) + "\n",
+                root=root,
+                max_bytes=maximum,
+            )
+            return True
+        except private_write.PrivateWriteSizeLimit:
+            return False
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        outcomes = list(pool.map(append, range(200)))
+
+    content = path.read_text(encoding="utf-8")
+    assert any(outcomes)
+    assert not all(outcomes)
+    assert path.stat().st_size <= maximum
+    assert all(len(line) == 25 and line[4] == ":" for line in content.splitlines())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix directory symlink semantics")
@@ -162,6 +263,41 @@ def test_root_confined_reader_enforces_size_limit(tmp_path: Path) -> None:
 
     with pytest.raises(OSError, match="exceeds"):
         private_write.read_root_confined_text(path, root=root, max_bytes=10)
+
+
+def test_root_confined_tail_reads_only_complete_suffix_lines(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    path = root / ".ai" / "cache" / "large.txt"
+    private_write.atomic_write_private_text(
+        path,
+        ("x" * 1000) + "\none\ntwo\n",
+        root=root,
+    )
+
+    data, state, truncated = private_write.read_root_confined_tail(
+        path,
+        root=root,
+        max_bytes=32,
+    )
+
+    assert data == b"one\ntwo\n"
+    assert state.st_size > 32
+    assert truncated is True
+
+
+def test_root_confined_tail_can_open_file_larger_than_read_budget(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    path = root / ".ai" / "cache" / "large.txt"
+    private_write.atomic_write_private_text(path, ("x" * 10_000) + "\nlast\n", root=root)
+
+    data, _state, truncated = private_write.read_root_confined_tail(
+        path,
+        root=root,
+        max_bytes=16,
+    )
+
+    assert data == b"last\n"
+    assert truncated is True
 
 
 def test_private_file_lock_creates_private_lock_file(tmp_path: Path) -> None:

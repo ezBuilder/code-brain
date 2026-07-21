@@ -3,7 +3,7 @@ SHELL := /usr/bin/env bash
 
 LATEST_ARCHIVE := $(shell ls -t dist/code-brain-*.tar.gz 2>/dev/null | head -n 1)
 
-.PHONY: help env-check preflight lockfile-check lock-check session-start install-into upgrade-in uninstall-from lint bootstrap test eval doctor quick ci ci-full smoke docs-check package verify-artifacts install-check reproducibility-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
+.PHONY: help env-check preflight lockfile-check lock-check session-start install-into upgrade-in uninstall-from lint bootstrap test eval doctor quick ci ci-full smoke docs-check stress-bounds package verify-artifacts install-check reproducibility-check tamper-check rollback-drill bootstrap-idempotency release-gate report release-notes clean-cache clean-artifacts clean-all
 
 help:
 	@printf '%s\n' \
@@ -18,6 +18,7 @@ help:
 		'  make lint              Run static script and Python compile checks' \
 		'  make eval              Run deterministic Code Brain behavior evals' \
 		'  make quick             Run fast local health checks' \
+		'  make stress-bounds     Stress bounded transcript and sandbox diagnostics' \
 		'  make package           Build release artifacts under dist/' \
 		'  make verify-artifacts  Verify checksum, manifest, SBOM, provenance, release notes' \
 		'  make install-check     Verify extracted package execution' \
@@ -64,7 +65,7 @@ bootstrap:
 	./bootstrap.sh
 
 test:
-	env -u CI -u GITHUB_ACTIONS -u GITLAB_CI -u AI_CI uv run --project .ai/runtime python -m pytest .ai/runtime/tests
+	uv run --project .ai/runtime python scripts/run-observed.py --label make-test -- env -u CI -u GITHUB_ACTIONS -u GITLAB_CI -u AI_CI uv run --project .ai/runtime python -m pytest .ai/runtime/tests
 
 eval:
 	uv run --project .ai/runtime python .ai/evals/run.py --axis precall_routing --axis context_budget --axis tool_discovery --axis autoresearch_retrieval --wired --strict --require-complete
@@ -86,6 +87,9 @@ smoke:
 
 docs-check:
 	./scripts/docs-check.sh
+
+stress-bounds:
+	uv run --project .ai/runtime python scripts/stress-bounds.py
 
 package:
 	./scripts/package.sh

@@ -7,12 +7,19 @@ import stat
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import BinaryIO, Iterable, Iterator
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
+
+
+class PrivateWriteSizeLimit(OSError):
+    def __init__(self, current: int, maximum: int) -> None:
+        self.current = int(current)
+        self.maximum = int(maximum)
+        super().__init__(f"private write exceeds {self.maximum} bytes: {self.current}")
 
 
 def _require_root_confined_parent(path: Path, root: Path | None) -> None:
@@ -325,9 +332,112 @@ def atomic_write_private_text(path: Path, text: str, *, root: Path | None = None
             pass
 
 
-def append_private_text(path: Path, text: str, *, root: Path | None = None) -> None:
-    """Append one UTF-8 record to a private regular file without following links."""
+def atomic_write_private_lines(
+    path: Path,
+    lines: Iterable[str],
+    *,
+    root: Path | None = None,
+    max_bytes: int | None = None,
+) -> int:
+    """Atomically replace *path* from a line iterator with bounded memory."""
     path = Path(path)
+    maximum = None if max_bytes is None else max(0, int(max_bytes))
+
+    def write_lines(fd: int) -> int:
+        total = 0
+        for item in lines:
+            encoded = str(item).encode("utf-8")
+            projected = total + len(encoded)
+            if maximum is not None and projected > maximum:
+                raise PrivateWriteSizeLimit(projected, maximum)
+            _write_all(fd, encoded)
+            total = projected
+        return total
+
+    if root is not None and os.name != "nt":
+        with _open_confined_parent_fd(path, root=Path(root), create=True) as parent_fd:
+            temporary_name = f".{path.name}.{secrets.token_hex(8)}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                total = write_lines(fd)
+                os.fsync(fd)
+                os.close(fd)
+                fd = -1
+                os.replace(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                try:
+                    os.fsync(parent_fd)
+                except OSError:
+                    pass
+                return total
+            finally:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+
+    _require_root_confined_parent(path, root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        total = write_lines(fd)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        if os.name != "nt":
+            path.chmod(0o600)
+        return total
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def append_private_text(
+    path: Path,
+    text: str,
+    *,
+    root: Path | None = None,
+    max_bytes: int | None = None,
+) -> int:
+    """Append one UTF-8 record and optionally enforce a final-size ceiling.
+
+    The size check and write occur while holding the target file lock, so
+    concurrent appenders cannot collectively cross ``max_bytes``.
+    """
+    path = Path(path)
+    encoded = text.encode("utf-8")
+    maximum = None if max_bytes is None else max(0, int(max_bytes))
     if root is not None and os.name != "nt":
         with _open_confined_parent_fd(path, root=Path(root), create=True) as parent_fd:
             flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
@@ -345,10 +455,15 @@ def append_private_text(path: Path, text: str, *, root: Path | None = None) -> N
                 _require_private_mutation_target(os.fstat(fd))
                 if hasattr(os, "fchmod"):
                     os.fchmod(fd, 0o600)
-                encoded = text.encode("utf-8")
                 if fcntl is not None:
                     fcntl.flock(fd, fcntl.LOCK_EX)
+                state = os.fstat(fd)
+                _require_private_mutation_target(state)
+                projected = int(state.st_size) + len(encoded)
+                if maximum is not None and projected > maximum:
+                    raise PrivateWriteSizeLimit(projected, maximum)
                 _write_all(fd, encoded)
+                return projected
             finally:
                 if fcntl is not None:
                     try:
@@ -367,19 +482,19 @@ def append_private_text(path: Path, text: str, *, root: Path | None = None) -> N
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
+    projected = 0
     try:
         _require_private_mutation_target(os.fstat(fd))
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
-        encoded = text.encode("utf-8")
         if fcntl is not None:
             fcntl.flock(fd, fcntl.LOCK_EX)
-        remaining = memoryview(encoded)
-        while remaining:
-            written = os.write(fd, remaining)
-            if written <= 0:
-                raise OSError("append made no progress")
-            remaining = remaining[written:]
+        state = os.fstat(fd)
+        _require_private_mutation_target(state)
+        projected = int(state.st_size) + len(encoded)
+        if maximum is not None and projected > maximum:
+            raise PrivateWriteSizeLimit(projected, maximum)
+        _write_all(fd, encoded)
     finally:
         if fcntl is not None:
             try:
@@ -389,6 +504,7 @@ def append_private_text(path: Path, text: str, *, root: Path | None = None) -> N
         os.close(fd)
     if os.name != "nt":
         path.chmod(0o600)
+    return projected
 
 
 def read_root_confined_text(
@@ -462,6 +578,108 @@ def _read_open_text_fd(
         return b"".join(chunks).decode("utf-8"), state
     finally:
         os.close(fd)
+
+
+@contextmanager
+def open_root_confined_binary(
+    path: Path,
+    *,
+    root: Path | None = None,
+    max_bytes: int | None = 1_000_000,
+    require_private: bool = True,
+) -> Iterator[tuple[BinaryIO, os.stat_result]]:
+    """Stream a bounded regular file without following symlinks."""
+    path = Path(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_context = (
+        _open_confined_parent_fd(path, root=Path(root), create=False)
+        if root is not None and os.name != "nt"
+        else None
+    )
+    if parent_context is not None:
+        with parent_context as parent_fd:
+            try:
+                fd = os.open(path.name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                _raise_confined_path_error(exc)
+    else:
+        _require_root_confined_parent(path, root)
+        if path.is_symlink():
+            raise OSError("refusing to read through symlink")
+        fd = os.open(path, flags)
+
+    handle: BinaryIO | None = None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("private read target is not a regular file")
+        _require_single_link(opened)
+        if require_private and os.name != "nt":
+            if stat.S_IMODE(opened.st_mode) & 0o077:
+                raise PermissionError("private read target has group/other permissions")
+            if hasattr(os, "geteuid") and opened.st_uid != os.geteuid():
+                raise PermissionError("private read target owner mismatch")
+        if max_bytes is not None:
+            limit = max(0, int(max_bytes))
+            if int(opened.st_size) > limit:
+                raise OSError(f"private read exceeds {limit} bytes")
+        handle = os.fdopen(fd, "rb")
+        fd = -1
+        try:
+            yield handle, opened
+        except BaseException:
+            raise
+        else:
+            final = os.fstat(handle.fileno())
+            if (
+                int(final.st_dev) != int(opened.st_dev)
+                or int(final.st_ino) != int(opened.st_ino)
+                or int(final.st_mtime_ns) != int(opened.st_mtime_ns)
+                or int(final.st_size) != int(opened.st_size)
+            ):
+                raise OSError("private read target changed during read")
+    finally:
+        if handle is not None:
+            handle.close()
+        elif fd >= 0:
+            os.close(fd)
+
+
+def read_root_confined_tail(
+    path: Path,
+    *,
+    root: Path | None = None,
+    max_bytes: int,
+    require_private: bool = True,
+) -> tuple[bytes, os.stat_result, bool]:
+    """Read at most the final ``max_bytes`` from a trusted file.
+
+    When the read starts inside the file, the first partial line is discarded.
+    The returned boolean reports whether older bytes were omitted.
+    """
+    limit = max(0, int(max_bytes))
+    with open_root_confined_binary(
+        path,
+        root=root,
+        max_bytes=None,
+        require_private=require_private,
+    ) as (handle, state):
+        size = max(0, int(state.st_size))
+        start = max(0, size - limit)
+        truncated = start > 0
+        handle.seek(start)
+        data = handle.read(limit)
+        if truncated:
+            boundary = data.find(b"\n")
+            if boundary < 0:
+                data = b""
+            else:
+                data = data[boundary + 1 :]
+        return data, state, truncated
 
 
 @contextmanager

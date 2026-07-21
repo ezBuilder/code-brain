@@ -10,14 +10,28 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from .config import load_config
 from .preflight_proof import PROOF_MAX_AGE_SECONDS, PROOF_SCHEMA, environment_fingerprint
-from .private_write import read_root_confined_text, validate_root_confined_directory
+from .private_write import (
+    open_root_confined_binary,
+    read_root_confined_text,
+    validate_root_confined_directory,
+)
 from .redact import contains_secret, redact_value
 from .render import build_manifest
 from .trust import parse_simple_toml
+
+
+JSONL_CHECK_MAX_FILES = 4096
+JSONL_CHECK_MAX_FILE_BYTES = 64_000_000
+JSONL_CHECK_MAX_TOTAL_BYTES = 256_000_000
+JSONL_CHECK_MAX_LINE_BYTES = 2_000_000
+JSONL_CHECK_MAX_REPORTED_ERRORS = 20
+AUDIT_INDEX_CHECK_MAX_BYTES = 64_000_000
+AUDIT_CHECK_MAX_LINE_BYTES = 128_000
+AUDIT_CHECK_MAX_RECORDS = 250_000
 
 
 @dataclass
@@ -55,11 +69,14 @@ def run_checks(
         check_config(root),
         check_gitattributes(root),
         check_sqlite_features(),
+        check_index_control(root),
         index_check,
+        check_index_storage(root),
         check_manifest(root),
         check_trust(root),
         check_jsonl(root),
         check_generated_artifacts_bounded(root),
+        check_runtime_retention(root),
         check_audit_index(root),
         check_audit_chain(root),
         hot_path_check,
@@ -300,6 +317,17 @@ def check_sqlite_features() -> Check:
 
 
 def check_index_freshness(root: Path) -> Check:
+    from .index_control import policy as index_policy
+
+    effective_policy = index_policy(root)
+    if effective_policy.get("ok") is not True:
+        return Check(
+            "index_freshness",
+            False,
+            "invalid index policy: " + "; ".join(str(item) for item in effective_policy.get("errors", [])[:5]),
+        )
+    if effective_policy.get("enabled") is not True:
+        return Check("index_freshness", True, "disabled by operator policy; freshness scan skipped")
     db = root / ".ai" / "cache" / "code.sqlite"
     if not db.exists():
         return Check("index_freshness", True, "not indexed")
@@ -308,7 +336,75 @@ def check_index_freshness(root: Path) -> Check:
     return check_index_freshness_from_status(index_hash_status(root))
 
 
+def check_index_control(root: Path) -> Check:
+    try:
+        from .index_control import policy as index_policy, progress_status
+
+        effective_policy = index_policy(root)
+        progress = progress_status(root, effective_policy=effective_policy)
+    except (OSError, ValueError) as exc:
+        return Check("index_control", False, f"unreadable: {exc}")
+    if effective_policy.get("ok") is not True:
+        return Check(
+            "index_control",
+            False,
+            "invalid policy: " + "; ".join(str(item) for item in effective_policy.get("errors", [])[:5]),
+        )
+    if progress.get("ok") is not True:
+        return Check(
+            "index_control",
+            False,
+            "progress unhealthy: "
+            f"state={progress.get('state')} reason={progress.get('reason')} "
+            f"stalled={progress.get('stalled')} orphaned={progress.get('orphaned')}",
+        )
+    mode = "disabled" if effective_policy.get("enabled") is not True else "enabled"
+    return Check(
+        "index_control",
+        True,
+        f"{mode}; auto_rebuild={bool(effective_policy.get('auto_rebuild'))}; "
+        f"max_files={effective_policy.get('max_files')}; "
+        f"max_source_bytes={effective_policy.get('max_source_bytes')}; "
+        f"max_seconds={effective_policy.get('max_seconds')}; progress={progress.get('state')}",
+    )
+
+
+def check_index_storage(root: Path) -> Check:
+    try:
+        from .search import index_storage
+
+        storage = index_storage(root)
+    except (OSError, sqlite3.Error) as exc:
+        return Check("index_storage", False, f"unreadable: {exc}")
+    if not storage.get("exists"):
+        return Check("index_storage", True, "not indexed")
+    total = int(storage.get("total_bytes") or 0)
+    maximum = int(storage.get("max_bytes") or 0)
+    if not storage.get("within_limit"):
+        return Check(
+            "index_storage",
+            False,
+            f"oversized: total={total}>{maximum}; run `ai index rebuild --json` or raise AI_INDEX_MAX_BYTES",
+        )
+    return Check(
+        "index_storage",
+        True,
+        f"ok total={total}/{maximum} free_ratio={storage.get('free_ratio', 0.0)}",
+    )
+
+
 def check_index_freshness_from_status(status: dict[str, object]) -> Check:
+    raw_policy = status.get("policy")
+    if isinstance(raw_policy, dict):
+        if raw_policy.get("ok") is not True:
+            return Check(
+                "index_freshness",
+                False,
+                "invalid index policy: "
+                + "; ".join(str(item) for item in raw_policy.get("errors", [])[:5]),
+            )
+        if raw_policy.get("enabled") is not True:
+            return Check("index_freshness", True, "disabled by operator policy; freshness scan skipped")
     reason = str(status.get("reason") or "unreadable")
     if status.get("ok"):
         return Check("index_freshness", True, f"ok indexed={status.get('indexed_files', 0)}")
@@ -320,6 +416,10 @@ def check_index_freshness_from_status(status: dict[str, object]) -> Check:
         return Check("index_freshness", False, "legacy index schema; run ai index rebuild")
     if reason == "unreadable":
         return Check("index_freshness", False, str(status.get("detail") or "index unreadable"))
+    if reason == "index_scan_limit":
+        return Check("index_freshness", False, str(status.get("detail") or "bounded scan limit exceeded"))
+    if reason == "index_policy_invalid":
+        return Check("index_freshness", False, str(status.get("detail") or "invalid index policy"))
     raw_changed = status.get("changed_paths") or []
     changed = list(raw_changed) if isinstance(raw_changed, (list, tuple, set)) else []
     if changed:
@@ -356,22 +456,125 @@ def check_trust(root: Path) -> Check:
     return Check("trust", not bad, "ok" if not bad else "invalid: " + ", ".join(bad))
 
 
+def _scan_jsonl_file(path: Path, *, root: Path) -> list[str]:
+    rel = path.relative_to(root).as_posix()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    issues: list[str] = []
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            return [f"{rel}:not-regular"]
+        if int(getattr(opened, "st_nlink", 1)) != 1:
+            return [f"{rel}:unsafe-hardlink"]
+        if int(opened.st_size) > int(JSONL_CHECK_MAX_FILE_BYTES):
+            return [f"{rel}:bytes={opened.st_size}>{JSONL_CHECK_MAX_FILE_BYTES}"]
+
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            line_no = 0
+            while True:
+                line = handle.readline(int(JSONL_CHECK_MAX_LINE_BYTES) + 1)
+                if not line:
+                    break
+                line_no += 1
+                if len(line) > int(JSONL_CHECK_MAX_LINE_BYTES):
+                    while line and not line.endswith(b"\n"):
+                        line = handle.readline(64 * 1024)
+                    issues.append(f"{rel}:{line_no}:line-byte-limit")
+                    continue
+                if not line.strip():
+                    continue
+                try:
+                    decoded = line.decode("utf-8", errors="strict")
+                    json.loads(decoded)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    issues.append(f"{rel}:{line_no}")
+                if len(issues) >= int(JSONL_CHECK_MAX_REPORTED_ERRORS):
+                    break
+
+            final = os.fstat(handle.fileno())
+            if (
+                int(final.st_dev) != int(opened.st_dev)
+                or int(final.st_ino) != int(opened.st_ino)
+                or int(final.st_mtime_ns) != int(opened.st_mtime_ns)
+                or int(final.st_size) != int(opened.st_size)
+            ):
+                issues.append(f"{rel}:changed-during-read")
+    except OSError as exc:
+        issues.append(f"{rel}:untrusted:{exc}")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return issues[: int(JSONL_CHECK_MAX_REPORTED_ERRORS)]
+
+
 def check_jsonl(root: Path) -> Check:
+    memory_root = root.joinpath(".ai", "memory")
+    try:
+        state = memory_root.lstat()
+    except FileNotFoundError:
+        return Check("jsonl", True, "ok")
+    except OSError as exc:
+        return Check("jsonl", False, f"invalid: memory-directory-untrusted:{exc}")
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+        return Check("jsonl", False, "invalid: memory-directory-untrusted")
+
     bad: list[str] = []
-    for path in root.joinpath(".ai", "memory").rglob("*.jsonl"):
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
+    checked = 0
+    total_bytes = 0
+    try:
+        candidates = memory_root.rglob("*.jsonl")
+        for path in candidates:
+            checked += 1
+            if checked > int(JSONL_CHECK_MAX_FILES):
+                bad.append(f"file-limit={checked}>{JSONL_CHECK_MAX_FILES}")
+                break
             try:
-                json.loads(line)
-            except json.JSONDecodeError:
-                bad.append(f"{path.relative_to(root)}:{line_no}")
-    return Check("jsonl", not bad, "ok" if not bad else "invalid: " + ", ".join(bad))
+                item = path.lstat()
+            except OSError as exc:
+                bad.append(f"{path.relative_to(root).as_posix()}:stat:{exc}")
+                continue
+            if stat.S_ISLNK(item.st_mode):
+                bad.append(f"{path.relative_to(root).as_posix()}:unsafe-symlink")
+                continue
+            if not stat.S_ISREG(item.st_mode):
+                bad.append(f"{path.relative_to(root).as_posix()}:not-regular")
+                continue
+            if int(getattr(item, "st_nlink", 1)) != 1:
+                bad.append(f"{path.relative_to(root).as_posix()}:unsafe-hardlink")
+                continue
+            total_bytes += max(0, int(item.st_size))
+            if total_bytes > int(JSONL_CHECK_MAX_TOTAL_BYTES):
+                bad.append(f"aggregate-bytes={total_bytes}>{JSONL_CHECK_MAX_TOTAL_BYTES}")
+                break
+            bad.extend(_scan_jsonl_file(path, root=root))
+            if len(bad) >= int(JSONL_CHECK_MAX_REPORTED_ERRORS):
+                break
+    except OSError as exc:
+        bad.append(f"memory-scan-untrusted:{exc}")
+
+    if bad:
+        return Check(
+            "jsonl",
+            False,
+            "invalid: " + ", ".join(bad[: int(JSONL_CHECK_MAX_REPORTED_ERRORS)]),
+        )
+    return Check("jsonl", True, f"ok files={checked} bytes={total_bytes}")
 
 
 def check_generated_artifacts_bounded(root: Path) -> Check:
     from .evidence import EVIDENCE_MAX_BYTES, evidence_path
-    from .memory import _SESSION_NOTE_MAX_BYTES, EVENTS_MAX_BYTES, events_path, session_current_path
+    from .memory import (
+        _SESSION_NOTE_MAX_BYTES,
+        AUDIT_MAX_BYTES,
+        AUDIT_RETENTION_YEARS,
+        EVENTS_MAX_BYTES,
+        all_audit_files,
+        events_path,
+        session_current_path,
+    )
     from .prompt_growth import PROMPT_GROWTH_MAX_BYTES, log_path
 
     targets = (
@@ -388,36 +591,128 @@ def check_generated_artifacts_bounded(root: Path) -> Check:
             continue
         if size > cap:
             oversized.append(f"{path.relative_to(root).as_posix()}={size}>{cap}")
+    audit_files = all_audit_files(root)
+    for path in audit_files:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > AUDIT_MAX_BYTES:
+            oversized.append(f"{path.relative_to(root).as_posix()}={size}>{AUDIT_MAX_BYTES}")
+    year_files = {
+        int(path.stem[:4])
+        for path in audit_files
+        if len(path.stem) >= 4 and path.stem[:4].isdigit()
+    }
+    if len(year_files) > max(1, int(AUDIT_RETENTION_YEARS)):
+        oversized.append(
+            f"audit_years={len(year_files)}>{max(1, int(AUDIT_RETENTION_YEARS))}"
+        )
     if oversized:
         return Check(
             "generated_artifacts_bounded",
             False,
             "oversized: " + ", ".join(oversized[:8]) + "; run ai memory page-out --json",
         )
-    return Check("generated_artifacts_bounded", True, f"ok checked={len(targets)}")
+    return Check("generated_artifacts_bounded", True, f"ok checked={len(targets) + len(audit_files)}")
 
 
-def read_jsonl(path: Path, *, root: Path) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
-    text, _state = read_root_confined_text(
+def check_runtime_retention(root: Path) -> Check:
+    try:
+        from .obs import diagnostics_retention_status, logs_retention_status
+        from .upgrade import upgrade_backup_retention_status
+
+        statuses = {
+            "logs": logs_retention_status(root),
+            "diagnostics": diagnostics_retention_status(root),
+            "upgrade": upgrade_backup_retention_status(root),
+        }
+    except (OSError, ValueError) as exc:
+        return Check("runtime_retention", False, f"unreadable: {exc}")
+    failed = [
+        f"{name}:{','.join(str(item) for item in status.get('violations', []))}"
+        for name, status in statuses.items()
+        if not status.get("ok")
+    ]
+    if failed:
+        return Check(
+            "runtime_retention",
+            False,
+            "invalid: " + "; ".join(failed) + "; run diagnostics prune and remove stale upgrade backups",
+        )
+    detail = ", ".join(
+        f"{name}={status.get('count', 0)}/{status.get('bytes', 0)}B"
+        for name, status in statuses.items()
+    )
+    return Check("runtime_retention", True, "ok " + detail)
+
+
+def _iter_bounded_jsonl(
+    path: Path,
+    *,
+    root: Path,
+    max_bytes: int,
+    max_records: int,
+) -> Iterator[tuple[int, str | None, dict[str, object] | None, str | None]]:
+    """Yield bounded JSONL rows while retaining only one line in memory."""
+    records = 0
+    with open_root_confined_binary(
         path,
         root=root,
-        max_bytes=100_000_000,
+        max_bytes=max_bytes,
         require_private=False,
+    ) as (handle, _state):
+        line_no = 0
+        while True:
+            raw = handle.readline(int(AUDIT_CHECK_MAX_LINE_BYTES) + 1)
+            if not raw:
+                break
+            line_no += 1
+            if len(raw) > int(AUDIT_CHECK_MAX_LINE_BYTES):
+                while raw and not raw.endswith(b"\n"):
+                    raw = handle.readline(64 * 1024)
+                yield line_no, None, None, "line-byte-limit"
+                continue
+            try:
+                line = raw.decode("utf-8", errors="strict").rstrip("\r\n")
+            except UnicodeDecodeError:
+                yield line_no, None, None, "invalid_utf8"
+                continue
+            if not line.strip():
+                continue
+            records += 1
+            if records > max(0, int(max_records)):
+                yield line_no, None, None, f"record-limit={records}>{max(0, int(max_records))}"
+                return
+            try:
+                loaded = json.loads(line)
+            except json.JSONDecodeError as exc:
+                yield line_no, line, None, f"invalid_json:{exc.msg}"
+                continue
+            if not isinstance(loaded, dict):
+                yield line_no, line, None, "not_object"
+                continue
+            yield line_no, line, loaded, None
+
+
+def audit_key(
+    record: dict[str, object],
+    path: str | None = None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    values = (
+        record.get("ts"),
+        record.get("action"),
+        record.get("category"),
+        path if path is not None else record.get("path"),
     )
-    for line in text.splitlines():
-        if line.strip():
-            loaded = json.loads(line)
-            if isinstance(loaded, dict):
-                records.append(loaded)
-    return records
-
-
-def audit_key(record: dict[str, object], path: str | None = None) -> tuple[object, object, object, object]:
-    return (record.get("ts"), record.get("action"), record.get("category"), path or record.get("path"))
+    if any(value is not None and not isinstance(value, str) for value in values):
+        raise ValueError("audit key fields must be strings")
+    return values  # type: ignore[return-value]
 
 
 def check_audit_index(root: Path) -> Check:
+    from .memory import AUDIT_MAX_BYTES, all_audit_files
+
     audit_root = root / ".ai" / "memory" / "audit"
     index_path = root / ".ai" / "memory" / "audit-index.jsonl"
     bad: list[str] = []
@@ -427,57 +722,88 @@ def check_audit_index(root: Path) -> Check:
         pass
     except OSError as exc:
         bad.append(f"audit-directory-untrusted:{exc}")
+    index_keys: dict[tuple[str | None, str | None, str | None, str | None], bool] = {}
     try:
-        index_records = read_jsonl(index_path, root=root)
-    except FileNotFoundError:
-        index_records = []
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        index_records = []
-        bad.append(f"audit-index-untrusted:{exc}")
-    index_keys = {audit_key(record) for record in index_records}
-
-    for record in index_records:
-        rel_path = record.get("path")
-        if not isinstance(rel_path, str):
-            bad.append("audit-index:path")
-            continue
-        target = root / rel_path
-        try:
-            target_state = target.lstat()
-        except OSError:
-            target_state = None
-        if (
-            target_state is None
-            or not stat.S_ISREG(target_state.st_mode)
-            or stat.S_ISLNK(target_state.st_mode)
-            or target.parent != audit_root
-            or target.suffix != ".jsonl"
+        for line_no, _line, record, issue in _iter_bounded_jsonl(
+            index_path,
+            root=root,
+            max_bytes=AUDIT_INDEX_CHECK_MAX_BYTES,
+            max_records=AUDIT_CHECK_MAX_RECORDS,
         ):
-            bad.append(rel_path)
+            if issue is not None:
+                bad.append(f"audit-index:line {line_no}:{issue}")
+                continue
+            assert record is not None
+            rel_path = record.get("path")
+            if not isinstance(rel_path, str):
+                bad.append(f"audit-index:line {line_no}:path")
+                continue
+            target = root / rel_path
+            try:
+                target_state = target.lstat()
+            except OSError:
+                target_state = None
+            if (
+                target_state is None
+                or not stat.S_ISREG(target_state.st_mode)
+                or stat.S_ISLNK(target_state.st_mode)
+                or int(getattr(target_state, "st_nlink", 1)) != 1
+                or target.parent != audit_root
+                or target.suffix != ".jsonl"
+            ):
+                bad.append(rel_path)
+                continue
+            try:
+                index_keys[audit_key(record)] = False
+            except ValueError as exc:
+                bad.append(f"audit-index:line {line_no}:{exc}")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        bad.append(f"audit-index-untrusted:{exc}")
 
-    audit_keys: set[tuple[object, object, object, object]] = set()
-    from .memory import all_audit_files
-
+    audit_records = 0
+    stop = False
     for path in all_audit_files(root):
+        if stop:
+            break
         rel_path = path.relative_to(root).as_posix()
         try:
-            records = read_jsonl(path, root=root)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            for line_no, _line, record, issue in _iter_bounded_jsonl(
+                path,
+                root=root,
+                max_bytes=AUDIT_MAX_BYTES,
+                max_records=max(0, AUDIT_CHECK_MAX_RECORDS - audit_records),
+            ):
+                if issue is not None:
+                    bad.append(f"{rel_path}:line {line_no}:{issue}")
+                    if issue.startswith("record-limit="):
+                        stop = True
+                    continue
+                assert record is not None
+                audit_records += 1
+                try:
+                    key = audit_key(record, rel_path)
+                except ValueError as exc:
+                    bad.append(f"{rel_path}:line {line_no}:{exc}")
+                    continue
+                if key not in index_keys:
+                    bad.append(f"{rel_path}:missing-index:{record.get('ts')}")
+                else:
+                    index_keys[key] = True
+        except OSError as exc:
             bad.append(f"{rel_path}:untrusted:{exc}")
-            continue
-        for record in records:
-            key = audit_key(record, rel_path)
-            audit_keys.add(key)
-            if key not in index_keys:
-                bad.append(f"{rel_path}:missing-index:{record.get('ts')}")
 
-    for key in sorted(index_keys - audit_keys, key=str):
-        bad.append(f"audit-index:orphan:{key[0]}")
+    for key, matched in sorted(index_keys.items(), key=lambda item: str(item[0])):
+        if not matched:
+            bad.append(f"audit-index:orphan:{key[0]}")
 
     return Check("audit_index", not bad, "ok" if not bad else "invalid: " + ", ".join(bad[:10]))
 
 
 def check_audit_chain(root: Path) -> Check:
+    from .memory import AUDIT_MAX_BYTES, all_audit_files
+
     audit_root = root / ".ai" / "memory" / "audit"
     bad: list[str] = []
     chained = 0
@@ -489,50 +815,38 @@ def check_audit_chain(root: Path) -> Check:
     except OSError as exc:
         return Check("audit_chain", False, f"invalid: audit-directory-untrusted:{exc}")
 
-    from .memory import all_audit_files
-
     for path in all_audit_files(root):
         previous_line: str | None = None
         previous_was_chained = False
         rel_path = path.relative_to(root).as_posix()
         try:
-            text, _state = read_root_confined_text(
+            rows = _iter_bounded_jsonl(
                 path,
                 root=root,
-                max_bytes=100_000_000,
-                require_private=False,
+                max_bytes=AUDIT_MAX_BYTES,
+                max_records=AUDIT_CHECK_MAX_RECORDS,
             )
-        except (OSError, UnicodeDecodeError) as exc:
+            for line_no, line, record, issue in rows:
+                if issue is not None:
+                    bad.append(f"{rel_path}:line {line_no}:{issue}")
+                    previous_line = line
+                    previous_was_chained = False
+                    continue
+                assert line is not None and record is not None
+                is_chained = "prev_sha" in record
+                if is_chained:
+                    chained += 1
+                    prev_sha = record.get("prev_sha")
+                    if prev_sha is not None and not (isinstance(prev_sha, str) and len(prev_sha) == 64):
+                        bad.append(f"{rel_path}:line {line_no}:prev_sha_invalid")
+                    expected = hashlib.sha256(previous_line.encode("utf-8")).hexdigest() if previous_line is not None else None
+                    if (previous_was_chained or previous_line is None) and prev_sha != expected:
+                        bad.append(f"{rel_path}:line {line_no}:prev_sha_mismatch")
+
+                previous_line = line
+                previous_was_chained = is_chained
+        except OSError as exc:
             bad.append(f"{rel_path}:untrusted:{exc}")
-            continue
-        for line_no, line in enumerate(text.splitlines(), 1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                bad.append(f"{rel_path}:line {line_no}:invalid_json:{exc.msg}")
-                previous_line = line
-                previous_was_chained = False
-                continue
-            if not isinstance(record, dict):
-                bad.append(f"{rel_path}:line {line_no}:not_object")
-                previous_line = line
-                previous_was_chained = False
-                continue
-
-            is_chained = "prev_sha" in record
-            if is_chained:
-                chained += 1
-                prev_sha = record.get("prev_sha")
-                if prev_sha is not None and not (isinstance(prev_sha, str) and len(prev_sha) == 64):
-                    bad.append(f"{rel_path}:line {line_no}:prev_sha_invalid")
-                expected = hashlib.sha256(previous_line.encode("utf-8")).hexdigest() if previous_line is not None else None
-                if (previous_was_chained or previous_line is None) and prev_sha != expected:
-                    bad.append(f"{rel_path}:line {line_no}:prev_sha_mismatch")
-
-            previous_line = line
-            previous_was_chained = is_chained
 
     if bad:
         # Add actionable remediation hint — chain damage usually comes from stash

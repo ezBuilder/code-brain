@@ -34,12 +34,19 @@ def register_child(root: Path, *, pid: int, kind: str, command: list[str]) -> No
         return
     path = registry_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        identity = _process_identity(pid)
+    except Exception:
+        # Registration is best-effort and must not make the caller forget a
+        # successfully spawned child merely because the process exited before
+        # identity sampling or a test/subprocess shim cannot service `ps`.
+        identity = None
     record = {
         "pid": int(pid),
         "kind": str(kind)[:64],
         "command": redact_value([str(part)[:240] for part in command[:12]]),
         "created_at": time.time(),
-        "identity": _process_identity(pid),
+        "identity": identity,
     }
     try:
         with private_file_lock(registry_lock_path(root), root=root):

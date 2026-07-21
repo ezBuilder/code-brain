@@ -32,12 +32,15 @@ from ai_core.recommend import (  # noqa: E402
     _sha256,
 )
 from ai_core.memory import (  # noqa: E402
+    append_audit,
     append_decision,
     append_jsonl,
     append_todo,
     decisions_path,
     todos_path,
 )
+from ai_core import hooks  # noqa: E402
+from ai_core import recommend as recommend_module  # noqa: E402
 from ai_core.hooks import handle_hook  # noqa: E402
 
 
@@ -56,6 +59,35 @@ def _seed_decisions(root: Path, tag: str, count: int) -> None:
 def _seed_todos(root: Path, phrase: str, count: int) -> None:
     for i in range(count):
         append_todo(root, title=f"{phrase} {i}", tags=["test"], source="test")
+
+
+def test_procedural_hints_read_only_latest_tail(
+    tmp_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ai_core.procedural_memory import procedural_path
+
+    path = procedural_path(tmp_root)
+    for index in range(60):
+        append_jsonl(
+            path,
+            {
+                "trigger": f"trigger-{index}",
+                "procedure": f"procedure-{index}",
+                "tags": ["test"],
+            },
+        )
+
+    def unexpected_all_reader(*_args, **_kwargs):
+        raise AssertionError("procedural hints must use the bounded tail reader")
+
+    monkeypatch.setattr(recommend_module, "read_jsonl_all", unexpected_all_reader)
+
+    hints = recommend_module._gather_procedural_hints(tmp_root)
+
+    assert len(hints) == 50
+    assert hints[0]["trigger"] == "trigger-10"
+    assert hints[-1]["trigger"] == "trigger-59"
 
 
 def test_hyphen_encode_path():
@@ -103,6 +135,102 @@ def test_stop_hook_does_not_auto_accept_skills_by_default(tmp_root: Path, monkey
     assert payload["ok"] is True
     assert not (tmp_root / ".claude" / "commands" / "auto-test.md").exists()
     assert list_catalog(tmp_root)[0].status == "pending"
+
+
+def _seed_autonomous_candidate(root: Path, *, candidate_id: str = "sk-autonomous") -> None:
+    entry = CatalogEntry(
+        id=candidate_id,
+        slug="autonomous-test",
+        status="pending",
+        draft={"description": "Autonomous test", "body": "Run the safe workflow."},
+        evidence={"signals": ["decisions:99"]},
+        created_at="2026-05-20T00:00:00Z",
+        installed_paths=[],
+        body_sha256="",
+    )
+    append_jsonl(catalog_path(root), entry.to_record())
+
+
+def test_autonomous_accept_cooldown_scan_streams_without_path_read_text(
+    tmp_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_autonomous_candidate(tmp_root)
+    append_audit(tmp_root, action="test.unrelated", category="test", payload={})
+    audit_dir = tmp_root / ".ai" / "memory" / "audit"
+    original_read_text = Path.read_text
+    accepted: list[str] = []
+
+    def guarded_read_text(self: Path, *args, **kwargs):
+        if self.parent == audit_dir and self.suffix == ".jsonl":
+            raise AssertionError("autonomous cooldown scan must stream audit JSONL")
+        return original_read_text(self, *args, **kwargs)
+
+    def fake_accept(_root: Path, candidate_id: str):
+        accepted.append(candidate_id)
+        return {"ok": True}
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    monkeypatch.setattr("ai_core.recommend.accept", fake_accept)
+
+    hooks._try_autonomous_accept(tmp_root, "Stop")
+
+    assert accepted == ["sk-autonomous"]
+
+
+def test_autonomous_accept_recent_audit_record_enforces_cooldown(
+    tmp_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_autonomous_candidate(tmp_root)
+    append_audit(tmp_root, action="skill.auto_accept", category="memory", payload={})
+    accepted: list[str] = []
+    monkeypatch.setattr(
+        "ai_core.recommend.accept",
+        lambda _root, candidate_id: accepted.append(candidate_id) or {"ok": True},
+    )
+
+    hooks._try_autonomous_accept(tmp_root, "Stop")
+
+    assert accepted == []
+
+
+def test_autonomous_accept_fails_closed_on_oversized_audit_line(
+    tmp_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_autonomous_candidate(tmp_root)
+    audit_file = tmp_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    audit_file.write_text("x" * 1024 + "\n", encoding="utf-8")
+    accepted: list[str] = []
+    monkeypatch.setattr(hooks, "AUDIT_LINE_MAX_BYTES", 64)
+    monkeypatch.setattr(
+        "ai_core.recommend.accept",
+        lambda _root, candidate_id: accepted.append(candidate_id) or {"ok": True},
+    )
+
+    hooks._try_autonomous_accept(tmp_root, "Stop")
+
+    assert accepted == []
+
+
+def test_autonomous_accept_fails_closed_on_audit_record_limit(
+    tmp_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_autonomous_candidate(tmp_root)
+    append_audit(tmp_root, action="test.one", category="test", payload={})
+    append_audit(tmp_root, action="test.two", category="test", payload={})
+    accepted: list[str] = []
+    monkeypatch.setattr(hooks, "AUTONOMOUS_ACCEPT_AUDIT_MAX_RECORDS", 1)
+    monkeypatch.setattr(
+        "ai_core.recommend.accept",
+        lambda _root, candidate_id: accepted.append(candidate_id) or {"ok": True},
+    )
+
+    hooks._try_autonomous_accept(tmp_root, "Stop")
+
+    assert accepted == []
 
 
 def test_gather_signals_reads_decisions(tmp_root: Path):

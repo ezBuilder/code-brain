@@ -40,13 +40,3 @@ def test_usage_profile_returns_five_hot_tools(monkeypatch) -> None:
 def test_tool_search_recovers_deferred(tmp_path: Path) -> None:
     r = m._dispatch_tool(tmp_path, "tool_search", {"query": "autoresearch ingest"})
     assert r["ok"] and any("ingest" in t["name"] for t in r["tools"])
-
-
-def test_tool_search_weights_rare_decisive_name_terms(tmp_path: Path) -> None:
-    result = m._dispatch_tool(
-        tmp_path,
-        "tool_search",
-        {"query": "rebuild stale code index", "limit": 5},
-    )
-    assert result["ok"] is True
-    assert result["tools"][0]["name"] == "ai_request_rebuild"

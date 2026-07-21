@@ -1,25 +1,19 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import shutil
 import sqlite3
-import stat as stat_module
 import subprocess
-import time
 from pathlib import Path
 from typing import Any
 
 from .config import load_config
 from .policy import is_ci
-from .private_write import atomic_write_private_text, read_root_confined_text
 from .redact import redact_value
 
 SCHEMA_VERSION = 8
-CANDIDATE_CACHE_SCHEMA = 3
-CANDIDATE_CACHE_MAX_AGE_SECONDS = 60.0
 import os as _os
 try:
     SNIPPET_MAX_BYTES = max(80, min(2048, int(_os.environ.get("AI_SNIPPET_MAX_BYTES", "240"))))
@@ -38,7 +32,6 @@ SKIP_PATH_PREFIXES = (
 )
 SKIP_DIRS = {
     ".git",
-    ".chatgpt2codex",
     ".venv",
     ".playwright-cli",
     ".playwright-mcp",
@@ -150,7 +143,6 @@ def drop_schema(conn: sqlite3.Connection) -> None:
         drop table if exists embeddings_vec0;
         drop table if exists code_symbols;
         drop table if exists code_calls;
-        drop table if exists file_state;
         drop table if exists chunks;
         """
     )
@@ -188,13 +180,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
           prompt_version text,
           chunker_version text not null,
           confidence real not null
-        );
-        create table if not exists file_state (
-          path text primary key,
-          size integer not null,
-          mtime_ns integer not null,
-          ctime_ns integer not null,
-          sha256 text not null
         );
         create table if not exists embeddings_vec0 (
           chunk_id integer primary key,
@@ -312,10 +297,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
         candidate_paths = (
             _target_text_files(root, paths)
             if paths is not None
-            else (
-                (path.relative_to(root).as_posix(), path)
-                for path in iter_text_files(root, use_cache=False, update_cache=True)
-            )
+            else ((path.relative_to(root).as_posix(), path) for path in iter_text_files(root))
         )
         for rel, path in candidate_paths:
             seen.add(rel)
@@ -327,7 +309,6 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
             existing_pair = existing.get(rel)
             if existing_pair is not None and existing_pair[1] == digest:
-                _upsert_file_state(conn, rel, path, digest)
                 unchanged += 1
                 continue
             # Need to (re)write this file: drop dependent rows, including the
@@ -372,7 +353,6 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             _insert_codegraph_for_path(conn, rel, redacted, path)
             # For supported languages, also insert function/class level chunks (hybrid chunking)
             _insert_function_chunks(conn, rel, content, chunk_id, root=root)
-            _upsert_file_state(conn, rel, path, digest)
             if existing_pair is not None:
                 changed += 1
             else:
@@ -396,7 +376,6 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
                 conn.execute("delete from provenance where path = ?", (rel,))
                 conn.execute("delete from code_symbols where path = ?", (rel,))
                 conn.execute("delete from code_calls where path = ?", (rel,))
-                conn.execute("delete from file_state where path = ?", (rel,))
                 # Also delete function chunks for this file
                 chunk_ids = conn.execute(
                     "select id from chunks where path like ?", (f"{rel}:%",)
@@ -405,8 +384,6 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
                     _delete_chunk_rows(conn, func_cid)
                 deleted += 1
         conn.commit()
-    if changed or added or deleted:
-        _mark_index_generation(root)
     return {
         "ok": True,
         "db_path": db_p.relative_to(root).as_posix(),
@@ -435,7 +412,7 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
         drop_schema(conn)
         create_schema(conn)
         indexed = 0
-        for path in iter_text_files(root, use_cache=False, update_cache=True):
+        for path in iter_text_files(root):
             rel = path.relative_to(root).as_posix()
             try:
                 content = path.read_text(encoding="utf-8")
@@ -463,53 +440,10 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
             _insert_codegraph_for_path(conn, rel, redacted, path)
             # For supported languages, also insert function/class level chunks (hybrid chunking)
             _insert_function_chunks(conn, rel, content, chunk_id, root=root)
-            _upsert_file_state(conn, rel, path, digest)
             indexed += 1
         conn.commit()
         conn.execute("vacuum")
-    _mark_index_generation(root)
     return {"ok": True, "db_path": db_path(root).relative_to(root).as_posix(), "indexed": indexed}
-
-
-def _mark_index_generation(root: Path) -> None:
-    marker = root / ".ai" / "cache" / "code-index-generation"
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    temporary = marker.with_suffix(".tmp")
-    temporary.write_text(str(time.time_ns()) + "\n", encoding="utf-8")
-    os.replace(temporary, marker)
-
-
-def _file_stat_values(
-    path: Path,
-    stat_result: os.stat_result | None = None,
-) -> tuple[int, int, int]:
-    stat_result = stat_result or path.stat()
-    return (
-        int(stat_result.st_size),
-        int(stat_result.st_mtime_ns),
-        int(getattr(stat_result, "st_ctime_ns", int(stat_result.st_ctime * 1_000_000_000))),
-    )
-
-
-def _upsert_file_state(
-    conn: sqlite3.Connection,
-    rel: str,
-    path: Path,
-    digest: str,
-) -> None:
-    size, mtime_ns, ctime_ns = _file_stat_values(path)
-    conn.execute(
-        """
-        insert into file_state(path, size, mtime_ns, ctime_ns, sha256)
-        values (?, ?, ?, ?, ?)
-        on conflict(path) do update set
-          size = excluded.size,
-          mtime_ns = excluded.mtime_ns,
-          ctime_ns = excluded.ctime_ns,
-          sha256 = excluded.sha256
-        """,
-        (rel, size, mtime_ns, ctime_ns, digest),
-    )
 
 
 def _codegraph_enabled() -> bool:
@@ -1323,29 +1257,28 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
         return {"enabled": False, "rebuilt": False, "reason": "ci_read_only"}
     dirty_paths = _git_dirty_paths(root)
     if dirty_paths:
-        dirty_status = index_hash_status(root, paths=dirty_paths)
-        changed_dirty = set(dirty_status.get("changed_paths") or [])
-        if changed_dirty:
-            result = rebuild(root, single_flight=True, incremental=True, paths=changed_dirty)
-            return {
-                "enabled": True,
-                "rebuilt": True,
-                "reason": "dirty_hash_mismatch",
-                "path_count": len(changed_dirty),
-                "result": result,
-            }
+        result = rebuild(root, single_flight=True, incremental=True, paths=dirty_paths)
+        return {
+            "enabled": True,
+            "rebuilt": True,
+            "reason": "dirty_paths",
+            "path_count": len(dirty_paths),
+            "result": result,
+        }
     db = db_path(root)
     if not db.exists():
         result = rebuild(root, single_flight=True, incremental=True)
         return {"enabled": True, "rebuilt": True, "reason": "missing", "result": result}
     try:
-        source_mtime = max((state.st_mtime for _path, state in iter_text_file_states(root)), default=0.0)
+        source_mtime = max((path.stat().st_mtime for path in iter_text_files(root)), default=0.0)
         db_mtime = db.stat().st_mtime
     except OSError as exc:
         return {"enabled": True, "rebuilt": False, "reason": f"stat_error:{exc}"}
-    if source_mtime >= db_mtime or 0 <= db_mtime - source_mtime <= MTIME_STALE_GRACE_SECONDS:
-        hash_status = index_hash_status(root, use_metadata=True, refresh_metadata=True, use_candidate_cache=True)
-        changed_paths = set(hash_status.get("changed_paths") or [])
+    if source_mtime >= db_mtime:
+        result = rebuild(root, single_flight=True, incremental=True)
+        return {"enabled": True, "rebuilt": True, "reason": "mtime_fallback", "result": result}
+    if 0 <= db_mtime - source_mtime <= MTIME_STALE_GRACE_SECONDS:
+        changed_paths = _changed_index_paths_by_hash(root)
         if changed_paths:
             result = rebuild(root, single_flight=True, incremental=True, paths=changed_paths)
             return {
@@ -1355,124 +1288,38 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
                 "path_count": len(changed_paths),
                 "result": result,
             }
-        if not hash_status.get("ok") and hash_status.get("reason") not in {"current"}:
-            result = rebuild(root, single_flight=True, incremental=True)
-            return {
-                "enabled": True,
-                "rebuilt": True,
-                "reason": str(hash_status.get("reason") or "hash_check_failed"),
-                "result": result,
-            }
     return {"enabled": True, "rebuilt": False, "reason": "current"}
 
 
-def index_hash_status(
-    root: Path,
-    *,
-    paths: set[str] | None = None,
-    use_metadata: bool = False,
-    refresh_metadata: bool = False,
-    use_candidate_cache: bool = False,
-) -> dict[str, Any]:
-    db = db_path(root)
-    if not db.exists():
-        return {
-            "ok": False,
-            "reason": "missing",
-            "changed_paths": [],
-            "indexed_files": 0,
-        }
+def _changed_index_paths_by_hash(root: Path) -> set[str]:
     try:
         with connect(root) as conn:
             init_schema(conn)
             indexed = {
-                str(row["path"]): (
-                    str(row["sha256"]),
-                    (
-                        int(row["size"]),
-                        int(row["mtime_ns"]),
-                        int(row["ctime_ns"]),
-                    )
-                    if row["size"] is not None
-                    else None,
-                )
+                str(row["path"]): str(row["sha256"])
                 for row in conn.execute(
                     """
-                    select c.path, c.sha256, s.size, s.mtime_ns, s.ctime_ns
+                    select c.path, c.sha256
                     from chunks c
                     join chunk_meta m on m.chunk_id = c.id
-                    left join file_state s on s.path = c.path
                     where m.kind = 'file'
                     """
                 ).fetchall()
             }
-    except RuntimeError as exc:
-        detail = str(exc)
-        reason = (
-            "legacy_schema"
-            if "legacy" in detail and "index schema" in detail
-            else "unreadable"
-        )
-        return {
-            "ok": False,
-            "reason": reason,
-            "detail": detail,
-            "changed_paths": [],
-            "indexed_files": 0,
-        }
-    except (OSError, sqlite3.Error) as exc:
-        return {
-            "ok": False,
-            "reason": "unreadable",
-            "detail": f"index unreadable: {exc}",
-            "changed_paths": [],
-            "indexed_files": 0,
-        }
+    except Exception:
+        return set()
     if not indexed:
-        return {
-            "ok": False,
-            "reason": "empty",
-            "changed_paths": [],
-            "indexed_files": 0,
-        }
+        return set()
 
     changed: set[str] = set()
     seen: set[str] = set()
-    metadata_updates: list[tuple[str, Path, str]] = []
-    if paths is None:
-        candidates = [
-            (path.relative_to(root).as_posix(), path, state)
-            for path, state in iter_text_file_states(
-                root,
-                use_cache=use_candidate_cache,
-                update_cache=True,
-            )
-        ]
-    else:
-        candidates = []
-        for rel in sorted(paths):
-            path = root / rel
-            state = _indexable_text_stat(root, path)
-            if state is not None:
-                candidates.append((rel, path, state))
-            elif rel in indexed:
-                changed.add(rel)
-
-    for rel, path, stat_result in candidates:
+    for path in iter_text_files(root):
+        rel = path.relative_to(root).as_posix()
         seen.add(rel)
-        indexed_entry = indexed.get(rel)
-        if indexed_entry is None:
+        expected = indexed.get(rel)
+        if expected is None:
             changed.add(rel)
             continue
-        expected, indexed_metadata = indexed_entry
-        if use_metadata and indexed_metadata is not None:
-            try:
-                current_metadata = _file_stat_values(path, stat_result)
-            except OSError:
-                changed.add(rel)
-                continue
-            if current_metadata == indexed_metadata:
-                continue
         try:
             redacted = str(redact_value(path.read_text(encoding="utf-8")))
         except (OSError, UnicodeDecodeError):
@@ -1481,41 +1328,14 @@ def index_hash_status(
         digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
         if digest != expected:
             changed.add(rel)
-        elif use_metadata and refresh_metadata:
-            metadata_updates.append((rel, path, digest))
-    if paths is None:
-        changed.update(set(indexed) - seen)
-    if metadata_updates:
-        try:
-            with connect(root) as conn:
-                init_schema(conn)
-                for rel, path, digest in metadata_updates:
-                    _upsert_file_state(conn, rel, path, digest)
-                conn.commit()
-        except (OSError, sqlite3.Error, RuntimeError):
-            pass
-    ordered = sorted(changed)
-    return {
-        "ok": not ordered,
-        "reason": "current" if not ordered else "hash_mismatch",
-        "changed_paths": ordered,
-        "indexed_files": len(indexed),
-    }
-
-
-def _changed_index_paths_by_hash(root: Path) -> set[str]:
-    """Backward-compatible internal wrapper for callers/tests using the old helper."""
-    return set(index_hash_status(root).get("changed_paths") or [])
+    changed.update(set(indexed) - seen)
+    return changed
 
 
 def _git_dirty_paths(root: Path) -> set[str]:
     try:
         result = subprocess.run(
-            # Tracked drift is cheap to enumerate. New untracked source files
-            # are detected by the mtime-triggered full hash status below.
-            # Including every untracked managed Code Brain file here forced
-            # ~300 hash candidates on every query in a freshly installed repo.
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=no"],
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=root,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -1633,64 +1453,34 @@ def configured_retriever(root: Path) -> str:
     return retriever
 
 
-def iter_text_file_states(
-    root: Path,
-    *,
-    use_cache: bool = True,
-    update_cache: bool = True,
-):
-    for path in candidate_files(root, use_cache=use_cache, update_cache=update_cache):
-        stat_result = _indexable_text_stat(root, path)
-        if stat_result is not None:
-            yield path, stat_result
-
-
-def iter_text_files(
-    root: Path,
-    *,
-    use_cache: bool = True,
-    update_cache: bool = True,
-):
-    for path, _stat_result in iter_text_file_states(
-        root,
-        use_cache=use_cache,
-        update_cache=update_cache,
-    ):
-        yield path
+def iter_text_files(root: Path):
+    for path in candidate_files(root):
+        if _is_indexable_text_file(root, path):
+            yield path
 
 
 def _is_indexable_text_file(root: Path, path: Path) -> bool:
-    return _indexable_text_stat(root, path) is not None
-
-
-def _indexable_text_stat(root: Path, path: Path) -> os.stat_result | None:
+    if not path.is_file():
+        return False
     try:
         rel = path.relative_to(root)
     except ValueError:
-        return None
+        return False
     rel_posix = rel.as_posix()
     if any(rel_posix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
-        return None
+        return False
     if any(part in SKIP_DIRS for part in rel.parts):
-        return None
+        return False
     if path.name in SKIP_NAMES:
-        return None
+        return False
     if any(path.name.endswith(suffix) for suffix in SKIP_SUFFIXES):
-        return None
+        return False
     try:
-        stat_result = path.lstat()
+        if path.stat().st_size > MAX_TEXT_BYTES:
+            return False
     except OSError:
-        return None
-    # Never follow repository symlinks while indexing. A tracked or untracked
-    # link can point outside the project and would otherwise copy arbitrary
-    # external source or credential material into the local SQLite index.
-    if stat_module.S_ISLNK(stat_result.st_mode):
-        return None
-    if not stat_module.S_ISREG(stat_result.st_mode) or stat_result.st_size > MAX_TEXT_BYTES:
-        return None
-    if path.suffix not in TEXT_SUFFIXES and path.name not in {"AGENTS.md", "CLAUDE.md"}:
-        return None
-    return stat_result
+        return False
+    return path.suffix in TEXT_SUFFIXES or path.name in {"AGENTS.md", "CLAUDE.md"}
 
 
 def _target_text_files(root: Path, rel_paths: set[str]):
@@ -1700,218 +1490,7 @@ def _target_text_files(root: Path, rel_paths: set[str]):
             yield rel, path
 
 
-def _candidate_cache_path(root: Path) -> Path:
-    return root / ".ai" / "cache" / "candidate-files.json"
-
-
-def _candidate_policy_fingerprint() -> str:
-    payload = {
-        "skip_dirs": sorted(SKIP_DIRS),
-        "skip_path_prefixes": list(SKIP_PATH_PREFIXES),
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _candidate_cache_parent_confined(root: Path, path: Path) -> bool:
-    try:
-        path.parent.resolve().relative_to(root.resolve())
-    except (OSError, ValueError):
-        return False
-    return True
-
-
-def _trusted_candidate_cache(root: Path) -> Path | None:
-    path = _candidate_cache_path(root)
-    try:
-        if path.is_symlink() or not path.is_file():
-            return None
-        if not _candidate_cache_parent_confined(root, path):
-            return None
-        state = path.stat()
-        if os.name != "nt" and stat_module.S_IMODE(state.st_mode) & 0o077:
-            return None
-        if hasattr(os, "geteuid") and state.st_uid != os.geteuid():
-            return None
-    except OSError:
-        return None
-    return path
-
-
-def _candidate_rel_allowed(rel: str) -> bool:
-    rel_path = Path(rel)
-    rel_posix = rel_path.as_posix()
-    if any(part in SKIP_DIRS for part in rel_path.parts):
-        return False
-    if any(rel_posix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
-        return False
-    return True
-
-
-def _path_signature(path: Path) -> list[int] | None:
-    try:
-        state = path.stat()
-    except OSError:
-        return None
-    return [
-        int(state.st_size),
-        int(state.st_mtime_ns),
-        int(getattr(state, "st_ctime_ns", int(state.st_ctime * 1_000_000_000))),
-    ]
-
-
-def _git_dir_path(root: Path) -> Path | None:
-    dot_git = root / ".git"
-    if dot_git.is_dir():
-        return dot_git
-    if not dot_git.is_file():
-        return None
-    try:
-        line = dot_git.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    prefix = "gitdir:"
-    if not line.lower().startswith(prefix):
-        return None
-    value = line[len(prefix):].strip()
-    if not value:
-        return None
-    path = Path(value)
-    return path if path.is_absolute() else (root / path).resolve()
-
-
-def _candidate_cache_tree_state(root: Path) -> tuple[dict[str, list[int]], dict[str, list[int] | None]]:
-    directories: dict[str, list[int]] = {}
-    ignore_files: dict[str, list[int] | None] = {}
-    for current, dir_names, file_names in os.walk(root, topdown=True, followlinks=False):
-        current_path = Path(current)
-        try:
-            current_rel = current_path.relative_to(root)
-        except ValueError:
-            continue
-        kept: list[str] = []
-        for name in dir_names:
-            child_rel = (current_rel / name).as_posix()
-            child_prefix = child_rel.rstrip("/") + "/"
-            if name == ".git" or name in SKIP_DIRS:
-                continue
-            if any(child_prefix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
-                continue
-            kept.append(name)
-        dir_names[:] = kept
-        try:
-            state = current_path.stat()
-            directories[current_rel.as_posix() or "."] = [
-                int(state.st_mtime_ns),
-                int(getattr(state, "st_ctime_ns", int(state.st_ctime * 1_000_000_000))),
-            ]
-        except OSError:
-            continue
-        if ".gitignore" in file_names:
-            ignore_path = current_path / ".gitignore"
-            ignore_files[ignore_path.relative_to(root).as_posix()] = _path_signature(ignore_path)
-    git_dir = _git_dir_path(root)
-    dot_git = root / ".git"
-    ignore_files[".git"] = _path_signature(dot_git)
-    if git_dir is not None:
-        for name, path in (
-            ("git-index", git_dir / "index"),
-            ("git-info-exclude", git_dir / "info" / "exclude"),
-        ):
-            ignore_files[name] = _path_signature(path)
-    return directories, ignore_files
-
-
-def _candidate_cache_load(root: Path) -> list[Path] | None:
-    cache_path = _trusted_candidate_cache(root)
-    if cache_path is None:
-        return None
-    try:
-        text, _state = read_root_confined_text(
-            cache_path,
-            root=root,
-            max_bytes=10_000_000,
-            require_private=True,
-        )
-        payload = json.loads(text)
-        created = float(payload.get("created_at_unix", 0))
-        if time.time() - created < 0 or time.time() - created > CANDIDATE_CACHE_MAX_AGE_SECONDS:
-            return None
-        if payload.get("schema") != CANDIDATE_CACHE_SCHEMA:
-            return None
-        if payload.get("policy_fingerprint") != _candidate_policy_fingerprint():
-            return None
-        cached_dirs = payload.get("directories")
-        cached_ignores = payload.get("ignore_files")
-        rel_paths = payload.get("paths")
-        if not isinstance(cached_dirs, dict) or not isinstance(cached_ignores, dict) or not isinstance(rel_paths, list):
-            return None
-        for rel, expected_state in cached_dirs.items():
-            if (
-                not isinstance(rel, str)
-                or not isinstance(expected_state, list)
-                or len(expected_state) != 2
-                or not all(isinstance(item, int) for item in expected_state)
-            ):
-                return None
-            path = root if rel == "." else root / rel
-            state = path.stat()
-            current_state = [
-                int(state.st_mtime_ns),
-                int(getattr(state, "st_ctime_ns", int(state.st_ctime * 1_000_000_000))),
-            ]
-            if current_state != expected_state:
-                return None
-        _dirs, current_ignores = _candidate_cache_tree_state(root)
-        if current_ignores != cached_ignores:
-            return None
-        paths: list[Path] = []
-        for rel in rel_paths:
-            if not isinstance(rel, str):
-                return None
-            rel_path = Path(rel)
-            if rel_path.is_absolute() or ".." in rel_path.parts:
-                return None
-            paths.append(root / rel_path)
-        return sorted(paths)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
-
-
-def _candidate_cache_write(root: Path, rels: list[str]) -> None:
-    cache_path = _candidate_cache_path(root)
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        if not _candidate_cache_parent_confined(root, cache_path):
-            return
-        directories, ignore_files = _candidate_cache_tree_state(root)
-        payload = {
-            "schema": CANDIDATE_CACHE_SCHEMA,
-            "policy_fingerprint": _candidate_policy_fingerprint(),
-            "created_at_unix": time.time(),
-            "directories": directories,
-            "ignore_files": ignore_files,
-            "paths": sorted(rels),
-        }
-        atomic_write_private_text(
-            cache_path,
-            json.dumps(payload, sort_keys=True),
-            root=root,
-        )
-    except OSError:
-        pass
-
-
-def candidate_files(
-    root: Path,
-    *,
-    use_cache: bool = True,
-    update_cache: bool = True,
-) -> list[Path]:
-    if use_cache:
-        cached = _candidate_cache_load(root)
-        if cached is not None:
-            return cached
+def candidate_files(root: Path) -> list[Path]:
     try:
         result = subprocess.run(
             ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
@@ -1921,19 +1500,9 @@ def candidate_files(
             check=True,
         )
     except (OSError, subprocess.CalledProcessError):
-        return sorted(
-            path
-            for path in root.rglob("*")
-            if path.is_file() and _candidate_rel_allowed(path.relative_to(root).as_posix())
-        )
-    rels = [
-        rel
-        for item in result.stdout.split(b"\0")
-        if item and _candidate_rel_allowed(rel := item.decode("utf-8"))
-    ]
-    if update_cache and not is_ci():
-        _candidate_cache_write(root, rels)
-    return sorted(root / rel for rel in rels)
+        return sorted(path for path in root.rglob("*") if path.is_file())
+    rels = [item.decode("utf-8") for item in result.stdout.split(b"\0") if item]
+    return sorted(path for rel in rels if (path := root / rel).is_file())
 
 
 def summarize(content: str) -> str:
@@ -1975,12 +1544,7 @@ def snippet_from_file(root: Path, rel_path: str, query_text: str, *, fallback: s
 
 
 def escape_fts_query(text: str) -> str:
-    # Split on punctuation before quoting. Quoting a whitespace token such as
-    # `reciprocal/fusion` turns it into an FTS phrase requiring adjacent terms,
-    # while natural-language callers intend two independent search terms.
-    # ``\w`` is Unicode-aware in Python, so Korean and other non-Latin words are
-    # preserved alongside identifiers and numbers.
-    terms = re.findall(r"\w+", str(text or ""), flags=re.UNICODE)
+    terms = [term.replace('"', "") for term in text.split() if term.strip()]
     if not terms:
         return '""'
     return " OR ".join(f'"{term}"' for term in terms)

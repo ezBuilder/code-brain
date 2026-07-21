@@ -9,12 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from .portable import lock_exclusive_blocking, unlock
-from .private_write import (
-    append_private_text,
-    atomic_write_private_text,
-    private_file_lock,
-    read_root_confined_text,
-)
 from .redact import redact_value
 
 _AUDIT_THREAD_LOCK = threading.RLock()
@@ -36,37 +30,15 @@ def _unlock(handle: Any) -> None:
     unlock(handle)
 
 
-def state_root_for_path(path: Path) -> Path:
-    """Infer the project root for a lexical ``<root>/.ai/...`` state path."""
-    path = Path(path)
-    for parent in (path.parent, *path.parents):
-        if parent.name == ".ai":
-            return parent.parent
-    return path.parent
-
-
-def read_state_text(path: Path, *, max_bytes: int = 100_000_000) -> str:
-    root = state_root_for_path(path)
-    text, _state = read_root_confined_text(
-        path,
-        root=root,
-        max_bytes=max_bytes,
-        require_private=False,
-    )
-    return text
-
-
-def jsonl_lock_path(path: Path) -> Path:
-    path = Path(path)
-    return path.with_name(f".{path.name}.lock")
-
-
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
-    path = Path(path)
-    root = state_root_for_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    with private_file_lock(jsonl_lock_path(path), root=root):
-        append_private_text(path, line + "\n", root=root)
+    with path.open("a", encoding="utf-8") as handle:
+        _lock_exclusive(handle)
+        try:
+            handle.write(line + "\n")
+        finally:
+            _unlock(handle)
 
 
 def decisions_path(root: Path) -> Path:
@@ -366,13 +338,11 @@ def close_todo(
     if status not in {"done", "closed", "cancelled", "canceled"}:
         return {"ok": False, "reason": "invalid_status"}
     path = todos_path(root)
-    try:
-        text = read_state_text(path)
-    except (OSError, UnicodeDecodeError):
+    if not path.exists():
         return {"ok": False, "reason": "no_todos"}
     candidates: dict[str, dict[str, Any]] = {}
     order: list[str] = []
-    for line in text.splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -474,51 +444,35 @@ def all_audit_files(root: Path) -> list[Path]:
     list when the audit directory is missing.
     """
     d = root / ".ai" / "memory" / "audit"
-    try:
-        state = d.lstat()
-    except OSError:
+    if not d.is_dir():
         return []
-    import stat as stat_module
-
-    if not stat_module.S_ISDIR(state.st_mode) or stat_module.S_ISLNK(state.st_mode):
-        return []
-    files: list[Path] = []
-    for path in sorted(d.glob("*.jsonl")):
-        try:
-            item_state = path.lstat()
-        except OSError:
-            continue
-        if stat_module.S_ISREG(item_state.st_mode) and not stat_module.S_ISLNK(item_state.st_mode):
-            files.append(path)
-    return files
+    return sorted(d.glob("*.jsonl"))
 
 
 def append_audit(root: Path, *, action: str, category: str, payload: dict[str, Any]) -> dict[str, Any]:
     timestamp = datetime.now(timezone.utc)
     path = audit_path(root, at=timestamp)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with _AUDIT_THREAD_LOCK:
-        with private_file_lock(jsonl_lock_path(path), root=root):
+        with path.open("a+", encoding="utf-8") as handle:
+            _lock_exclusive(handle)
             try:
-                text, _state = read_root_confined_text(
-                    path,
-                    root=root,
-                    max_bytes=100_000_000,
-                    require_private=False,
-                )
-            except FileNotFoundError:
-                text = ""
-            previous_lines = [line for line in text.splitlines() if line.strip()]
-            prev_sha = line_sha(previous_lines[-1]) if previous_lines else None
-            record = {
-                "ts": timestamp.isoformat().replace("+00:00", "Z"),
-                "monotonic_ns": time.monotonic_ns(),
-                "action": action,
-                "category": category,
-                "payload": redact_value(payload),
-                "prev_sha": prev_sha,
-            }
-            line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            append_private_text(path, line + "\n", root=root)
+                handle.seek(0)
+                previous_lines = [line for line in handle.read().splitlines() if line.strip()]
+                prev_sha = line_sha(previous_lines[-1]) if previous_lines else None
+                record = {
+                    "ts": timestamp.isoformat().replace("+00:00", "Z"),
+                    "monotonic_ns": time.monotonic_ns(),
+                    "action": action,
+                    "category": category,
+                    "payload": redact_value(payload),
+                    "prev_sha": prev_sha,
+                }
+                line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                handle.seek(0, 2)
+                handle.write(line + "\n")
+            finally:
+                _unlock(handle)
     append_jsonl(
         root / ".ai" / "memory" / "audit-index.jsonl",
         {"ts": record["ts"], "category": category, "action": action, "path": path.relative_to(root).as_posix()},
@@ -530,30 +484,13 @@ def rebuild_audit_index(root: Path) -> dict[str, Any]:
     audit_root = root / ".ai" / "memory" / "audit"
     index_path = root / ".ai" / "memory" / "audit-index.jsonl"
     rows: list[dict[str, Any]] = []
-    skipped = 0
-    for path in all_audit_files(root):
+    for path in sorted(audit_root.glob("*.jsonl")):
         rel = path.relative_to(root).as_posix()
-        try:
-            with private_file_lock(jsonl_lock_path(path), root=root):
-                text, _state = read_root_confined_text(
-                    path,
-                    root=root,
-                    max_bytes=100_000_000,
-                    require_private=False,
-                )
-        except (OSError, UnicodeDecodeError):
-            skipped += 1
-            continue
-        for line in text.splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                skipped += 1
-                continue
+            record = json.loads(line)
             if not isinstance(record, dict):
-                skipped += 1
                 continue
             rows.append(
                 {
@@ -563,24 +500,17 @@ def rebuild_audit_index(root: Path) -> dict[str, Any]:
                     "path": rel,
                 }
             )
+    index_path.parent.mkdir(parents=True, exist_ok=True)
     text = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for row in rows)
-    with private_file_lock(jsonl_lock_path(index_path), root=root):
-        atomic_write_private_text(index_path, text, root=root)
-    result: dict[str, Any] = {
-        "ok": True,
-        "path": index_path.relative_to(root).as_posix(),
-        "indexed": len(rows),
-    }
-    if skipped:
-        result["skipped"] = skipped
-    return result
+    index_path.write_text(text, encoding="utf-8")
+    return {"ok": True, "path": index_path.relative_to(root).as_posix(), "indexed": len(rows)}
 
 
 def read_jsonl_tail(path: Path, limit: int) -> list[dict[str, Any]]:
-    if limit <= 0:
+    if not path.exists() or limit <= 0:
         return []
     try:
-        lines = read_state_text(path).splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return []
     out: list[dict[str, Any]] = []
@@ -598,10 +528,10 @@ def read_jsonl_tail(path: Path, limit: int) -> list[dict[str, Any]]:
 
 
 def read_jsonl_open_todos(path: Path, limit: int) -> list[dict[str, Any]]:
-    if limit <= 0:
+    if not path.exists() or limit <= 0:
         return []
     try:
-        lines = read_state_text(path).splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return []
     latest: dict[str, dict[str, Any]] = {}
@@ -639,8 +569,10 @@ def read_jsonl_open_todos(path: Path, limit: int) -> list[dict[str, Any]]:
 
 
 def read_jsonl_all(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
     try:
-        lines = read_state_text(path).splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return []
     out: list[dict[str, Any]] = []
@@ -658,10 +590,10 @@ def read_jsonl_all(path: Path) -> list[dict[str, Any]]:
 
 
 def read_text_tail(path: Path, lines: int) -> str:
-    if lines <= 0:
+    if not path.exists() or lines <= 0:
         return ""
     try:
-        text = read_state_text(path)
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return ""
     tail = text.rstrip().splitlines()[-lines:]
@@ -676,75 +608,53 @@ def rotate_jsonl_tail(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Keep the newest JSONL tail within both a line and byte budget."""
-    path = Path(path)
-    root = state_root_for_path(path)
     rel = path.as_posix()
     try:
-        text, state = read_root_confined_text(
-            path,
-            root=root,
-            max_bytes=max(100_000_000, int(max_bytes) * 8),
-            require_private=False,
-        )
-        before = int(state.st_size)
-    except FileNotFoundError:
+        before = path.stat().st_size
+    except OSError:
         return {"ok": True, "path": rel, "exists": False, "rotated": False, "bytes_before": 0, "bytes_after": 0}
-    except (OSError, UnicodeDecodeError) as exc:
-        return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": str(exc)}
     if before <= max_bytes:
         return {"ok": True, "path": rel, "exists": True, "rotated": False, "bytes_before": before, "bytes_after": before}
 
     try:
-        with private_file_lock(jsonl_lock_path(path), root=root):
-            # Re-read under the same lock used by append_jsonl so concurrent
-            # appends cannot be lost between the size check and replacement.
-            text, state = read_root_confined_text(
-                path,
-                root=root,
-                max_bytes=max(100_000_000, int(max_bytes) * 8),
-                require_private=False,
-            )
-            before = int(state.st_size)
-            if before <= max_bytes:
+        with path.open("r+", encoding="utf-8") as handle:
+            _lock_exclusive(handle)
+            try:
+                lines = handle.read().splitlines()
+                tail = lines[-max(1, int(keep_lines)):]
+                kept_reversed: list[str] = []
+                total = 0
+                for line in reversed(tail):
+                    line_bytes = len((line + "\n").encode("utf-8"))
+                    if kept_reversed and total + line_bytes > max_bytes:
+                        break
+                    kept_reversed.append(line)
+                    total += line_bytes
+                    if total >= max_bytes:
+                        break
+                if not kept_reversed and tail:
+                    kept_reversed.append(tail[-1])
+                    total = len((tail[-1] + "\n").encode("utf-8"))
+                kept = list(reversed(kept_reversed))
+                after = total if kept else 0
+                if not dry_run:
+                    handle.seek(0)
+                    handle.write(("\n".join(kept) + "\n") if kept else "")
+                    handle.truncate()
+                    after = path.stat().st_size
                 return {
                     "ok": True,
                     "path": rel,
                     "exists": True,
-                    "rotated": False,
+                    "rotated": True,
+                    "dry_run": dry_run,
                     "bytes_before": before,
-                    "bytes_after": before,
+                    "bytes_after": after,
+                    "lines_before": len(lines),
+                    "lines_after": len(kept),
                 }
-            lines = text.splitlines()
-            tail = lines[-max(1, int(keep_lines)):]
-            kept_reversed: list[str] = []
-            total = 0
-            for line in reversed(tail):
-                line_bytes = len((line + "\n").encode("utf-8"))
-                if kept_reversed and total + line_bytes > max_bytes:
-                    break
-                kept_reversed.append(line)
-                total += line_bytes
-                if total >= max_bytes:
-                    break
-            if not kept_reversed and tail:
-                kept_reversed.append(tail[-1])
-                total = len((tail[-1] + "\n").encode("utf-8"))
-            kept = list(reversed(kept_reversed))
-            replacement = ("\n".join(kept) + "\n") if kept else ""
-            after = len(replacement.encode("utf-8"))
-            if not dry_run:
-                atomic_write_private_text(path, replacement, root=root)
-            return {
-                "ok": True,
-                "path": rel,
-                "exists": True,
-                "rotated": True,
-                "dry_run": dry_run,
-                "bytes_before": before,
-                "bytes_after": after,
-                "lines_before": len(lines),
-                "lines_after": len(kept),
-            }
+            finally:
+                _unlock(handle)
     except OSError as exc:
         return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": str(exc)}
 

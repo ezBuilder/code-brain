@@ -15,8 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .private_write import atomic_write_private_text, read_root_confined_text
-
 # Default ceiling on the serialized cache so SessionStart injection stays small
 # (the "fewer tokens" win). Env-overridable. ~4 KB is well under any hook budget.
 HOT_CACHE_BYTES_DEFAULT = 4096
@@ -101,7 +99,9 @@ def write_hot_cache(
         "limit": int(limit),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_private_text(path, json.dumps(payload, ensure_ascii=False), root=root)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
     return payload
 
 
@@ -116,17 +116,13 @@ def read_hot_cache(
 
     path = hot_cache_path(root)
     try:
-        text, state = read_root_confined_text(
-            path,
-            root=root,
-            max_bytes=max(HOT_CACHE_BYTES_DEFAULT * 4, 65536),
-            require_private=True,
-        )
+        if not path.exists():
+            return None
         if max_age_seconds is not None:
-            age = time.time() - state.st_mtime
+            age = time.time() - path.stat().st_mtime
             if age > float(max_age_seconds):
                 return None
-        payload = json.loads(text)
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or not payload.get("ok"):

@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import stat
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -161,49 +158,6 @@ def test_write_snapshot_redacts_secrets(tmp_path: Path) -> None:
     assert "[REDACTED]" in raw
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
-def test_snapshot_memory_sources_never_follow_external_symlinks(tmp_path: Path) -> None:
-    mem = _memory(tmp_path)
-    external = tmp_path / "external-memory"
-    external.mkdir()
-    markers = {
-        "decisions.jsonl": '{"id":"d1","text":"EXTERNAL_DECISION"}\n',
-        "todos.jsonl": '{"id":"t1","status":"open","title":"EXTERNAL_TODO"}\n',
-        "session-current.md": "EXTERNAL_SESSION_TAIL\n",
-        "audit.jsonl": '{"action":"EXTERNAL_AUDIT"}\n',
-    }
-    for name, content in markers.items():
-        target = external / name
-        target.write_text(content, encoding="utf-8")
-        link = mem / name
-        link.symlink_to(target)
-
-    result = write_snapshot(tmp_path, session_id="external-memory", agent="operator")
-    raw = Path(result["path"]).read_text(encoding="utf-8")
-
-    for marker in (
-        "EXTERNAL_DECISION",
-        "EXTERNAL_TODO",
-        "EXTERNAL_SESSION_TAIL",
-        "EXTERNAL_AUDIT",
-    ):
-        assert marker not in raw
-
-
-@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")
-def test_snapshot_memory_sources_never_read_external_hardlinks(tmp_path: Path) -> None:
-    mem = _memory(tmp_path)
-    external = tmp_path / "external-decisions.jsonl"
-    external.write_text('{"id":"d1","text":"EXTERNAL_HARDLINK"}\n', encoding="utf-8")
-    linked = mem / "decisions.jsonl"
-    os.link(external, linked)
-
-    result = write_snapshot(tmp_path, session_id="hardlinked-memory", agent="operator")
-    raw = Path(result["path"]).read_text(encoding="utf-8")
-
-    assert "EXTERNAL_HARDLINK" not in raw
-
-
 def test_write_snapshot_atomic_no_partial(tmp_path: Path) -> None:
     _memory(tmp_path)
     write_snapshot(tmp_path, session_id="atomic", agent="claude")
@@ -212,37 +166,6 @@ def test_write_snapshot_atomic_no_partial(tmp_path: Path) -> None:
     assert not (session_dir / "resume.json.tmp").exists()
     contents = sorted(p.name for p in session_dir.iterdir())
     assert contents == ["resume.json"]
-
-
-def test_write_snapshot_maps_unsafe_session_id_to_confined_directory(tmp_path: Path) -> None:
-    _memory(tmp_path)
-    unsafe = "../../outside;rm -rf"
-
-    result = write_snapshot(tmp_path, session_id=unsafe, agent="claude")
-
-    path = Path(result["path"])
-    sessions = (tmp_path / ".ai" / "memory" / "sessions").resolve()
-    path.resolve().relative_to(sessions)
-    assert path.parent.name.startswith("sid-")
-    assert path.parent.name != unsafe
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["session_id"] == unsafe
-    assert payload["resume_hint"] == "claude --resume"
-    assert not (tmp_path.parent / "outside;rm -rf").exists()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Unix directory symlink semantics")
-def test_write_snapshot_rejects_external_sessions_parent_symlink(tmp_path: Path) -> None:
-    external = tmp_path.parent / (tmp_path.name + "-session-target")
-    external.mkdir()
-    sessions = tmp_path / ".ai" / "memory" / "sessions"
-    sessions.parent.mkdir(parents=True)
-    sessions.symlink_to(external, target_is_directory=True)
-
-    with pytest.raises(OSError, match="escapes project root"):
-        write_snapshot(tmp_path, session_id="safe", agent="operator")
-
-    assert not (external / "safe").exists()
 
 
 def test_read_latest_snapshot_returns_newest(tmp_path: Path) -> None:
@@ -326,32 +249,6 @@ def test_handoff_partial_update_and_clear(tmp_path: Path) -> None:
     assert not read_handoff(tmp_path).get("goal")
 
 
-def test_concurrent_handoff_partial_updates_preserve_distinct_fields(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from ai_core.session_resume import read_handoff, write_handoff
-
-    monkeypatch.setenv("AI_MACHINE_LABEL", "test-machine")
-
-    def write_goal() -> None:
-        write_handoff(tmp_path, goal="concurrent goal", agent="goal-agent")
-
-    def write_next() -> None:
-        write_handoff(tmp_path, next_step="concurrent next", agent="next-agent")
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        goal_future = pool.submit(write_goal)
-        next_future = pool.submit(write_next)
-        goal_future.result()
-        next_future.result()
-
-    handoff = read_handoff(tmp_path)
-    assert handoff["goal"] == "concurrent goal"
-    assert handoff["next_step"] == "concurrent next"
-    assert handoff["machine_id"] == "test-machine"
-
-
 def test_handoff_survives_size_cap(tmp_path: Path, monkeypatch) -> None:
     import ai_core.session_resume as sr
 
@@ -396,7 +293,7 @@ def test_budget_shrink_preserves_handoff_rubric_verdict_blockers() -> None:
         "todos_open": [{"title": "drop " + "c" * 200}],
     }
 
-    shrunk = sr._shrink_to_fit(payload, 256)
+    shrunk = sr._shrink_to_fit(payload, 80)
 
     assert shrunk["handoff"]["goal"] == "keep handoff"
     assert shrunk["rubric"] == "keep rubric"
@@ -405,55 +302,6 @@ def test_budget_shrink_preserves_handoff_rubric_verdict_blockers() -> None:
     assert "audit_tail_actions" not in shrunk
     assert "session_tail" not in shrunk
     assert "todos_open" not in shrunk
-    assert sr._payload_size(shrunk) <= 256
-
-
-def test_budget_shrink_compacts_oversized_protected_values_to_hard_cap() -> None:
-    import ai_core.session_resume as sr
-
-    payload = {
-        "schema_version": 1,
-        "session_id": "safe",
-        "written_at": "2026-07-20T00:00:00Z",
-        "handoff": {"goal": "g" * 20_000, "next_step": "n" * 20_000},
-        "rubric": "r" * 20_000,
-        "verdict": "v" * 20_000,
-        "blockers": ["b" * 20_000],
-    }
-
-    shrunk = sr._shrink_to_fit(payload, 512)
-
-    assert sr._payload_size(shrunk) <= 512
-    assert {"handoff", "rubric", "verdict", "blockers"}.issubset(shrunk)
-
-
-def test_write_snapshot_hard_caps_extreme_session_id(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ai_core.session_resume as sr
-
-    _memory(tmp_path)
-    monkeypatch.setattr(sr, "RESUME_MAX_BYTES", 512)
-    raw_session_id = "세션" * 50_000
-
-    result = sr.write_snapshot(
-        tmp_path,
-        session_id=raw_session_id,
-        agent="claude" * 1000,
-    )
-    path = Path(result["path"])
-    raw = path.read_bytes()
-    payload = json.loads(raw)
-
-    assert len(raw) <= 512
-    assert result["bytes_written"] == len(raw)
-    assert payload["session_id"] != raw_session_id
-    assert payload["session_id_sha256"] == hashlib.sha256(
-        raw_session_id.encode("utf-8")
-    ).hexdigest()
-    assert payload["session_id_truncated"] is True
-    assert len(payload.get("agent", "")) <= 64
 
 
 def test_handoff_fallback_from_open_todo(tmp_path: Path) -> None:
@@ -470,60 +318,6 @@ def test_machine_id_stable_and_resume_hints(tmp_path: Path) -> None:
 
     first = machine_id(tmp_path)
     assert first and machine_id(tmp_path) == first  # cached/stable
-    cache = tmp_path / ".ai" / "cache" / "machine_id"
-    if os.name != "nt":
-        assert stat.S_IMODE(cache.stat().st_mode) == 0o600
     assert _resume_hint("claude", "S1") == "claude --resume S1"
     assert _resume_hint("antigravity", "C9") == "agy --conversation=C9"
     assert _resume_hint("codex", "anything") == "codex resume"
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
-def test_machine_id_replaces_external_symlink_without_touching_target(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from ai_core.session_resume import machine_id
-
-    external = tmp_path / "external-machine-id"
-    external.write_text("external-id", encoding="utf-8")
-    cache = tmp_path / ".ai" / "cache" / "machine_id"
-    cache.parent.mkdir(parents=True)
-    cache.symlink_to(external)
-    monkeypatch.setenv("AI_MACHINE_LABEL", "safe-local")
-
-    result = machine_id(tmp_path)
-
-    assert result == "safe-local"
-    assert not cache.is_symlink()
-    assert cache.read_text(encoding="utf-8") == "safe-local"
-    assert external.read_text(encoding="utf-8") == "external-id"
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Unix mode semantics")
-def test_machine_id_ignores_public_cache_and_rewrites_private(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from ai_core.session_resume import machine_id
-
-    cache = tmp_path / ".ai" / "cache" / "machine_id"
-    cache.parent.mkdir(parents=True)
-    cache.write_text("untrusted-id", encoding="utf-8")
-    cache.chmod(0o644)
-    monkeypatch.setenv("AI_MACHINE_LABEL", "trusted-id")
-
-    assert machine_id(tmp_path) == "trusted-id"
-    assert cache.read_text(encoding="utf-8") == "trusted-id"
-    assert stat.S_IMODE(cache.stat().st_mode) == 0o600
-
-
-def test_machine_id_concurrent_first_use_returns_one_stable_value(tmp_path: Path) -> None:
-    from ai_core.session_resume import machine_id
-
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        values = list(pool.map(lambda _index: machine_id(tmp_path), range(64)))
-
-    assert len(set(values)) == 1
-    assert values[0].startswith("cb-")
-    assert machine_id(tmp_path) == values[0]

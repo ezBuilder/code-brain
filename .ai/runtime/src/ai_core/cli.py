@@ -515,26 +515,6 @@ def build_parser() -> argparse.ArgumentParser:
     exec_run = exec_sub.add_parser("run")
     exec_run.add_argument("--cwd")
     exec_run.add_argument("--timeout", type=int, default=30)
-    exec_run.add_argument(
-        "--isolate-network",
-        action="store_true",
-        dest="isolate_network",
-        help="deny IP network/DNS access; fail closed when the platform sandbox is unavailable",
-    )
-    exec_run.add_argument(
-        "--isolate-env",
-        action="store_true",
-        dest="isolate_env",
-        help="replace the child environment with a minimal non-secret allowlist",
-    )
-    exec_run.add_argument(
-        "--extra-env",
-        action="append",
-        default=[],
-        dest="extra_env_vars",
-        metavar="NAME",
-        help="allow one additional non-secret environment variable when --isolate-env is set; repeatable",
-    )
     exec_run.add_argument("--json", action="store_true", dest="command_json")
     exec_run.add_argument("argv", nargs=argparse.REMAINDER, help="command and arguments after --")
     exec_fetch = exec_sub.add_parser("fetch")
@@ -764,16 +744,6 @@ def build_parser() -> argparse.ArgumentParser:
     session_start.add_argument("--rebuild", choices=["auto", "always", "never"], default="auto")
     session_start.add_argument("--dry-run", action="store_true")
     session_start.add_argument("--strict", action="store_true")
-    session_start.add_argument(
-        "--repair-audit-index",
-        action="store_true",
-        help="rebuild the audit summary index before SessionStart and doctor checks",
-    )
-    session_start.add_argument(
-        "--render-manifest",
-        action="store_true",
-        help="render the generated manifest before SessionStart and doctor checks",
-    )
     session_start.add_argument("--query")
     session_start.add_argument("--limit", type=int, default=5)
     session_start.add_argument("--mode", choices=["high_fidelity", "balanced", "aggressive"], default="balanced")
@@ -1690,23 +1660,11 @@ def main(argv: list[str] | None = None) -> int:
                 if argv and argv[0] == "--":
                     argv = argv[1:]
                 if not argv:
-                    print(
-                        "usage: ai exec run [--cwd PATH] [--timeout N] [--isolate-network] "
-                        "[--isolate-env] [--extra-env NAME] -- COMMAND [ARGS...]",
-                        file=sys.stderr,
-                    )
+                    print("usage: ai exec run [--cwd PATH] [--timeout N] -- COMMAND [ARGS...]", file=sys.stderr)
                     return GENERIC_ERROR
-                payload = sandbox_execute(
-                    root,
-                    command=argv,
-                    cwd=args.cwd,
-                    timeout=args.timeout,
-                    isolate_network=bool(args.isolate_network),
-                    isolate_env=bool(args.isolate_env),
-                    extra_env_vars=list(args.extra_env_vars or []),
-                )
+                payload = sandbox_execute(root, command=argv, cwd=args.cwd, timeout=args.timeout)
                 emit(payload, as_json=as_json)
-                return OK if payload.get("ok") else GENERIC_ERROR
+                return OK
             if args.exec_command == "fetch":
                 payload = sandbox_fetch(
                     root,
@@ -1849,8 +1807,6 @@ def main(argv: list[str] | None = None) -> int:
                 rebuild_mode=args.rebuild,
                 dry_run=args.dry_run,
                 strict=args.strict,
-                repair_audit_index=args.repair_audit_index,
-                render_manifest=args.render_manifest,
                 query_text=args.query,
                 limit=args.limit,
                 context_budget_mode=args.mode,

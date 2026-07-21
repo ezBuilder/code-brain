@@ -23,7 +23,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from ai_core import audit_fold
 from ai_core.audit_fold import fold_old_entries
+from ai_core.doctor import check_audit_chain, check_audit_index
 
 
 @pytest.fixture
@@ -314,3 +316,100 @@ class TestDisabledFolding:
 
         # File unchanged
         assert audit_file.read_text(encoding="utf-8") == original
+
+
+class TestStreamingAndAtomicity:
+    def test_fold_streams_without_path_read_text(
+        self,
+        audit_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        audit_file = audit_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+        original_read_text = Path.read_text
+        audit_file.write_text(
+            _make_audit_entry("old.action", _past_iso(40))
+            + "\n"
+            + _make_audit_entry("recent.action", _now_iso())
+            + "\n",
+            encoding="utf-8",
+        )
+
+        def guarded_read_text(self: Path, *args, **kwargs):
+            if self == audit_file:
+                raise AssertionError("audit folding must stream source JSONL")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+        result = fold_old_entries(audit_root, days=30)
+
+        assert result["ok"] is True
+        assert result["removed_entries"] == 1
+        content = original_read_text(audit_file, encoding="utf-8")
+        assert "recent.action" in content
+        assert '"action":"_folded"' in content
+
+    def test_fold_rechains_and_rebuilds_index(self, audit_root: Path) -> None:
+        audit_file = audit_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+        audit_file.write_text(
+            _make_audit_entry("old.action", _past_iso(40))
+            + "\n"
+            + _make_audit_entry("recent.action", _now_iso())
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = fold_old_entries(audit_root, days=30)
+
+        assert result["ok"] is True
+        assert result["audit_index"]["ok"] is True
+        assert check_audit_chain(audit_root).ok is True
+        assert check_audit_index(audit_root).ok is True
+        records = [json.loads(line) for line in audit_file.read_text(encoding="utf-8").splitlines()]
+        assert all("prev_sha" in record for record in records)
+
+    def test_fold_oversized_source_line_fails_without_mutation(
+        self,
+        audit_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        audit_file = audit_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+        original = (
+            json.dumps(
+                {
+                    "ts": _past_iso(40),
+                    "action": "old.action",
+                    "category": "test",
+                    "payload": {"blob": "x" * 4096},
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        audit_file.write_bytes(original)
+        monkeypatch.setattr(audit_fold, "AUDIT_LINE_MAX_BYTES", 256)
+
+        result = fold_old_entries(audit_root, days=30)
+
+        assert result["ok"] is False
+        assert "audit line exceeds" in result["errors"][0]
+        assert audit_file.read_bytes() == original
+
+    def test_fold_output_limit_preserves_previous_file(
+        self,
+        audit_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        audit_file = audit_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+        original = (_make_audit_entry("old.action", _past_iso(40)) + "\n").encode("utf-8")
+        audit_file.write_bytes(original)
+        monkeypatch.setattr(audit_fold, "AUDIT_MAX_BYTES", len(original) + 8)
+
+        result = fold_old_entries(audit_root, days=30)
+
+        assert result["ok"] is False
+        assert "private write exceeds" in result["errors"][0]
+        assert result["removed_entries"] == 0
+        assert audit_file.read_bytes() == original
+        assert list(audit_file.parent.glob(f".{audit_file.name}.*.tmp")) == []

@@ -8,13 +8,23 @@ into one fold record per day, preserving action counts and metadata.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from .memory import all_audit_files
+from .memory import (
+    AUDIT_LINE_MAX_BYTES,
+    AUDIT_MAX_BYTES,
+    _chained_line,
+    all_audit_files,
+    jsonl_lock_path,
+    rebuild_audit_index,
+)
+from .private_write import (
+    atomic_write_private_lines,
+    open_root_confined_binary,
+    private_file_lock,
+)
 
 
 def _parse_ts(ts_str: str) -> datetime | None:
@@ -29,6 +39,69 @@ def _parse_ts(ts_str: str) -> datetime | None:
 def _date_from_ts(ts: datetime) -> str:
     """Return YYYY-MM-DD string for a datetime."""
     return ts.date().isoformat()
+
+
+def _iter_audit_rows(path: Path, *, root: Path) -> Iterator[tuple[str, dict[str, Any] | None]]:
+    """Stream one bounded audit line at a time.
+
+    Invalid JSON is returned as ``None`` so callers can preserve the original
+    line. Invalid UTF-8 and oversized lines fail closed because they cannot be
+    round-tripped safely through the UTF-8 atomic writer.
+    """
+    with open_root_confined_binary(
+        path,
+        root=root,
+        max_bytes=AUDIT_MAX_BYTES,
+        require_private=False,
+    ) as (handle, _state):
+        while True:
+            raw = handle.readline(int(AUDIT_LINE_MAX_BYTES) + 1)
+            if not raw:
+                break
+            if len(raw) > int(AUDIT_LINE_MAX_BYTES):
+                while raw and not raw.endswith(b"\n"):
+                    raw = handle.readline(64 * 1024)
+                raise OSError(f"audit line exceeds {AUDIT_LINE_MAX_BYTES} bytes")
+            try:
+                line = raw.decode("utf-8", errors="strict").rstrip("\r\n")
+            except UnicodeDecodeError as exc:
+                raise OSError("audit line is not valid UTF-8") from exc
+            if not line.strip():
+                continue
+            try:
+                loaded = json.loads(line)
+            except json.JSONDecodeError:
+                yield line, None
+                continue
+            yield line, loaded if isinstance(loaded, dict) else None
+
+
+def _cold_date(entry: dict[str, Any], *, cutoff: datetime) -> str | None:
+    if entry.get("action") == "_folded":
+        return None
+    parsed = _parse_ts(entry.get("ts"))
+    if parsed is None or parsed >= cutoff:
+        return None
+    return _date_from_ts(parsed)
+
+
+def _fold_record(
+    *,
+    date_key: str,
+    summary: dict[str, Any],
+    source_path: str,
+) -> dict[str, Any]:
+    return {
+        "action": "_folded",
+        "category": "audit",
+        "payload": {
+            "date": date_key,
+            "counts": dict(summary["counts"]),
+            "total": int(summary["total"]),
+            "source_files": [source_path],
+        },
+        "ts": f"{date_key}T23:59:59Z",
+    }
 
 
 def fold_old_entries(
@@ -89,118 +162,81 @@ def fold_old_entries(
         result["ok"] = True
         return result
 
+    changed = False
     for audit_path in audit_files:
-        if not audit_path.exists():
-            continue
-
+        relative_path = audit_path.relative_to(root).as_posix()
         try:
-            entries: list[dict[str, Any]] = []
-            for line in audit_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    if not isinstance(entry, dict):
-                        entries.append(entry)
+            with private_file_lock(jsonl_lock_path(audit_path), root=root):
+                summaries: dict[str, dict[str, Any]] = {}
+                for _raw, entry in _iter_audit_rows(audit_path, root=root):
+                    if entry is None:
                         continue
-                    entries.append(entry)
-                except json.JSONDecodeError:
-                    entries.append({"_malformed": True, "_raw": line})
+                    date_key = _cold_date(entry, cutoff=cutoff)
+                    if date_key is None:
+                        continue
+                    summary = summaries.setdefault(date_key, {"counts": {}, "total": 0})
+                    action = entry.get("action")
+                    action_key = action if isinstance(action, str) and action else "_unknown"
+                    counts = summary["counts"]
+                    counts[action_key] = int(counts.get(action_key, 0)) + 1
+                    summary["total"] = int(summary["total"]) + 1
 
-            # Partition into cold and recent
-            cold_entries: dict[str, list[dict[str, Any]]] = {}
-            recent_entries: list[dict[str, Any]] = []
-
-            for entry in entries:
-                if entry.get("_malformed"):
-                    recent_entries.append(entry)
+                if not summaries:
                     continue
 
-                ts_str = entry.get("ts")
-                ts = _parse_ts(ts_str)
-
-                # Skip entries already folded (idempotent)
-                if entry.get("action") == "_folded":
-                    recent_entries.append(entry)
+                removed_for_file = sum(int(item["total"]) for item in summaries.values())
+                folded_for_file = len(summaries)
+                if dry_run:
+                    result["folded_days"] += folded_for_file
+                    result["removed_entries"] += removed_for_file
+                    result["added_fold_records"] += folded_for_file
+                    result["files_touched"].append(f"{relative_path} (dry_run)")
                     continue
 
-                if ts and ts < cutoff:
-                    date_key = _date_from_ts(ts)
-                    if date_key not in cold_entries:
-                        cold_entries[date_key] = []
-                    cold_entries[date_key].append(entry)
-                else:
-                    recent_entries.append(entry)
+                def output_lines() -> Iterator[str]:
+                    previous_line: str | None = None
+                    for raw, entry in _iter_audit_rows(audit_path, root=root):
+                        if entry is not None and _cold_date(entry, cutoff=cutoff) is not None:
+                            continue
+                        if entry is None:
+                            rendered = raw
+                        else:
+                            rendered = _chained_line(entry, previous_line)
+                        yield rendered + "\n"
+                        previous_line = rendered
+                    for date_key in sorted(summaries):
+                        rendered = _chained_line(
+                            _fold_record(
+                                date_key=date_key,
+                                summary=summaries[date_key],
+                                source_path=relative_path,
+                            ),
+                            previous_line,
+                        )
+                        yield rendered + "\n"
+                        previous_line = rendered
 
-            if not cold_entries:
-                continue
+                atomic_write_private_lines(
+                    audit_path,
+                    output_lines(),
+                    root=root,
+                    max_bytes=AUDIT_MAX_BYTES,
+                )
+                result["folded_days"] += folded_for_file
+                result["removed_entries"] += removed_for_file
+                result["added_fold_records"] += folded_for_file
+                result["files_touched"].append(relative_path)
+                changed = True
+        except OSError as exc:
+            result["errors"].append(f"{relative_path}: {exc}")
 
-            # Build fold records
-            fold_records: list[dict[str, Any]] = []
-            for date_key in sorted(cold_entries.keys()):
-                old_entries = cold_entries[date_key]
-                action_counts: dict[str, int] = {}
-                for entry in old_entries:
-                    action = entry.get("action", "_unknown")
-                    action_counts[action] = action_counts.get(action, 0) + 1
-
-                fold_record = {
-                    "action": "_folded",
-                    "payload": {
-                        "date": date_key,
-                        "counts": action_counts,
-                        "total": len(old_entries),
-                        "source_files": [audit_path.relative_to(root).as_posix()],
-                    },
-                    "ts": f"{date_key}T23:59:59Z",
-                }
-                fold_records.append(fold_record)
-                result["folded_days"] += 1
-                result["removed_entries"] += len(old_entries)
-                result["added_fold_records"] += 1
-
-            if not dry_run:
-                # Write atomically: temp file, then replace
-                try:
-                    temp_fd, temp_path = tempfile.mkstemp(
-                        suffix=".jsonl",
-                        dir=audit_path.parent,
-                        text=True,
-                    )
-                    with os.fdopen(temp_fd, "w", encoding="utf-8") as tmp:
-                        for entry in recent_entries:
-                            if entry.get("_malformed"):
-                                # Preserve malformed lines as-is
-                                tmp.write(entry.get("_raw", "") + "\n")
-                            else:
-                                line = json.dumps(
-                                    entry,
-                                    ensure_ascii=False,
-                                    sort_keys=True,
-                                    separators=(",", ":"),
-                                )
-                                tmp.write(line + "\n")
-                        for fold in fold_records:
-                            line = json.dumps(
-                                fold,
-                                ensure_ascii=False,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            )
-                            tmp.write(line + "\n")
-
-                    os.replace(temp_path, audit_path)
-                    result["files_touched"].append(audit_path.relative_to(root).as_posix())
-                except OSError as e:
-                    result["errors"].append(f"{audit_path.relative_to(root).as_posix()}: {e}")
-            else:
-                # dry_run: just count, no writes
-                result["files_touched"].append(f"{audit_path.relative_to(root).as_posix()} (dry_run)")
-
-        except OSError as e:
-            result["errors"].append(f"{audit_path.relative_to(root).as_posix()}: {e}")
-            continue
+    if changed:
+        index_result = rebuild_audit_index(root)
+        result["audit_index"] = index_result
+        if not index_result.get("ok"):
+            result["errors"].append(
+                f"audit-index: {index_result.get('error', 'rebuild failed')}"
+            )
 
     result["ok"] = not bool(result["errors"])
     return result

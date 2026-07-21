@@ -90,6 +90,23 @@ def test_record_turn_never_raises(tmp_path: Path) -> None:
     assert pg.evaluate_and_grow(tmp_path / "nope")["ok"] in {True, False}
 
 
+def test_recent_observations_use_bounded_tail_reader(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _seed(tmp_path)
+    calls: list[tuple[Path, int]] = []
+
+    def fake_tail(path: Path, limit: int):
+        calls.append((path, limit))
+        return [{"output_chars": 1}, {"output_chars": 2}]
+
+    monkeypatch.setattr(pg, "read_jsonl_tail", fake_tail)
+
+    assert pg._recent(root, 2) == [{"output_chars": 1}, {"output_chars": 2}]
+    assert calls == [(pg.log_path(root), 2)]
+
+
 def test_prompt_growth_log_rotates_by_bytes(tmp_path: Path, monkeypatch) -> None:
     root = _seed(tmp_path)
     monkeypatch.setattr(pg, "PROMPT_GROWTH_MAX_BYTES", 700)

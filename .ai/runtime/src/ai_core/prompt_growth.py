@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .memory import append_audit, append_jsonl, now_iso, read_jsonl_all, rotate_jsonl_tail
+from .memory import append_audit, append_jsonl, now_iso, read_jsonl_tail, rotate_jsonl_tail
 
 
 _ALLOWED_RULE_SOURCES = frozenset({
@@ -146,7 +146,7 @@ def record_turn(root: Path, *, output_chars: int, agent: str = "claude") -> None
 
 def _recent(root: Path, n: int) -> list[dict[str, Any]]:
     try:
-        return read_jsonl_all(log_path(root))[-n:]
+        return read_jsonl_tail(log_path(root), max(0, int(n)))
     except Exception:
         return []
 

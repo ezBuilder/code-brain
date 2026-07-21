@@ -16,7 +16,7 @@ from .obs import diagnostics, health_summary, metrics, prune_diagnostics, search
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, MANIFEST_DRIFT, OK, PERMISSION_DENIED, PolicyDenied, WORKER_UNAVAILABLE, reject_ci_write
 from .render import render
-from .search import context_pack, query, rebuild
+from .search import context_pack, index_control_status, query, rebuild
 from .secrets_store import status as secrets_status
 from .trust import init_machine, list_machines, revoke_machine
 
@@ -311,6 +311,12 @@ def build_parser() -> argparse.ArgumentParser:
     obs_log.add_argument("--event", required=True)
     obs_log.add_argument("--json", action="store_true", dest="command_json")
     obs_metrics = obs_sub.add_parser("metrics")
+    obs_metrics.add_argument(
+        "--skip-usage",
+        action="store_true",
+        dest="skip_usage",
+        help="skip external Claude/Codex transcript scans for lightweight health checks",
+    )
     obs_metrics.add_argument("--json", action="store_true", dest="command_json")
     obs_search = obs_sub.add_parser("search")
     obs_search.add_argument("--query")
@@ -339,6 +345,12 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostics_sub = diagnostics_parser.add_subparsers(dest="diagnostics_command", required=True)
     diagnostics_bundle = diagnostics_sub.add_parser("bundle")
     diagnostics_bundle.add_argument("--dry-run", action="store_true")
+    diagnostics_bundle.add_argument(
+        "--skip-usage",
+        action="store_true",
+        dest="skip_usage",
+        help="omit external Claude/Codex transcript usage from the bundle",
+    )
     diagnostics_bundle.add_argument("--json", action="store_true", dest="command_json")
     diagnostics_prune = diagnostics_sub.add_parser("prune")
     diagnostics_prune.add_argument("--keep-days", type=int, default=30)
@@ -551,8 +563,20 @@ def build_parser() -> argparse.ArgumentParser:
     exec_prune.add_argument("--json", action="store_true", dest="command_json")
     index = sub.add_parser("index")
     index_sub = index.add_subparsers(dest="index_command", required=True)
+    index_status_parser = index_sub.add_parser("status")
+    index_status_parser.add_argument("--json", action="store_true", dest="command_json")
     index_rebuild = index_sub.add_parser("rebuild")
     index_rebuild.add_argument("--json", action="store_true", dest="command_json")
+    index_rebuild.add_argument(
+        "--force",
+        action="store_true",
+        help="override search.indexing.enabled=false for this explicit rebuild only",
+    )
+    index_rebuild.add_argument(
+        "--max-seconds",
+        type=int,
+        help="override the bounded rebuild wall-clock limit for this invocation",
+    )
     index_rebuild.add_argument(
         "--single-flight",
         action="store_true",
@@ -799,10 +823,12 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report")
     report_sub = report.add_subparsers(dest="report_command", required=True)
     report_status = report_sub.add_parser("status")
+    report_status.add_argument("--skip-usage", action="store_true")
     report_status.add_argument("--json", action="store_true", dest="command_json")
     report_sub.add_parser("release-notes")
     report_summary = report_sub.add_parser("release-gate-summary")
     report_summary.add_argument("--git-sha")
+    report_summary.add_argument("--skip-usage", action="store_true")
     report_summary.add_argument("--json", action="store_true", dest="command_json")
     return parser
 
@@ -1247,7 +1273,7 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK
         if args.command == "obs" and args.obs_command == "metrics":
-            payload = metrics(root)
+            payload = metrics(root, include_usage=not bool(getattr(args, "skip_usage", False)))
             emit(payload, as_json=as_json)
             return OK
         if args.command == "obs" and args.obs_command == "search":
@@ -1294,7 +1320,11 @@ def main(argv: list[str] | None = None) -> int:
             return OK
         if args.command == "diagnostics" and args.diagnostics_command == "bundle":
             reject_ci_write("diagnostics_write", dry_run=args.dry_run)
-            payload = diagnostics(root, dry_run=args.dry_run)
+            payload = diagnostics(
+                root,
+                dry_run=args.dry_run,
+                include_usage=not bool(getattr(args, "skip_usage", False)),
+            )
             emit(payload, as_json=as_json)
             return OK
         if args.command == "diagnostics" and args.diagnostics_command == "prune":
@@ -1521,15 +1551,21 @@ def main(argv: list[str] | None = None) -> int:
             payload = repair_audit_chain(root, year=args.year)
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "index" and args.index_command == "status":
+            payload = index_control_status(root)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "index" and args.index_command == "rebuild":
             reject_ci_write("index")
             payload = rebuild(
                 root,
                 single_flight=getattr(args, "single_flight", False),
                 incremental=getattr(args, "incremental", False),
+                force=getattr(args, "force", False),
+                max_seconds=getattr(args, "max_seconds", None),
             )
             emit(payload, as_json=as_json)
-            return OK
+            return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "recommend" and args.recommend_command == "skills":
             from .recommend import accept as rec_accept_fn, recommend as rec_run, reject as rec_reject_fn
             sub_cmd = getattr(args, "recommend_skills_command", None)
@@ -1706,7 +1742,10 @@ def main(argv: list[str] | None = None) -> int:
                     extra_env_vars=list(args.extra_env_vars or []),
                 )
                 emit(payload, as_json=as_json)
-                return OK if payload.get("ok") else GENERIC_ERROR
+                command_ok = payload.get("command_ok")
+                if command_ok is None:
+                    command_ok = payload.get("exit_code") == 0
+                return OK if payload.get("ok") and command_ok else GENERIC_ERROR
             if args.exec_command == "fetch":
                 payload = sandbox_fetch(
                     root,
@@ -1893,7 +1932,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "report" and args.report_command == "status":
             from .report import status_exit_ok, status_report
 
-            payload = status_report(root)
+            payload = status_report(root, include_usage=not args.skip_usage)
             emit(payload, as_json=as_json)
             return OK if status_exit_ok(payload) else GENERIC_ERROR
         if args.command == "report" and args.report_command == "release-notes":
@@ -1904,7 +1943,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "report" and args.report_command == "release-gate-summary":
             from .report import release_gate_summary
 
-            payload = release_gate_summary(root, git_sha=args.git_sha)
+            payload = release_gate_summary(root, git_sha=args.git_sha, include_usage=not args.skip_usage)
             emit(payload, as_json=True)
             return OK
     except PolicyDenied as exc:

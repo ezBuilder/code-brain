@@ -185,7 +185,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "sandbox_execute",
-        "description": "Run a shell command with compact output in the sandbox; 요약+exec_id를 반환하고 전체 출력은 디스크에 저장. 쓰기성. command는 argv 배열 또는 단일 셸 문자열 모두 허용한다. isolate_network는 IP/DNS를 차단하고 제공 불가 시 fail-closed, isolate_env는 자격증명 환경을 제거한다. 두 옵션은 독립적이며 강한 실행에는 함께 사용한다.",
+        "description": "Run a shell command in the sandbox with stdout/stderr streamed to disk instead of retained unbounded in RAM. Returns compact bounded output, exec_id, command_ok, peak_rss_kib, and structured termination evidence (including SIGKILL/OOM vs external execution-limit classification). 쓰기성. command는 argv 배열 또는 단일 셸 문자열 모두 허용한다. isolate_network는 IP/DNS를 차단하고 제공 불가 시 fail-closed, isolate_env는 자격증명 환경을 제거한다. 두 옵션은 독립적이며 강한 실행에는 함께 사용한다.",
         "inputSchema": {
             "type": "object",
             "properties": {

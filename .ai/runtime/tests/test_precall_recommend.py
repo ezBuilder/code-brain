@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
+from ai_core import precall_recommend  # noqa: E402
 from ai_core.precall_recommend import (  # noqa: E402
     accept,
     activate,
@@ -24,7 +26,10 @@ from ai_core.precall_recommend import (  # noqa: E402
     recommend,
     reject,
     _candidate_id,
+    _extract_claude_transcript_bash,
+    _extract_codex_transcript_bash,
 )
+from ai_core.portable import hyphen_encode_path  # noqa: E402
 from ai_core.precall import evaluate  # noqa: E402
 from ai_core.memory import append_audit, append_event  # noqa: E402
 
@@ -243,3 +248,104 @@ def test_list_visible_includes_all_states(tmp_root: Path):
     visible = list_visible(tmp_root)
     statuses = {v["status"] for v in visible}
     assert "dry_run" in statuses
+
+
+def _write_claude_bash_transcript(
+    home: Path,
+    root: Path,
+    commands: list[str],
+) -> Path:
+    path = home / "projects" / hyphen_encode_path(str(root)) / "session.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "input": {"command": command},
+                        }
+                        for command in commands
+                    ]
+                }
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_claude_transcript_extraction_streams_without_path_read_text(
+    tmp_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "claude"
+    transcript = _write_claude_bash_transcript(home, tmp_root, ["pytest -q"])
+    original_read_text = Path.read_text
+
+    def guarded_read_text(self: Path, *args, **kwargs):
+        if self == transcript:
+            raise AssertionError("precall transcript extraction must stream")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    assert _extract_claude_transcript_bash(tmp_root, home=home) == ["pytest -q"]
+
+
+def test_claude_transcript_extraction_enforces_file_and_command_limits(
+    tmp_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "claude"
+    transcript = _write_claude_bash_transcript(
+        home,
+        tmp_root,
+        ["pytest first", "pytest second"],
+    )
+    monkeypatch.setattr(precall_recommend, "PRECALL_TRANSCRIPT_MAX_COMMANDS", 1)
+    assert _extract_claude_transcript_bash(tmp_root, home=home) == ["pytest first"]
+
+    monkeypatch.setattr(
+        precall_recommend,
+        "PRECALL_TRANSCRIPT_MAX_FILE_BYTES",
+        max(1, transcript.stat().st_size - 1),
+    )
+    assert _extract_claude_transcript_bash(tmp_root, home=home) == []
+
+
+def _write_codex_rollout(home: Path, name: str, cwd: Path, command: str, *, mtime: int) -> Path:
+    path = home / "sessions" / "2026" / "07" / "21" / f"rollout-{name}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"cwd": str(cwd)}, separators=(",", ":"))
+        + "\n"
+        + json.dumps(
+            {"payload": {"command": ["bash", "-lc", command]}},
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_codex_transcript_cwd_filter_rejects_prefix_sibling(
+    tmp_root: Path,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "codex"
+    _write_codex_rollout(home, "wrong", Path(str(tmp_root) + "-other"), "echo wrong", mtime=2)
+    _write_codex_rollout(home, "right", tmp_root, "echo right", mtime=1)
+
+    commands = _extract_codex_transcript_bash(tmp_root, home=home)
+
+    assert "bash -lc echo right" in commands
+    assert "bash -lc echo wrong" not in commands

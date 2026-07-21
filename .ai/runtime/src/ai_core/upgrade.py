@@ -13,7 +13,9 @@ from typing import Any
 
 from . import __version__
 from .memory import append_audit
+from .private_write import atomic_write_private_text
 from .render import build_manifest, render
+from .retention import prune_directory, retention_status
 from .worker.ipc import PROTOCOL_VERSION
 
 DEFAULT_REPO_URL = "https://github.com/ezBuilder/code-brain.git"
@@ -21,8 +23,46 @@ DEFAULT_REF = "main"
 _TAIL_LIMIT = 4000
 
 
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+UPGRADE_BACKUP_RETENTION_DAYS = _env_int("AI_UPGRADE_BACKUP_RETENTION_DAYS", 90)
+UPGRADE_BACKUP_MAX_FILES = _env_int("AI_UPGRADE_BACKUP_MAX_FILES", 10, minimum=1)
+UPGRADE_BACKUP_MAX_BYTES = _env_int("AI_UPGRADE_BACKUP_MAX_BYTES", 20_000_000, minimum=1024)
+
+
 def now_stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def upgrade_backup_retention_status(root: Path) -> dict[str, Any]:
+    return retention_status(
+        root,
+        root / ".ai" / "cache" / "upgrade",
+        prefixes=("rollback-",),
+        suffixes=(".json",),
+        keep_days=UPGRADE_BACKUP_RETENTION_DAYS,
+        max_files=UPGRADE_BACKUP_MAX_FILES,
+        max_bytes=UPGRADE_BACKUP_MAX_BYTES,
+    )
+
+
+def prune_upgrade_backups(root: Path, *, preserve: tuple[Path, ...] = ()) -> dict[str, Any]:
+    return prune_directory(
+        root,
+        root / ".ai" / "cache" / "upgrade",
+        prefixes=("rollback-",),
+        suffixes=(".json",),
+        keep_days=UPGRADE_BACKUP_RETENTION_DAYS,
+        max_files=UPGRADE_BACKUP_MAX_FILES,
+        max_bytes=UPGRADE_BACKUP_MAX_BYTES,
+        preserve=preserve,
+    )
 
 
 def semver_major(version: str) -> int:
@@ -86,7 +126,8 @@ def upgrade_apply(root: Path, *, target_version: str, dry_run: bool = False) -> 
         manifest_bytes = (
             json.dumps(build_manifest(root), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
-    backup_path.write_text(
+    atomic_write_private_text(
+        backup_path,
         json.dumps(
             {
                 "runtime_version": __version__,
@@ -100,8 +141,9 @@ def upgrade_apply(root: Path, *, target_version: str, dry_run: bool = False) -> 
             sort_keys=True,
         )
         + "\n",
-        encoding="utf-8",
+        root=root,
     )
+    result["retention"] = prune_upgrade_backups(root, preserve=(backup_path,))
     migrate(root)
     render(root)
     append_audit(root, action="upgrade.apply", category="upgrade", payload={"target_version": target_version, "backup_path": result["backup_path"]})

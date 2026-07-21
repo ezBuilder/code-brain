@@ -11,6 +11,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
+from ai_core import audit_repair  # noqa: E402
+
 
 def _sha(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -136,3 +138,78 @@ def test_empty_year_file(tmp_path: Path) -> None:
     result = repair_audit_chain(tmp_path)
     assert result["ok"]
     assert result["total_repaired"] == 0
+
+
+def test_repair_streams_without_path_read_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [_row("a", None), _row("b", "wrong")]
+    path = _make_audit(tmp_path, rows)
+    original_read_text = Path.read_text
+
+    def guarded_read_text(self: Path, *args, **kwargs):
+        if self == path:
+            raise AssertionError("audit repair must stream source JSONL")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    result = audit_repair.repair_audit_chain(tmp_path)
+
+    assert result["ok"] is True
+    assert result["total_repaired"] == 1
+    repaired = original_read_text(path, encoding="utf-8").splitlines()
+    assert json.loads(repaired[1])["prev_sha"] == _sha(repaired[0])
+
+
+def test_repair_output_limit_preserves_original_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _make_audit(tmp_path, [_row("a", None), _row("b", "x")])
+    original = path.read_bytes()
+    monkeypatch.setattr(audit_repair, "AUDIT_MAX_BYTES", len(original) + 10)
+
+    result = audit_repair.repair_audit_chain(tmp_path)
+
+    assert result["ok"] is False
+    assert result["total_repaired"] == 0
+    assert "private write exceeds" in result["errors"][0]
+    assert path.read_bytes() == original
+    assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
+
+
+def test_repair_record_limit_fails_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _make_audit(tmp_path, [_row("a", None), _row("b", "wrong")])
+    original = path.read_bytes()
+    monkeypatch.setattr(audit_repair, "AUDIT_REPAIR_MAX_RECORDS", 1)
+
+    result = audit_repair.repair_audit_chain(tmp_path)
+
+    assert result["ok"] is False
+    assert "record limit exceeded" in result["errors"][0]
+    assert path.read_bytes() == original
+
+
+def test_year_specific_repair_rejects_symlink(
+    tmp_path: Path,
+) -> None:
+    audit_dir = tmp_path / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True)
+    external = tmp_path / "external.jsonl"
+    external.write_text(_row("a", "wrong") + "\n", encoding="utf-8")
+    link = audit_dir / "2026.jsonl"
+    try:
+        link.symlink_to(external)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+
+    result = audit_repair.repair_audit_chain(tmp_path, year=2026)
+
+    assert result["ok"] is False
+    assert result["files"][0]["skipped"] == "untrusted_file"
+    assert external.read_text(encoding="utf-8") == _row("a", "wrong") + "\n"

@@ -134,6 +134,40 @@ def test_metric_not_found_is_crash(proj, tmp_path):
     assert r["decision"] == "crash" and r["reason"] == "metric_not_found"
 
 
+def test_nonzero_metric_command_surfaces_termination_evidence(proj, tmp_path, monkeypatch):
+    (tmp_path / "ws").mkdir()
+    s = loop.start(
+        proj,
+        workspace="ws",
+        metric_cmd=["ignored"],
+        metric_grep=r"metric:\s*([0-9.]+)",
+        direction="minimize",
+    )
+    monkeypatch.setattr(
+        loop.sandbox,
+        "execute",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "command_ok": False,
+            "exit_code": -9,
+            "exec_id": "0123456789abcdef",
+            "peak_rss_kib": 43210,
+            "output_truncated": False,
+            "termination": {
+                "classification": "external_sigkill_or_execution_limit",
+                "signal": "SIGKILL",
+            },
+        },
+    )
+
+    result = loop.record(proj, s["session_id"])
+
+    assert result["decision"] == "crash"
+    assert result["reason"] == "external_sigkill_or_execution_limit"
+    assert result["termination"]["signal"] == "SIGKILL"
+    assert result["peak_rss_kib"] == 43210
+
+
 def test_loop_tools_registered_and_dispatch(tmp_path):
     from ai_core import mcp_server
     for t in ("autoresearch_loop_start", "autoresearch_loop_record",

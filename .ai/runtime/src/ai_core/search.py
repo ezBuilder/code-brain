@@ -3,16 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
 import stat as stat_module
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from .config import load_config
+from .index_control import IndexProgress, IndexScanLimit, policy as index_policy, progress_status
 from .policy import is_ci
 from .private_write import atomic_write_private_text, read_root_confined_text
 from .redact import redact_value
@@ -21,6 +24,44 @@ SCHEMA_VERSION = 8
 CANDIDATE_CACHE_SCHEMA = 3
 CANDIDATE_CACHE_MAX_AGE_SECONDS = 60.0
 import os as _os
+
+
+def _bounded_env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(_os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+# Hard operational bounds.  The index is derived cache state and must never be
+# allowed to consume a disk indefinitely.  Operators can raise the cap for very
+# large monorepos, while doctor keeps the effective limit visible.
+INDEX_MAX_BYTES = _bounded_env_int(
+    "AI_INDEX_MAX_BYTES",
+    512_000_000,
+    minimum=16_000_000,
+    maximum=8_000_000_000,
+)
+INDEX_CACHE_KIB = _bounded_env_int(
+    "AI_INDEX_CACHE_KIB",
+    16_384,
+    minimum=2_048,
+    maximum=262_144,
+)
+INDEX_VACUUM_FREE_RATIO = 0.20
+INDEX_VACUUM_MIN_FREE_PAGES = 256
+
+
+class IndexSizeLimit(RuntimeError):
+    def __init__(self, current: int, maximum: int, *, observed: int, reserved: int) -> None:
+        self.current = int(current)
+        self.maximum = int(maximum)
+        self.observed = int(observed)
+        self.reserved = int(reserved)
+        super().__init__(f"index bytes exceeded: {self.current}>{self.maximum}")
+
+
 try:
     SNIPPET_MAX_BYTES = max(80, min(2048, int(_os.environ.get("AI_SNIPPET_MAX_BYTES", "240"))))
 except (ValueError, TypeError):
@@ -118,7 +159,140 @@ def connect(root: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.execute("pragma journal_mode=WAL")
+    conn.execute("pragma busy_timeout=5000")
+    conn.execute(f"pragma cache_size={-max(2048, int(INDEX_CACHE_KIB))}")
+    conn.execute("pragma temp_store=FILE")
+    conn.execute(f"pragma journal_size_limit={max(1_000_000, min(64_000_000, int(INDEX_MAX_BYTES) // 8))}")
     return conn
+
+
+def _index_storage_stats(root: Path, conn: sqlite3.Connection) -> dict[str, Any]:
+    path = db_path(root)
+    wal = path.with_name(path.name + "-wal")
+    shm = path.with_name(path.name + "-shm")
+    db_bytes = path.stat().st_size if path.exists() else 0
+    wal_bytes = wal.stat().st_size if wal.exists() else 0
+    shm_bytes = shm.stat().st_size if shm.exists() else 0
+    page_count = int(conn.execute("pragma page_count").fetchone()[0])
+    free_pages = int(conn.execute("pragma freelist_count").fetchone()[0])
+    page_size = int(conn.execute("pragma page_size").fetchone()[0])
+    total_bytes = int(db_bytes + wal_bytes + shm_bytes)
+    return {
+        "db_bytes": int(db_bytes),
+        "wal_bytes": int(wal_bytes),
+        "shm_bytes": int(shm_bytes),
+        "total_bytes": total_bytes,
+        "max_bytes": int(INDEX_MAX_BYTES),
+        "within_limit": total_bytes <= int(INDEX_MAX_BYTES),
+        "page_count": page_count,
+        "free_pages": free_pages,
+        "page_size": page_size,
+        "free_ratio": round(free_pages / page_count, 6) if page_count else 0.0,
+    }
+
+
+def _enforce_index_size_limit(
+    root: Path,
+    conn: sqlite3.Connection,
+    *,
+    reserve_bytes: int = 0,
+) -> dict[str, Any]:
+    stats = _index_storage_stats(root, conn)
+    observed = int(stats["total_bytes"])
+    reserved = max(0, int(reserve_bytes))
+    projected = observed + reserved
+    if projected > int(INDEX_MAX_BYTES):
+        _rollback_index_transaction(conn)
+        raise IndexSizeLimit(
+            projected,
+            int(INDEX_MAX_BYTES),
+            observed=observed,
+            reserved=reserved,
+        )
+    return stats
+
+
+def _rollback_index_transaction(conn: sqlite3.Connection) -> None:
+    try:
+        conn.rollback()
+    finally:
+        try:
+            conn.execute("pragma wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error:
+            pass
+
+
+def index_storage(root: Path) -> dict[str, Any]:
+    path = db_path(root)
+    if not path.exists():
+        return {
+            "exists": False,
+            "db_bytes": 0,
+            "wal_bytes": 0,
+            "shm_bytes": 0,
+            "total_bytes": 0,
+            "max_bytes": int(INDEX_MAX_BYTES),
+            "within_limit": True,
+            "page_count": 0,
+            "free_pages": 0,
+            "page_size": 0,
+            "free_ratio": 0.0,
+        }
+    with connect(root) as conn:
+        stats = _index_storage_stats(root, conn)
+    stats["exists"] = True
+    return stats
+
+
+def index_control_status(root: Path) -> dict[str, Any]:
+    effective_policy = index_policy(root)
+    progress = progress_status(root, effective_policy=effective_policy)
+    storage = index_storage(root)
+    path = db_path(root)
+    return {
+        "ok": bool(
+            effective_policy.get("ok")
+            and progress.get("ok")
+            and storage.get("within_limit")
+        ),
+        "db_path": path.relative_to(root).as_posix(),
+        "exists": path.exists(),
+        "policy": effective_policy,
+        "progress": progress,
+        "storage": storage,
+    }
+
+
+def _maintain_index_storage(root: Path, conn: sqlite3.Connection) -> dict[str, Any]:
+    checkpoint_busy = False
+    try:
+        checkpoint = conn.execute("pragma wal_checkpoint(TRUNCATE)").fetchone()
+        checkpoint_busy = bool(checkpoint and int(checkpoint[0]))
+    except sqlite3.Error:
+        checkpoint_busy = True
+    before = _index_storage_stats(root, conn)
+    should_vacuum = (
+        before["free_pages"] >= max(0, int(INDEX_VACUUM_MIN_FREE_PAGES))
+        and before["free_ratio"] >= max(0.0, float(INDEX_VACUUM_FREE_RATIO))
+    ) or not before["within_limit"]
+    vacuumed = False
+    if should_vacuum and not conn.in_transaction:
+        conn.execute("vacuum")
+        vacuumed = True
+        try:
+            conn.execute("pragma wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error:
+            checkpoint_busy = True
+    after = _index_storage_stats(root, conn)
+    after.update(
+        {
+            "vacuumed": vacuumed,
+            "checkpoint_busy": checkpoint_busy,
+            "reclaimed_bytes": max(0, int(before["total_bytes"]) - int(after["total_bytes"])),
+        }
+    )
+    return after
 
 
 def init_schema(conn: sqlite3.Connection, *, migrate_legacy: bool = False) -> None:
@@ -141,33 +315,37 @@ def init_schema(conn: sqlite3.Connection, *, migrate_legacy: bool = False) -> No
 
 
 def drop_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
-        drop table if exists chunks_fts;
-        drop table if exists chunk_meta;
-        drop table if exists summaries;
-        drop table if exists provenance;
-        drop table if exists embeddings_vec0;
-        drop table if exists code_symbols;
-        drop table if exists code_calls;
-        drop table if exists file_state;
-        drop table if exists chunks;
-        """
-    )
+    for statement in (
+        "drop table if exists chunks_fts",
+        "drop table if exists chunk_meta",
+        "drop table if exists summaries",
+        "drop table if exists provenance",
+        "drop table if exists embeddings_vec0",
+        "drop table if exists code_symbols",
+        "drop table if exists code_calls",
+        "drop table if exists file_state",
+        "drop table if exists chunks",
+    ):
+        conn.execute(statement)
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
-        create table if not exists chunks (
+    for statement in (
+        """create table if not exists chunks (
           id integer primary key,
           path text not null,
           sha256 text not null,
           summary text not null,
           updated_at text default current_timestamp
-        );
-        create virtual table if not exists chunks_fts using fts5(path, content, content='', contentless_delete=1, tokenize="porter unicode61 remove_diacritics 2");
-        create table if not exists chunk_meta (
+        )""",
+        """create virtual table if not exists chunks_fts using fts5(
+          path,
+          content,
+          content='',
+          contentless_delete=1,
+          tokenize="porter unicode61 remove_diacritics 2"
+        )""",
+        """create table if not exists chunk_meta (
           chunk_id integer primary key,
           kind text not null default 'file',
           bytes integer not null,
@@ -175,37 +353,37 @@ def create_schema(conn: sqlite3.Connection) -> None:
           qualname text,
           start_line integer,
           end_line integer
-        );
-        create table if not exists summaries (
+        )""",
+        """create table if not exists summaries (
           path text primary key,
           summary text not null,
           updated_at text default current_timestamp
-        );
-        create table if not exists provenance (
+        )""",
+        """create table if not exists provenance (
           path text primary key,
           processor text not null,
           model_hash text,
           prompt_version text,
           chunker_version text not null,
           confidence real not null
-        );
-        create table if not exists file_state (
+        )""",
+        """create table if not exists file_state (
           path text primary key,
           size integer not null,
           mtime_ns integer not null,
           ctime_ns integer not null,
           sha256 text not null
-        );
-        create table if not exists embeddings_vec0 (
+        )""",
+        """create table if not exists embeddings_vec0 (
           chunk_id integer primary key,
           disabled_reason text not null default 'embeddings_default_off',
           vector blob,
           model_name text,
           vector_dim integer,
           created_at text
-        );
-        create index if not exists embeddings_vec0_model_idx on embeddings_vec0(model_name);
-        create table if not exists code_symbols (
+        )""",
+        "create index if not exists embeddings_vec0_model_idx on embeddings_vec0(model_name)",
+        """create table if not exists code_symbols (
           id integer primary key,
           path text not null,
           qualname text not null,
@@ -214,23 +392,23 @@ def create_schema(conn: sqlite3.Connection) -> None:
           end_lineno integer not null,
           parent text,
           lang text not null default 'python'
-        );
-        create index if not exists code_symbols_path_idx on code_symbols(path);
-        create index if not exists code_symbols_qualname_idx on code_symbols(qualname);
-        create index if not exists code_symbols_lang_idx on code_symbols(lang);
-        create table if not exists code_calls (
+        )""",
+        "create index if not exists code_symbols_path_idx on code_symbols(path)",
+        "create index if not exists code_symbols_qualname_idx on code_symbols(qualname)",
+        "create index if not exists code_symbols_lang_idx on code_symbols(lang)",
+        """create table if not exists code_calls (
           id integer primary key,
           path text not null,
           caller text not null,
           callee text not null,
           lineno integer not null,
           lang text not null default 'python'
-        );
-        create index if not exists code_calls_callee_idx on code_calls(callee);
-        create index if not exists code_calls_caller_idx on code_calls(caller);
-        create index if not exists code_calls_lang_idx on code_calls(lang);
-        """
-    )
+        )""",
+        "create index if not exists code_calls_callee_idx on code_calls(callee)",
+        "create index if not exists code_calls_caller_idx on code_calls(caller)",
+        "create index if not exists code_calls_lang_idx on code_calls(lang)",
+    ):
+        conn.execute(statement)
     conn.execute(f"pragma user_version={SCHEMA_VERSION}")
 
 
@@ -240,7 +418,88 @@ def rebuild(
     single_flight: bool = False,
     incremental: bool = False,
     paths: set[str] | None = None,
+    force: bool = False,
+    max_seconds: int | None = None,
 ) -> dict[str, Any]:
+    effective_policy = index_policy(root, max_seconds=max_seconds)
+    if effective_policy.get("ok") is not True:
+        return {
+            "ok": False,
+            "error": "INDEX_POLICY_INVALID",
+            "errors": effective_policy.get("errors", []),
+            "committed": False,
+            "complete": False,
+            "partial": False,
+            "policy": effective_policy,
+        }
+    if effective_policy.get("enabled") is not True and not force:
+        return {
+            "ok": False,
+            "error": "INDEXING_DISABLED",
+            "skipped": "indexing disabled by operator policy",
+            "committed": False,
+            "complete": False,
+            "partial": False,
+            "policy": effective_policy,
+            "db_path": db_path(root).relative_to(root).as_posix(),
+        }
+
+    def run() -> dict[str, Any]:
+        progress = IndexProgress(
+            root=root,
+            operation="incremental" if incremental else "full",
+            effective_policy=effective_policy,
+        )
+        progress.begin()
+        try:
+            result = (
+                _rebuild_incremental_inner(root, paths=paths, progress=progress)
+                if incremental
+                else _rebuild_inner(root, progress=progress)
+            )
+        except IndexScanLimit as exc:
+            failed = progress.fail("INDEX_SCAN_LIMIT", limit=exc)
+            return {
+                "ok": False,
+                "error": "INDEX_SCAN_LIMIT",
+                "limit": {"name": exc.limit, "current": exc.current, "maximum": exc.maximum},
+                "committed": False,
+                "complete": False,
+                "partial": False,
+                "policy": effective_policy,
+                "progress": failed,
+                "db_path": db_path(root).relative_to(root).as_posix(),
+            }
+        except IndexSizeLimit as exc:
+            failed = progress.fail("INDEX_SIZE_LIMIT")
+            return {
+                "ok": False,
+                "error": "INDEX_SIZE_LIMIT",
+                "limit": {
+                    "name": "max_index_bytes",
+                    "current": exc.current,
+                    "maximum": exc.maximum,
+                    "observed": exc.observed,
+                    "reserved": exc.reserved,
+                },
+                "committed": False,
+                "complete": False,
+                "partial": False,
+                "policy": effective_policy,
+                "progress": failed,
+                "storage": index_storage(root),
+                "db_path": db_path(root).relative_to(root).as_posix(),
+            }
+        except Exception as exc:
+            progress.fail(type(exc).__name__)
+            raise
+        result["policy"] = effective_policy
+        result["committed"] = True
+        result["complete"] = True
+        result["partial"] = False
+        result["progress"] = progress.complete(committed=True)
+        return result
+
     if single_flight:
         from .portable import lock_exclusive_nonblocking, unlock
         lock_path = root / ".ai" / "cache" / ".rebuild.lock"
@@ -255,7 +514,7 @@ def rebuild(
                     "db_path": db_path(root).relative_to(root).as_posix(),
                 }
             try:
-                return _rebuild_incremental_inner(root, paths=paths) if incremental else _rebuild_inner(root)
+                return run()
             finally:
                 unlock(lock_fd)
         finally:
@@ -263,10 +522,15 @@ def rebuild(
                 lock_fd.close()
             except Exception:
                 pass
-    return _rebuild_incremental_inner(root, paths=paths) if incremental else _rebuild_inner(root)
+    return run()
 
 
-def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> dict[str, Any]:
+def _rebuild_incremental_inner(
+    root: Path,
+    *,
+    paths: set[str] | None = None,
+    progress: IndexProgress,
+) -> dict[str, Any]:
     """Re-index only files whose redacted-content sha256 has changed.
 
     Drops chunks for deleted files; updates chunks for changed files; leaves
@@ -282,14 +546,14 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
     """
     db_p = db_path(root)
     if not db_p.exists():
-        return _rebuild_inner(root)
+        return _rebuild_inner(root, progress=progress)
 
     with connect(root) as conn:
         try:
             init_schema(conn, migrate_legacy=False)
         except RuntimeError:
             # legacy schema → caller must do a full rebuild
-            return _rebuild_inner(root)
+            return _rebuild_inner(root, progress=progress)
         existing = {
             row["path"]: (int(row["id"]), str(row["sha256"]))
             for row in conn.execute(
@@ -302,7 +566,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             ).fetchall()
         }
         if not existing:
-            return _rebuild_inner(root)
+            return _rebuild_inner(root, progress=progress)
 
         conn.execute("begin immediate")
         seen: set[str] = set()
@@ -314,22 +578,37 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             if paths is not None
             else (
                 (path.relative_to(root).as_posix(), path)
-                for path in iter_text_files(root, use_cache=False, update_cache=True)
+                for path in iter_text_files(
+                    root,
+                    use_cache=False,
+                    update_cache=False,
+                    progress=progress,
+                )
             )
         )
         for rel, path in candidate_paths:
             seen.add(rel)
+            if paths is not None:
+                progress.candidate(size=len(rel.encode("utf-8")) + 1, path=rel)
+                try:
+                    source_size = int(path.stat().st_size)
+                except OSError:
+                    source_size = 0
+                progress.scan(size=source_size, path=rel)
             try:
                 content = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
             redacted = redact_value(content)
-            digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+            redacted_bytes = redacted.encode("utf-8")
+            digest = hashlib.sha256(redacted_bytes).hexdigest()
             existing_pair = existing.get(rel)
             if existing_pair is not None and existing_pair[1] == digest:
                 _upsert_file_state(conn, rel, path, digest)
                 unchanged += 1
+                progress.indexed()
                 continue
+            _enforce_index_size_limit(root, conn, reserve_bytes=len(redacted_bytes))
             # Need to (re)write this file: drop dependent rows, including the
             # row-level FTS entries for the file and its function chunks.
             if existing_pair is not None:
@@ -358,7 +637,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             )
             conn.execute(
                 "insert into chunk_meta(chunk_id, kind, bytes, line_count) values (?, ?, ?, ?)",
-                (chunk_id, "file", len(redacted.encode("utf-8")), redacted.count("\n") + 1),
+                (chunk_id, "file", len(redacted_bytes), redacted.count("\n") + 1),
             )
             conn.execute(
                 "insert into summaries(path, summary) values (?, ?)",
@@ -377,6 +656,8 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
                 changed += 1
             else:
                 added += 1
+            progress.indexed()
+            _enforce_index_size_limit(root, conn)
         # Cleanup deleted files. In targeted mode, only target paths are allowed
         # to delete rows; full mode compares against the complete seen set.
         deleted = 0
@@ -404,11 +685,13 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
                 for (func_cid,) in chunk_ids:
                     _delete_chunk_rows(conn, func_cid)
                 deleted += 1
+        _enforce_index_size_limit(root, conn, reserve_bytes=64 * 1024)
         conn.commit()
+        storage = _maintain_index_storage(root, conn)
     if changed or added or deleted:
         _mark_index_generation(root)
-    return {
-        "ok": True,
+    result = {
+        "ok": bool(storage["within_limit"]),
         "db_path": db_p.relative_to(root).as_posix(),
         "incremental": True,
         "unchanged": unchanged,
@@ -417,7 +700,11 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
         "deleted": deleted,
         "indexed": unchanged + changed + added,
         "targeted": paths is not None,
+        "storage": storage,
     }
+    if not storage["within_limit"]:
+        result["error"] = "INDEX_SIZE_LIMIT"
+    return result
 
 
 def _delete_chunk_rows(conn: sqlite3.Connection, chunk_id: int) -> None:
@@ -428,28 +715,34 @@ def _delete_chunk_rows(conn: sqlite3.Connection, chunk_id: int) -> None:
     conn.execute("delete from chunks where id = ?", (chunk_id,))
 
 
-def _rebuild_inner(root: Path) -> dict[str, Any]:
+def _rebuild_inner(root: Path, *, progress: IndexProgress) -> dict[str, Any]:
     with connect(root) as conn:
-        init_schema(conn, migrate_legacy=True)
         conn.execute("begin immediate")
         drop_schema(conn)
         create_schema(conn)
         indexed = 0
-        for path in iter_text_files(root, use_cache=False, update_cache=True):
+        for path in iter_text_files(
+            root,
+            use_cache=False,
+            update_cache=False,
+            progress=progress,
+        ):
             rel = path.relative_to(root).as_posix()
             try:
                 content = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
             redacted = redact_value(content)
-            digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+            redacted_bytes = redacted.encode("utf-8")
+            _enforce_index_size_limit(root, conn, reserve_bytes=len(redacted_bytes))
+            digest = hashlib.sha256(redacted_bytes).hexdigest()
             summary = summarize(redacted)
             cursor = conn.execute("insert into chunks(path, sha256, summary) values (?, ?, ?)", (rel, digest, summary))
             chunk_id = int(cursor.lastrowid)
             conn.execute("insert into chunks_fts(rowid, path, content) values (?, ?, ?)", (chunk_id, rel, redacted))
             conn.execute(
                 "insert into chunk_meta(chunk_id, kind, bytes, line_count) values (?, ?, ?, ?)",
-                (chunk_id, "file", len(redacted.encode("utf-8")), redacted.count("\n") + 1),
+                (chunk_id, "file", len(redacted_bytes), redacted.count("\n") + 1),
             )
             conn.execute(
                 "insert into summaries(path, summary) values (?, ?)",
@@ -465,10 +758,21 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
             _insert_function_chunks(conn, rel, content, chunk_id, root=root)
             _upsert_file_state(conn, rel, path, digest)
             indexed += 1
+            progress.indexed()
+            _enforce_index_size_limit(root, conn)
+        _enforce_index_size_limit(root, conn, reserve_bytes=64 * 1024)
         conn.commit()
-        conn.execute("vacuum")
+        storage = _maintain_index_storage(root, conn)
     _mark_index_generation(root)
-    return {"ok": True, "db_path": db_path(root).relative_to(root).as_posix(), "indexed": indexed}
+    result: dict[str, Any] = {
+        "ok": bool(storage["within_limit"]),
+        "db_path": db_path(root).relative_to(root).as_posix(),
+        "indexed": indexed,
+        "storage": storage,
+    }
+    if not storage["within_limit"]:
+        result["error"] = "INDEX_SIZE_LIMIT"
+    return result
 
 
 def _mark_index_generation(root: Path) -> None:
@@ -1321,6 +1625,18 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
         return {"enabled": False, "rebuilt": False, "reason": "disabled"}
     if is_ci():
         return {"enabled": False, "rebuilt": False, "reason": "ci_read_only"}
+    effective_policy = index_policy(root)
+    if effective_policy.get("ok") is not True:
+        return {
+            "enabled": False,
+            "rebuilt": False,
+            "reason": "index_policy_invalid",
+            "errors": effective_policy.get("errors", []),
+        }
+    if effective_policy.get("enabled") is not True:
+        return {"enabled": False, "rebuilt": False, "reason": "indexing_disabled"}
+    if effective_policy.get("auto_rebuild") is not True:
+        return {"enabled": False, "rebuilt": False, "reason": "auto_rebuild_disabled"}
     dirty_paths = _git_dirty_paths(root)
     if dirty_paths:
         dirty_status = index_hash_status(root, paths=dirty_paths)
@@ -1329,7 +1645,7 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
             result = rebuild(root, single_flight=True, incremental=True, paths=changed_dirty)
             return {
                 "enabled": True,
-                "rebuilt": True,
+                "rebuilt": result.get("ok") is True and not result.get("skipped"),
                 "reason": "dirty_hash_mismatch",
                 "path_count": len(changed_dirty),
                 "result": result,
@@ -1337,32 +1653,44 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
     db = db_path(root)
     if not db.exists():
         result = rebuild(root, single_flight=True, incremental=True)
-        return {"enabled": True, "rebuilt": True, "reason": "missing", "result": result}
-    try:
-        source_mtime = max((state.st_mtime for _path, state in iter_text_file_states(root)), default=0.0)
-        db_mtime = db.stat().st_mtime
-    except OSError as exc:
-        return {"enabled": True, "rebuilt": False, "reason": f"stat_error:{exc}"}
-    if source_mtime >= db_mtime or 0 <= db_mtime - source_mtime <= MTIME_STALE_GRACE_SECONDS:
-        hash_status = index_hash_status(root, use_metadata=True, refresh_metadata=True, use_candidate_cache=True)
-        changed_paths = set(hash_status.get("changed_paths") or [])
-        if changed_paths:
-            result = rebuild(root, single_flight=True, incremental=True, paths=changed_paths)
+        return {
+            "enabled": True,
+            "rebuilt": result.get("ok") is True and not result.get("skipped"),
+            "reason": "missing",
+            "result": result,
+        }
+    hash_status = index_hash_status(
+        root,
+        use_metadata=True,
+        refresh_metadata=True,
+        use_candidate_cache=True,
+    )
+    changed_paths = set(hash_status.get("changed_paths") or [])
+    if changed_paths:
+        result = rebuild(root, single_flight=True, incremental=True, paths=changed_paths)
+        return {
+            "enabled": True,
+            "rebuilt": result.get("ok") is True and not result.get("skipped"),
+            "reason": "hash_mismatch",
+            "path_count": len(changed_paths),
+            "result": result,
+        }
+    if not hash_status.get("ok") and hash_status.get("reason") not in {"current"}:
+        reason = str(hash_status.get("reason") or "hash_check_failed")
+        if reason in {"index_scan_limit", "legacy_schema"}:
             return {
                 "enabled": True,
-                "rebuilt": True,
-                "reason": "hash_mismatch",
-                "path_count": len(changed_paths),
-                "result": result,
+                "rebuilt": False,
+                "reason": reason,
+                "status": hash_status,
             }
-        if not hash_status.get("ok") and hash_status.get("reason") not in {"current"}:
-            result = rebuild(root, single_flight=True, incremental=True)
-            return {
-                "enabled": True,
-                "rebuilt": True,
-                "reason": str(hash_status.get("reason") or "hash_check_failed"),
-                "result": result,
-            }
+        result = rebuild(root, single_flight=True, incremental=True)
+        return {
+            "enabled": True,
+            "rebuilt": result.get("ok") is True and not result.get("skipped"),
+            "reason": reason,
+            "result": result,
+        }
     return {"enabled": True, "rebuilt": False, "reason": "current"}
 
 
@@ -1374,6 +1702,26 @@ def index_hash_status(
     refresh_metadata: bool = False,
     use_candidate_cache: bool = False,
 ) -> dict[str, Any]:
+    effective_policy = index_policy(root)
+    if effective_policy.get("ok") is not True:
+        return {
+            "ok": False,
+            "reason": "index_policy_invalid",
+            "detail": "; ".join(str(item) for item in effective_policy.get("errors", [])[:5]),
+            "changed_paths": [],
+            "indexed_files": 0,
+            "policy": effective_policy,
+        }
+    if paths is None and effective_policy.get("enabled") is not True:
+        return {
+            "ok": True,
+            "reason": "indexing_disabled",
+            "detail": "freshness scan disabled by operator policy",
+            "changed_paths": [],
+            "indexed_files": 0,
+            "policy": effective_policy,
+            "scan": {"bounded": True, "skipped": True},
+        }
     db = db_path(root)
     if not db.exists():
         return {
@@ -1436,53 +1784,82 @@ def index_hash_status(
             "indexed_files": 0,
         }
 
+    probe = IndexProgress(
+        root=root,
+        operation="freshness_probe",
+        effective_policy=effective_policy,
+        persist=False,
+    )
+    probe.begin()
     changed: set[str] = set()
     seen: set[str] = set()
     metadata_updates: list[tuple[str, Path, str]] = []
-    if paths is None:
-        candidates = [
-            (path.relative_to(root).as_posix(), path, state)
-            for path, state in iter_text_file_states(
-                root,
-                use_cache=use_candidate_cache,
-                update_cache=True,
+    try:
+        if paths is None:
+            candidates = (
+                (path.relative_to(root).as_posix(), path, state)
+                for path, state in iter_text_file_states(
+                    root,
+                    use_cache=use_candidate_cache,
+                    update_cache=False,
+                    progress=probe,
+                )
             )
-        ]
-    else:
-        candidates = []
-        for rel in sorted(paths):
-            path = root / rel
-            state = _indexable_text_stat(root, path)
-            if state is not None:
-                candidates.append((rel, path, state))
-            elif rel in indexed:
-                changed.add(rel)
+        else:
+            targeted: list[tuple[str, Path, os.stat_result]] = []
+            for rel in sorted(paths):
+                probe.candidate(size=len(rel.encode("utf-8", errors="replace")) + 1, path=rel)
+                path = root / rel
+                state = _indexable_text_stat(root, path)
+                if state is not None:
+                    probe.scan(size=int(state.st_size), path=rel)
+                    targeted.append((rel, path, state))
+                elif rel in indexed:
+                    changed.add(rel)
+            candidates = iter(targeted)
 
-    for rel, path, stat_result in candidates:
-        seen.add(rel)
-        indexed_entry = indexed.get(rel)
-        if indexed_entry is None:
-            changed.add(rel)
-            continue
-        expected, indexed_metadata = indexed_entry
-        if use_metadata and indexed_metadata is not None:
-            try:
-                current_metadata = _file_stat_values(path, stat_result)
-            except OSError:
+        for rel, path, stat_result in candidates:
+            seen.add(rel)
+            indexed_entry = indexed.get(rel)
+            if indexed_entry is None:
                 changed.add(rel)
                 continue
-            if current_metadata == indexed_metadata:
+            expected, indexed_metadata = indexed_entry
+            if use_metadata and indexed_metadata is not None:
+                try:
+                    current_metadata = _file_stat_values(path, stat_result)
+                except OSError:
+                    changed.add(rel)
+                    continue
+                if current_metadata == indexed_metadata:
+                    continue
+            try:
+                redacted = str(redact_value(path.read_text(encoding="utf-8")))
+            except (OSError, UnicodeDecodeError):
+                changed.add(rel)
                 continue
-        try:
-            redacted = str(redact_value(path.read_text(encoding="utf-8")))
-        except (OSError, UnicodeDecodeError):
-            changed.add(rel)
-            continue
-        digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
-        if digest != expected:
-            changed.add(rel)
-        elif use_metadata and refresh_metadata:
-            metadata_updates.append((rel, path, digest))
+            digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+            if digest != expected:
+                changed.add(rel)
+            elif use_metadata and refresh_metadata:
+                metadata_updates.append((rel, path, digest))
+    except IndexScanLimit as exc:
+        return {
+            "ok": False,
+            "reason": "index_scan_limit",
+            "detail": str(exc),
+            "limit": {"name": exc.limit, "current": exc.current, "maximum": exc.maximum},
+            "changed_paths": sorted(changed),
+            "indexed_files": len(indexed),
+            "policy": effective_policy,
+            "scan": {
+                "bounded": True,
+                "candidate_files": probe.candidate_files,
+                "candidate_bytes": probe.candidate_bytes,
+                "scanned_files": probe.scanned_files,
+                "source_bytes": probe.source_bytes,
+            },
+        }
     if paths is None:
         changed.update(set(indexed) - seen)
     if metadata_updates:
@@ -1500,6 +1877,14 @@ def index_hash_status(
         "reason": "current" if not ordered else "hash_mismatch",
         "changed_paths": ordered,
         "indexed_files": len(indexed),
+        "policy": effective_policy,
+        "scan": {
+            "bounded": True,
+            "candidate_files": probe.candidate_files,
+            "candidate_bytes": probe.candidate_bytes,
+            "scanned_files": probe.scanned_files,
+            "source_bytes": probe.source_bytes,
+        },
     }
 
 
@@ -1553,6 +1938,13 @@ def observability(root: Path, *, query_text: str | None = None, limit: int = 5) 
         "schema_version": None,
         "sqlite_bytes": 0,
         "sqlite_wal_bytes": 0,
+        "sqlite_shm_bytes": 0,
+        "sqlite_total_bytes": 0,
+        "sqlite_max_bytes": int(INDEX_MAX_BYTES),
+        "sqlite_within_limit": True,
+        "sqlite_page_count": 0,
+        "sqlite_free_pages": 0,
+        "sqlite_free_ratio": 0.0,
         "indexed_files": 0,
         "indexed_bytes": 0,
         "summary_bytes": 0,
@@ -1567,6 +1959,16 @@ def observability(root: Path, *, query_text: str | None = None, limit: int = 5) 
     payload["sqlite_wal_bytes"] = wal.stat().st_size if wal.exists() else 0
     with connect(root) as conn:
         init_schema(conn)
+        storage = _index_storage_stats(root, conn)
+        payload["sqlite_bytes"] = storage["db_bytes"]
+        payload["sqlite_wal_bytes"] = storage["wal_bytes"]
+        payload["sqlite_shm_bytes"] = storage["shm_bytes"]
+        payload["sqlite_total_bytes"] = storage["total_bytes"]
+        payload["sqlite_max_bytes"] = storage["max_bytes"]
+        payload["sqlite_within_limit"] = storage["within_limit"]
+        payload["sqlite_page_count"] = storage["page_count"]
+        payload["sqlite_free_pages"] = storage["free_pages"]
+        payload["sqlite_free_ratio"] = storage["free_ratio"]
         payload["schema_version"] = int(conn.execute("pragma user_version").fetchone()[0])
         row = conn.execute(
             """
@@ -1638,10 +2040,21 @@ def iter_text_file_states(
     *,
     use_cache: bool = True,
     update_cache: bool = True,
+    progress: IndexProgress | None = None,
 ):
-    for path in candidate_files(root, use_cache=use_cache, update_cache=update_cache):
+    for path in candidate_files(
+        root,
+        use_cache=use_cache,
+        update_cache=update_cache,
+        progress=progress,
+    ):
         stat_result = _indexable_text_stat(root, path)
         if stat_result is not None:
+            if progress is not None:
+                progress.scan(
+                    size=int(stat_result.st_size),
+                    path=path.relative_to(root).as_posix(),
+                )
             yield path, stat_result
 
 
@@ -1650,11 +2063,13 @@ def iter_text_files(
     *,
     use_cache: bool = True,
     update_cache: bool = True,
+    progress: IndexProgress | None = None,
 ):
     for path, _stat_result in iter_text_file_states(
         root,
         use_cache=use_cache,
         update_cache=update_cache,
+        progress=progress,
     ):
         yield path
 
@@ -1902,16 +2317,132 @@ def _candidate_cache_write(root: Path, rels: list[str]) -> None:
         pass
 
 
+def _bounded_git_candidate_rels(root: Path, progress: IndexProgress) -> list[str]:
+    process = subprocess.Popen(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    assert process.stdout is not None
+    chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=4)
+    stop = threading.Event()
+
+    def read_stdout() -> None:
+        read_chunk = getattr(process.stdout, "read1", process.stdout.read)
+        try:
+            while not stop.is_set():
+                chunk = read_chunk(64 * 1024)
+                if not chunk:
+                    break
+                while not stop.is_set():
+                    try:
+                        chunks.put(chunk, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            while not stop.is_set():
+                try:
+                    chunks.put(None, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    reader = threading.Thread(target=read_stdout, name="code-brain-index-candidates", daemon=True)
+    reader.start()
+    pending = b""
+    rels: list[str] = []
+    try:
+        while True:
+            remaining = progress.deadline - time.monotonic()
+            if remaining <= 0:
+                elapsed = time.monotonic() - progress.started_monotonic
+                raise IndexScanLimit(
+                    "max_seconds",
+                    round(elapsed, 3),
+                    progress.effective_policy["max_seconds"],
+                )
+            try:
+                chunk = chunks.get(timeout=min(0.25, remaining))
+            except queue.Empty:
+                progress.heartbeat(force=True)
+                if process.poll() is not None and not reader.is_alive():
+                    break
+                continue
+            if chunk is None:
+                break
+            pending += chunk
+            parts = pending.split(b"\0")
+            pending = parts.pop()
+            for raw in parts:
+                if not raw:
+                    continue
+                rel = raw.decode("utf-8", errors="replace")
+                progress.candidate(size=len(raw) + 1, path=rel)
+                if _candidate_rel_allowed(rel):
+                    rels.append(rel)
+        if pending:
+            rel = pending.decode("utf-8", errors="replace")
+            progress.candidate(size=len(pending), path=rel)
+            if _candidate_rel_allowed(rel):
+                rels.append(rel)
+        return_code = process.wait(timeout=2)
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, process.args)
+        return rels
+    except Exception:
+        stop.set()
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    finally:
+        stop.set()
+        reader.join(timeout=1)
+
+
+def _bounded_fallback_candidates(root: Path, progress: IndexProgress) -> list[Path]:
+    paths: list[Path] = []
+    for path in root.rglob("*"):
+        try:
+            state = path.stat()
+        except OSError:
+            continue
+        if not stat_module.S_ISREG(state.st_mode):
+            continue
+        rel = path.relative_to(root).as_posix()
+        progress.candidate(size=len(rel.encode("utf-8", errors="replace")) + 1, path=rel)
+        if _candidate_rel_allowed(rel):
+            paths.append(path)
+    return sorted(paths)
+
+
 def candidate_files(
     root: Path,
     *,
     use_cache: bool = True,
     update_cache: bool = True,
+    progress: IndexProgress | None = None,
 ) -> list[Path]:
     if use_cache:
         cached = _candidate_cache_load(root)
         if cached is not None:
+            if progress is not None:
+                for path in cached:
+                    rel = path.relative_to(root).as_posix()
+                    progress.candidate(size=len(rel.encode("utf-8", errors="replace")) + 1, path=rel)
             return cached
+    if progress is not None:
+        try:
+            rels = _bounded_git_candidate_rels(root, progress)
+        except (OSError, subprocess.CalledProcessError):
+            return _bounded_fallback_candidates(root, progress)
+        return sorted(root / rel for rel in rels)
     try:
         result = subprocess.run(
             ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],

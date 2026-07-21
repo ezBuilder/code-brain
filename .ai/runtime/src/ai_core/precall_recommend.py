@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +26,13 @@ from .memory import (
     audit_path,
     now_iso,
     read_jsonl_all,
+    read_jsonl_tail,
+)
+from .transcripts import (
+    TranscriptFileScan,
+    TranscriptScan,
+    _collect_latest_candidates,
+    _iter_jsonl_records,
 )
 
 CATALOG_PATH_PARTS = (".ai", "precall_rules", "catalog.jsonl")
@@ -31,6 +40,12 @@ DEFAULT_LIMIT = 5
 DEFAULT_MIN_SIGNAL = 5
 DEFAULT_REQUIRED_OBSERVATIONS = 5
 DEFAULT_AUTO_DISABLE_THRESHOLD = 3
+PRECALL_EVENT_SCAN_LINES = 5000
+PRECALL_TRANSCRIPT_MAX_FILES = 50
+PRECALL_TRANSCRIPT_MAX_FILE_BYTES = 16_000_000
+PRECALL_TRANSCRIPT_MAX_TOTAL_BYTES = 64_000_000
+PRECALL_TRANSCRIPT_MAX_COMMANDS = 10_000
+PRECALL_TRANSCRIPT_MAX_SCAN_SECONDS = 3.0
 
 # Whitelist commands that should never be matched by any user rule. If a candidate
 # pattern accidentally matches one of these, accept() rejects it (sanity probe).
@@ -128,6 +143,48 @@ def _has_hatch_hint(command: str) -> bool:
     return any(token in command for token in HATCH_HINTS)
 
 
+def _bounded_transcript_candidates(paths: Iterable[Path], *, limit: int):
+    started = time.monotonic()
+    scan = TranscriptScan(
+        started=started,
+        deadline=started + max(0.1, float(PRECALL_TRANSCRIPT_MAX_SCAN_SECONDS)),
+    )
+    candidates = _collect_latest_candidates(iter(paths), scan)
+    return candidates[: max(0, int(limit))], scan.deadline
+
+
+def _cwd_is_within_project(value: object, root: Path) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        candidate = os.path.realpath(os.path.expanduser(raw))
+        target = os.path.realpath(str(root))
+        return os.path.commonpath((candidate, target)) == target
+    except (OSError, ValueError):
+        return False
+
+
+def _bounded_transcript_records(candidate, *, deadline: float, remaining_bytes: int):
+    scan = TranscriptFileScan()
+    if int(candidate.size) > int(PRECALL_TRANSCRIPT_MAX_FILE_BYTES):
+        return iter(()), scan
+    maximum = min(
+        max(1, int(PRECALL_TRANSCRIPT_MAX_FILE_BYTES)),
+        max(1, int(remaining_bytes)),
+    )
+    return (
+        _iter_jsonl_records(
+            candidate.path,
+            scan=scan,
+            deadline=deadline,
+            max_bytes=maximum,
+            expected=candidate,
+        ),
+        scan,
+    )
+
+
 # ---------- gather ----------
 
 def gather_bash_invocations(root: Path, *, include_transcripts: bool = False) -> list[str]:
@@ -138,7 +195,7 @@ def gather_bash_invocations(root: Path, *, include_transcripts: bool = False) ->
     """
     invocations: list[str] = []
     events_path = root / ".ai" / "memory" / "events" / "events.jsonl"
-    event_records = read_jsonl_all(events_path)
+    event_records = read_jsonl_tail(events_path, PRECALL_EVENT_SCAN_LINES)
     for rec in event_records:
         if rec.get("kind") != "PreToolUse":
             continue
@@ -159,27 +216,32 @@ def gather_bash_invocations(root: Path, *, include_transcripts: bool = False) ->
     return invocations
 
 
-def _extract_claude_transcript_bash(root: Path) -> list[str]:
+def _extract_claude_transcript_bash(
+    root: Path,
+    *,
+    home: Path | None = None,
+) -> list[str]:
     """Extract Bash tool_use commands from this project's Claude session JSONLs."""
     from .portable import hyphen_encode_path
-    home = Path("~/.claude").expanduser()
-    proj_dir = home / "projects" / hyphen_encode_path(str(root))
+    claude_home = home or Path("~/.claude").expanduser()
+    proj_dir = claude_home / "projects" / hyphen_encode_path(str(root))
     if not proj_dir.is_dir():
         return []
     out: list[str] = []
-    for sess in sorted(proj_dir.glob("*.jsonl"))[:30]:
-        try:
-            text = sess.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or '"Bash"' not in line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    candidates, deadline = _bounded_transcript_candidates(
+        proj_dir.glob("*.jsonl"),
+        limit=min(30, PRECALL_TRANSCRIPT_MAX_FILES),
+    )
+    remaining = int(PRECALL_TRANSCRIPT_MAX_TOTAL_BYTES)
+    for candidate in candidates:
+        if remaining <= 0 or len(out) >= int(PRECALL_TRANSCRIPT_MAX_COMMANDS):
+            break
+        records, file_scan = _bounded_transcript_records(
+            candidate,
+            deadline=deadline,
+            remaining_bytes=remaining,
+        )
+        for rec in records:
             content = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
             if not isinstance(content, list):
                 continue
@@ -192,48 +254,51 @@ def _extract_claude_transcript_bash(root: Path) -> list[str]:
                         cmd = inp.get("command")
                         if isinstance(cmd, str) and cmd.strip():
                             out.append(cmd.strip())
+                            if len(out) >= int(PRECALL_TRANSCRIPT_MAX_COMMANDS):
+                                break
+            if len(out) >= int(PRECALL_TRANSCRIPT_MAX_COMMANDS):
+                break
+        remaining -= max(0, int(file_scan.bytes_read))
     return out
 
 
-def _extract_codex_transcript_bash(root: Path) -> list[str]:
+def _extract_codex_transcript_bash(
+    root: Path,
+    *,
+    home: Path | None = None,
+) -> list[str]:
     """Extract Bash invocations from this project's Codex rollout JSONLs.
 
     Codex rollouts live under ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl. We filter
     by `cwd` field equality to avoid leaking other projects' commands.
     """
-    home = Path("~/.codex").expanduser()
-    sessions_root = home / "sessions"
+    codex_home = home or Path("~/.codex").expanduser()
+    sessions_root = codex_home / "sessions"
     if not sessions_root.is_dir():
         return []
-    target = str(root.resolve())
     out: list[str] = []
-    for path in sorted(sessions_root.rglob("rollout-*.jsonl"))[-50:]:
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
+    candidates, deadline = _bounded_transcript_candidates(
+        sessions_root.rglob("rollout-*.jsonl"),
+        limit=PRECALL_TRANSCRIPT_MAX_FILES,
+    )
+    remaining = int(PRECALL_TRANSCRIPT_MAX_TOTAL_BYTES)
+    for candidate in candidates:
+        if remaining <= 0 or len(out) >= int(PRECALL_TRANSCRIPT_MAX_COMMANDS):
+            break
         cwd_match = False
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        records, file_scan = _bounded_transcript_records(
+            candidate,
+            deadline=deadline,
+            remaining_bytes=remaining,
+        )
+        for rec in records:
             if not cwd_match:
-                if '"cwd"' in line:
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    cwd_val = ""
-                    if isinstance(rec, dict):
-                        cwd_val = str(rec.get("cwd") or (rec.get("payload") or {}).get("cwd") or "")
-                    if cwd_val and cwd_val.startswith(target):
-                        cwd_match = True
-                continue
-            if '"shell"' not in line and '"command"' not in line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
+                payload = rec.get("payload") if isinstance(rec, dict) else None
+                cwd_val = rec.get("cwd") if isinstance(rec, dict) else None
+                if cwd_val is None and isinstance(payload, dict):
+                    cwd_val = payload.get("cwd")
+                if _cwd_is_within_project(cwd_val, root):
+                    cwd_match = True
                 continue
             payload = rec.get("payload") if isinstance(rec, dict) else None
             if not isinstance(payload, dict):
@@ -247,6 +312,9 @@ def _extract_codex_transcript_bash(root: Path) -> list[str]:
                 continue
             if cmd_str.strip():
                 out.append(cmd_str.strip())
+                if len(out) >= int(PRECALL_TRANSCRIPT_MAX_COMMANDS):
+                    break
+        remaining -= max(0, int(file_scan.bytes_read))
     return out
 
 

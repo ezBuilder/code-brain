@@ -253,7 +253,7 @@ def test_release_gate_workflow_invariants() -> None:
     assert "concurrency:" in workflow
     assert "cancel-in-progress: true" in workflow
     assert "summary-observe" in workflow
-    assert "actions/download-artifact@v4" in workflow
+    assert "actions/download-artifact@v8" in workflow
     assert "summary-parity.py" in workflow
     assert "dist/dep-advisory.json" in workflow
     assert "ubuntu-latest" in workflow

@@ -8,6 +8,7 @@ All notable Code Brain changes are recorded here.
 
 - Branch deletion guards now hard-block only protected branch names while allowing worktree, session, feature, and scratch branch cleanup.
 - Session start and upgrades now enforce bounded `.ai/tmp`, `.ai/outputs`, and total `.ai` storage with tracked-file and `.keep` preservation.
+- Doctor now validates the bounded audit-index tail instead of falsely requiring evicted historical rows.
 
 ## 0.6.5 - 2026-07-21
 

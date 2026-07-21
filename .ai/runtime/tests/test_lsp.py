@@ -226,6 +226,154 @@ def test_query_failure_returns_ok_false(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert gd["ok"] is False and gd["definition"] is None
 
 
+def _build_syntactic_navigation_fixture(root: Path) -> None:
+    from ai_core.search import rebuild
+
+    service = root / "pkg" / "service.py"
+    service.parent.mkdir(parents=True)
+    service.write_text(
+        "def helper():\n    return 1\n\nclass Worker:\n    def run(self):\n        return helper()\n",
+        encoding="utf-8",
+    )
+    consumer = root / "app.py"
+    consumer.write_text(
+        "from pkg.service import helper as h\n\ndef execute():\n    return h()\n",
+        encoding="utf-8",
+    )
+    (root / ".ai" / "cache").mkdir(parents=True)
+    rebuilt = rebuild(root)
+    assert rebuilt["ok"] is True
+
+
+def test_unavailable_lsp_falls_back_to_syntactic_definition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _build_syntactic_navigation_fixture(tmp_path)
+    monkeypatch.setattr(lsp, "_MULTILSPY_AVAILABLE", False, raising=True)
+
+    out = lsp.goto_definition(tmp_path, "app.py", 3, 11)
+
+    assert out["ok"] is True
+    assert out["backend"] == "syntactic_codegraph"
+    assert out["precision"] == "syntactic"
+    assert out["complete"] is False
+    assert out["fallback_reason"] == "multilspy_not_installed"
+    assert out["definition"]["path"] == "pkg/service.py"
+    assert out["definition"]["qualname"] == "helper"
+    assert out["definition"]["line"] == 0
+
+
+def test_unavailable_lsp_falls_back_to_syntactic_references(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _build_syntactic_navigation_fixture(tmp_path)
+    monkeypatch.setattr(lsp, "_MULTILSPY_AVAILABLE", False, raising=True)
+
+    out = lsp.find_references(tmp_path, "pkg/service.py", 0, 5)
+
+    assert out["ok"] is True
+    assert out["backend"] == "syntactic_codegraph"
+    assert out["precision"] == "syntactic"
+    assert out["complete"] is False
+    reference = next(ref for ref in out["references"] if ref["path"] == "app.py")
+    assert reference["line"] == 3
+    assert reference["callee"] == "helper"
+    assert reference["target"] == "pkg.service.helper"
+    assert reference["resolution"] == "from_import_alias"
+    assert reference["confidence"] == 0.95
+
+
+def test_workspace_symbols_uses_syntactic_fallback_when_lsp_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _build_syntactic_navigation_fixture(tmp_path)
+    monkeypatch.setattr(lsp, "_MULTILSPY_AVAILABLE", False, raising=True)
+
+    out = lsp.workspace_symbols(tmp_path, "Worker", limit=5)
+
+    assert out["ok"] is True
+    assert out["backend"] == "syntactic_codegraph"
+    assert out["precision"] == "syntactic"
+    assert out["fallback_reason"] == "multilspy_not_installed"
+    assert [symbol["name"] for symbol in out["symbols"]] == ["Worker", "Worker.run"]
+
+
+def test_lsp_query_failure_uses_index_fallback_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _build_syntactic_navigation_fixture(tmp_path)
+    _stub_available(monkeypatch)
+    monkeypatch.setattr(lsp, "_lsp_call", lambda *args, **kwargs: None, raising=True)
+
+    out = lsp.goto_definition(tmp_path, "app.py", 3, 11)
+
+    assert out["ok"] is True
+    assert out["backend"] == "syntactic_codegraph"
+    assert out["fallback_reason"] == "lsp_query_failed"
+    assert out["definition"]["qualname"] == "helper"
+
+
+def test_syntactic_fallback_does_not_create_missing_index(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "a.py"
+    source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    monkeypatch.setattr(lsp, "_MULTILSPY_AVAILABLE", False, raising=True)
+
+    out = lsp.goto_definition(tmp_path, "a.py", 0, 5)
+
+    assert out["ok"] is False
+    assert out["reason"] == "multilspy_not_installed"
+    assert not (tmp_path / ".ai" / "cache" / "code.sqlite").exists()
+
+
+def test_syntactic_reference_index_returns_non_call_use_and_exact_range(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from ai_core.search import rebuild
+
+    service = tmp_path / "pkg" / "service.py"
+    service.parent.mkdir(parents=True)
+    service.write_text("def helper():\n    return 1\n", encoding="utf-8")
+    consumer = tmp_path / "consumer.py"
+    consumer.write_text(
+        "from pkg.service import helper as h\n\n"
+        "callback = h\n"
+        "result = h()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".ai" / "cache").mkdir(parents=True)
+    assert rebuild(tmp_path)["ok"] is True
+    monkeypatch.setattr(lsp, "_MULTILSPY_AVAILABLE", False, raising=True)
+
+    out = lsp.find_references(tmp_path, "pkg/service.py", 0, 5)
+
+    assert out["ok"] is True
+    assert out["reference_index"] == "code_references"
+    assert [(item["kind"], item["line"], item["column"]) for item in out["references"]] == [
+        ("name_read", 2, 11),
+        ("call", 3, 9),
+        ("import_binding", 0, 24),
+    ]
+    assert [(item["end_line"], item["end_column"]) for item in out["references"]] == [
+        (2, 12),
+        (3, 10),
+        (0, 35),
+    ]
+    assert all(item["target"] == "pkg.service.helper" for item in out["references"])
+
+    definition = lsp.goto_definition(tmp_path, "consumer.py", 2, 11)
+    assert definition["ok"] is True
+    assert definition["definition"]["path"] == "pkg/service.py"
+    assert definition["definition"]["qualname"] == "helper"
+
+
 def test_doctor_lsp_probe_never_fails(tmp_path: Path) -> None:
     from ai_core.doctor import check_lsp_available
     chk = check_lsp_available(tmp_path)

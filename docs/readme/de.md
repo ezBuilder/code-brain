@@ -50,10 +50,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\pat
 Erfolg endet mit:
 
 ```text
-[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.
+[code-brain] installed. Code Brain files, memory, search, MCP, and hook definitions are ready in <project>.
+[code-brain] Codex action required: trust this project, run /hooks, and approve the discovered Code Brain hooks.
+[code-brain] After install or hook changes, Codex may require reapproval before project hooks run.
 ```
 
-Öffne nach der Installation eine neue Claude-/Codex-/Antigravity-Session.
+Öffne nach der Installation eine neue Claude-/Codex-/Antigravity-Session. Für Codex muss zuerst die folgende Freigabe erfolgen.
+
+## Erforderliche Freigabe der Codex-Hooks
+
+**Hook-Registrierung ist nicht Hook-Aktivierung.** Der Installer schreibt `.codex/hooks.json` und aktiviert `features.hooks = true`, aber Codex führt Projekt-Command-Hooks erst aus, nachdem sowohl das Projekt als auch die erkannten Hook-Definitionen als vertrauenswürdig bestätigt wurden.
+
+1. Öffne das Ziel-Repository in Codex und vertraue dem Projekt.
+2. Führe `/hooks` in Codex aus oder öffne die Hooks-Prüfansicht.
+3. Prüfe und genehmige die erkannten Code-Brain-Hooks.
+4. Öffne eine neue Codex-Session, damit `SessionStart` und die übrigen genehmigten Hooks von Beginn an laufen.
+
+Vor der Freigabe können Session-Memory-Injection, automatisches Command-Routing, Redaction von Tool-Ausgaben, Audit-Erfassung und Stop-Hook-Fortsetzung inaktiv wirken, obwohl die Dateien korrekt installiert sind. Ändert eine Installation oder ein Upgrade eine Hook-Definition, kann Codex eine erneute Freigabe verlangen; prüfe `/hooks` erneut. Dies ist getrennt von der Command-Approval-Policy und erfordert weder `approval_policy = "never"` noch uneingeschränkten Shell-Zugriff.
 
 ## Upgrade von GitHub
 
@@ -70,7 +83,7 @@ Führe innerhalb einer Agent-Session aus:
 /cb-upgrade
 ```
 
-Öffne nach einem erfolgreichen Upgrade eine neue Agent-Session, damit neue Hooks, MCP-Konfiguration, `AGENTS.md` und `CLAUDE.md` geladen werden.
+Wenn Codex nach einem erfolgreichen Upgrade eine erneute Freigabe verlangt, prüfe `/hooks` und öffne anschließend eine neue Agent-Session, damit genehmigte Hooks, MCP-Konfiguration, `AGENTS.md` und `CLAUDE.md` geladen werden.
 
 Für ein erstmaliges Bootstrap ohne lokalen Klon:
 
@@ -164,7 +177,7 @@ Für ein öffentliches README solltest du mit diesen reproduzierbaren Checks beg
 .ai/                         runtime, memory structure, hooks, MCP shim
 .mcp.json                    Claude Code MCP
 .codex/config.toml           Codex MCP profile usage
-.codex/hooks.json            Codex hooks
+.codex/hooks.json            Codex hooks (Projektvertrauen + /hooks-Freigabe erforderlich)
 .claude/settings.json        Claude Code hooks
 .claude/commands/            slash commands
 .codex/prompts/              Codex prompts

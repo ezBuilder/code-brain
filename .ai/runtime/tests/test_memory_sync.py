@@ -56,6 +56,10 @@ def _origin_with_mac(tmp_path: Path) -> tuple[Path, Path]:
     _gok(mac, "init", "-q")
     _config(mac)
     _gok(mac, "remote", "add", "origin", str(remote))
+    # Match the production repository contract: machine IDs and sync locks are
+    # per-machine cache state, never versioned. Tracking machine_id here makes
+    # every clone immediately dirty and causes Git itself to reject a rebase.
+    (mac / ".gitignore").write_text("/.ai/cache/\n/AGENTS.md\n", encoding="utf-8")
     _mem(mac)
     _set_machine_id(mac, "mac-test")
     (mac / ".ai" / "memory" / "decisions.jsonl").write_text('{"id":"d1"}\n', encoding="utf-8")

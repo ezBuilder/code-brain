@@ -185,7 +185,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "sandbox_execute",
-        "description": "Run a shell command with compact output in the sandbox; 요약+exec_id를 반환하고 전체 출력은 디스크에 저장. 쓰기성. command는 argv 배열 또는 단일 셸 문자열 모두 허용한다. isolate_network는 IP/DNS를 차단하고 제공 불가 시 fail-closed, isolate_env는 자격증명 환경을 제거한다. 두 옵션은 독립적이며 강한 실행에는 함께 사용한다.",
+        "description": "Run a shell command in the sandbox with stdout/stderr streamed to disk instead of retained unbounded in RAM. Returns compact bounded output, exec_id, command_ok, peak_rss_kib, and structured termination evidence (including SIGKILL/OOM vs external execution-limit classification). 쓰기성. command는 argv 배열 또는 단일 셸 문자열 모두 허용한다. isolate_network는 IP/DNS를 차단하고 제공 불가 시 fail-closed, isolate_env는 자격증명 환경을 제거한다. 두 옵션은 독립적이며 강한 실행에는 함께 사용한다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -226,6 +226,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "retest_after": {"type": "string", "description": "ISO date; re-test backstop"},
                 "status": {"type": "string", "enum": ["observed", "confirmed", "stale", "refuted"]},
                 "supersedes_id": {"type": "string", "description": "retire this prior failure id"},
+                "contradicts": {"type": "string", "description": "decision id contradicted by this record"},
+                "derives_from": {"type": "string", "description": "decision id this record was derived from"},
+                "expires_at": {"type": "string", "description": "optional ISO-8601 expiry; expired records are hidden by default"},
             },
             "required": ["text"],
         },
@@ -329,7 +332,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "memory_recall",
-        "description": "질의에 관련된 durable 메모리(결정·실패·교훈·절차)를 confidence*relevance*recency로 통합 회상하고 인용 블록을 반환. 읽기전용·로컬·LLM합성 없음. lessons_recall의 상위호환(교훈만이 아니라 결정/실패/절차까지). 위험/반복 작업 전 '이 주제로 뭘 알고있나' 조회.",
+        "description": "질의에 관련된 durable memory를 recall/remember: past decisions, failures, lessons, procedures를 식별자·경로·태그·시간 유효성·출처·관계까지 반영해 bounded 통합 회상하고 인용 블록과 scan 진단을 반환. 읽기전용·로컬·LLM합성 없음. 위험/반복 작업 전 '이 주제로 뭘 알고있나' 조회.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1029,6 +1032,9 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             retest_after=args.get("retest_after") if isinstance(args.get("retest_after"), str) else None,
             status=args.get("status") if isinstance(args.get("status"), str) else None,
             supersedes_id=args.get("supersedes_id") if isinstance(args.get("supersedes_id"), str) else None,
+            contradicts=args.get("contradicts") if isinstance(args.get("contradicts"), str) else None,
+            derives_from=args.get("derives_from") if isinstance(args.get("derives_from"), str) else None,
+            expires_at=args.get("expires_at") if isinstance(args.get("expires_at"), str) else None,
         )
     if name == "ast_grep_search":
         pattern = args.get("pattern")

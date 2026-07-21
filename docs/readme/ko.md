@@ -50,10 +50,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 C:\pat
 성공하면 다음으로 끝납니다.
 
 ```text
-[code-brain] installed. New AI sessions in <project> now load Code Brain memory, search, hooks, and MCP automatically.
+[code-brain] installed. Code Brain files, memory, search, MCP, and hook definitions are ready in <project>.
+[code-brain] Codex action required: trust this project, run /hooks, and approve the discovered Code Brain hooks.
+[code-brain] After install or hook changes, Codex may require reapproval before project hooks run.
 ```
 
-설치 후 새 Claude/Codex/Antigravity 세션을 여세요.
+설치 후 새 Claude/Codex/Antigravity 세션을 여세요. Codex는 먼저 아래 승인 절차를 완료해야 합니다.
+
+## Codex 훅 신뢰 승인 필수
+
+**훅 등록과 훅 활성화는 다릅니다.** 설치 프로그램이 `.codex/hooks.json`을 만들고 `features.hooks = true`를 설정해도, Codex가 프로젝트와 발견된 훅 정의를 신뢰하기 전에는 프로젝트 명령 훅을 실행하지 않습니다.
+
+1. Codex에서 대상 레포지토리를 열고 프로젝트를 신뢰 처리합니다.
+2. Codex에서 `/hooks`를 실행하거나 Hooks 검토 화면을 엽니다.
+3. 발견된 Code Brain 훅을 검토하고 승인합니다.
+4. 새 Codex 세션을 열어 `SessionStart`부터 승인된 훅이 실행되게 합니다.
+
+승인 전에는 파일 설치가 정상이어도 세션 메모리 주입, 명령 자동 라우팅, 도구 출력 시크릿 제거, 감사 기록, Stop 훅 연속 실행이 동작하지 않는 것처럼 보일 수 있습니다. 설치·업그레이드로 훅 정의가 바뀌면 Codex가 재승인을 요구할 수 있으므로 `/hooks`에서 다시 확인하세요. 이 절차는 Codex 명령 승인 정책과 별개이며 `approval_policy = "never"` 또는 무제한 셸 권한을 요구하지 않습니다.
 
 ## GitHub에서 업그레이드
 
@@ -70,7 +83,7 @@ cd /path/to/project
 /cb-upgrade
 ```
 
-업그레이드가 성공한 후에는 새 에이전트 세션을 열어 새 훅, MCP 설정, `AGENTS.md`, `CLAUDE.md`가 로드되도록 하세요.
+업그레이드가 성공한 후 Codex가 재승인을 요구하면 `/hooks`에서 다시 승인한 다음, 새 에이전트 세션을 열어 승인된 훅, MCP 설정, `AGENTS.md`, `CLAUDE.md`가 로드되도록 하세요.
 
 로컬 클론을 유지하지 않고 처음으로 부트스트랩하려면:
 
@@ -164,7 +177,7 @@ uv run --project .ai/runtime python -m pytest .ai/runtime/tests/test_cli.py -k "
 .ai/                         runtime, memory structure, hooks, MCP shim
 .mcp.json                    Claude Code MCP
 .codex/config.toml           Codex MCP profile usage
-.codex/hooks.json            Codex hooks
+.codex/hooks.json            Codex hooks (프로젝트 신뢰 + /hooks 승인 필요)
 .claude/settings.json        Claude Code hooks
 .claude/commands/            slash commands
 .codex/prompts/              Codex prompts

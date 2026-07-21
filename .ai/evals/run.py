@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -71,6 +72,7 @@ def _observe_context_budget(case: dict[str, Any]) -> Observed:
         mode=str(case.get("mode") or "balanced"),
         limit=int(case.get("limit") or len(results) or 1),
         base_max_bytes=int(case.get("base_max_bytes") or 4096),
+        query=str(case.get("query") or ""),
     )
 
 
@@ -110,11 +112,128 @@ def _observe_autoresearch_retrieval(case: dict[str, Any]) -> Observed:
         return evalset.evaluate(ar_root, golden, k=int(case.get("k") or 5))
 
 
+def _observe_code_retrieval(case: dict[str, Any]) -> Observed:
+    from ai_core import code_retrieval_eval
+    from ai_core.search import rebuild
+
+    corpus = case.get("corpus")
+    golden = case.get("golden")
+    if not isinstance(corpus, list) or not all(isinstance(item, dict) for item in corpus):
+        raise ValueError("code_retrieval case requires an object list in corpus")
+    if not isinstance(golden, list) or not all(isinstance(item, dict) for item in golden):
+        raise ValueError("code_retrieval case requires an object list in golden")
+
+    with tempfile.TemporaryDirectory(prefix="codebrain_code_retrieval_eval_") as tmpdir:
+        repo = pathlib.Path(tmpdir) / "repo"
+        (repo / ".ai").mkdir(parents=True)
+        (repo / ".ai" / "config.yaml").write_text("project_name: code-retrieval-eval\n", encoding="utf-8")
+        for item in corpus:
+            rel = pathlib.PurePosixPath(str(item.get("path") or ""))
+            if not rel.parts or rel.is_absolute() or ".." in rel.parts or rel.parts[0] == ".ai":
+                raise ValueError(f"invalid corpus path: {rel}")
+            destination = repo.joinpath(*rel.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(str(item.get("content") or ""), encoding="utf-8")
+        rebuilt = rebuild(repo)
+        if rebuilt.get("ok") is not True:
+            raise RuntimeError(f"code retrieval index rebuild failed: {rebuilt.get('error') or rebuilt}")
+        return code_retrieval_eval.evaluate(repo, golden, k=int(case.get("k") or 5))
+
+
+def _observe_code_navigation(case: dict[str, Any]) -> Observed:
+    from ai_core import code_navigation_eval
+    from ai_core.search import rebuild
+
+    corpus = case.get("corpus")
+    golden = case.get("golden")
+    if not isinstance(corpus, list) or not all(isinstance(item, dict) for item in corpus):
+        raise ValueError("code_navigation case requires an object list in corpus")
+    if not isinstance(golden, list) or not all(isinstance(item, dict) for item in golden):
+        raise ValueError("code_navigation case requires an object list in golden")
+
+    with tempfile.TemporaryDirectory(prefix="codebrain_code_navigation_eval_") as tmpdir:
+        repo = pathlib.Path(tmpdir) / "repo"
+        (repo / ".ai").mkdir(parents=True)
+        (repo / ".ai" / "config.yaml").write_text("project_name: code-navigation-eval\n", encoding="utf-8")
+        for item in corpus:
+            rel = pathlib.PurePosixPath(str(item.get("path") or ""))
+            if not rel.parts or rel.is_absolute() or ".." in rel.parts or rel.parts[0] == ".ai":
+                raise ValueError(f"invalid corpus path: {rel}")
+            destination = repo.joinpath(*rel.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(str(item.get("content") or ""), encoding="utf-8")
+        rebuilt = rebuild(repo)
+        if rebuilt.get("ok") is not True:
+            raise RuntimeError(f"code navigation index rebuild failed: {rebuilt.get('error') or rebuilt}")
+        return code_navigation_eval.evaluate(repo, golden, k=int(case.get("k") or 5))
+
+
+def _observe_memory_retrieval(case: dict[str, Any]) -> Observed:
+    from ai_core import memory_retrieval_eval
+
+    corpus = case.get("corpus")
+    golden = case.get("golden")
+    if not isinstance(corpus, list) or not all(isinstance(item, dict) for item in corpus):
+        raise ValueError("memory_retrieval case requires an object list in corpus")
+    if not isinstance(golden, list) or not all(isinstance(item, dict) for item in golden):
+        raise ValueError("memory_retrieval case requires an object list in golden")
+    allowed_stores = {
+        "decisions": "decisions.jsonl",
+        "lessons": "lessons.jsonl",
+        "procedures": "procedural.jsonl",
+    }
+    grouped: dict[str, list[dict[str, Any]]] = {name: [] for name in allowed_stores}
+    for item in corpus:
+        store = str(item.get("store") or "")
+        record = item.get("record")
+        if store not in allowed_stores or not isinstance(record, dict):
+            raise ValueError(f"invalid memory corpus item store={store!r}")
+        grouped[store].append(record)
+
+    now_raw = str(case.get("now") or "2026-07-21T00:00:00Z")
+    try:
+        now = (
+            datetime.fromisoformat(now_raw[:-1]).replace(tzinfo=timezone.utc)
+            if now_raw.endswith("Z")
+            else datetime.fromisoformat(now_raw)
+        )
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ValueError(f"invalid memory_retrieval now timestamp: {now_raw}") from exc
+
+    with tempfile.TemporaryDirectory(prefix="codebrain_memory_retrieval_eval_") as tmpdir:
+        repo = pathlib.Path(tmpdir) / "repo"
+        memory_root = repo / ".ai" / "memory"
+        memory_root.mkdir(parents=True)
+        for store, filename in allowed_stores.items():
+            records = grouped[store]
+            if records:
+                (memory_root / filename).write_text(
+                    "".join(
+                        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                        for record in records
+                    ),
+                    encoding="utf-8",
+                )
+        types = case.get("types")
+        return memory_retrieval_eval.evaluate(
+            repo,
+            golden,
+            k=int(case.get("k") or 5),
+            now=now,
+            types=[str(item) for item in types] if isinstance(types, list) else None,
+        )
+
+
 ADAPTERS: dict[str, Adapter] = {
     "precall_routing": _observe_precall,
     "context_budget": _observe_context_budget,
     "tool_discovery": _observe_tool_discovery,
     "autoresearch_retrieval": _observe_autoresearch_retrieval,
+    "code_retrieval": _observe_code_retrieval,
+    "code_navigation": _observe_code_navigation,
+    "memory_retrieval": _observe_memory_retrieval,
 }
 
 
@@ -176,6 +295,19 @@ def _assert_expectation(expectation: dict[str, Any], observed: Observed) -> str 
         expected = expectation.get("value")
         if actual != expected:
             return f"expected {path}={expected!r}, observed={actual!r}"
+        return None
+
+    if kind in {"assert_field_at_most", "assert_field_at_least"}:
+        path = str(expectation.get("path") or "")
+        try:
+            actual = float(_field(observed, path))
+            threshold = float(expectation.get("value"))
+        except (KeyError, TypeError, ValueError):
+            return f"expected numeric field path={path!r}"
+        if kind == "assert_field_at_most" and actual > threshold:
+            return f"expected {path} <= {threshold}, observed={actual}"
+        if kind == "assert_field_at_least" and actual < threshold:
+            return f"expected {path} >= {threshold}, observed={actual}"
         return None
 
     if kind == "assert_contains":

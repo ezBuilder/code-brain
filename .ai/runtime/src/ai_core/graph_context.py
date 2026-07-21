@@ -37,7 +37,15 @@ def pack_graph_context(
     for row in seed_symbols:
         items.append(_symbol_item(root, row, summaries, role="seed"))
     for row in caller_edges:
-        items.append(_edge_item(root, row, summaries, relation="caller", matched_symbol=_match_alias(alias_map, row["callee"])))
+        items.append(
+            _edge_item(
+                root,
+                row,
+                summaries,
+                relation="caller",
+                matched_symbol=_match_alias(alias_map, _edge_match_name(row)),
+            )
+        )
     for row in callee_edges:
         items.append(_edge_item(root, row, summaries, relation="callee"))
     for row in related_symbols:
@@ -123,13 +131,15 @@ def _caller_edges(conn, *, aliases: list[str], limit: int) -> list[dict[str, Any
     placeholders = ",".join("?" for _ in aliases)
     rows = conn.execute(
         f"""
-        select path, caller, callee, lineno
+        select path, caller, callee, lineno, lexical_callee, target, resolution, confidence
         from code_calls
         where callee in ({placeholders})
-        order by path, lineno, caller, callee
+           or lexical_callee in ({placeholders})
+           or target in ({placeholders})
+        order by confidence desc, path, lineno, caller, callee
         limit ?
         """,
-        [*aliases, limit],
+        [*aliases, *aliases, *aliases, limit],
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -149,7 +159,7 @@ def _callee_edges(conn, *, qualnames: list[str], paths: list[str], limit: int) -
         return []
     rows = conn.execute(
         f"""
-        select path, caller, callee, lineno
+        select path, caller, callee, lineno, lexical_callee, target, resolution, confidence
         from code_calls
         where {" or ".join(clauses)}
         order by path, lineno, caller, callee
@@ -163,7 +173,7 @@ def _callee_edges(conn, *, qualnames: list[str], paths: list[str], limit: int) -
 def _related_symbols(conn, seed_symbols: list[dict[str, Any]], caller_edges: list[dict[str, Any]], callee_edges: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
     names = {str(row["caller"]) for row in caller_edges}
     for row in callee_edges:
-        callee = str(row["callee"])
+        callee = _edge_match_name(row)
         names.add(callee)
         names.add(callee.rsplit(".", 1)[-1])
     names.discard("<module>")
@@ -209,6 +219,15 @@ def _edge_item(root: Path, row: dict[str, Any], summaries: dict[str, str], *, re
         "path": path,
         "caller": str(row["caller"]),
         "callee": str(row["callee"]),
+        "lexical_callee": str(row.get("lexical_callee") or row["callee"]),
+        "target": str(row.get("target") or "") or None,
+        "resolution": str(row.get("resolution") or "lexical"),
+        "confidence": float(row.get("confidence") or 0.0),
+        "provenance": {
+            "backend": "syntactic_codegraph",
+            "resolution": str(row.get("resolution") or "lexical"),
+            "confidence": float(row.get("confidence") or 0.0),
+        },
         "line": int(row["lineno"]),
         "summary": summaries.get(path, ""),
         "snippet": _source_snippet(root, path, int(row["lineno"])),
@@ -237,6 +256,12 @@ def _match_alias(alias_map: dict[str, list[str]], callee: str) -> str | None:
         if callee in aliases:
             return qualname
     return None
+
+
+def _edge_match_name(row: dict[str, Any]) -> str:
+    if str(row.get("resolution") or "") == "class_member" and row.get("target"):
+        return str(row["target"])
+    return str(row.get("callee") or row.get("target") or "")
 
 
 def _public_symbol(row: dict[str, Any]) -> dict[str, Any]:

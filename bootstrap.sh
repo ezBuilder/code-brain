@@ -12,5 +12,7 @@ else
 fi
 uv run --project .ai/runtime ai doctor --strict
 if [[ ! "${AI_BOOTSTRAP_SKIP_TESTS:-}" =~ ^(1|true|yes)$ ]]; then
-  env -u CI -u GITHUB_ACTIONS -u GITLAB_CI -u AI_CI uv run --project .ai/runtime python -m pytest .ai/runtime/tests
+  ./scripts/run-observed-command.sh bootstrap-pytest -- \
+    env -u CI -u GITHUB_ACTIONS -u GITLAB_CI -u AI_CI \
+    uv run --project .ai/runtime python -m pytest .ai/runtime/tests
 fi

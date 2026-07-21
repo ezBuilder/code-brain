@@ -44,6 +44,8 @@ git status --short
 - Release archives are deterministic and written to ignored `dist/` with `.sha256` checksums, `.manifest.json` file manifests, `.sbom.json` dependency inventories, `.provenance.json` build attestations, and `.release-notes.md` handoff notes.
 - Artifact verification checks checksum, manifest, SBOM, provenance, and release notes before package code execution.
 - Install check verifies the tarball in a temporary directory, including `.ai/bin/ai`, `.ai/bin/ai-hook`, and PowerShell shims when PowerShell is available.
+- Install and upgrade output must state that Codex project trust and `/hooks` approval are required; every localized README must repeat that hook registration is not activation and that hook changes may require reapproval.
+- The install manifest must expose the machine-readable Codex activation contract (`codex_hook_activation_required`, `codex_project_trust_required`, `codex_hook_review_command`, and reapproval guidance).
 - Reproducibility check rebuilds the archive in a temporary directory and verifies the archive SHA-256 is identical.
 - Artifact tamper check verifies corrupted checksum, manifest, SBOM, provenance, and release notes artifacts are rejected.
 - Rollback drill verifies upgrade backup and rollback restore the generated manifest byte-for-byte in a temporary copy.

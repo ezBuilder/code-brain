@@ -103,7 +103,9 @@ try {
   Pop-Location
 }
 
-Write-Host "[code-brain] installed. New AI sessions in $Target now load Code Brain memory, search, hooks, and MCP automatically."
+Write-Host "[code-brain] installed. Code Brain files, memory, search, MCP, and hook definitions are ready in $Target."
+Write-Host "[code-brain] Codex action required: trust this project, run /hooks, and approve the discovered Code Brain hooks."
+Write-Host "[code-brain] After install or hook changes, Codex may require reapproval before project hooks run."
 if ($UvInstalledByInstaller) {
   Write-Host "[code-brain] note: uv was installed at $env:USERPROFILE\.local\bin. Open a new PowerShell session if the 'uv' command is not visible in the current shell."
 }

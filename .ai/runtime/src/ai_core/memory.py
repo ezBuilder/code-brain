@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,10 +15,19 @@ from .private_write import (
     atomic_write_private_text,
     private_file_lock,
     read_root_confined_text,
+    read_root_confined_tail_text,
 )
 from .redact import redact_value
 
 _AUDIT_THREAD_LOCK = threading.RLock()
+
+# Audit logs are operational state, not an unlimited archive. Keep each
+# yearly file bounded and retain only a small rolling year window.
+AUDIT_MAX_BYTES = 16_000_000
+AUDIT_KEEP_BYTES = 12_000_000
+AUDIT_RETENTION_YEARS = 3
+AUDIT_PAYLOAD_MAX_BYTES = 64_000
+AUDIT_PAYLOAD_PREVIEW_BYTES = 16_000
 
 
 def now_iso() -> str:
@@ -466,6 +476,12 @@ def audit_path(root: Path, *, at: datetime | None = None) -> Path:
     return root / ".ai" / "memory" / "audit" / f"{effective.year}.jsonl"
 
 
+def audit_maintenance_lock_path(root: Path) -> Path:
+    # Keep the lock outside audit/ so rebuild can safely ignore a malicious or
+    # broken audit-directory symlink and still repair the standalone index.
+    return root / ".ai" / "memory" / ".audit-maintenance.lock"
+
+
 def all_audit_files(root: Path) -> list[Path]:
     """Return all per-year audit jsonl files sorted ascending.
 
@@ -493,40 +509,222 @@ def all_audit_files(root: Path) -> list[Path]:
     return files
 
 
+def _json_line(record: dict[str, Any]) -> str:
+    return json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _bounded_audit_payload(payload: dict[str, Any]) -> Any:
+    redacted = redact_value(payload)
+    encoded = _json_line({"payload": redacted}).encode("utf-8")
+    if len(encoded) <= AUDIT_PAYLOAD_MAX_BYTES:
+        return redacted
+    preview = encoded[: max(0, int(AUDIT_PAYLOAD_PREVIEW_BYTES))].decode("utf-8", errors="ignore")
+    return {
+        "truncated": True,
+        "original_bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "preview": preview,
+    }
+
+
+def _chained_line(record: dict[str, Any], previous_line: str | None) -> str:
+    chained = dict(record)
+    chained["prev_sha"] = line_sha(previous_line) if previous_line is not None else None
+    return _json_line(chained)
+
+
+def _record_ts(raw_line: str) -> str | None:
+    try:
+        loaded = json.loads(raw_line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    value = loaded.get("ts")
+    return value if isinstance(value, str) else None
+
+
+def _render_rechained(lines: list[str], checkpoint: dict[str, Any]) -> str:
+    rendered: list[str] = []
+    previous: str | None = None
+    for item in [checkpoint, *lines]:
+        if isinstance(item, str):
+            try:
+                loaded = json.loads(item)
+            except json.JSONDecodeError:
+                rendered.append(item)
+                previous = item
+                continue
+            if not isinstance(loaded, dict):
+                rendered.append(item)
+                previous = item
+                continue
+            record = loaded
+        else:
+            record = item
+        line = _chained_line(record, previous)
+        rendered.append(line)
+        previous = line
+    return "\n".join(rendered) + "\n"
+
+
+def _compact_audit_text(
+    text: str,
+    *,
+    path: Path,
+    timestamp: datetime,
+    reserve_bytes: int,
+) -> tuple[str, dict[str, Any] | None]:
+    before = len(text.encode("utf-8"))
+    cap = max(1024, int(AUDIT_MAX_BYTES))
+    if before + max(0, int(reserve_bytes)) <= cap:
+        return text, None
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    source_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    tail_budget = max(
+        0,
+        min(
+            max(0, int(AUDIT_KEEP_BYTES)),
+            cap - max(0, int(reserve_bytes)) - 1024,
+        ),
+    )
+    selected_reversed: list[str] = []
+    selected_bytes = 0
+    for line in reversed(lines):
+        line_bytes = len((line + "\n").encode("utf-8"))
+        if selected_reversed and selected_bytes + line_bytes > tail_budget:
+            break
+        if line_bytes > tail_budget and not selected_reversed:
+            break
+        selected_reversed.append(line)
+        selected_bytes += line_bytes
+    selected = list(reversed(selected_reversed))
+
+    def build_checkpoint(retained: list[str]) -> dict[str, Any]:
+        dropped_count = len(lines) - len(retained)
+        dropped = lines[:dropped_count]
+        return {
+            "ts": timestamp.isoformat().replace("+00:00", "Z"),
+            "monotonic_ns": time.monotonic_ns(),
+            "action": "audit.retention_compact",
+            "category": "audit",
+            "payload": {
+                "path": path.name,
+                "bytes_before": before,
+                "source_sha256": source_sha,
+                "dropped_records": dropped_count,
+                "retained_records": len(retained),
+                "first_dropped_ts": _record_ts(dropped[0]) if dropped else None,
+                "last_dropped_ts": _record_ts(dropped[-1]) if dropped else None,
+            },
+        }
+
+    checkpoint = build_checkpoint(selected)
+    replacement = _render_rechained(selected, checkpoint)
+    while selected and len(replacement.encode("utf-8")) + reserve_bytes > cap:
+        selected.pop(0)
+        checkpoint = build_checkpoint(selected)
+        replacement = _render_rechained(selected, checkpoint)
+
+    return replacement, {
+        "bytes_before": before,
+        "bytes_after": len(replacement.encode("utf-8")),
+        "dropped_records": len(lines) - len(selected),
+        "retained_records": len(selected),
+    }
+
+
+def _prune_expired_audit_files(root: Path, *, current_year: int) -> tuple[list[dict[str, Any]], list[str]]:
+    keep_years = max(1, int(AUDIT_RETENTION_YEARS))
+    oldest_year = current_year - keep_years + 1
+    removed: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for path in all_audit_files(root):
+        stem = path.stem
+        if len(stem) < 4 or not stem[:4].isdigit() or int(stem[:4]) >= oldest_year:
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            removed.append({"path": path.name, "bytes": int(size)})
+        except OSError as exc:
+            errors.append(f"{path.name}:{exc}")
+    return removed, errors
+
+
 def append_audit(root: Path, *, action: str, category: str, payload: dict[str, Any]) -> dict[str, Any]:
     timestamp = datetime.now(timezone.utc)
     path = audit_path(root, at=timestamp)
     with _AUDIT_THREAD_LOCK:
-        with private_file_lock(jsonl_lock_path(path), root=root):
-            try:
-                text, _state = read_root_confined_text(
-                    path,
-                    root=root,
-                    max_bytes=100_000_000,
-                    require_private=False,
-                )
-            except FileNotFoundError:
-                text = ""
-            previous_lines = [line for line in text.splitlines() if line.strip()]
-            prev_sha = line_sha(previous_lines[-1]) if previous_lines else None
-            record = {
+        with private_file_lock(audit_maintenance_lock_path(root), root=root):
+            removed_files, retention_errors = _prune_expired_audit_files(root, current_year=timestamp.year)
+            base_record = {
                 "ts": timestamp.isoformat().replace("+00:00", "Z"),
                 "monotonic_ns": time.monotonic_ns(),
                 "action": action,
                 "category": category,
-                "payload": redact_value(payload),
-                "prev_sha": prev_sha,
+                "payload": _bounded_audit_payload(payload),
             }
-            line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            append_private_text(path, line + "\n", root=root)
-    append_jsonl(
-        root / ".ai" / "memory" / "audit-index.jsonl",
-        {"ts": record["ts"], "category": category, "action": action, "path": path.relative_to(root).as_posix()},
-    )
+            maintenance_record: dict[str, Any] | None = None
+            if removed_files or retention_errors:
+                maintenance_record = {
+                    "ts": base_record["ts"],
+                    "monotonic_ns": time.monotonic_ns(),
+                    "action": "audit.retention_prune",
+                    "category": "audit",
+                    "payload": _bounded_audit_payload(
+                        {
+                            "retention_years": max(1, int(AUDIT_RETENTION_YEARS)),
+                            "removed_files": removed_files,
+                            "errors": retention_errors,
+                        }
+                    ),
+                }
+            reserve_records = [record for record in (maintenance_record, base_record) if record is not None]
+            reserve_bytes = sum(len(_chained_line(record, "0" * 64).encode("utf-8")) + 1 for record in reserve_records)
+            compacted = False
+            with private_file_lock(jsonl_lock_path(path), root=root):
+                try:
+                    text, _state = read_root_confined_text(
+                        path,
+                        root=root,
+                        max_bytes=max(100_000_000, int(AUDIT_MAX_BYTES) * 8),
+                        require_private=False,
+                    )
+                except FileNotFoundError:
+                    text = ""
+                replacement, compact_result = _compact_audit_text(
+                    text,
+                    path=path,
+                    timestamp=timestamp,
+                    reserve_bytes=reserve_bytes,
+                )
+                if compact_result is not None:
+                    atomic_write_private_text(path, replacement, root=root)
+                    text = replacement
+                    compacted = True
+                previous_lines = [line for line in text.splitlines() if line.strip()]
+                previous_line = previous_lines[-1] if previous_lines else None
+                appended_lines: list[str] = []
+                for pending in reserve_records:
+                    line = _chained_line(pending, previous_line)
+                    appended_lines.append(line)
+                    previous_line = line
+                append_private_text(path, "\n".join(appended_lines) + "\n", root=root)
+                record = json.loads(appended_lines[-1])
+
+            if compacted or removed_files or retention_errors:
+                _rebuild_audit_index_locked(root)
+            else:
+                append_jsonl(
+                    root / ".ai" / "memory" / "audit-index.jsonl",
+                    {"ts": record["ts"], "category": category, "action": action, "path": path.relative_to(root).as_posix()},
+                )
     return record
 
 
-def rebuild_audit_index(root: Path) -> dict[str, Any]:
+def _rebuild_audit_index_locked(root: Path) -> dict[str, Any]:
     audit_root = root / ".ai" / "memory" / "audit"
     index_path = root / ".ai" / "memory" / "audit-index.jsonl"
     rows: list[dict[str, Any]] = []
@@ -574,6 +772,12 @@ def rebuild_audit_index(root: Path) -> dict[str, Any]:
     if skipped:
         result["skipped"] = skipped
     return result
+
+
+def rebuild_audit_index(root: Path) -> dict[str, Any]:
+    with _AUDIT_THREAD_LOCK:
+        with private_file_lock(audit_maintenance_lock_path(root), root=root):
+            return _rebuild_audit_index_locked(root)
 
 
 def read_jsonl_tail(path: Path, limit: int) -> list[dict[str, Any]]:
@@ -655,6 +859,102 @@ def read_jsonl_all(path: Path) -> list[dict[str, Any]]:
         if isinstance(entry, dict):
             out.append(entry)
     return out
+
+
+def read_jsonl_recent_bounded(
+    path: Path,
+    *,
+    max_records: int = 10_000,
+    max_bytes: int = 8_000_000,
+) -> dict[str, Any]:
+    """Read only the newest bounded JSONL window with explicit partial evidence.
+
+    This is intended for interactive recall/status paths where scanning an
+    append-only lifetime archive is neither necessary nor safe. Records remain
+    oldest-to-newest inside the retained window so last-write-wins folding keeps
+    its normal semantics.
+    """
+    path = Path(path)
+    root = state_root_for_path(path)
+    record_limit = max(0, int(max_records))
+    byte_limit = max(1, int(max_bytes))
+    try:
+        text, _state, tail = read_root_confined_tail_text(
+            path,
+            root=root,
+            max_bytes=byte_limit,
+            require_private=False,
+        )
+    except FileNotFoundError:
+        return {
+            "ok": True,
+            "items": [],
+            "scan": {
+                "exists": False,
+                "complete": True,
+                "partial": False,
+                "records_seen": 0,
+                "records_returned": 0,
+                "invalid_lines": 0,
+                "non_object_lines": 0,
+                "record_limit_hit": False,
+                "policy": {"max_records": record_limit, "max_bytes": byte_limit},
+            },
+        }
+    except (OSError, UnicodeDecodeError) as exc:
+        return {
+            "ok": False,
+            "items": [],
+            "scan": {
+                "exists": True,
+                "complete": False,
+                "partial": True,
+                "error": type(exc).__name__,
+                "records_seen": 0,
+                "records_returned": 0,
+                "invalid_lines": 0,
+                "non_object_lines": 0,
+                "record_limit_hit": False,
+                "policy": {"max_records": record_limit, "max_bytes": byte_limit},
+            },
+        }
+
+    retained: deque[dict[str, Any]] = deque(maxlen=record_limit or 1)
+    valid_records = 0
+    invalid_lines = 0
+    non_object_lines = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_lines += 1
+            continue
+        if not isinstance(entry, dict):
+            non_object_lines += 1
+            continue
+        valid_records += 1
+        if record_limit:
+            retained.append(entry)
+    record_limit_hit = valid_records > record_limit if record_limit else valid_records > 0
+    items = list(retained) if record_limit else []
+    source_partial = bool(tail.get("partial"))
+    partial = source_partial or record_limit_hit
+    scan = {
+        "exists": True,
+        "complete": not partial,
+        "partial": partial,
+        "records_seen": valid_records,
+        "records_returned": len(items),
+        "invalid_lines": invalid_lines,
+        "non_object_lines": non_object_lines,
+        "record_limit_hit": record_limit_hit,
+        "policy": {"max_records": record_limit, "max_bytes": byte_limit},
+        **tail,
+    }
+    return {"ok": True, "items": items, "scan": scan}
 
 
 def read_text_tail(path: Path, lines: int) -> str:

@@ -8,15 +8,10 @@ regress retrieval. stdlib only.
 """
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
+from ..ranking_metrics import evaluate_ranked_retrieval
 from . import fts as fts_mod
-
-
-def _expected_pages(value: object) -> list[str]:
-    raw = value if isinstance(value, list) else [value]
-    return list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
 
 
 def evaluate(ar_root: Path, golden: list[dict], k: int = 5) -> dict:
@@ -26,53 +21,15 @@ def evaluate(ar_root: Path, golden: list[dict], k: int = 5) -> dict:
     relevant paths. Metrics are macro-averaged per query so one topic with many
     labels cannot dominate the smoke suite.
     """
-    k = max(1, int(k))
-    results: list[dict] = []
-    hits = 0
-    recall_total = 0.0
-    reciprocal_rank_total = 0.0
-    ndcg_total = 0.0
-    for g in golden:
-        q = str(g.get("query", ""))
-        expected = _expected_pages(g.get("expect"))
-        found = fts_mod.search(ar_root, q, k=k)
-        pages = [str(h.get("page")) for h in found if isinstance(h, dict) and "error" not in h and h.get("page")]
-        ranks = sorted(pages.index(page) + 1 for page in expected if page in pages)
-        relevant_retrieved = len(ranks)
-        query_recall = relevant_retrieved / len(expected) if expected else 0.0
-        reciprocal_rank = 1.0 / ranks[0] if ranks else 0.0
-        dcg = sum(1.0 / math.log2(rank + 1) for rank in ranks)
-        ideal_count = min(len(expected), k)
-        idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_count + 1))
-        ndcg = dcg / idcg if idcg else 0.0
-        hit = bool(ranks)
-        results.append({
-            "query": q,
-            "expect": g.get("expect"),
-            "expected_pages": expected,
-            "hit": hit,
-            "rank": ranks[0] if ranks else None,
-            "relevant_retrieved": relevant_retrieved,
-            "recall_at_k": round(query_recall, 6),
-            "reciprocal_rank": round(reciprocal_rank, 6),
-            "ndcg_at_k": round(ndcg, 6),
-        })
-        hits += 1 if hit else 0
-        recall_total += query_recall
-        reciprocal_rank_total += reciprocal_rank
-        ndcg_total += ndcg
-    total = len(golden)
-    return {
-        "recall_at_k": round(recall_total / total, 6) if total else 0.0,
-        "hit_rate_at_k": round(hits / total, 6) if total else 0.0,
-        "mrr": round(reciprocal_rank_total / total, 6) if total else 0.0,
-        "ndcg_at_k": round(ndcg_total / total, 6) if total else 0.0,
-        "k": k,
-        "total": total,
-        "hits": hits,
-        "misses": [r for r in results if not r["hit"]],
-        "results": results,
-    }
+    def ranked_search(query_text: str, requested_k: int) -> list[str]:
+        found = fts_mod.search(ar_root, query_text, k=requested_k)
+        return [
+            str(item.get("page"))
+            for item in found
+            if isinstance(item, dict) and "error" not in item and item.get("page")
+        ]
+
+    return evaluate_ranked_retrieval(golden, ranked_search, k=k)
 
 
 def load_golden(path: Path) -> list[dict]:

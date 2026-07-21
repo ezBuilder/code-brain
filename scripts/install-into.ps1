@@ -288,7 +288,7 @@ managed = {
     "SubagentStop": [{"hooks": [cb("SubagentStop", "Recording Code Brain subagent stop")]}],
     "PreCompact": [{"hooks": [cb("PreCompact", "Saving Code Brain compact snapshot")]}],
     "PostCompact": [{"hooks": [cb("PostCompact", "Recording Code Brain compact completion")]}],
-    "PermissionRequest": [{"matcher": "Bash", "hooks": [cb("PermissionRequest", "Checking Code Brain approval policy")]}],
+    "PermissionRequest": [{"matcher": "Bash", "hooks": [cb("PermissionRequest", "Recording Code Brain approval request")]}],
 }
 existing_payload = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
 if not isinstance(existing_payload, dict):
@@ -346,6 +346,10 @@ function Write-InstallManifest {
         tool                 = "code-brain"
         upgrade_channel      = $(if ($sourceRepoUrl) { "github" } else { "local" })
         upgrade_command      = ".ai/bin/ai upgrade latest --json"
+        codex_hook_activation_required = $true
+        codex_project_trust_required = $true
+        codex_hook_review_command = "/hooks"
+        codex_hook_reapproval_after_changes = $true
     }
     $json = $manifest | ConvertTo-Json -Depth 6
     $dstDir = Split-Path $dst -Parent
@@ -458,6 +462,12 @@ function Install-OrUpgrade {
         Invoke-Bootstrap
     }
     Write-Host "code-brain $Action`: $TargetRoot"
+    if ($Action -eq "install") {
+        Write-Host "codex activation: trust the project, run /hooks, and approve the discovered Code Brain hooks"
+    }
+    else {
+        Write-Host "codex activation: review /hooks and reapprove Code Brain hooks if Codex requests it"
+    }
 }
 
 function Uninstall {

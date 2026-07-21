@@ -173,6 +173,8 @@ fi
 if [[ "$RUNTIME_DEFERRED" -eq 1 ]]; then
   echo "[code-brain] files staged. Runtime activation was deferred for $TARGET." >&2
 else
-  echo "[code-brain] installed. New AI sessions in $TARGET now load Code Brain memory, search, hooks, and MCP automatically." >&2
+  echo "[code-brain] installed. Code Brain files, memory, search, MCP, and hook definitions are ready in $TARGET." >&2
 fi
+echo "[code-brain] Codex action required: trust this project, run /hooks, and approve the discovered Code Brain hooks." >&2
+echo "[code-brain] After install or hook changes, Codex may require reapproval before project hooks run." >&2
 echo "[code-brain] (optional) cross-machine sync: set memory_sync.enabled: true in .ai/config.yaml + AI_REMOTE_FETCH=1." >&2

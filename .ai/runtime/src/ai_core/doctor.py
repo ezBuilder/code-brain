@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import subprocess
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -665,7 +666,11 @@ def check_audit_index(root: Path) -> Check:
             bad.append(rel_path)
 
     audit_keys: set[tuple[object, object, object, object]] = set()
-    from .memory import all_audit_files
+    from .memory import _AUDIT_INDEX_MAX_ROWS, all_audit_files
+
+    expected_index_keys: deque[tuple[object, object, object, object]] = deque(
+        maxlen=_AUDIT_INDEX_MAX_ROWS
+    )
 
     for path in all_audit_files(root):
         rel_path = path.relative_to(root).as_posix()
@@ -677,8 +682,11 @@ def check_audit_index(root: Path) -> Check:
         for record in records:
             key = audit_key(record, rel_path)
             audit_keys.add(key)
-            if key not in index_keys:
-                bad.append(f"{rel_path}:missing-index:{record.get('ts')}")
+            expected_index_keys.append(key)
+
+    for key in expected_index_keys:
+        if key not in index_keys:
+            bad.append(f"{key[3]}:missing-index:{key[0]}")
 
     for key in sorted(index_keys - audit_keys, key=str):
         bad.append(f"audit-index:orphan:{key[0]}")

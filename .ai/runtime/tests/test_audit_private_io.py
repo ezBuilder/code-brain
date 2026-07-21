@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from ai_core import memory
 from ai_core.doctor import check_audit_chain, check_audit_index
 from ai_core.memory import append_audit, audit_path, rebuild_audit_index
 
@@ -87,6 +88,22 @@ def test_concurrent_audit_append_and_index_rebuild_preserve_chain_and_rows(tmp_p
     assert result["indexed"] == 40
     assert len(rows) == 40
     assert check_audit_chain(tmp_path).ok is True
+
+
+def test_bounded_audit_index_validates_retained_tail(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(memory, "_AUDIT_INDEX_MAX_ROWS", 2)
+    for index in range(3):
+        append_audit(
+            tmp_path,
+            action=f"test.{index}",
+            category="test",
+            payload={"index": index},
+        )
+
+    result = rebuild_audit_index(tmp_path)
+
+    assert result["indexed"] == 2
+    assert check_audit_index(tmp_path).ok is True
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")

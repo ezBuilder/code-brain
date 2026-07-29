@@ -123,7 +123,7 @@ def test_query_self_heals_outdated_schema_index(
     assert any(item["path"].startswith("src/board.js") for item in payload["results"])
     with connect(repo) as conn:
         version = int(conn.execute("pragma user_version").fetchone()[0])
-    assert version == 9
+    assert version == 10
 
 
 def test_structural_legacy_schema_still_requires_explicit_rebuild(
@@ -166,3 +166,19 @@ def test_non_schema_runtime_error_still_propagates(tmp_path: Path) -> None:
         RuntimeError("outdated search index schema; run ai index rebuild")
     ) is True
     assert search_mod._is_legacy_schema_error(sqlite3.OperationalError("x")) is False
+
+
+def test_observability_degrades_on_outdated_schema_instead_of_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ai_core.search import observability
+
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/board.js", "function fetchFlightScheduleBoard() {}\n")
+    rebuild(repo)
+    with connect(repo) as conn:
+        conn.execute("pragma user_version=5")
+        conn.commit()
+    payload = observability(repo)
+    assert payload["ok"] is False
+    assert payload["reason"] == "outdated_schema"

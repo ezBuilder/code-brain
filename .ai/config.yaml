@@ -20,6 +20,7 @@ cache:
   sqlite_path: .ai/cache/code.sqlite
 search:
   retriever: bm25
+  index_vendored_runtime: true   # source repo only: .ai/runtime IS the product source
 manifest:
   path: .ai/generated/manifest.json
 autoresearch:

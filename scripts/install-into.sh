@@ -460,6 +460,10 @@ for line in text.splitlines():
     if line.startswith("project_name:"):
         lines.append(f"project_name: {root.name}")
         replaced = True
+    elif "index_vendored_runtime" in line:
+        # Source-repo-only flag: consumer installs must not index the vendored
+        # .ai/runtime payload, so the opt-in never propagates to targets.
+        continue
     else:
         lines.append(line)
 if not replaced:

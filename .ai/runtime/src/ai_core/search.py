@@ -30,7 +30,7 @@ from .private_write import (
 )
 from .redact import redact_value
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 CANDIDATE_CACHE_SCHEMA = 3
 CANDIDATE_CACHE_MAX_AGE_SECONDS = 60.0
 import os as _os
@@ -63,6 +63,18 @@ SKIP_PATH_PREFIXES = (
     ".ai/agents_catalog/",
     ".codebrain/",
 )
+# Vendored Code Brain install payload inside consumer repos. Indexing it drowns
+# project code in runtime noise (observed in installs: split-word queries return
+# only .ai/runtime files), so these are skipped unless the repo opts in via
+# `search.index_vendored_runtime: true` — the Code Brain source repo itself opts
+# in because .ai/runtime IS its product source.
+VENDORED_RUNTIME_PREFIXES = (
+    ".ai/runtime/",
+    ".ai/bin/",
+    ".ai/generated/",
+    ".ai/evals/",
+)
+_VENDORED_OPT_IN_CACHE: dict[str, tuple[int, bool]] = {}
 SKIP_DIRS = {
     ".git",
     ".chatgpt2codex",
@@ -150,6 +162,34 @@ _SUBTOKEN_PART_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+
 def _subtokens_enabled() -> bool:
     raw = os.environ.get("AI_SEARCH_SUBTOKENS", "1")
     return str(raw).strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _index_vendored_runtime_enabled(root: Path) -> bool:
+    """search.index_vendored_runtime opt-in, cached per root by config mtime."""
+    config_path = Path(root) / ".ai" / "config.yaml"
+    try:
+        mtime_ns = int(config_path.stat().st_mtime_ns)
+    except OSError:
+        return False
+    key = str(root)
+    cached = _VENDORED_OPT_IN_CACHE.get(key)
+    if cached is not None and cached[0] == mtime_ns:
+        return cached[1]
+    enabled = False
+    try:
+        search_cfg = load_config(Path(root)).get("search", {})
+        if isinstance(search_cfg, dict):
+            enabled = search_cfg.get("index_vendored_runtime") is True
+    except Exception:
+        enabled = False
+    _VENDORED_OPT_IN_CACHE[key] = (mtime_ns, enabled)
+    return enabled
+
+
+def _skip_path_prefixes(root: Path) -> tuple[str, ...]:
+    if _index_vendored_runtime_enabled(root):
+        return SKIP_PATH_PREFIXES
+    return SKIP_PATH_PREFIXES + VENDORED_RUNTIME_PREFIXES
 
 
 def identifier_subtokens(text: str, *, max_terms: int = SUBTOKEN_MAX_TERMS) -> list[str]:
@@ -2103,23 +2143,34 @@ def observability(root: Path, *, query_text: str | None = None, limit: int = 5) 
     payload["sqlite_bytes"] = path.stat().st_size
     wal = path.with_name(path.name + "-wal")
     payload["sqlite_wal_bytes"] = wal.stat().st_size if wal.exists() else 0
-    with _connection_scope(root) as conn:
-        init_schema(conn)
-        payload["schema_version"] = int(conn.execute("pragma user_version").fetchone()[0])
-        row = conn.execute(
-            """
-            select count(*) as indexed_files,
-                   coalesce(sum(m.bytes), 0) as indexed_bytes,
-                   coalesce(sum(length(c.summary)), 0) as summary_bytes
-            from chunks c
-            left join chunk_meta m on m.chunk_id = c.id
-            """
-        ).fetchone()
-        payload["indexed_files"] = int(row["indexed_files"])
-        payload["indexed_bytes"] = int(row["indexed_bytes"])
-        payload["summary_bytes"] = int(row["summary_bytes"])
-        disabled = conn.execute("select count(*) as count from embeddings_vec0").fetchone()
-        payload["embeddings"] = {"enabled": False, "disabled_rows": int(disabled["count"])}
+    try:
+        with _connection_scope(root) as conn:
+            init_schema(conn)
+            payload["schema_version"] = int(conn.execute("pragma user_version").fetchone()[0])
+            row = conn.execute(
+                """
+                select count(*) as indexed_files,
+                       coalesce(sum(m.bytes), 0) as indexed_bytes,
+                       coalesce(sum(length(c.summary)), 0) as summary_bytes
+                from chunks c
+                left join chunk_meta m on m.chunk_id = c.id
+                """
+            ).fetchone()
+            payload["indexed_files"] = int(row["indexed_files"])
+            payload["indexed_bytes"] = int(row["indexed_bytes"])
+            payload["summary_bytes"] = int(row["summary_bytes"])
+            disabled = conn.execute("select count(*) as count from embeddings_vec0").fetchone()
+            payload["embeddings"] = {"enabled": False, "disabled_rows": int(disabled["count"])}
+    except RuntimeError as exc:
+        # Read-only observability must not crash a report on a pre-rebuild index;
+        # degrade like missing_index and let query()/rebuild heal the schema.
+        if not (_is_legacy_schema_error(exc) or _is_outdated_schema_error(exc)):
+            raise
+        payload["ok"] = False
+        payload["reason"] = (
+            "legacy_schema" if _is_legacy_schema_error(exc) else "outdated_schema"
+        )
+        return payload
     if query_text:
         pack = context_pack(root, query_text, limit=limit)
         result_paths = [item["path"] for item in pack["results"]]
@@ -2207,7 +2258,7 @@ def _indexable_text_stat(root: Path, path: Path) -> os.stat_result | None:
     except ValueError:
         return None
     rel_posix = rel.as_posix()
-    if any(rel_posix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
+    if any(rel_posix.startswith(prefix) for prefix in _skip_path_prefixes(root)):
         return None
     if any(part in SKIP_DIRS for part in rel.parts):
         return None
@@ -2253,23 +2304,23 @@ def _candidate_cache_path(root: Path) -> Path:
     return root / ".ai" / "cache" / "candidate-files.json"
 
 
-def _candidate_policy_fingerprint() -> str:
+def _candidate_policy_fingerprint(root: Path) -> str:
     payload = {
         "skip_dirs": sorted(SKIP_DIRS),
-        "skip_path_prefixes": list(SKIP_PATH_PREFIXES),
+        "skip_path_prefixes": list(_skip_path_prefixes(root)),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _candidate_rel_allowed(rel: str) -> bool:
+def _candidate_rel_allowed(rel: str, root: Path) -> bool:
     rel_path = Path(rel)
     if rel_path.is_absolute() or not rel_path.parts or ".." in rel_path.parts:
         return False
     rel_posix = rel_path.as_posix()
     if any(part in SKIP_DIRS for part in rel_path.parts):
         return False
-    if any(rel_posix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
+    if any(rel_posix.startswith(prefix) for prefix in _skip_path_prefixes(root)):
         return False
     return True
 
@@ -2321,7 +2372,7 @@ def _candidate_cache_tree_state(root: Path) -> tuple[dict[str, list[int]], dict[
             child_prefix = child_rel.rstrip("/") + "/"
             if name == ".git" or name in SKIP_DIRS:
                 continue
-            if any(child_prefix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
+            if any(child_prefix.startswith(prefix) for prefix in _skip_path_prefixes(root)):
                 continue
             kept.append(name)
         dir_names[:] = kept
@@ -2366,7 +2417,7 @@ def _candidate_cache_load(root: Path) -> list[Path] | None:
             return None
         if payload.get("schema") != CANDIDATE_CACHE_SCHEMA:
             return None
-        if payload.get("policy_fingerprint") != _candidate_policy_fingerprint():
+        if payload.get("policy_fingerprint") != _candidate_policy_fingerprint(root):
             return None
         cached_dirs = payload.get("directories")
         cached_ignores = payload.get("ignore_files")
@@ -2421,7 +2472,7 @@ def _candidate_cache_write(root: Path, rels: list[str]) -> None:
         directories, ignore_files = _candidate_cache_tree_state(root)
         payload = {
             "schema": CANDIDATE_CACHE_SCHEMA,
-            "policy_fingerprint": _candidate_policy_fingerprint(),
+            "policy_fingerprint": _candidate_policy_fingerprint(root),
             "created_at_unix": time.time(),
             "directories": directories,
             "ignore_files": ignore_files,
@@ -2478,7 +2529,7 @@ def _filesystem_candidate_files(
             child_posix = child_rel.as_posix().rstrip("/") + "/"
             if name == ".git" or name in SKIP_DIRS:
                 continue
-            if any(child_posix.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
+            if any(child_posix.startswith(prefix) for prefix in _skip_path_prefixes(root)):
                 continue
             try:
                 state = (current_path / name).lstat()
@@ -2499,7 +2550,7 @@ def _filesystem_candidate_files(
                 state = path.lstat()
             except (OSError, ValueError):
                 continue
-            if not _candidate_rel_allowed(rel) or not stat_module.S_ISREG(state.st_mode):
+            if not _candidate_rel_allowed(rel, root) or not stat_module.S_ISREG(state.st_mode):
                 continue
             found.append(path)
             if len(found) >= path_limit:
@@ -2533,7 +2584,7 @@ def candidate_files(
         or any("\ufffd" in rel for rel in rels)
     ):
         return _filesystem_candidate_files(root)
-    rels = [rel for rel in rels if _candidate_rel_allowed(rel)]
+    rels = [rel for rel in rels if _candidate_rel_allowed(rel, root)]
     if update_cache and not is_ci():
         _candidate_cache_write(root, rels)
     return sorted(root / rel for rel in rels)

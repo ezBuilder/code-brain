@@ -110,11 +110,40 @@ def _observe_autoresearch_retrieval(case: dict[str, Any]) -> Observed:
         return evalset.evaluate(ar_root, golden, k=int(case.get("k") or 5))
 
 
+def _observe_code_retrieval(case: dict[str, Any]) -> Observed:
+    from ai_core import code_retrieval_eval
+    from ai_core.search import rebuild
+
+    corpus = case.get("corpus")
+    golden = case.get("golden")
+    if not isinstance(corpus, list) or not all(isinstance(item, dict) for item in corpus):
+        raise ValueError("code_retrieval case requires an object list in corpus")
+    if not isinstance(golden, list) or not all(isinstance(item, dict) for item in golden):
+        raise ValueError("code_retrieval case requires an object list in golden")
+
+    with tempfile.TemporaryDirectory(prefix="codebrain_code_retrieval_eval_") as tmpdir:
+        repo = pathlib.Path(tmpdir) / "repo"
+        (repo / ".ai").mkdir(parents=True)
+        (repo / ".ai" / "config.yaml").write_text("project_name: code-retrieval-eval\n", encoding="utf-8")
+        for item in corpus:
+            rel = pathlib.PurePosixPath(str(item.get("path") or ""))
+            if not rel.parts or rel.is_absolute() or ".." in rel.parts or rel.parts[0] == ".ai":
+                raise ValueError(f"invalid corpus path: {rel}")
+            destination = repo.joinpath(*rel.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(str(item.get("content") or ""), encoding="utf-8")
+        rebuilt = rebuild(repo)
+        if rebuilt.get("ok") is not True:
+            raise RuntimeError(f"code retrieval index rebuild failed: {rebuilt.get('error') or rebuilt}")
+        return code_retrieval_eval.evaluate(repo, golden, k=int(case.get("k") or 5))
+
+
 ADAPTERS: dict[str, Adapter] = {
     "precall_routing": _observe_precall,
     "context_budget": _observe_context_budget,
     "tool_discovery": _observe_tool_discovery,
     "autoresearch_retrieval": _observe_autoresearch_retrieval,
+    "code_retrieval": _observe_code_retrieval,
 }
 
 
@@ -176,6 +205,23 @@ def _assert_expectation(expectation: dict[str, Any], observed: Observed) -> str 
         expected = expectation.get("value")
         if actual != expected:
             return f"expected {path}={expected!r}, observed={actual!r}"
+        return None
+
+    if kind in {"assert_field_at_most", "assert_field_at_least"}:
+        path = str(expectation.get("path") or "")
+        try:
+            actual = _field(observed, path)
+        except KeyError:
+            return f"missing field path={path!r}"
+        try:
+            actual_number = float(actual)
+            threshold = float(expectation.get("value"))
+        except (TypeError, ValueError):
+            return f"non-numeric comparison for {path!r}: {actual!r} vs {expectation.get('value')!r}"
+        if kind == "assert_field_at_most" and actual_number > threshold:
+            return f"expected {path} <= {threshold}, observed={actual_number}"
+        if kind == "assert_field_at_least" and actual_number < threshold:
+            return f"expected {path} >= {threshold}, observed={actual_number}"
         return None
 
     if kind == "assert_contains":

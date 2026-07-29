@@ -851,17 +851,59 @@ def _tool_profile() -> str:
     return "compact" if _compact_tools_enabled() else "full"
 
 
+# MCP tool annotations (spec: readOnlyHint/destructiveHint/idempotentHint/openWorldHint).
+# Curated conservatively: tools with uncertain side effects carry no annotations at all
+# (absent = unknown), so a wrong "read-only" claim can never weaken client approval UX.
+_READ_ONLY_TOOLS = frozenset({
+    "memory_query", "code_query", "context_pack",
+    "code_graph_callers", "code_graph_callees", "code_graph_symbol",
+    "code_graph_trace", "code_graph_impact", "code_graph_architecture",
+    "code_find_references", "code_goto_definition", "code_read_hashline",
+    "stream_guard_scan", "ast_grep_search", "tool_search",
+    "obs_usage", "obs_health_summary", "obs_search", "doctor_strict",
+    "lessons_recall", "memory_recall", "list_decisions",
+    "evidence_list", "security_finding_list",
+    "loopd_status", "loopd_agents", "speculative_hit_rate",
+    "autoresearch_search", "autoresearch_query",
+    "autoresearch_deepresearch_status", "autoresearch_loop_status",
+})
+_WRITE_TOOLS = frozenset({
+    "ai_request_rebuild", "sandbox_execute", "record_decision",
+    "loop_submit", "loopd_dispatch_once", "record_todo", "close_todo",
+    "append_session_note", "evidence_record", "evidence_set_status",
+    "security_finding_record", "security_finding_update", "append_handoff",
+    "autoresearch_ingest_stage", "autoresearch_ingest_commit",
+})
+# Write tools that may reach beyond the repo (network fetch / arbitrary shell).
+_OPEN_WORLD_TOOLS = frozenset({"sandbox_execute", "autoresearch_ingest_stage"})
+
+
+def _annotated_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    entry = dict(tool)
+    name = str(entry.get("name") or "")
+    if name in _READ_ONLY_TOOLS:
+        entry["annotations"] = {"readOnlyHint": True, "openWorldHint": False}
+    elif name in _WRITE_TOOLS:
+        entry["annotations"] = {
+            "readOnlyHint": False,
+            "destructiveHint": name == "sandbox_execute",
+            "idempotentHint": name == "ai_request_rebuild",
+            "openWorldHint": name in _OPEN_WORLD_TOOLS,
+        }
+    return entry
+
+
 def _build_tools_list_payload() -> dict[str, Any]:
     """Build the tools/list result payload. Pure function over module constants."""
     profile = _tool_profile()
     if profile == "usage":
-        return {"tools": [dict(t) for t in TOOLS if t["name"] in _USAGE_TOOLS]}
+        return {"tools": [_annotated_tool(t) for t in TOOLS if t["name"] in _USAGE_TOOLS]}
     if profile in {"core", "compact"}:
-        return {"tools": [dict(t) for t in TOOLS if t["name"] in _CORE_TOOLS]}
+        return {"tools": [_annotated_tool(t) for t in TOOLS if t["name"] in _CORE_TOOLS]}
     if profile == "full-all":  # escape hatch: surface even the hidden worker-pool tools
-        return {"tools": [dict(tool) for tool in TOOLS]}
+        return {"tools": [_annotated_tool(tool) for tool in TOOLS]}
     # default "full": everything EXCEPT the hidden worker-pool/loop-dispatch surface
-    return {"tools": [dict(tool) for tool in TOOLS if tool["name"] not in _HIDDEN_TOOLS]}
+    return {"tools": [_annotated_tool(tool) for tool in TOOLS if tool["name"] not in _HIDDEN_TOOLS]}
 
 
 def _get_tools_list_payload() -> dict[str, Any]:

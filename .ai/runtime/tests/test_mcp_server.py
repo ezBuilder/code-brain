@@ -168,3 +168,29 @@ def test_full_all_profile_resurfaces_hidden(tmp_path: Path, monkeypatch) -> None
     names = {t["name"] for t in resp["result"]["tools"]}
     assert "loopd_status" in names
     mcp_server._invalidate_tools_list_cache()
+
+
+def test_tool_annotation_sets_reference_real_tools() -> None:
+    names = set(mcp_server.MCP_METHODS)
+    assert mcp_server._READ_ONLY_TOOLS <= names
+    assert mcp_server._WRITE_TOOLS <= names
+    assert mcp_server._OPEN_WORLD_TOOLS <= mcp_server._WRITE_TOOLS
+    assert not (mcp_server._READ_ONLY_TOOLS & mcp_server._WRITE_TOOLS)
+
+
+def test_tools_list_carries_conservative_annotations(tmp_path: Path) -> None:
+    mcp_server._invalidate_tools_list_cache()
+    resp = mcp_server.handle_request(
+        tmp_path, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    )
+    tools = {t["name"]: t for t in resp["result"]["tools"]}
+    assert tools["code_query"]["annotations"]["readOnlyHint"] is True
+    assert tools["code_read_hashline"]["annotations"]["readOnlyHint"] is True
+    assert tools["record_decision"]["annotations"]["readOnlyHint"] is False
+    assert tools["record_decision"]["annotations"]["destructiveHint"] is False
+    assert tools["sandbox_execute"]["annotations"]["destructiveHint"] is True
+    assert tools["sandbox_execute"]["annotations"]["openWorldHint"] is True
+    assert tools["ai_request_rebuild"]["annotations"]["idempotentHint"] is True
+    # Uncertain-side-effect tools stay unannotated (absent = unknown, fail-safe).
+    assert "annotations" not in tools["selfimprove_run"]
+    mcp_server._invalidate_tools_list_cache()

@@ -67,7 +67,7 @@ test:
 	env -u CI -u GITHUB_ACTIONS -u GITLAB_CI -u AI_CI uv run --project .ai/runtime python -m pytest .ai/runtime/tests
 
 eval:
-	uv run --project .ai/runtime python .ai/evals/run.py --axis precall_routing --axis context_budget --axis tool_discovery --axis autoresearch_retrieval --wired --strict --require-complete
+	uv run --project .ai/runtime python .ai/evals/run.py --axis precall_routing --axis context_budget --axis tool_discovery --axis autoresearch_retrieval --axis code_retrieval --wired --strict --require-complete
 
 doctor:
 	uv run --project .ai/runtime ai doctor --strict --json

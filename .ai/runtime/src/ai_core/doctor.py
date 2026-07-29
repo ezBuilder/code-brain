@@ -338,6 +338,8 @@ def check_index_freshness_from_status(status: dict[str, object]) -> Check:
         return Check("index_freshness", True, "not indexed")
     if reason == "legacy_schema":
         return Check("index_freshness", False, "legacy index schema; run ai index rebuild")
+    if reason == "outdated_schema":
+        return Check("index_freshness", False, "outdated index schema; rebuilds on next query or ai index rebuild")
     if reason == "unreadable":
         return Check("index_freshness", False, str(status.get("detail") or "index unreadable"))
     raw_changed = status.get("changed_paths") or []

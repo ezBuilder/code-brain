@@ -45,14 +45,14 @@ def _write(repo: Path, rel: str, content: str) -> Path:
     return path
 
 
-def test_schema_version_is_eight(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 8
+def test_schema_version_is_nine(tmp_path: Path) -> None:
+    assert SCHEMA_VERSION == 9
     repo = _make_repo(tmp_path)
     _write(repo, "doc.md", "hello world\n")
     rebuild(repo)
     with connect(repo) as conn:
         version = int(conn.execute("pragma user_version").fetchone()[0])
-    assert version == 8
+    assert version == 9
 
 
 def test_porter_stemming_matches_inflected_forms(tmp_path: Path) -> None:
@@ -129,7 +129,7 @@ def test_legacy_v2_cache_auto_migrates_to_current_schema(tmp_path: Path) -> None
         assert version_before == 2
         init_schema(conn, migrate_legacy=True)
         version_after = int(conn.execute("pragma user_version").fetchone()[0])
-        assert version_after == 8
+        assert version_after == 9
 
         tables = {
             row[0]

@@ -4,7 +4,15 @@ All notable Code Brain changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- Identifier-subtoken dual-emission indexing (schema v9): camelCase identifiers are now searchable by their split words (e.g. `fetchFlightScheduleBoard` matches "flight schedule board"); disable with `AI_SEARCH_SUBTOKENS=0`. Evidence: identifier-aware BM25 tokenization improves code retrieval by double digits (arXiv:2605.18561).
+- `code_retrieval` eval axis: golden-query Recall@K/MRR/NDCG@K/latency regression gate over the production `search.query` path, wired into `make eval` (re-lands the deferred retrieval-evaluation follow-up).
+- MCP tool annotations (`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`) on curated read-only and write tools, aligning with the 2026 MCP spec and client approval UX; uncertain tools stay unannotated (fail-safe).
+
 ### Fixed
+
+- `search.query` now self-heals a version-outdated index (auto rebuild) instead of failing until a manual `ai index rebuild`; structural pre-v2 legacy indexes still require the explicit rebuild and are never dropped on a read path.
 
 - Branch deletion guards now hard-block only protected branch names while allowing worktree, session, feature, and scratch branch cleanup.
 - Session start and upgrades now enforce bounded `.ai/tmp`, `.ai/outputs`, and total `.ai` storage with tracked-file and `.keep` preservation.

@@ -30,7 +30,7 @@ from .private_write import (
 )
 from .redact import redact_value
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 CANDIDATE_CACHE_SCHEMA = 3
 CANDIDATE_CACHE_MAX_AGE_SECONDS = 60.0
 import os as _os
@@ -137,6 +137,58 @@ TEXT_SUFFIXES = {
     ".ps1",
 }
 
+# Dual-emission subtoken indexing (BM25 tokenization for code identifiers):
+# unicode61 splits snake_case at "_" but keeps camelCase identifiers as one
+# token, so split-word queries miss them. At index time we append the camel/
+# digit-boundary parts of each identifier to the FTS document (contentless
+# FTS5 never stores or displays it). Kill switch: AI_SEARCH_SUBTOKENS=0.
+SUBTOKEN_MAX_TERMS = 512
+_SUBTOKEN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{2,63}")
+_SUBTOKEN_PART_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+
+
+def _subtokens_enabled() -> bool:
+    raw = os.environ.get("AI_SEARCH_SUBTOKENS", "1")
+    return str(raw).strip().lower() not in {"0", "off", "false", "no"}
+
+
+def identifier_subtokens(text: str, *, max_terms: int = SUBTOKEN_MAX_TERMS) -> list[str]:
+    """Unique lowercase camelCase/digit-boundary parts of identifiers in text."""
+    seen_words: set[str] = set()
+    seen_parts: set[str] = set()
+    parts: list[str] = []
+    for match in _SUBTOKEN_WORD_RE.finditer(text):
+        word = match.group(0)
+        if word in seen_words:
+            continue
+        seen_words.add(word)
+        if word.islower() or word.isupper():
+            continue
+        pieces = _SUBTOKEN_PART_RE.findall(word)
+        if len(pieces) < 2:
+            continue
+        for piece in pieces:
+            if len(piece) < 2:
+                continue
+            folded = piece.lower()
+            if folded in seen_parts:
+                continue
+            seen_parts.add(folded)
+            parts.append(folded)
+            if len(parts) >= max_terms:
+                return parts
+    return parts
+
+
+def _fts_document(text: str) -> str:
+    """FTS-indexed document: raw text plus appended identifier subtokens."""
+    if not _subtokens_enabled():
+        return text
+    subtokens = identifier_subtokens(text)
+    if not subtokens:
+        return text
+    return text + "\n" + " ".join(subtokens)
+
 
 def db_path(root: Path) -> Path:
     return root / ".ai" / "cache" / "code.sqlite"
@@ -209,6 +261,16 @@ def _is_corrupt_index_error(exc: BaseException) -> bool:
     )
 
 
+def _is_legacy_schema_error(exc: BaseException) -> bool:
+    """True for init_schema's guard on a structural pre-v2 content schema."""
+    return isinstance(exc, RuntimeError) and "legacy search index schema" in str(exc)
+
+
+def _is_outdated_schema_error(exc: BaseException) -> bool:
+    """True for init_schema's guard on a modern schema at an older version."""
+    return isinstance(exc, RuntimeError) and "outdated search index schema" in str(exc)
+
+
 def _is_index_size_error(exc: BaseException) -> bool:
     message = str(exc).casefold()
     return any(
@@ -241,7 +303,13 @@ def init_schema(conn: sqlite3.Connection, *, migrate_legacy: bool = False) -> No
     )
     needs_migration = (current_version and current_version < SCHEMA_VERSION) or legacy_schema
     if needs_migration and not migrate_legacy:
-        raise RuntimeError("legacy search index schema; run ai index rebuild")
+        if legacy_schema:
+            # Structural pre-v2 content schema: never dropped implicitly on a
+            # read path — the operator opts into migration via `ai index rebuild`.
+            raise RuntimeError("legacy search index schema; run ai index rebuild")
+        # Same modern contentless schema at an older version (routine upgrade):
+        # safe to rebuild automatically; query() self-heals on this error.
+        raise RuntimeError("outdated search index schema; run ai index rebuild")
     if needs_migration:
         drop_schema(conn)
     create_schema(conn)
@@ -492,7 +560,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             chunk_id = int(cursor.lastrowid)
             conn.execute(
                 "insert into chunks_fts(rowid, path, content) values (?, ?, ?)",
-                (chunk_id, rel, redacted),
+                (chunk_id, rel, _fts_document(redacted)),
             )
             conn.execute(
                 "insert into chunk_meta(chunk_id, kind, bytes, line_count) values (?, ?, ?, ?)",
@@ -584,7 +652,7 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
             summary = summarize(redacted)
             cursor = conn.execute("insert into chunks(path, sha256, summary) values (?, ?, ?)", (rel, digest, summary))
             chunk_id = int(cursor.lastrowid)
-            conn.execute("insert into chunks_fts(rowid, path, content) values (?, ?, ?)", (chunk_id, rel, redacted))
+            conn.execute("insert into chunks_fts(rowid, path, content) values (?, ?, ?)", (chunk_id, rel, _fts_document(redacted)))
             conn.execute(
                 "insert into chunk_meta(chunk_id, kind, bytes, line_count) values (?, ?, ?, ?)",
                 (chunk_id, "file", len(redacted.encode("utf-8")), redacted.count("\n") + 1),
@@ -763,7 +831,7 @@ def _insert_function_chunks(
             # Insert into FTS index
             conn.execute(
                 "insert into chunks_fts(rowid, path, content) values (?, ?, ?)",
-                (chunk_id, chunk_path, chunk_text),
+                (chunk_id, chunk_path, _fts_document(chunk_text)),
             )
 
             # Insert into chunk_meta with function metadata
@@ -1627,9 +1695,14 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
     }
     try:
         index_state, rows, vectors_by_id = load_index_rows()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, RuntimeError) as exc:
+        if isinstance(exc, RuntimeError) and not _is_outdated_schema_error(exc):
+            # Structural legacy schema (and any other RuntimeError) keeps the
+            # explicit-rebuild contract; only version-outdated indexes self-heal.
+            raise
         index_state, rows, vectors_by_id = empty_state, [], {}
-        if _is_corrupt_index_error(exc):
+        recovery_reason = "outdated_schema" if _is_outdated_schema_error(exc) else "corrupt_index"
+        if _is_corrupt_index_error(exc) or _is_outdated_schema_error(exc):
             recovery = rebuild(root, single_flight=True)
             if recovery.get("ok") and not recovery.get("skipped"):
                 try:
@@ -1637,20 +1710,20 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
                     auto_refresh = {
                         "enabled": True,
                         "rebuilt": True,
-                        "reason": "corrupt_index",
+                        "reason": recovery_reason,
                         "result": recovery,
                     }
                 except sqlite3.Error:
                     auto_refresh = {
                         "enabled": True,
                         "rebuilt": False,
-                        "reason": "corrupt_index_recovery_failed",
+                        "reason": f"{recovery_reason}_recovery_failed",
                     }
             else:
                 auto_refresh = {
                     "enabled": True,
                     "rebuilt": False,
-                    "reason": "corrupt_index_recovery_deferred",
+                    "reason": f"{recovery_reason}_recovery_deferred",
                     "result": recovery,
                 }
         else:
@@ -1872,6 +1945,8 @@ def index_hash_status(
         reason = (
             "legacy_schema"
             if "legacy" in detail and "index schema" in detail
+            else "outdated_schema"
+            if "outdated" in detail and "index schema" in detail
             else "unreadable"
         )
         return {

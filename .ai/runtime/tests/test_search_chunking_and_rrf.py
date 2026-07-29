@@ -52,9 +52,9 @@ def _count_candidate_discovery(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
     return calls
 
 
-def test_schema_version_is_eight() -> None:
-    """Schema v8 enables row-level FTS delete for true incremental updates."""
-    assert SCHEMA_VERSION == 8
+def test_schema_version_is_nine() -> None:
+    """Schema v9 adds identifier-subtoken dual emission to the FTS document."""
+    assert SCHEMA_VERSION == 9
 
 
 def test_escape_fts_query_splits_natural_language_punctuation() -> None:

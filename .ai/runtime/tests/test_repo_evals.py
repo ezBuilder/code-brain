@@ -54,6 +54,18 @@ def test_autoresearch_retrieval_axis_measures_ranking_quality() -> None:
     assert report["failed"] == []
 
 
+def test_code_retrieval_axis_measures_production_search_quality_and_latency() -> None:
+    runner = _load_runner()
+    report = runner.run_axis("code_retrieval", wired=True)
+    assert report["measured"] == report["cases"] == 4
+    assert report["passed"] == 4
+    assert report["failed"] == []
+    baseline = report["case_results"][0]["observed"]
+    assert len(baseline["corpus_sha256"]) == 64
+    assert baseline["latency_ms"]["p95"] >= 0.0
+    assert baseline["retrieval_policy_counts"]
+
+
 def test_unsupported_axis_is_explicitly_skipped_not_passed() -> None:
     runner = _load_runner()
     report = runner.run_axis("decision_logging", wired=True)
@@ -77,6 +89,8 @@ def test_cli_is_a_strict_complete_gate_for_supported_axes() -> None:
             "tool_discovery",
             "--axis",
             "autoresearch_retrieval",
+            "--axis",
+            "code_retrieval",
             "--wired",
             "--strict",
             "--require-complete",
@@ -91,10 +105,10 @@ def test_cli_is_a_strict_complete_gate_for_supported_axes() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
     payload = json.loads(completed.stdout)
     assert payload["summary"] == {
-        "axes": 4,
-        "cases": 19,
-        "measured": 19,
-        "passed": 19,
+        "axes": 5,
+        "cases": 23,
+        "measured": 23,
+        "passed": 23,
         "failed": 0,
         "skipped": 0,
     }

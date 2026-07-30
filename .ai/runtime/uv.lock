@@ -47,7 +47,7 @@ wheels = [
 
 [[package]]
 name = "code-brain-runtime"
-version = "0.6.5"
+version = "0.6.6"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },

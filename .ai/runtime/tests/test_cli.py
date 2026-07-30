@@ -93,15 +93,75 @@ def usable_bash_or_skip() -> str:
 
 def _copy_repo_ignore(src: str, names: list[str]) -> set[str]:
     rel = Path(src).resolve()
-    blocked = {".git", ".venv", ".pytest_cache", "__pycache__", "cache", "kits"}
+    blocked = {
+        ".dart_tool",
+        ".git",
+        ".next",
+        ".nuxt",
+        ".pnpm-store",
+        ".pytest_cache",
+        ".venv",
+        ".yarn",
+        "DerivedData",
+        "__pycache__",
+        "build",
+        "cache",
+        "coverage",
+        "kits",
+        "node_modules",
+        "target",
+    }
+    linked = {name for name in names if (Path(src) / name).is_symlink()}
     if rel.name == ".claude":
-        return {n for n in names if n != "commands"}
-    return {n for n in names if n in blocked}
+        return {name for name in names if name != "commands"} | linked
+    return {name for name in names if name in blocked} | linked
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink fixture requires no-elevation symlinks")
+def test_copy_repo_ignores_dependencies_and_external_symlinks(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "src").mkdir()
+    (source / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (source / "node_modules" / "pkg").mkdir(parents=True)
+    (source / "node_modules" / "pkg" / "index.js").write_text("dependency\n", encoding="utf-8")
+    external = tmp_path / "external-dependencies"
+    external.mkdir()
+    (external / "large.bin").write_bytes(b"x" * 1024)
+    (source / "linked-dependencies").symlink_to(external, target_is_directory=True)
+
+    target = tmp_path / "copy"
+    shutil.copytree(source, target, ignore=_copy_repo_ignore)
+
+    assert (target / "src" / "app.py").exists()
+    assert not (target / "node_modules").exists()
+    assert not (target / "linked-dependencies").exists()
+
+
+def test_runtime_pytest_removes_basetemp_after_session(tmp_path: Path) -> None:
+    nested_basetemp = tmp_path / "nested-basetemp"
+    result = subprocess.run(
+        [
+            PYTHON,
+            "-m",
+            "pytest",
+            f"{Path(__file__)}::test_version_json",
+            "-q",
+            f"--basetemp={nested_basetemp}",
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not nested_basetemp.exists()
 
 
 def copy_repo(tmp_path: Path) -> Path:
     target = tmp_path / "repo"
-    shutil.copytree(ROOT, target, ignore=_copy_repo_ignore)
+    shutil.copytree(ROOT, target, ignore=_copy_repo_ignore, symlinks=True)
     for pattern in (
         ".ai/memory/queue/*.json",
         ".ai/memory/queue/.tmp/*.json*",

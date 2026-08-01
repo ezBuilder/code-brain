@@ -14,7 +14,7 @@ from .inbox import decide, list_approvals, request_approval
 from .memory import append_audit, append_event, rebuild_audit_index
 from .obs import diagnostics, health_summary, metrics, prune_diagnostics, search_report, slo_bench, usage_report, write_log
 from .paths import find_repo_root
-from .policy import CONFIG_INVALID, GENERIC_ERROR, MANIFEST_DRIFT, OK, PERMISSION_DENIED, PolicyDenied, WORKER_UNAVAILABLE, reject_ci_write
+from .policy import CONFIG_INVALID, GENERIC_ERROR, MANIFEST_DRIFT, OK, PERMISSION_DENIED, PolicyDenied, USAGE_ERROR, WORKER_UNAVAILABLE, reject_ci_write
 from .render import render
 from .search import context_pack, query, rebuild
 from .secrets_store import status as secrets_status
@@ -426,6 +426,19 @@ def build_parser() -> argparse.ArgumentParser:
     memory_conflicts.add_argument("--dry-run", action="store_true", dest="dry_run", help="scan but do not write")
     memory_conflicts.add_argument("--limit", type=int, default=20)
     memory_conflicts.add_argument("--json", action="store_true", dest="command_json")
+    memory_forget = memory_sub.add_parser(
+        "forget", help="hard-forget a decision/failure id (tombstone + compaction; CLI-only, not exposed over MCP)")
+    memory_forget.add_argument("--id", required=True, dest="forget_id")
+    memory_forget.add_argument("--confirm-id", required=True, dest="confirm_id",
+                               help="retype the id; a destructive op must not run on a pasted typo")
+    memory_forget.add_argument("--yes", action="store_true", help="required acknowledgement")
+    memory_forget.add_argument("--reason", default="")
+    memory_forget.add_argument("--json", action="store_true", dest="command_json")
+    memory_forget_note = memory_sub.add_parser(
+        "forget-note", help="remove session-note lines containing a substring (also purges embedding resume snapshots)")
+    memory_forget_note.add_argument("--contains", required=True, help="substring, min 4 chars")
+    memory_forget_note.add_argument("--yes", action="store_true", help="required acknowledgement")
+    memory_forget_note.add_argument("--json", action="store_true", dest="command_json")
     memory_todo = memory_sub.add_parser("todo")
     memory_todo_sub = memory_todo.add_subparsers(dest="memory_todo_command", required=True)
     memory_todo_add = memory_todo_sub.add_parser("add")
@@ -639,6 +652,16 @@ def build_parser() -> argparse.ArgumentParser:
     emb_install.add_argument("--json", action="store_true", dest="command_json")
     emb_uninstall = embedding_sub.add_parser("uninstall", help="remove cached model files")
     emb_uninstall.add_argument("--json", action="store_true", dest="command_json")
+
+    reranker_parser = sub.add_parser("reranker", help="cross-encoder rerank model management (opt-in)")
+    reranker_sub = reranker_parser.add_subparsers(dest="reranker_command", required=True)
+    rr_status = reranker_sub.add_parser("status", help="show reranker readiness")
+    rr_status.add_argument("--json", action="store_true", dest="command_json")
+    rr_install = reranker_sub.add_parser("install", help="download ONNX ms-marco-MiniLM model (~23MB, one-shot)")
+    rr_install.add_argument("--verify", action="store_true", help="only check presence")
+    rr_install.add_argument("--json", action="store_true", dest="command_json")
+    rr_uninstall = reranker_sub.add_parser("uninstall", help="remove cached model files")
+    rr_uninstall.add_argument("--json", action="store_true", dest="command_json")
 
     agents_parser = sub.add_parser("agents")
     agents_sub = agents_parser.add_subparsers(dest="agents_command", required=True)
@@ -1416,6 +1439,28 @@ def main(argv: list[str] | None = None) -> int:
                 payload = list_conflicts(root, limit=args.limit)
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "forget":
+            reject_ci_write("memory")
+            if not args.yes:
+                emit({"ok": False, "reason": "confirmation_required", "hint": "re-run with --yes"}, as_json=as_json)
+                return USAGE_ERROR
+            if args.forget_id != args.confirm_id:
+                emit({"ok": False, "reason": "confirm_id_mismatch",
+                      "hint": "--confirm-id must repeat --id exactly"}, as_json=as_json)
+                return USAGE_ERROR
+            from .memory import forget_decision
+            payload = forget_decision(root, target_id=args.forget_id, reason=args.reason)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "forget-note":
+            reject_ci_write("memory")
+            if not args.yes:
+                emit({"ok": False, "reason": "confirmation_required", "hint": "re-run with --yes"}, as_json=as_json)
+                return USAGE_ERROR
+            from .memory import forget_session_notes
+            payload = forget_session_notes(root, contains=args.contains)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "memory" and args.memory_command == "todo" and args.memory_todo_command == "add":
             reject_ci_write("memory")
             from .memory import append_todo
@@ -1641,11 +1686,29 @@ def main(argv: list[str] | None = None) -> int:
                 emit(emb_mod.status(root), as_json=as_json)
                 return OK
             if cmd == "install":
+                reject_ci_write("embedding", dry_run=bool(args.verify))
                 payload = emb_mod.install_model(root, verify_only=bool(args.verify))
                 emit(payload, as_json=as_json)
                 return OK if payload.get("ok") else 1
             if cmd == "uninstall":
+                reject_ci_write("embedding")
                 payload = emb_mod.uninstall_model(root)
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else 1
+        if args.command == "reranker":
+            from . import reranker as rr_mod
+            cmd = args.reranker_command
+            if cmd == "status":
+                emit(rr_mod.status(root), as_json=as_json)
+                return OK
+            if cmd == "install":
+                reject_ci_write("reranker", dry_run=bool(args.verify))
+                payload = rr_mod.install_model(root, verify_only=bool(args.verify))
+                emit(payload, as_json=as_json)
+                return OK if payload.get("ok") else 1
+            if cmd == "uninstall":
+                reject_ci_write("reranker")
+                payload = rr_mod.uninstall_model(root)
                 emit(payload, as_json=as_json)
                 return OK if payload.get("ok") else 1
         if args.command == "agents":

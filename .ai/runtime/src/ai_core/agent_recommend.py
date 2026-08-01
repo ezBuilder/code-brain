@@ -20,6 +20,7 @@ from .memory import (
     append_audit,
     append_jsonl,
     decisions_path,
+    live_decision_records,
     now_iso,
     read_jsonl_all,
     read_jsonl_tail,
@@ -161,7 +162,10 @@ def _gather_subagent_intents(root: Path) -> Counter[str]:
 
 def _gather_decision_tags(root: Path) -> Counter[str]:
     counts: Counter[str] = Counter()
-    for entry in read_jsonl_tail(decisions_path(root), 200):
+    # Shared live filter — twin of recommend._candidates_from_decision_tags: these tag counts
+    # decide which sub-agent definitions get drafted, so a refuted or time-boxed decision must
+    # not keep voting.
+    for entry in live_decision_records(read_jsonl_tail(decisions_path(root), 200)):
         for tag in entry.get("tags") or []:
             t = str(tag).strip().lower()
             if t:

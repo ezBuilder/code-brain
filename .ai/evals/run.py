@@ -138,12 +138,55 @@ def _observe_code_retrieval(case: dict[str, Any]) -> Observed:
         return code_retrieval_eval.evaluate(repo, golden, k=int(case.get("k") or 5))
 
 
+def _observe_memory_retrieval(case: dict[str, Any]) -> Observed:
+    from datetime import datetime, timezone
+
+    from ai_core import memory_retrieval_eval
+
+    store = case.get("store")
+    golden = case.get("golden")
+    if not isinstance(store, dict):
+        raise ValueError("memory_retrieval case requires a store object")
+    if not isinstance(golden, list) or not all(isinstance(item, dict) for item in golden):
+        raise ValueError("memory_retrieval case requires an object list in golden")
+
+    with tempfile.TemporaryDirectory(prefix="codebrain_memory_retrieval_eval_") as tmpdir:
+        repo = pathlib.Path(tmpdir) / "repo"
+        mem = repo / ".ai" / "memory"
+        mem.mkdir(parents=True)
+        (repo / ".ai" / "config.yaml").write_text("project_name: memory-retrieval-eval\n", encoding="utf-8")
+        for key, filename in (
+            ("decisions", "decisions.jsonl"),
+            ("lessons", "lessons.jsonl"),
+            ("procedures", "procedural.jsonl"),
+        ):
+            rows = store.get(key) or []
+            if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                raise ValueError(f"memory_retrieval store.{key} must be an object list")
+            if rows:
+                target = mem / filename
+                target.write_text(
+                    "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
+                    encoding="utf-8",
+                )
+                target.chmod(0o600)
+        # Pins recency decay only. Liveness (expires_at) folds against the wall
+        # clock inside live_decision_records, so fixtures use far past/future
+        # bounds — see memory_retrieval_eval's module docstring.
+        now_raw = str(case.get("now") or "2026-01-01T00:00:00Z")
+        moment = datetime.fromisoformat(now_raw.replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return memory_retrieval_eval.evaluate(repo, golden, k=int(case.get("k") or 5), now=moment)
+
+
 ADAPTERS: dict[str, Adapter] = {
     "precall_routing": _observe_precall,
     "context_budget": _observe_context_budget,
     "tool_discovery": _observe_tool_discovery,
     "autoresearch_retrieval": _observe_autoresearch_retrieval,
     "code_retrieval": _observe_code_retrieval,
+    "memory_retrieval": _observe_memory_retrieval,
 }
 
 

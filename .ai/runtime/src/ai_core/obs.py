@@ -21,6 +21,24 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _parse_ts_utc(ts: str) -> datetime | None:
+    """ISO timestamp → aware UTC datetime, or None (fail-soft).
+
+    Offset-less reads as UTC: every caller compares against an aware window
+    bound, so a naive return would TypeError outside the except-ValueError
+    guard this replaces. Twin of hooks._parse_audit_ts_utc.
+    """
+    if not ts:
+        return None
+    try:
+        if ts.endswith("Z"):
+            return datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(ts)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def log_path(root: Path) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return root / ".ai" / "cache" / "logs" / f"{stamp}.jsonl"
@@ -478,15 +496,7 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
             tail = act.split(".", 1)[1]
             pid = (rec.get("payload") or {}).get("id") if isinstance(rec.get("payload"), dict) else None
             ts_raw = str(rec.get("ts") or "")
-            parsed_ts: datetime | None = None
-            if ts_raw:
-                try:
-                    parsed_ts = (
-                        datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
-                        if ts_raw.endswith("Z") else datetime.fromisoformat(ts_raw)
-                    )
-                except ValueError:
-                    parsed_ts = None
+            parsed_ts = _parse_ts_utc(ts_raw)
             if tail == "recommend_pending":
                 counts["surfaced"] += 1
                 if isinstance(pid, str):
@@ -766,16 +776,7 @@ def mem_eval_summary(root: Path, *, window_days: int = 7) -> dict[str, Any]:
             except json.JSONDecodeError:
                 continue
             ts_raw = str(rec.get("ts") or "")
-            parsed_ts: datetime | None = None
-            if ts_raw:
-                try:
-                    parsed_ts = (
-                        datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
-                        if ts_raw.endswith("Z")
-                        else datetime.fromisoformat(ts_raw)
-                    )
-                except ValueError:
-                    parsed_ts = None
+            parsed_ts = _parse_ts_utc(ts_raw)
             if parsed_ts is None or parsed_ts < window_start:
                 continue
             date_key = parsed_ts.strftime("%Y-%m-%d")
@@ -832,16 +833,7 @@ def mem_eval_summary(root: Path, *, window_days: int = 7) -> dict[str, Any]:
                     except json.JSONDecodeError:
                         continue
                     ts_raw = str(rec.get("created_at") or "")
-                    parsed_ts: datetime | None = None
-                    if ts_raw:
-                        try:
-                            parsed_ts = (
-                                datetime.fromisoformat(ts_raw[:-1]).replace(tzinfo=timezone.utc)
-                                if ts_raw.endswith("Z")
-                                else datetime.fromisoformat(ts_raw)
-                            )
-                        except ValueError:
-                            parsed_ts = None
+                    parsed_ts = _parse_ts_utc(ts_raw)
                     if parsed_ts is not None and parsed_ts >= window_start:
                         lessons_added_recent += 1
 

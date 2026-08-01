@@ -246,42 +246,28 @@ def test_e2e_reranker_activate_with_model_mock(tmp_root: Path, monkeypatch) -> N
     assert scores == sorted(scores, reverse=True), "Results should be sorted by score descending"
 
 
-def test_e2e_reranker_model_install_spawn_background(tmp_root: Path) -> None:
+def test_e2e_reranker_activation_never_spawns_install(tmp_root: Path) -> None:
     """
-    Verify: When model missing but deps present, background install spawns.
-    Uses lock to prevent duplicates.
+    Verify (-006): model missing + deps present → is_active_for stays False and
+    NOTHING is spawned. The old in-query background install violated the
+    read-only/closed-world contract code_query advertises over MCP.
     """
     from ai_core import reranker
 
-    # Ensure model dir exists but has no model files
+    # Model dir exists but has no model files — the exact pre-006 spawn trigger
     model_dir = reranker.model_cache_dir(tmp_root)
     model_dir.mkdir(parents=True, exist_ok=True)
-
-    # Mock ai binary and deps
     ai_bin = tmp_root / ".ai" / "bin" / "ai"
     ai_bin.parent.mkdir(parents=True, exist_ok=True)
     ai_bin.write_text("#!/bin/sh\necho mock", encoding="utf-8")
     ai_bin.chmod(0o755)
 
-    mock_proc = mock.MagicMock()
-    mock_proc.pid = 54321
-
-    with mock.patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+    with mock.patch("subprocess.Popen") as mock_popen:
         with mock.patch.object(reranker, "_deps_present", return_value=True):
-            reranker._maybe_spawn_background_install(tmp_root)
+            assert reranker.is_active_for(tmp_root) is False
 
-    # Verify lock created
-    lock = model_dir / ".install-lock"
-    assert lock.exists(), "Install lock should exist"
-
-    # Verify child registered
-    child_registry = tmp_root / ".ai" / "cache" / "child-processes.jsonl"
-    if child_registry.exists():
-        lines = child_registry.read_text(encoding="utf-8").splitlines()
-        children = [json.loads(l) for l in lines if l.strip()]
-        pids = [c.get("pid") for c in children]
-        # Note: may not register if register_child not called in mock, so just check call count
-        assert mock_popen.call_count >= 1, "Popen should have been called for install"
+    mock_popen.assert_not_called()
+    assert not (model_dir / ".install-lock").exists(), "activation must not claim install locks"
 
 
 # ============================================================================

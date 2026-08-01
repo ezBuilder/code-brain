@@ -483,6 +483,27 @@ def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
     return {"ok": True, "spawned": spawned, "skipped": False, "reason": None}
 
 
+def _parse_audit_ts_utc(ts: str):
+    """Audit 'ts' → aware UTC datetime, or None (fail-soft).
+
+    An offset-less value is read as UTC, matching now_iso(). Every caller compares
+    the result against an aware cutoff (or sorts/subtracts it against aware peers),
+    so returning a naive datetime here would raise TypeError PAST the callers'
+    except-ValueError guards — audit lines are git-synced and hand-editable, so the
+    offset-less shape does arrive. Twin of lessons._parse_ts.
+    """
+    from datetime import datetime, timezone
+    if not ts:
+        return None
+    try:
+        if ts.endswith("Z"):
+            return datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(ts)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
     """Return candidate IDs whose recommend_pending audit event landed within cooldown_hours.
 
@@ -513,16 +534,8 @@ def _recently_surfaced_ids(root: Path, cooldown_hours: float) -> set[str]:
             if not act.endswith(".recommend_pending"):
                 continue
             ts = str(rec.get("ts") or "")
-            if not ts:
-                continue
-            try:
-                if ts.endswith("Z"):
-                    parsed = datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
-                else:
-                    parsed = datetime.fromisoformat(ts)
-            except ValueError:
-                continue
-            if parsed < cutoff:
+            parsed = _parse_audit_ts_utc(ts)
+            if parsed is None or parsed < cutoff:
                 continue
             cid = (rec.get("payload") or {}).get("id")
             if isinstance(cid, str) and cid:
@@ -590,14 +603,8 @@ def _cooldown_weights(
             if not act.endswith(".recommend_pending"):
                 continue
             ts = str(rec.get("ts") or "")
-            if not ts:
-                continue
-            try:
-                if ts.endswith("Z"):
-                    parsed = datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
-                else:
-                    parsed = datetime.fromisoformat(ts)
-            except ValueError:
+            parsed = _parse_audit_ts_utc(ts)
+            if parsed is None:
                 continue
             cid = (rec.get("payload") or {}).get("id")
             if not isinstance(cid, str) or not cid:
@@ -1092,12 +1099,8 @@ def _try_autonomous_accept(root: Path, trigger: str) -> None:
             except json.JSONDecodeError:
                 continue
             ts = str(rec.get("ts") or "")
-            try:
-                parsed = (datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
-                          if ts.endswith("Z") else datetime.fromisoformat(ts))
-            except ValueError:
-                continue
-            if parsed >= cutoff:
+            parsed = _parse_audit_ts_utc(ts)
+            if parsed is not None and parsed >= cutoff:
                 return  # already auto-accepted recently
 
     # find strongest eligible candidate
@@ -1294,14 +1297,9 @@ def _satisfaction_summary_context_uncached(root: Path) -> str:
                 counts["surfaced"] += 1
                 ts = str(rec.get("ts") or "")
                 if ts and isinstance(pid, str):
-                    try:
-                        parsed = (
-                            datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc)
-                            if ts.endswith("Z") else datetime.fromisoformat(ts)
-                        )
+                    parsed = _parse_audit_ts_utc(ts)
+                    if parsed is not None:
                         surfaced_records.append((parsed, pid))
-                    except ValueError:
-                        pass
             elif tail.startswith("accept"):
                 counts["accepted"] += 1
                 if isinstance(pid, str):
@@ -2337,6 +2335,8 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         for entry in plain_decisions:
             ts = str(entry.get("decided_at") or entry.get("timestamp") or "")[:19]
             text = str(entry.get("decision") or entry.get("summary") or entry.get("text") or "")[:160]
+            if not text:
+                continue  # same guard as the resume-tail renderer: never inject an empty bullet
             lines.append(f"  - [{ts}] {text}" if ts else f"  - {text}")
         sections.append("\n".join(lines))
     if live_failures:

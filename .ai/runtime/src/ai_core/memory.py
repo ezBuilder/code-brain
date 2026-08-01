@@ -276,6 +276,21 @@ def _decision_id_exists(root: Path, dec_id: str) -> bool:
     return False
 
 
+def tombstoned_decision_ids(root: Path) -> set[str]:
+    """Ids hard-forgotten via a tombstone marker. Fail-soft (empty on read error)."""
+    out: set[str] = set()
+    try:
+        rows = read_jsonl_all(decisions_path(root))
+    except Exception:
+        return out
+    for rec in rows:
+        if isinstance(rec, dict) and rec.get("kind") == "tombstone":
+            tid = str(rec.get("target_id") or "")
+            if tid:
+                out.add(tid)
+    return out
+
+
 def _valid_edge_id(value: str | None) -> str | None:
     """Return a decision id only if it looks like one (dec-<hex>); else None (fail-soft).
 
@@ -291,6 +306,45 @@ def _valid_edge_id(value: str | None) -> str | None:
     return s
 
 
+_EXPIRES_AT_MAX_CHARS = 32
+_ISO_DATE_LEN = 10  # YYYY-MM-DD
+
+
+def _valid_expires_at(value: str | None) -> str | None:
+    """Return a UTC-normalized ISO bound, or None (fail-soft) when the value is malformed.
+
+    _is_expired compares LEXICALLY against now_iso() (a UTC '...Z' string), so an unvalidated
+    bound silently misorders: 'expires_at=2026' sorts before every real timestamp, which killed
+    the record the instant it was written — no error, no undo. An offset-bearing value is just
+    as bad ('2026-07-30T08:00:00-05:00' is an hour in the FUTURE yet lexically precedes
+    '2026-07-30T12:00:00Z'), hence the normalization to UTC. A malformed bound is dropped so the
+    record simply never expires, exactly how _valid_edge_id drops a malformed edge.
+
+    A date-only bound is accepted and widened to the LAST instant of that day: 'expires_at:
+    2026-12-31' reads as "valid through 2026-12-31", not "dead at 2026-12-31T00:00Z" (which
+    would make expires_at=<today> expire on arrival — the very bug being fixed). A naive
+    (offset-less) datetime is read as UTC, matching now_iso().
+    """
+    raw = str(redact_value(str(value or ""))).strip()[:_EXPIRES_AT_MAX_CHARS]
+    # shape-gate before parsing so acceptance never depends on fromisoformat leniency
+    if len(raw) < _ISO_DATE_LEN or raw[4] != "-" or raw[7] != "-":
+        return None
+    if len(raw) > _ISO_DATE_LEN and raw[_ISO_DATE_LEN] != "T":
+        return None
+    # OverflowError joins ValueError because the UTC conversion itself can fail at the
+    # datetime domain edges ('9999-12-31T23:59:59-14:00' shifts past datetime.max,
+    # '0001-01-01T00:00:00+14:00' before datetime.min); both are malformed bounds to drop.
+    try:
+        dt = datetime.fromisoformat(raw)
+        if len(raw) == _ISO_DATE_LEN:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except (ValueError, OverflowError):
+        return None
+
+
 def _is_expired(rec: dict[str, Any], *, now: str | None = None) -> bool:
     """True when rec carries an expires_at strictly before now (ISO compare). Fail-soft.
 
@@ -302,6 +356,65 @@ def _is_expired(rec: dict[str, Any], *, now: str | None = None) -> bool:
     if not exp:
         return False
     return exp < (now or now_iso())
+
+
+def live_decision_records(
+    rows: list[Any],
+    *,
+    now: str | None = None,
+    include_retired: bool = False,
+    include_expired: bool = False,
+) -> list[dict[str, Any]]:
+    """Single source of truth for "which decision rows are still live".
+
+    Every path that surfaces decision content to an agent must go through this, otherwise a
+    refuted or time-boxed decision leaks back into the injected context through a side door
+    (memory_tier's HOT consolidation and recommend's decision-tag mining both did exactly that).
+    Rules: failures fold by id — last write wins, so a later 'stale'/'refuted' reappend retires
+    the original — retired failures drop unless include_retired, and a past expires_at drops
+    unless include_expired. Plain decisions keep file order and folded failures follow them in
+    first-seen order, so callers can still partition or re-sort. Fail-soft: non-dict rows and
+    id-less failures (unfoldable, so they could duplicate) are skipped.
+
+    Tombstones (hard-forget markers) are handled HERE and only here, deliberately:
+      - a tombstone row itself never surfaces AND never consumes a caller's tail
+        window (DECISIONS_TAIL is 3 — three forgets rendered as plain rows would
+        evict every real decision from the SessionStart block);
+      - any row whose id was tombstoned is suppressed in BOTH partitions, with no
+        include_* escape — forget is unconditional, unlike retire/expire;
+      - suppression is order-independent, so a peer's union merge that re-adds the
+        forgotten line (or lands it AFTER the tombstone) changes nothing.
+    """
+    now_s = now or now_iso()
+    tombstoned: set[str] = set()
+    for rec in rows:
+        if isinstance(rec, dict) and rec.get("kind") == "tombstone":
+            tid = str(rec.get("target_id") or "")
+            if tid:
+                tombstoned.add(tid)
+    plain: list[dict[str, Any]] = []
+    failures: dict[str, dict[str, Any]] = {}
+    for rec in rows:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("kind") == "tombstone":
+            continue
+        if tombstoned and str(rec.get("id") or "") in tombstoned:
+            continue
+        if rec.get("kind") == "failure":
+            fid = str(rec.get("id") or "")
+            if fid:
+                failures[fid] = rec  # fold
+        elif include_expired or not _is_expired(rec, now=now_s):
+            plain.append(rec)
+    out = list(plain)
+    for rec in failures.values():
+        if not include_retired and str(rec.get("status", "observed")) in _RETIRED_STATUSES:
+            continue
+        if not include_expired and _is_expired(rec, now=now_s):
+            continue
+        out.append(rec)
+    return out
 
 
 def append_decision(
@@ -334,6 +447,14 @@ def append_decision(
         "tags": tag_list,
         "source": str(source or "operator")[:64],
     }
+    # A hard-forgotten id must never be reborn: ids carry only 32 bits, so a fresh
+    # record CAN collide with a tombstoned target — and would then be silently
+    # suppressed by live_decision_records on arrival. Regenerate past collisions.
+    suppressed = tombstoned_decision_ids(root)
+    for _ in range(8):
+        if record["id"] not in suppressed:
+            break
+        record["id"] = _short_id("dec")
     if _norm_kind(kind) == "failure":
         record["kind"] = "failure"
         record["status"] = _norm_status(status)
@@ -351,17 +472,17 @@ def append_decision(
         if supersedes_id and _decision_id_exists(root, str(supersedes_id)):
             record["id"] = str(supersedes_id)
     # optional DAG edges (kind-agnostic): stored ONLY when provided so legacy/plain
-    # decisions stay byte-identical. Edge ids are validated (fail-soft); expires_at is a date.
+    # decisions stay byte-identical. Edge ids and the expires_at bound are both validated
+    # fail-soft: a malformed value is omitted, never stored and never raised.
     contradicts_id = _valid_edge_id(contradicts)
     if contradicts_id:
         record["contradicts"] = contradicts_id
     derives_id = _valid_edge_id(derives_from)
     if derives_id:
         record["derives_from"] = derives_id
-    if expires_at:
-        exp_clean = str(redact_value(str(expires_at))).strip()[:32]
-        if exp_clean:
-            record["expires_at"] = exp_clean
+    expires_bound = _valid_expires_at(expires_at)
+    if expires_bound:
+        record["expires_at"] = expires_bound
     append_jsonl(decisions_path(root), record)
     append_audit(root, action="memory.decision_add", category="memory",
                  payload={"id": record["id"], "kind": record.get("kind", "decision")})
@@ -379,29 +500,13 @@ def read_decisions_for_surface(
     optional expires_at is in the past are treated as retired and dropped unless include_expired.
     Fail-soft.
     """
-    plain: list[dict[str, Any]] = []
-    failures: dict[str, dict[str, Any]] = {}
     try:
         rows = read_jsonl_all(decisions_path(root))
     except Exception:
         return [], []
-    now = now_iso()
-    for rec in rows:
-        if not isinstance(rec, dict):
-            continue
-        if rec.get("kind") == "failure":
-            fid = str(rec.get("id") or "")
-            if fid:
-                failures[fid] = rec  # fold
-        else:
-            plain.append(rec)
-    if not include_expired:
-        plain = [r for r in plain if not _is_expired(r, now=now)]
-    live = [
-        r for r in failures.values()
-        if str(r.get("status", "observed")) not in _RETIRED_STATUSES
-        and (include_expired or not _is_expired(r, now=now))
-    ]
+    rows_live = live_decision_records(rows, include_expired=include_expired)
+    plain = [r for r in rows_live if r.get("kind") != "failure"]
+    live = [r for r in rows_live if r.get("kind") == "failure"]
     live.sort(key=lambda r: str(r.get("observed_at") or r.get("decided_at") or ""), reverse=True)
     return plain[-limit:], live
 
@@ -432,28 +537,9 @@ def read_decisions_filtered(
     except Exception:
         return {"ok": True, "count": 0, "items": []}
 
-    now = now_iso()
-    plain: list[dict[str, Any]] = []
-    failures: dict[str, dict[str, Any]] = {}
-    for rec in rows:
-        if not isinstance(rec, dict):
-            continue
-        if rec.get("kind") == "failure":
-            fid = str(rec.get("id") or "")
-            if fid:
-                failures[fid] = rec  # fold by id
-        else:
-            plain.append(rec)
-
-    items: list[dict[str, Any]] = [
-        r for r in plain if include_expired or not _is_expired(r, now=now)
-    ]
-    for rec in failures.values():
-        if not include_retired and str(rec.get("status", "observed")) in _RETIRED_STATUSES:
-            continue
-        if not include_expired and _is_expired(rec, now=now):
-            continue
-        items.append(rec)
+    items = live_decision_records(
+        rows, include_retired=include_retired, include_expired=include_expired
+    )
 
     kind_f = (kind or "").strip().lower() or None
     status_f = (status or "").strip().lower() or None
@@ -549,6 +635,7 @@ def close_todo(
             order.append(eid)
         candidates[eid] = entry
     target: dict[str, Any] | None = None
+    target_key = ""
     needle = match.strip().lower()
     for eid in reversed(order):
         entry = candidates[eid]
@@ -556,14 +643,20 @@ def close_todo(
         if cur_status in {"done", "closed", "completed", "cancelled", "canceled"}:
             continue
         if needle == str(entry.get("id") or "").lower():
-            target = entry; break
+            target = entry; target_key = eid; break
         title = str(entry.get("title") or entry.get("text") or "").lower()
         if needle and needle in title:
-            target = entry; break
+            target = entry; target_key = eid; break
     if target is None:
         return {"ok": False, "reason": "no_match"}
+    # A legacy row can carry no id at all, and it DOES surface as an open todo, so subscripting
+    # target["id"] used to raise KeyError on a todo the user could see. Close it under the same
+    # synthetic 'legacy:<title>' key the readers derive, so the append actually folds onto the
+    # original row and the todo really leaves the open list. Rows that do have an id keep it
+    # verbatim (type included), so their update record stays byte-identical.
+    target_ref = target.get("id") or target_key
     update = {
-        "id": target["id"],
+        "id": target_ref,
         "title": target.get("title"),
         "status": status,
         "owner": target.get("owner", ""),
@@ -574,7 +667,7 @@ def close_todo(
         "source": target.get("source", "operator"),
     }
     append_jsonl(path, update)
-    append_audit(root, action="memory.todo_close", category="memory", payload={"id": target["id"], "status": status})
+    append_audit(root, action="memory.todo_close", category="memory", payload={"id": target_ref, "status": status})
     return {"ok": True, "record": update}
 
 
@@ -640,6 +733,185 @@ def append_session_note(root: Path, *, text: str) -> dict[str, Any]:
         return {"ok": False, "reason": "write_error"}
     append_audit(root, action="memory.session_append", category="memory", payload={"bytes": len(line)})
     return {"ok": True, "appended_bytes": appended_bytes, "path": relative_path}
+
+
+def forget_decision(
+    root: Path,
+    *,
+    target_id: str,
+    reason: str = "",
+    source: str = "operator",
+) -> dict[str, Any]:
+    """Hard-forget a decision/failure id: tombstone marker + unconditional compaction.
+
+    CLI-only surface — deliberately NOT exposed over MCP: the tool table hardcodes
+    destructiveHint for sandbox_execute alone, so a destructive memory tool there
+    would ship advertising destructiveHint=false, a false wire contract.
+
+    Mechanics, each load-bearing:
+      - the tombstone carries a FRESH tomb-<hex> id and names its victim via
+        target_id; reusing the victim's id would collide with the failure fold;
+      - suppression happens inside live_decision_records (every reader), with no
+        include_* escape — see that docstring for the tail-window rationale;
+      - the body is physically removed under the same lock append_jsonl takes, so
+        the two readers that legitimately bypass the shared helper (hooks'
+        exception fallback, loop_engineering's raw conflict scan) cannot leak it
+        and a concurrent append cannot be lost;
+      - the audit event carries ids only (decision bodies never enter the hash
+        chain), so compaction cannot break chain verification.
+
+    The receipt reports union_merge_restorable=True: .ai/.gitattributes merges
+    *.jsonl with merge=union, so a peer clone that still has the old file can
+    resurrect the removed LINE. The (also union-merged) tombstone keeps it
+    suppressed on every reader, but this is a surfacing guarantee, not
+    cryptographic erasure — the bytes may persist in git history and on peers.
+    """
+    tid = str(target_id or "").strip()
+    if not tid:
+        return {"ok": False, "reason": "empty_id"}
+    root = Path(root)
+    path = decisions_path(root)
+    tomb: dict[str, Any] = {
+        "id": _short_id("tomb"),
+        "kind": "tombstone",
+        "target_id": tid,
+        "decided_at": now_iso(),
+        "source": str(redact_value(str(source or "operator")))[:64],
+    }
+    reason_clean = str(redact_value(str(reason or ""))).strip()
+    if reason_clean:
+        tomb["reason"] = reason_clean[:200]
+    tomb_line = json.dumps(
+        tomb, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    removed = 0
+    removed_kinds: set[str] = set()
+    kept: list[str] = []
+    try:
+        with private_file_lock(jsonl_lock_path(path), root=root):
+            try:
+                lines = list(iter_root_confined_text_lines(
+                    path,
+                    root=root,
+                    max_bytes=_JSONL_ALL_MAX_BYTES,
+                    max_line_bytes=_JSONL_LINE_MAX_BYTES,
+                    require_private=False,
+                    require_owner=True,
+                    reject_group_other_writable=True,
+                ))
+            except FileNotFoundError:
+                return {"ok": False, "reason": "no_match", "target_id": tid}
+            for raw in lines:
+                line = raw.rstrip("\n")
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    kept.append(line)  # fail-soft: never destroy what we cannot parse
+                    continue
+                if (
+                    isinstance(rec, dict)
+                    and rec.get("kind") != "tombstone"
+                    and str(rec.get("id") or "") == tid
+                ):
+                    removed += 1
+                    removed_kinds.add(str(rec.get("kind") or "decision"))
+                    continue
+                kept.append(line)
+            if not removed:
+                return {"ok": False, "reason": "no_match", "target_id": tid}
+            kept.append(tomb_line)
+            atomic_write_private_text(path, "".join(l + "\n" for l in kept), root=root)
+    except OSError as exc:
+        return {"ok": False, "reason": f"write_error:{exc}"[:200]}
+    append_audit(
+        root,
+        action="memory.decision_forget",
+        category="memory",
+        payload={"id": tid, "tombstone_id": tomb["id"], "removed_rows": removed},
+    )
+    return {
+        "ok": True,
+        "target_id": tid,
+        "tombstone_id": tomb["id"],
+        "removed_rows": removed,
+        "removed_kinds": sorted(removed_kinds),
+        "union_merge_restorable": True,
+        "note": (
+            "peers merging an older decisions.jsonl (merge=union) can restore the removed "
+            "line; the tombstone keeps it suppressed on every reader"
+        ),
+    }
+
+
+def forget_session_notes(root: Path, *, contains: str) -> dict[str, Any]:
+    """Remove session-note lines containing `contains` (-008).
+
+    Session notes are id-less Markdown append logs, so unlike decisions there is
+    no id to tombstone — removal is by content match and the receipt (plus a
+    counts-only audit event) is the record. resume.json snapshots that embed the
+    text are deleted whole: they are regenerable caches, and editing JSON in
+    place risks breaking the snapshot schema. The needle must be >=4 non-space
+    chars so a slip cannot silently gut the whole log.
+    """
+    needle = str(contains or "")
+    if len(needle.strip()) < 4:
+        return {"ok": False, "reason": "needle_too_short_min_4_chars"}
+    root = Path(root)
+    path = session_current_path(root)
+    max_bytes = max(2048, int(_SESSION_NOTE_MAX_BYTES))
+    read_cap = max(max_bytes * 2, max_bytes + 65536)
+    removed_lines = 0
+    try:
+        with private_file_lock(jsonl_lock_path(path), root=root):
+            try:
+                text, _state = read_root_confined_text(
+                    path,
+                    root=root,
+                    max_bytes=read_cap,
+                    require_private=False,
+                    require_owner=True,
+                    reject_group_other_writable=True,
+                )
+            except FileNotFoundError:
+                text = ""
+            if text:
+                kept_lines = [ln for ln in text.splitlines() if needle not in ln]
+                removed_lines = len(text.splitlines()) - len(kept_lines)
+                if removed_lines:
+                    content = "\n".join(kept_lines)
+                    atomic_write_private_text(
+                        path, content + "\n" if content else "", root=root
+                    )
+    except OSError as exc:
+        return {"ok": False, "reason": f"write_error:{exc}"[:200]}
+    removed_snapshots: list[str] = []
+    base = root / ".ai" / "memory" / "sessions"
+    if base.exists():
+        for snap in sorted(base.glob("*/resume.json")):
+            try:
+                if needle in snap.read_text(encoding="utf-8", errors="replace"):
+                    unlink_root_confined_regular_file(snap, root=root)
+                    removed_snapshots.append(str(snap.relative_to(root)))
+            except OSError:
+                continue
+    append_audit(
+        root,
+        action="memory.session_forget",
+        category="memory",
+        payload={"removed_lines": removed_lines, "removed_snapshots": len(removed_snapshots)},
+    )
+    return {
+        "ok": True,
+        "removed_lines": removed_lines,
+        "removed_snapshots": removed_snapshots,
+        "git_history_restorable": True,
+        "note": (
+            "session notes are git-synced; removed lines persist in git history and on "
+            "peers until their clones catch up"
+        ),
+    }
 
 
 def audit_path(root: Path, *, at: datetime | None = None) -> Path:
@@ -733,8 +1005,18 @@ def _rotate_audit_chain_locked(root: Path, path: Path) -> bool:
     rebuilt: list[str] = []
     prev_sha: str | None = None
     for record in [marker, *candidates]:
+        # Retained records survived only json.loads, so "ts" can be null, "", or garbage —
+        # .get("ts", default) does NOT cover null, and an unparseable value used to abort
+        # the whole rotation with ValueError. Fall back to now; offset-less reads as UTC.
+        ts_raw = str(record.get("ts") or now_iso())
+        try:
+            ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        except ValueError:
+            ts_dt = datetime.fromisoformat(now_iso().replace("Z", "+00:00"))
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
         bounded, line = _bounded_audit_line(
-            timestamp=datetime.fromisoformat(str(record.get("ts", now_iso())).replace("Z", "+00:00")),
+            timestamp=ts_dt,
             action=record.get("action", "unknown"),
             category=record.get("category", "unknown"),
             payload=record.get("payload", {}),

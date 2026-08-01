@@ -60,6 +60,7 @@ def run_checks(
     checks = [
         check_layout(root),
         check_config(root),
+        check_network_defaults(root),
         check_gitattributes(root),
         check_sqlite_features(),
         index_check,
@@ -285,6 +286,36 @@ def check_config(root: Path) -> Check:
     if retriever != "bm25":
         return Check("config", False, f"search retriever not implemented by default install: {retriever}")
     return Check("config", True, "ok")
+
+
+def check_network_defaults(root: Path) -> Check:
+    """Egress alignment (-006): the query path never downloads model artifacts.
+
+    Surfaces two stale states instead of silently ignoring them:
+      - a truthy AI_SEARCH_*_AUTO_INSTALL env — the in-query background install
+        those envs used to gate was removed, so a lingering opt-in means the
+        operator still expects egress that will never happen;
+      - an .install-lock without model artifacts — residue of the pre-fix broken
+        reranker spawn (which retried hourly against an unregistered command) or
+        of an aborted install; nothing consumes it anymore.
+    """
+    problems: list[str] = []
+    truthy = {"1", "true", "yes", "on"}
+    for env in ("AI_SEARCH_DENSE_AUTO_INSTALL", "AI_SEARCH_RERANK_AUTO_INSTALL"):
+        if os.environ.get(env, "").lower() in truthy:
+            problems.append(
+                f"{env} is set but in-query auto-install was removed; run `ai embedding install` / `ai reranker install` explicitly"
+            )
+    try:
+        from . import embedding as _emb
+        from . import reranker as _rr
+        for mod, name in ((_emb, "embedding"), (_rr, "reranker")):
+            lock = mod.model_cache_dir(root) / ".install-lock"
+            if lock.exists() and not mod.is_model_present(root):
+                problems.append(f"stale {name} install-lock without artifacts: {lock.relative_to(root)} (delete it)")
+    except Exception as exc:  # cache probe must not crash doctor, but must not pass silently either
+        problems.append(f"model cache probe failed: {exc}")
+    return Check("network_defaults", not problems, "ok" if not problems else "; ".join(problems))
 
 
 def check_gitattributes(root: Path) -> Check:

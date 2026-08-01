@@ -952,7 +952,14 @@ def test_code_query_rejects_legacy_schema_without_dropping_it(tmp_path: Path) ->
             """
         )
 
-    query_result = run_ai("code", "query", "worker", "--json", cwd=repo)
+    # Disable query auto-refresh so the legacy schema is what the read path actually meets.
+    # With auto-refresh on (the default) any source mtime at/after the just-planted db mtime
+    # makes _auto_refresh_if_stale rebuild first, which migrates the legacy table away — that
+    # is the opt-in `ai index rebuild` path covered by
+    # test_code_index_migrates_legacy_content_schema. Without this the outcome depends on
+    # worktree mtimes: it holds for a pristine export and breaks for any edited checkout.
+    # doctor keeps the default env on purpose: it must flag legacy schema while only reading.
+    query_result = run_ai("code", "query", "worker", "--json", cwd=repo, env={"AI_SEARCH_AUTO_REFRESH": "0"})
     doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
     with sqlite3.connect(db) as conn:
         columns = [row[1] for row in conn.execute("pragma table_info(chunks)").fetchall()]

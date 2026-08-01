@@ -114,7 +114,7 @@ cd /path/to/project
 
 회상은 결정·실패·교훈·절차를 하나의 순위·인용 답변으로 통합하며, `memory conflicts`는 모순되는 결정을 오프라인에서 탐지합니다. 내구 plan(`ai plan`)은 멀티스텝 작업을 끝까지 끌고 갑니다 — `AI_LOOP_CONTINUATION`이 켜지면 Stop 훅이 모든 스텝이 체크될 때까지 다시 프롬프트합니다. 언어 서버가 설치돼 있으면 `code_find_references`/`code_goto_definition`이 LSP급 탐색을 더합니다. 옵트인 추가: 결정에 `contradicts`/`derives_from`/`expires_at` 관계를 달 수 있고(만료된 결정은 회상에서 제외), `AI_MCP_RESOURCES`는 plan/report/handoff를 `codebrain://` 읽기전용 MCP 리소스로 노출하며, `AI_AST_CHUNK`는 Python 인덱싱을 AST 인지(cAST) 청킹으로 전환합니다. v0.6.0부터 안전 pilot(MCP resources·디렉토리 컨텍스트·충돌 탐지)은 기본 ON이며 `ai config pilots`로 관리합니다. cAST는 `ai cast eval`로 자가검증되어, 자기 repo에서 기본 청커를 이길 때만 recall ratchet이 켭니다(무측정 변경 없음).
 
-v0.7.0은 증명 가능한 망각과 측정되는 회상을 더합니다: `ai memory forget`은 결정/실패를 하드 삭제(tombstone + 압축 + 삭제 영수증)해 SessionStart 주입을 포함한 어떤 읽기 경로에도 다시 떠오르지 않게 하고, `ai memory forget-note`는 세션 노트에 같은 일을 합니다. `memory_retrieval` 평가축이 `make eval`에서 회상 품질을 게이트하며(만료·반박·tombstone 레코드는 절대 랭크되지 않음), 모델 다운로드는 명시적 `ai embedding install` / `ai reranker install`로만 일어납니다 — 쿼리 경로는 네트워크를 건드리지 않습니다.
+v0.7.0은 증명 가능한 망각과 측정되는 회상을 더합니다: `ai memory forget`은 결정/실패를 하드 삭제(tombstone + 압축 + 삭제 영수증)해 SessionStart 주입을 포함한 어떤 읽기 경로에도 다시 떠오르지 않게 하고, `ai memory forget-note`는 세션 노트에 같은 일을 합니다. `memory_retrieval` 평가축이 `make eval`에서 회상 품질을 게이트하며(만료·반박·tombstone 레코드는 절대 랭크되지 않음), 모델 다운로드는 명시적 `ai embedding install` / `ai reranker install`로만 일어납니다 — 쿼리 경로는 네트워크를 건드리지 않습니다. v0.7.1은 인덱스 계약을 굳힙니다: 읽기 경로는 구조적 레거시 인덱스를 절대 마이그레이션하지 않으며, 쿼리는 mtime과 무관하게 명시적 `ai index rebuild` 처방과 함께 결정적으로 실패하고, 반복 실패에도 저장소 증가는 0입니다.
 
 기본 MCP 도구:
 

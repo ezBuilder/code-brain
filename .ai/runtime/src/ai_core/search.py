@@ -1898,6 +1898,14 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
     dirty_paths = _git_dirty_paths(root)
     if dirty_paths:
         dirty_status = index_hash_status(root, paths=dirty_paths)
+        if dirty_status.get("reason") == "legacy_schema":
+            # Structural pre-v2 index: NEVER migrated from a read path (-012).
+            # Without this skip a stale-looking worktree rebuilt (= migrated)
+            # while a fresh-looking one raised the explicit-rebuild error — the
+            # same query answered two ways depending on file mtimes. Returning
+            # here also spares the second index open below: the query is about
+            # to fail deterministically anyway.
+            return {"enabled": True, "rebuilt": False, "reason": "legacy_requires_explicit_rebuild"}
         changed_dirty = set(dirty_status.get("changed_paths") or [])
         if changed_dirty:
             result = rebuild(root, single_flight=True, incremental=True, paths=changed_dirty)
@@ -1919,6 +1927,9 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
         return {"enabled": True, "rebuilt": False, "reason": f"stat_error:{exc}"}
     if source_mtime >= db_mtime or 0 <= db_mtime - source_mtime <= MTIME_STALE_GRACE_SECONDS:
         hash_status = index_hash_status(root, use_metadata=True, refresh_metadata=True, use_candidate_cache=True)
+        if hash_status.get("reason") == "legacy_schema":
+            # Same -012 contract as the dirty branch above.
+            return {"enabled": True, "rebuilt": False, "reason": "legacy_requires_explicit_rebuild"}
         changed_paths = set(hash_status.get("changed_paths") or [])
         if changed_paths:
             result = rebuild(root, single_flight=True, incremental=True, paths=changed_paths)

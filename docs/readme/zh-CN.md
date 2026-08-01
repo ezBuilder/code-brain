@@ -114,7 +114,7 @@ cd /path/to/project
 
 召回将决策、失败、教训和流程整合为一个带排序与引用的答案；`memory conflicts` 离线标记相互矛盾的决策。持久化计划(`ai plan`)让多步骤工作坚持到底 —— 启用 `AI_LOOP_CONTINUATION` 后，Stop 钩子会持续重新提示直到每个步骤都被勾选。安装语言服务器后，`code_find_references`/`code_goto_definition` 提供 LSP 级导航。可选扩展：决策可携带 `contradicts`/`derives_from`/`expires_at` 关系（过期决策从召回中剔除）；`AI_MCP_RESOURCES` 将 plan/report/handoff 暴露为 `codebrain://` 只读 MCP 资源；`AI_AST_CHUNK` 将 Python 索引切换为 AST 感知（cAST）分块。自 v0.6.0 起，安全 pilot（MCP 资源、目录上下文、冲突检测）默认开启，用 `ai config pilots` 管理；cAST 通过 `ai cast eval` 自我验证，仅当在你的 repo 上胜过默认分块器时由 recall ratchet 启用（不做无度量更改）。
 
-v0.7.0 新增可证明的遗忘与可度量的召回：`ai memory forget` 硬删除决策/失败记录（墓碑 + 压缩 + 删除回执），任何读取路径——包括 SessionStart 注入——都无法再让它浮现；`ai memory forget-note` 对会话笔记做同样的事。`memory_retrieval` 评估轴在 `make eval` 中把关召回质量（过期、被驳回、已墓碑的记录绝不参与排序），模型下载只会通过显式的 `ai embedding install` / `ai reranker install` 发生——查询路径从不触网。
+v0.7.0 新增可证明的遗忘与可度量的召回：`ai memory forget` 硬删除决策/失败记录（墓碑 + 压缩 + 删除回执），任何读取路径——包括 SessionStart 注入——都无法再让它浮现；`ai memory forget-note` 对会话笔记做同样的事。`memory_retrieval` 评估轴在 `make eval` 中把关召回质量（过期、被驳回、已墓碑的记录绝不参与排序），模型下载只会通过显式的 `ai embedding install` / `ai reranker install` 发生——查询路径从不触网。v0.7.1 加固了索引契约：读取路径绝不迁移结构性遗留索引——查询以明确的 `ai index rebuild` 处方确定性地失败，与 mtime 无关，重复失败也零存储增长。
 
 默认 MCP 工具：
 

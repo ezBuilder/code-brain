@@ -109,9 +109,12 @@ cd /path/to/project
 .ai/bin/ai memory conflicts --json
 .ai/bin/ai plan init --id feat --step "do A" --step "do B"
 .ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
+.ai/bin/ai memory forget --id dec-1234 --confirm-id dec-1234 --yes
 ```
 
 Recall fasst Entscheidungen, Fehler, Lektionen und Prozeduren in einer einzigen gerankten, zitierten Antwort zusammen; `memory conflicts` meldet widersprüchliche Entscheidungen offline. Ein dauerhafter Plan (`ai plan`) hält mehrstufige Arbeit bis zum Ende durch — mit `AI_LOOP_CONTINUATION` fordert der Stop-Hook erneut auf, bis jeder Schritt abgehakt ist. `code_find_references` / `code_goto_definition` ergänzen LSP-Navigation, wenn ein Language-Server installiert ist. Opt-in-Extras: Entscheidungen können `contradicts`/`derives_from`/`expires_at`-Relationen tragen (abgelaufene fallen aus dem Recall); `AI_MCP_RESOURCES` stellt Pläne/Reports/Handoff als schreibgeschützte `codebrain://`-MCP-Ressourcen bereit; `AI_AST_CHUNK` schaltet die Python-Indizierung auf AST-bewusstes (cAST) Chunking um. Ab v0.6.0 sind die sicheren Pilots (MCP-Ressourcen, Verzeichniskontext, Konflikterkennung) standardmäßig aktiv — verwalte sie mit `ai config pilots`; cAST validiert sich selbst über `ai cast eval`, ein Recall-Ratchet aktiviert es nur, wenn es den Standard-Chunker in deinem Repo schlägt (keine Änderung ohne Messung).
+
+v0.7.0 bringt beweisbares Vergessen und gemessenen Recall: `ai memory forget` löscht eine Entscheidung/einen Fehler hart (Tombstone + Kompaktierung + Lösch-Quittung), sodass kein Lesepfad — einschließlich der SessionStart-Injektion — sie wieder auftauchen lässt; `ai memory forget-note` tut dasselbe für Session-Notizen. Eine `memory_retrieval`-Eval-Achse sichert die Recall-Qualität in `make eval` ab (abgelaufene, widerlegte und tombstonte Einträge dürfen nie ranken), und Modell-Downloads passieren nur noch über explizites `ai embedding install` / `ai reranker install` — Query-Pfade berühren nie das Netzwerk.
 
 Standard-MCP-Tools:
 

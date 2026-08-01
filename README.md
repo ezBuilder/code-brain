@@ -109,9 +109,12 @@ cd /path/to/project
 .ai/bin/ai memory conflicts --json
 .ai/bin/ai plan init --id feat --step "do A" --step "do B"
 .ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
+.ai/bin/ai memory forget --id dec-1234 --confirm-id dec-1234 --yes
 ```
 
 Recall spans decisions, failures, lessons, and procedures in one ranked, cited answer; `memory conflicts` flags contradicting decisions offline. A durable plan (`ai plan`) keeps multi-step work honest — with `AI_LOOP_CONTINUATION` the Stop hook re-prompts until every step is checked. `code_find_references` / `code_goto_definition` add LSP-grade navigation when a language server is installed. Opt-in extras: decisions can carry `contradicts`/`derives_from`/`expires_at` relations (expired ones drop from recall); `AI_MCP_RESOURCES` exposes plans/reports/handoff as read-only `codebrain://` MCP resources; `AI_AST_CHUNK` switches Python indexing to AST-aware (cAST) chunking. As of v0.6.0 the safe pilots (MCP resources, directory context, conflict detection) are ON by default — manage them with `ai config pilots`; cAST self-validates via `ai cast eval`, a recall ratchet that enables it only when it beats the default chunker on your repo (nothing changes unmeasured).
+
+v0.7.0 adds provable forgetting and measured recall: `ai memory forget` hard-deletes a decision or failure (tombstone + compaction + deletion receipt) so no read path — SessionStart injection included — can resurface it, and `ai memory forget-note` does the same for session notes. A `memory_retrieval` eval axis gates recall quality in `make eval` (expired, refuted, and tombstoned records must never rank), and model downloads happen only via explicit `ai embedding install` / `ai reranker install` — query paths never touch the network.
 
 Default MCP tools:
 

@@ -109,9 +109,12 @@ cd /path/to/project
 .ai/bin/ai memory conflicts --json
 .ai/bin/ai plan init --id feat --step "do A" --step "do B"
 .ai/bin/ai memory decision add --text "use X" --contradicts dec-1234 --expires-at 2026-12-31
+.ai/bin/ai memory forget --id dec-1234 --confirm-id dec-1234 --yes
 ```
 
 Le rappel couvre décisions, échecs, leçons et procédures en une seule réponse classée et citée ; `memory conflicts` signale les décisions contradictoires hors ligne. Un plan durable (`ai plan`) tient le travail multi-étapes jusqu'au bout — avec `AI_LOOP_CONTINUATION`, le hook Stop relance jusqu'à ce que chaque étape soit cochée. `code_find_references` / `code_goto_definition` ajoutent une navigation de niveau LSP quand un serveur de langage est installé. Extras optionnels : les décisions peuvent porter des relations `contradicts`/`derives_from`/`expires_at` (les expirées sont exclues du rappel) ; `AI_MCP_RESOURCES` expose plans/rapports/handoff comme ressources MCP `codebrain://` en lecture seule ; `AI_AST_CHUNK` bascule l'indexation Python vers un découpage conscient de l'AST (cAST). Depuis v0.6.0, les pilots sûrs (ressources MCP, contexte de répertoire, détection de conflits) sont activés par défaut — gérez-les avec `ai config pilots` ; cAST s'autovalide via `ai cast eval`, un ratchet de rappel qui ne l'active que s'il bat le découpeur par défaut sur votre dépôt (rien ne change sans mesure).
+
+v0.7.0 ajoute l'oubli prouvable et le rappel mesuré : `ai memory forget` supprime définitivement une décision/un échec (tombstone + compactage + reçu de suppression) afin qu'aucun chemin de lecture — injection SessionStart comprise — ne puisse la faire resurgir ; `ai memory forget-note` fait de même pour les notes de session. Un axe d'évaluation `memory_retrieval` verrouille la qualité du rappel dans `make eval` (les enregistrements expirés, réfutés ou tombstonés ne doivent jamais ranker), et les téléchargements de modèles ne passent que par `ai embedding install` / `ai reranker install` explicites — les chemins de requête ne touchent jamais au réseau.
 
 Outils MCP par défaut :
 

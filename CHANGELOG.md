@@ -2,7 +2,34 @@
 
 All notable Code Brain changes are recorded here.
 
-## Unreleased
+## 0.7.0 - 2026-08-01
+
+Memory-correctness round: the 2026-08-01 agent-memory deep-research concluded
+"build core, borrow concepts, buy none" — every change below hardens Code
+Brain's own read/write paths instead of adopting an external memory product.
+
+### Added
+
+- `ai memory forget`: hard-forget a decision/failure by id — appends a tombstone marker and physically compacts the body out of `decisions.jsonl` under the append lock, with a deletion receipt (`removed_rows`, `tombstone_id`, honest `union_merge_restorable: true`). Suppression lives inside the shared `live_decision_records` filter so no reader — including the tail-window SessionStart block — can resurface a forgotten record, and freshly minted ids can never collide with a tombstoned one. CLI-only (`--yes` + `--confirm-id`, CI-rejected); deliberately not exposed over MCP.
+- `ai memory forget-note`: remove session-note lines by substring (min 4 chars) and purge `resume.json` snapshots that embed the text, with a receipt.
+- `memory_retrieval` eval axis: golden-query Recall@K/MRR gate over the production `recall_memory` pipeline, wired into `make eval` — including liveness cases proving expired, refuted, stale, and tombstoned records never rank.
+- `ai reranker status|install|uninstall`: the reranker model finally has a real install surface (the old background spawn targeted a command that never existed).
+- Doctor `network_defaults` check: flags stale `AI_SEARCH_*_AUTO_INSTALL` env opt-ins and orphaned model install-locks left behind by the removed background installer.
+- MCP temporality parity: `record_decision` accepts `contradicts`/`derives_from`/`expires_at`, `list_decisions` accepts `include_expired`.
+
+### Fixed
+
+- Decision liveness is now enforced on every read path via one shared predicate (`live_decision_records`): HOT-cache consolidation, command drafting, sub-agent recommendation, conflict scanning, resume snapshots, and cross-project federated tag mining all previously leaked expired or refuted decisions back into injected context.
+- `expires_at` is validated and UTC-normalized on write; a malformed bound (e.g. `"2026"`) used to expire the record on arrival, silently. Date-only bounds now mean "valid through that day".
+- `close_todo` no longer raises `KeyError` on legacy id-less todos; they close under the same derived key the readers use.
+- Naive/aware datetime mixing: offset-less timestamps (git-synced or hand-edited stores) raised `TypeError` past fail-soft guards in the SessionStart HOT-cache path, cooldown scanners, observability windows, trajectory summaries, audit folding, and loop expiry; all parse helpers now read offset-less as UTC. Audit rotation also survives `"ts": null/""/garbage` rows instead of aborting.
+- `code_query`'s advertised MCP contract (`readOnlyHint`, `openWorldHint: false`) is now truthful in every configuration: dense/rerank activation never spawns background model downloads. With the `[dense]` extras installed, a read-only `code_query` used to trigger a multi-MB fetch.
+
+### Security
+
+- Model downloads are explicit CLI actions only (`ai embedding install`, `ai reranker install`); both command groups joined the CI read-only reject list, and the legacy in-query auto-install (env-default ON) was removed.
+
+## 0.6.6 - 2026-07-30
 
 ### Added
 
@@ -14,7 +41,6 @@ All notable Code Brain changes are recorded here.
 ### Fixed
 
 - `search.query` now self-heals a version-outdated index (auto rebuild) instead of failing until a manual `ai index rebuild`; structural pre-v2 legacy indexes still require the explicit rebuild and are never dropped on a read path.
-
 - Branch deletion guards now hard-block only protected branch names while allowing worktree, session, feature, and scratch branch cleanup.
 - Session start and upgrades now enforce bounded `.ai/tmp`, `.ai/outputs`, and total `.ai` storage with tracked-file and `.keep` preservation.
 - Doctor now validates the bounded audit-index tail instead of falsely requiring evicted historical rows.

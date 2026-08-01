@@ -2,6 +2,13 @@
 
 All notable Code Brain changes are recorded here.
 
+## 0.7.1 - 2026-08-01
+
+### Fixed
+
+- Structural pre-v2 legacy search indexes now answer deterministically (-012, option A): auto-refresh detects the legacy schema and skips its rebuild instead of silently migrating, so a query fails with the explicit `run ai index rebuild` message regardless of file mtimes. Previously a stale-looking worktree migrated the index from a read path while a fresh-looking one raised — the same query answered two ways. `ai index rebuild` remains the single migration door.
+- Hardened for zero steady-state growth and zero added cost: repeated failing legacy queries append no logs, audit rows, locks, or index bytes; the legacy verdict stops after a single hash probe (no second index open); fresh-path queries still run zero probes and never rebuild (regression-gated, happy-path median ~89ms on the source repo).
+
 ## 0.7.0 - 2026-08-01
 
 Memory-correctness round: the 2026-08-01 agent-memory deep-research concluded

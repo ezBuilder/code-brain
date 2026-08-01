@@ -22,6 +22,7 @@ regressions in agent-facing behavior that unit tests cannot — e.g.
 | `tool_discovery` | natural-language intents retrieve the correct MCP tool within a bounded rank | production function |
 | `autoresearch_retrieval` | production FTS ranking preserves Recall@K, MRR, and NDCG@K smoke baselines | temporary production index |
 | `code_retrieval` | production `search.query` golden-query Recall@K, MRR, NDCG@K, latency (incl. camelCase subtoken recall) | temporary production index |
+| `memory_retrieval` | production `recall_memory` golden-query Recall@K/MRR incl. expiry/refuted/tombstone liveness filtering | temporary memory store |
 | `skill_drift` | installed skills' body-sha256 matches catalog | `ai skills list` |
 | `precall_overrides` | user override ratio stays below auto-disable threshold | audit |
 
@@ -36,7 +37,7 @@ Eval runs are read-only and never write to `.ai/memory/`.
 
 `make eval` is the strict complete gate for the currently supported axes:
 `precall_routing`, `context_budget`, `tool_discovery`, `autoresearch_retrieval`,
-and `code_retrieval`.
+`code_retrieval`, and `memory_retrieval`.
 Retrieval cases write only throwaway indexes under the system temporary directory;
 they never touch repo memory or the real index. `--all --wired` also reports planned
 axes, but unsupported axes remain explicitly `skipped`; they are never counted
@@ -45,8 +46,11 @@ as passing. Add `--require-complete` when skipped cases must fail the command.
 ## Status
 
 The offline runner currently wires `precall_routing`, `context_budget`,
-`tool_discovery`, `autoresearch_retrieval`, and `code_retrieval` to their
-production implementations.
+`tool_discovery`, `autoresearch_retrieval`, `code_retrieval`, and
+`memory_retrieval` to their production implementations.
+`memory_retrieval` fixtures pin recency via `now` but place expiry bounds in
+the far past/future — decision liveness folds against the wall clock, and a
+near-now bound would make the axis flaky.
 `decision_logging` remains unsupported until
 there is a real prompt-to-memory production path to exercise; its cases stay
 visible as skipped work rather than producing synthetic success.

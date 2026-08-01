@@ -566,6 +566,10 @@ def _is_expired(value: Any) -> bool:
         expires = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return False
+    if expires.tzinfo is None:
+        # Inbox requests arrive from external writers; a naive bound would
+        # TypeError against aware now() instead of failing soft. Read as UTC.
+        expires = expires.replace(tzinfo=timezone.utc)
     return expires <= now()
 
 

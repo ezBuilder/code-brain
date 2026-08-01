@@ -18,7 +18,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .memory import read_jsonl_all, read_jsonl_tail
+from .memory import live_decision_records, read_jsonl_all, read_jsonl_tail
 from .private_write import atomic_write_private_text, read_root_confined_text
 
 
@@ -77,7 +77,12 @@ def gather_cross_project_signals(
 
     for proj in projects:
         try:
-            for entry in read_jsonl_tail(proj / ".ai" / "memory" / "decisions.jsonl", 200):
+            # Shared live filter — twin of agent_recommend._gather_decision_tags. These counts
+            # ride cross_project_summary into hooks' injected context, so a sibling project's
+            # refuted or time-boxed decision must not keep voting from across the workspace.
+            for entry in live_decision_records(
+                read_jsonl_tail(proj / ".ai" / "memory" / "decisions.jsonl", 200)
+            ):
                 for tag in entry.get("tags") or []:
                     t = str(tag).strip().lower()
                     if t:

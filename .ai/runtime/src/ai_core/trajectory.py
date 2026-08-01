@@ -85,10 +85,12 @@ def _parse_ts(ts: str | None) -> datetime | None:
     if not ts:
         return None
     try:
-        # Accept trailing 'Z' as UTC.
+        # Accept trailing 'Z' as UTC; offset-less also reads as UTC — start/end pairs
+        # are subtracted, so one naive member would TypeError instead of fail-soft.
         if ts.endswith("Z"):
             ts = ts[:-1] + "+00:00"
-        return datetime.fromisoformat(ts)
+        dt = datetime.fromisoformat(ts)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 

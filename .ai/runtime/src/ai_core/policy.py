@@ -37,6 +37,11 @@ WRITE_COMMANDS = {
     "selfimprove",
     "evidence",
     "security_finding",
+    # model install/uninstall reach the network / delete cache trees — CI must
+    # reject them before worker contact (status subcommands stay read-only and
+    # are dispatched without a reject_ci_write gate).
+    "embedding",
+    "reranker",
 }
 
 

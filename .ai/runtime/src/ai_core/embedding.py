@@ -16,7 +16,6 @@ Architecture (per T26 PoC plan):
 from __future__ import annotations
 
 import os
-import secrets
 from pathlib import Path
 from typing import Any
 
@@ -27,10 +26,8 @@ from .model_artifacts import (
     read_model_artifact,
 )
 from .private_write import (
-    claim_private_ttl_marker,
     release_private_ttl_marker,
     remove_root_confined_tree,
-    validate_root_confined_executable,
 )
 
 EMBEDDING_DIM = 384
@@ -63,85 +60,24 @@ def is_enabled() -> bool:
 def is_active_for(root: Path) -> bool:
     """True when dense search should fire for `root`.
 
-    Default policy = ON whenever the system can support it. When deps are
-    present but the ONNX model is missing, we trigger a one-shot background
-    install (idempotent via .install-lock marker) and return False for this
-    call only — the next session will find the model and light up.
+    Activation NEVER triggers a download: `code_query` is advertised to MCP
+    clients as read-only/closed-world, and hooks/MCP hot paths must not touch
+    the network, so a missing model simply means "off" until the user runs
+    `ai embedding install` explicitly (the only network-touching entry point).
+    The pre-006 in-query background auto-install violated exactly that wire
+    contract for anyone who had installed the optional [dense] extras.
 
     Decision tree:
       AI_SEARCH_DENSE=1/true   → on iff deps importable
       AI_SEARCH_DENSE=0/false  → off (explicit opt-out)
-      AI_SEARCH_DENSE unset    → ON iff deps + model present;
-                                  if deps present but model missing AND
-                                  AI_SEARCH_DENSE_AUTO_INSTALL != 0 →
-                                  spawn one-shot background download
-                                  (~25MB), return False for THIS call.
+      AI_SEARCH_DENSE unset    → on iff deps + model already present
     """
     raw = os.environ.get("AI_SEARCH_DENSE", "").lower()
     if raw in {"0", "false", "no", "off"}:
         return False
     if raw in {"1", "true", "yes", "on"}:
         return _deps_present()
-    # default: opportunistic activation
-    if not _deps_present():
-        return False
-    if is_model_present(root):
-        return True
-    # deps ready, model missing — fire-and-forget background install (once)
-    if os.environ.get("AI_SEARCH_DENSE_AUTO_INSTALL", "1").lower() in {"1", "true", "yes", "on"}:
-        _maybe_spawn_background_install(root)
-    return False
-
-
-def _maybe_spawn_background_install(root: Path) -> None:
-    """Spawn `ai embedding install` in the background, idempotent per-root.
-
-    Uses a lock file so concurrent SessionStart calls don't pile up multiple
-    downloads.
-    """
-    import subprocess
-    ai_bin = root / ".ai" / "bin" / "ai"
-    try:
-        validate_root_confined_executable(ai_bin, root=root)
-    except OSError:
-        return
-    lock = model_cache_dir(root) / ".install-lock"
-    marker_token = f"embedding:{secrets.token_urlsafe(24)}"
-    try:
-        if not claim_private_ttl_marker(
-            lock,
-            root=root,
-            ttl_seconds=3600,
-            text=marker_token,
-        ):
-            return
-    except OSError:
-        return
-    try:
-        from .portable import detached_popen_kwargs
-        from .process_janitor import cleanup_children, register_child
-        cleanup_children(root, ttl_seconds=3600)
-
-        child_env = os.environ.copy()
-        child_env[_INSTALL_MARKER_ENV] = marker_token
-        with open(os.devnull, "wb") as devnull:
-            cmd = [str(ai_bin), "embedding", "install", "--json"]
-            proc = subprocess.Popen(
-                cmd,
-                stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
-                env=child_env,
-                **detached_popen_kwargs(),
-            )
-    except Exception:
-        try:
-            release_private_ttl_marker(lock, root=root, expected_text=marker_token)
-        except OSError:
-            pass
-        return
-    try:
-        register_child(root, pid=proc.pid, kind="embedding_install", command=cmd)
-    except Exception:
-        pass
+    return _deps_present() and is_model_present(root)
 
 
 def model_cache_dir(root: Path) -> Path:

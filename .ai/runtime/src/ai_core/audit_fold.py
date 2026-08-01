@@ -23,10 +23,15 @@ from .private_write import atomic_write_private_text, private_file_lock
 
 
 def _parse_ts(ts_str: str) -> datetime | None:
-    """Parse ISO timestamp to UTC datetime, or None if invalid."""
+    """Parse ISO timestamp to UTC datetime, or None if invalid.
+
+    Offset-less values read as UTC: the fold cutoff is aware, so a naive return
+    would TypeError at the `ts >= cutoff` comparison outside this guard.
+    """
     try:
         ts_str_clean = ts_str.replace("Z", "+00:00")
-        return datetime.fromisoformat(ts_str_clean)
+        dt = datetime.fromisoformat(ts_str_clean)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except (ValueError, AttributeError, TypeError):
         return None
 

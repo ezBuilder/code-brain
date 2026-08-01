@@ -89,7 +89,11 @@ def _parse_ts(s: str) -> datetime | None:
     try:
         if s.endswith("Z"):
             return datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        # Offset-less reads as UTC (matches now_iso()). Naive would TypeError against
+        # the aware cutoffs in classify() and scored_durable_items() — the SessionStart
+        # HOT-cache path — past their fail-soft guards, which only catch ValueError.
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 
@@ -460,7 +464,7 @@ def scored_durable_items(root: Path) -> list[dict[str, Any]]:
     (histogram + eviction candidates) and page-in HOT consolidation, so neither
     duplicates the scoring nor bloats the other's public output.
     """
-    from .memory import decisions_path, read_jsonl_all
+    from .memory import decisions_path, live_decision_records, read_jsonl_all
     from .lessons import lessons_path, score_lessons
     from .procedural_memory import procedural_path
 
@@ -474,18 +478,10 @@ def scored_durable_items(root: Path) -> list[dict[str, Any]]:
 
     scored: list[dict[str, Any]] = []
 
-    # Fold by id so a superseded failure (reused-id reappend) is scored once, not N times.
-    _decisions_by_id: dict[str, dict[str, Any]] = {}
-    _decisions_order: list[str] = []
-    for rec in read_jsonl_all(decisions_path(root)):
-        if not isinstance(rec, dict):
-            continue
-        rid = str(rec.get("id") or f"_anon{len(_decisions_order)}")
-        if rid not in _decisions_by_id:
-            _decisions_order.append(rid)
-        _decisions_by_id[rid] = rec
-    for rid in _decisions_order:
-        rec = _decisions_by_id[rid]
+    # Shared live filter: folds a superseded failure (reused-id reappend) so it is scored once,
+    # and drops retired/expired rows — this list feeds the HOT cache SessionStart injects, so a
+    # dead decision scored here reappears in the next prompt.
+    for rec in live_decision_records(read_jsonl_all(decisions_path(root))):
         s = retention_score(mem_type="decision", age_days=_age_days(rec))
         scored.append({
             "kind": "decision",

@@ -356,6 +356,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "retest_after": {"type": "string", "description": "ISO date; re-test backstop"},
                 "status": {"type": "string", "enum": ["observed", "confirmed", "stale", "refuted"]},
                 "supersedes_id": {"type": "string", "description": "retire this prior failure id"},
+                "contradicts": {"type": "string", "description": "dec-<hex> id this decision contradicts; malformed ids are dropped"},
+                "derives_from": {"type": "string", "description": "dec-<hex> id this decision builds on; malformed ids are dropped"},
+                "expires_at": {"type": "string", "description": "ISO-8601 date or datetime after which this decision stops surfacing; a date means valid through that day, malformed bounds are dropped"},
             },
             "required": ["text"],
         },
@@ -485,6 +488,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "text": {"type": "string", "description": "substring match on decision text"},
                 "limit": {"type": "integer", "default": 20},
                 "include_retired": {"type": "boolean", "default": False},
+                "include_expired": {"type": "boolean", "default": False, "description": "also return decisions whose expires_at has passed"},
             },
         },
     },
@@ -1356,6 +1360,9 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             retest_after=args.get("retest_after") if isinstance(args.get("retest_after"), str) else None,
             status=args.get("status") if isinstance(args.get("status"), str) else None,
             supersedes_id=args.get("supersedes_id") if isinstance(args.get("supersedes_id"), str) else None,
+            contradicts=args.get("contradicts") if isinstance(args.get("contradicts"), str) else None,
+            derives_from=args.get("derives_from") if isinstance(args.get("derives_from"), str) else None,
+            expires_at=args.get("expires_at") if isinstance(args.get("expires_at"), str) else None,
         )
     if name == "ast_grep_search":
         pattern = args.get("pattern")
@@ -1446,6 +1453,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             text=args.get("text") if isinstance(args.get("text"), str) else None,
             limit=_coerce_int(args.get("limit"), 20, minimum=1, maximum=100),
             include_retired=_coerce_bool(args.get("include_retired")),
+            include_expired=_coerce_bool(args.get("include_expired")),
         )
     if name == "record_todo":
         title = args.get("title")

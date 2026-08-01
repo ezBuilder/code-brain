@@ -76,21 +76,56 @@ def test_unsupported_axis_is_explicitly_skipped_not_passed() -> None:
     assert {item["reason"] for item in report["case_results"]} == {"axis_adapter_unsupported"}
 
 
+def test_memory_retrieval_axis_measures_recall_liveness_and_forget() -> None:
+    runner = _load_runner()
+    report = runner.run_axis("memory_retrieval", wired=True)
+    assert report["measured"] == report["cases"] == 4
+    assert report["passed"] == 4
+    assert report["failed"] == []
+    baseline = report["case_results"][0]["observed"]
+    assert len(baseline["store_sha256"]) == 64
+    assert baseline["latency_ms"]["p95"] >= 0.0
+    # determinism: identical store + pinned now → identical ranking metrics
+    rerun = runner.run_axis("memory_retrieval", wired=True)
+
+    def _strip_latency(rep):
+        stripped = []
+        for case in rep["case_results"]:
+            observed = {k: v for k, v in case["observed"].items() if k != "latency_ms"}
+            observed["results"] = [
+                {k: v for k, v in result.items() if k != "duration_ms"}
+                for result in observed.get("results", [])
+            ]
+            stripped.append(observed)
+        return stripped
+
+    assert _strip_latency(rerun) == _strip_latency(report)
+
+
 def test_cli_is_a_strict_complete_gate_for_supported_axes() -> None:
+    # Lockstep guard: this axis list must equal the Makefile `eval` target's.
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    eval_line = next(line for line in makefile.splitlines() if ".ai/evals/run.py" in line)
+    axes = [
+        "precall_routing",
+        "context_budget",
+        "tool_discovery",
+        "autoresearch_retrieval",
+        "code_retrieval",
+        "memory_retrieval",
+    ]
+    assert [part for part in eval_line.split() if part in set(axes) or part == "--axis"].count("--axis") == len(axes)
+    for axis in axes:
+        assert f"--axis {axis}" in eval_line, f"Makefile eval target missing axis {axis}"
+
+    axis_args: list[str] = []
+    for axis in axes:
+        axis_args.extend(["--axis", axis])
     completed = subprocess.run(
         [
             sys.executable,
             str(RUNNER),
-            "--axis",
-            "precall_routing",
-            "--axis",
-            "context_budget",
-            "--axis",
-            "tool_discovery",
-            "--axis",
-            "autoresearch_retrieval",
-            "--axis",
-            "code_retrieval",
+            *axis_args,
             "--wired",
             "--strict",
             "--require-complete",
@@ -105,10 +140,10 @@ def test_cli_is_a_strict_complete_gate_for_supported_axes() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
     payload = json.loads(completed.stdout)
     assert payload["summary"] == {
-        "axes": 5,
-        "cases": 23,
-        "measured": 23,
-        "passed": 23,
+        "axes": 6,
+        "cases": 27,
+        "measured": 27,
+        "passed": 27,
         "failed": 0,
         "skipped": 0,
     }

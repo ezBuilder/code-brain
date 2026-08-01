@@ -20,7 +20,14 @@ import re
 from typing import Any
 from pathlib import Path
 
-from .memory import append_audit, append_jsonl, now_iso, read_jsonl_all, decisions_path
+from .memory import (
+    append_audit,
+    append_jsonl,
+    decisions_path,
+    live_decision_records,
+    now_iso,
+    read_jsonl_all,
+)
 
 # Mirror loop_engineering's tokenizer/stopwords so the two conflict paths agree on "same topic".
 _STOPWORDS = frozenset(
@@ -57,24 +64,19 @@ def conflicts_path(root: Path) -> Path:
 
 
 def _live_decisions(root: Path, *, scan: int) -> list[dict[str, Any]]:
-    """Folded, non-retired decisions+failures with text, most recent `scan` kept."""
-    rows = read_jsonl_all(decisions_path(root))
-    folded: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for rec in rows:
-        if not isinstance(rec, dict):
-            continue
-        rid = str(rec.get("id") or f"_anon{len(order)}")
-        if rid not in folded:
-            order.append(rid)
-        folded[rid] = rec
-    live: list[dict[str, Any]] = []
-    for rid in order:
-        rec = folded[rid]
-        if rec.get("kind") == "failure" and str(rec.get("status", "observed")) in {"stale", "refuted"}:
-            continue
-        if str(rec.get("decision", "")).strip():
-            live.append(rec)
+    """Folded, non-retired, non-expired decisions+failures with text, most recent `scan` kept.
+
+    Shared live filter (memory.live_decision_records) instead of a local fold: the hand-rolled
+    version ignored expires_at, so a time-boxed decision that had already lapsed could still be
+    reported as a *live* conflict. The old `_anon{n}` fold keys are no longer needed — the helper
+    only folds `kind="failure"` rows by id and appends plain rows verbatim in file order, so two
+    id-less plain decisions stay distinct instead of collapsing into one.
+    """
+    live = [
+        rec
+        for rec in live_decision_records(read_jsonl_all(decisions_path(root)))
+        if str(rec.get("decision", "")).strip()
+    ]
     return live[-max(1, int(scan)):]
 
 

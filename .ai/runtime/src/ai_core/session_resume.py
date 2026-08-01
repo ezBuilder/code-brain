@@ -100,8 +100,13 @@ def _read_text(path: Path, *, root: Path) -> str:
 
 
 def _decisions_tail(root: Path) -> list[dict[str, Any]]:
+    # Shared live filter before the tail: this snapshot copies FULL decision records into
+    # resume.json, which hooks.py injects into the next session, so an expired or refuted row
+    # would otherwise outlive its own retirement.
+    from .memory import live_decision_records
+
     entries = _read_jsonl(root / ".ai" / "memory" / "decisions.jsonl", root=root)
-    return entries[-5:]
+    return live_decision_records(entries)[-5:]
 
 
 def _todos_open(root: Path) -> list[dict[str, Any]]:

@@ -26,6 +26,7 @@ from .memory import (
     audit_path,
     decisions_path,
     jsonl_lock_path,
+    live_decision_records,
     now_iso,
     read_jsonl_all,
     read_jsonl_open_todos,
@@ -534,7 +535,9 @@ def _evidence_snippets(items: Iterable[str], head: int = 3) -> list[str]:
 def _candidates_from_decision_tags(signals: Signals, *, min_signal: int) -> list[Candidate]:
     tag_counts: Counter[str] = Counter()
     tag_to_decisions: dict[str, list[str]] = {}
-    for entry in signals.decisions:
+    # Shared live filter: this path copies decision TEXT into a drafted command body, the
+    # loudest possible place for a refuted or time-boxed decision to resurface.
+    for entry in live_decision_records(signals.decisions):
         tags = entry.get("tags") or []
         text = str(entry.get("decision") or entry.get("text") or "")
         for raw in tags:

@@ -126,3 +126,90 @@ def test_mcp_list_decisions_dispatch(tmp_path: Path) -> None:
     })
     payload = resp["result"]["structuredContent"]
     assert payload["ok"] and payload["count"] == 1
+
+
+def _call_tool(root: Path, name: str, arguments: dict, *, request_id: int = 3) -> dict:
+    resp = mcp_server.handle_request(root, {
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+    return resp["result"]["structuredContent"]
+
+
+def _last_decision(root: Path) -> dict:
+    return memory.read_jsonl_all(memory.decisions_path(root))[-1]
+
+
+def test_mcp_record_decision_forwards_dag_edges_and_expiry(tmp_path: Path) -> None:
+    """append_decision and the CLI already accepted these three; MCP silently dropped them,
+    which left expires_at — the only way to time-box a plain decision — unreachable from an
+    agent."""
+    root = _seed(tmp_path)
+    payload = _call_tool(root, "record_decision", {
+        "text": "pin torch 2.4 for the trainer",
+        "contradicts": "dec-abcd1234",
+        "derives_from": "dec-0f0f0f0f",
+        "expires_at": "2099-01-01",
+    })
+    assert payload["ok"] is True
+
+    stored = _last_decision(root)
+    assert stored["contradicts"] == "dec-abcd1234"
+    assert stored["derives_from"] == "dec-0f0f0f0f"
+    # a date-only bound widens to the last instant of that day
+    assert stored["expires_at"] == "2099-01-01T23:59:59.999999Z"
+
+
+def test_mcp_record_decision_expiry_actually_retires_the_row(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    assert _call_tool(root, "record_decision", {
+        "text": "ledger cutover freeze", "tags": ["ledger"], "expires_at": "2000-01-01",
+    })["ok"] is True
+    assert _last_decision(root)["expires_at"] == "2000-01-01T23:59:59.999999Z"
+
+    plain, _failures = memory.read_decisions_for_surface(root, limit=10)
+    assert [p["decision"] for p in plain] == []  # never injected again
+
+
+def test_mcp_record_decision_drops_malformed_edges_fail_soft(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    assert _call_tool(root, "record_decision", {
+        "text": "fail-soft edges", "contradicts": "not-an-id", "expires_at": "2026",
+    })["ok"] is True
+    stored = _last_decision(root)
+    assert "contradicts" not in stored and "expires_at" not in stored
+
+
+def test_mcp_record_decision_without_new_params_stays_legacy_shape(tmp_path: Path) -> None:
+    """Byte-identity guard: omitting every new parameter writes exactly the legacy keys."""
+    root = _seed(tmp_path)
+    assert _call_tool(root, "record_decision", {
+        "text": "plain decision via mcp", "tags": ["x"],
+    })["ok"] is True
+    stored = _last_decision(root)
+    assert set(stored.keys()) == {"id", "decided_at", "decision", "tags", "source"}
+    assert stored["source"] == "agent"
+
+
+def test_mcp_list_decisions_honors_include_expired(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    memory.append_decision(root, text="ledger cutover freeze", tags=["ledger"],
+                           expires_at="2000-01-01")
+
+    assert _call_tool(root, "list_decisions", {"tag": "ledger"}, request_id=4)["count"] == 0
+
+    with_expired = _call_tool(
+        root, "list_decisions", {"tag": "ledger", "include_expired": True}, request_id=5
+    )
+    assert with_expired["count"] == 1
+    assert with_expired["items"][0]["decision"] == "ledger cutover freeze"
+
+
+def test_mcp_record_decision_schema_exposes_the_new_parameters(tmp_path: Path) -> None:
+    mcp_server._invalidate_tools_list_cache()
+    resp = mcp_server.handle_request(tmp_path, {"jsonrpc": "2.0", "id": 6, "method": "tools/list"})
+    tools = {t["name"]: t for t in resp["result"]["tools"]}
+    record_props = set(tools["record_decision"]["inputSchema"]["properties"])
+    assert {"contradicts", "derives_from", "expires_at"} <= record_props
+    assert "include_expired" in tools["list_decisions"]["inputSchema"]["properties"]
+    mcp_server._invalidate_tools_list_cache()

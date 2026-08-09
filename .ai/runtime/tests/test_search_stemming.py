@@ -22,6 +22,7 @@ from ai_core.search import (  # noqa: E402
     connect,
     context_pack,
     db_path,
+    index_hash_status,
     init_schema,
     query,
     rebuild,
@@ -45,14 +46,14 @@ def _write(repo: Path, rel: str, content: str) -> Path:
     return path
 
 
-def test_schema_version_is_ten(tmp_path: Path) -> None:
-    assert SCHEMA_VERSION == 10
+def test_schema_version_is_eleven(tmp_path: Path) -> None:
+    assert SCHEMA_VERSION == 11
     repo = _make_repo(tmp_path)
     _write(repo, "doc.md", "hello world\n")
     rebuild(repo)
     with connect(repo) as conn:
         version = int(conn.execute("pragma user_version").fetchone()[0])
-    assert version == 10
+    assert version == 11
 
 
 def test_porter_stemming_matches_inflected_forms(tmp_path: Path) -> None:
@@ -129,7 +130,7 @@ def test_legacy_v2_cache_auto_migrates_to_current_schema(tmp_path: Path) -> None
         assert version_before == 2
         init_schema(conn, migrate_legacy=True)
         version_after = int(conn.execute("pragma user_version").fetchone()[0])
-        assert version_after == 10
+        assert version_after == 11
 
         tables = {
             row[0]
@@ -249,6 +250,59 @@ def test_rg_fallback_triggers_on_zero_fts_hits(tmp_path: Path, monkeypatch) -> N
     assert any(str(c[0]).endswith("rg") for c in calls), f"rg not invoked; calls={calls}"
 
 
+def test_csharp_is_indexed_and_live_symbol_source_ranks_before_docs(tmp_path: Path, monkeypatch) -> None:
+    if not shutil.which("rg"):
+        pytest.skip("ripgrep not installed on test runner")
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    _write(repo, "docs/design.md", "TransportSimulation coordinates the game loop.\n")
+    _write(
+        repo,
+        "Assets/RouteFoundry/Runtime/Simulation/TransportSimulation.cs",
+        "namespace RouteFoundry.Simulation;\npublic sealed class TransportSimulation {}\n",
+    )
+    rebuild(repo)
+
+    result = query(repo, "TransportSimulation", limit=5)
+
+    assert result["retrieval_policy"] == "bm25+rg"
+    assert result["results"][0]["path"] == "Assets/RouteFoundry/Runtime/Simulation/TransportSimulation.cs"
+    with connect(repo) as conn:
+        indexed = conn.execute(
+            "select count(*) from chunks where path = ?",
+            ("Assets/RouteFoundry/Runtime/Simulation/TransportSimulation.cs",),
+        ).fetchone()[0]
+    assert indexed == 1
+
+
+def test_agent_outputs_do_not_pollute_index_or_freshness(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/live.py", "def live_source():\n    return 1\n")
+    output = _write(repo, ".ai/outputs/generated.json", '{"needle": "GeneratedOnlyNeedle"}\n')
+    rebuild(repo)
+
+    assert query(repo, "GeneratedOnlyNeedle", limit=5)["results"] == []
+    output.write_text('{"needle": "ChangedGeneratedOnlyNeedle"}\n', encoding="utf-8")
+    assert index_hash_status(repo, use_candidate_cache=True)["reason"] == "current"
+
+
+def test_old_mtime_new_source_still_refreshes_by_metadata(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/base.py", "def base():\n    return 1\n")
+    rebuild(repo)
+    added = _write(repo, "src/older.py", "def OldTimestampNeedle():\n    return 2\n")
+    db_mtime = db_path(repo).stat().st_mtime
+    os.utime(added, (db_mtime - 120, db_mtime - 120))
+
+    result = query(repo, "OldTimestampNeedle", limit=5)
+
+    assert result["auto_refresh"]["rebuilt"] is True
+    assert result["auto_refresh"]["reason"] == "hash_mismatch"
+    assert any(item["path"].startswith("src/older.py") for item in result["results"])
+
+
 def test_rg_fallback_respects_disable_env(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "0")
     repo = _make_repo(tmp_path)
@@ -275,6 +329,7 @@ def test_symbol_detection() -> None:
     assert _looks_like_code_symbol("MyClassName") is True
     assert _looks_like_code_symbol("snake_case_var") is True
     assert _looks_like_code_symbol("src/file.py") is True
+    assert _looks_like_code_symbol("Assets/Vehicle.cs") is True
     assert _looks_like_code_symbol("E1001") is True
     assert _looks_like_code_symbol("hello world") is False
     # snake_case rule fires; acceptable false positive for fallback bias.

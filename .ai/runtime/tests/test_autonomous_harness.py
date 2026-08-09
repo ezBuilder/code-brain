@@ -53,6 +53,22 @@ def test_analyze_code_brain_runtime_layout(tmp_path: Path) -> None:
     assert payload["signals"]["test_files"] == 1
 
 
+def test_analyze_unity_csharp_layout(tmp_path: Path) -> None:
+    runtime = tmp_path / "Assets" / "RouteFoundry" / "Runtime"
+    tests = tmp_path / "Assets" / "Tests"
+    runtime.mkdir(parents=True)
+    tests.mkdir(parents=True)
+    for index in range(5):
+        (runtime / f"Vehicle{index}.cs").write_text("public sealed class Vehicle {}\n", encoding="utf-8")
+    (tests / "TransportSimulationTests.cs").write_text("public sealed class Tests {}\n", encoding="utf-8")
+
+    payload = analyze(tmp_path)
+
+    assert payload["mode"] == "hardening"
+    assert payload["signals"]["source_files"] == 6
+    assert payload["signals"]["test_files"] == 1
+
+
 def test_context_line_is_short_and_actionable(tmp_path: Path) -> None:
     line = context_line(tmp_path)
 

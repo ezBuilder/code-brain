@@ -36,11 +36,13 @@
 
 ## Search Routing
 
-- Code discovery: MCP `code_query` first, `context_pack` next.
+- Exact symbols, paths, and fast live checks: targeted `rg` or native file tools first.
+- Semantic discovery: MCP `code_query` first when its index is fresh and the target language is supported; use `context_pack` only when bounded richer context is needed.
+- If indexed retrieval is stale, empty, or low-confidence, continue with targeted native search; retrieval output is a lead, not proof.
 - Call graph: `code_graph_callers`, `code_graph_callees`, `code_graph_symbol`.
 - Before editing existing files, read exact target slices: `code_read_hashline`; CLI fallback: `.ai/bin/ai code read-hashline PATH --start START --end END`.
 - Long output or broad search: MCP `sandbox_execute` or `.ai/bin/ai exec run -- ...`.
-- Direct broad shell `grep -r`, `rg .`, `find`, `tree`, `ack`, `ag`, `git grep` is last resort only when Code Brain is unavailable/stale.
+- Direct broad shell `grep -r`, `rg .`, `find`, `tree`, `ack`, `ag`, `git grep` is last resort; keep native fallbacks targeted.
 
 ## Memory
 

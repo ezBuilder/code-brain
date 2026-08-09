@@ -84,6 +84,23 @@ def test_query_recovers_future_dated_corrupt_index(tmp_path: Path) -> None:
     assert any(item["path"] == "src/main.py" for item in payload["results"])
 
 
+def test_older_runtime_refuses_future_schema_without_downgrade(tmp_path: Path) -> None:
+    root, _source = _make_repo(tmp_path)
+    search_mod.rebuild(root)
+    future_version = search_mod.SCHEMA_VERSION + 1
+    with sqlite3.connect(search_mod.db_path(root)) as conn:
+        conn.execute(f"pragma user_version={future_version}")
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="future search index schema"):
+        search_mod.query(root, "RecoveredIndexNeedle")
+    with pytest.raises(RuntimeError, match="future search index schema"):
+        search_mod.rebuild(root, incremental=True)
+
+    with sqlite3.connect(search_mod.db_path(root)) as conn:
+        assert int(conn.execute("pragma user_version").fetchone()[0]) == future_version
+
+
 def test_query_degrades_to_fallback_for_noncorrupt_sqlite_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

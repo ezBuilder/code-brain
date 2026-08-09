@@ -14,6 +14,8 @@ COMMAND_LIMIT = 8
 
 LANG_BY_SUFFIX = {
     ".py": "python",
+    ".cs": "csharp",
+    ".csx": "csharp",
     ".ts": "typescript",
     ".tsx": "typescript",
     ".js": "javascript",

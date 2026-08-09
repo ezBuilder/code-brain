@@ -123,7 +123,7 @@ def test_query_self_heals_outdated_schema_index(
     assert any(item["path"].startswith("src/board.js") for item in payload["results"])
     with connect(repo) as conn:
         version = int(conn.execute("pragma user_version").fetchone()[0])
-    assert version == 10
+    assert version == 11
 
 
 def test_structural_legacy_schema_still_requires_explicit_rebuild(

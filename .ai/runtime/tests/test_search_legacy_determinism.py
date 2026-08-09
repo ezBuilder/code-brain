@@ -197,7 +197,7 @@ def test_repeated_legacy_queries_grow_storage_by_zero_bytes(tmp_path: Path) -> N
     assert not (repo / ".ai" / "cache" / ".rebuild.lock").exists()
 
 
-def test_fresh_path_runs_zero_hash_probes_and_never_rebuilds(
+def test_fresh_path_runs_one_metadata_probe_and_never_rebuilds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = _make_repo(tmp_path)
@@ -227,5 +227,5 @@ def test_fresh_path_runs_zero_hash_probes_and_never_rebuilds(
 
     assert payload["ok"] is True
     assert payload["auto_refresh"]["reason"] == "current"
-    assert probes["count"] == 0, "-012 fix must add zero probe work to the fresh path"
+    assert probes["count"] == 1, "freshness must detect old-mtime additions without hashing unchanged content"
     assert elapsed_ms < 2000.0

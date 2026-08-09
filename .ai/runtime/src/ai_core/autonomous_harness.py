@@ -46,8 +46,9 @@ REQUEST_PATTERNS = (
 def analyze(root: Path) -> dict[str, Any]:
     root = Path(root)
     manifests = [rel for rel in DEPENDENCY_MANIFESTS if (root / rel).exists()]
-    source_count = _count_files(root, ("src", "app", "lib", "packages", ".ai/runtime/src"), {".py", ".js", ".jsx", ".ts", ".tsx", ".dart", ".go", ".rs"})
-    test_count = _count_files(root, ("test", "tests", "__tests__", ".ai/runtime/tests"), {".py", ".js", ".jsx", ".ts", ".tsx", ".dart", ".go", ".rs"})
+    source_suffixes = {".py", ".cs", ".csx", ".js", ".jsx", ".ts", ".tsx", ".dart", ".go", ".rs"}
+    source_count = _count_files(root, ("src", "app", "lib", "packages", "Assets", ".ai/runtime/src"), source_suffixes)
+    test_count = _count_files(root, ("test", "tests", "__tests__", "Assets/Tests", ".ai/runtime/tests"), source_suffixes)
     dirty_count = len(_git_status(root))
     mode = _mode(manifests=manifests, source_count=source_count, test_count=test_count)
     should_use = mode != "observe"

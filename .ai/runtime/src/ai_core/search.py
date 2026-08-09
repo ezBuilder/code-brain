@@ -30,7 +30,7 @@ from .private_write import (
 )
 from .redact import redact_value
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 CANDIDATE_CACHE_SCHEMA = 3
 CANDIDATE_CACHE_MAX_AGE_SECONDS = 60.0
 import os as _os
@@ -58,6 +58,7 @@ FILESYSTEM_CANDIDATE_TIMEOUT_SECONDS = 10.0
 SKIP_PATH_PREFIXES = (
     ".ai/memory/",
     ".ai/cache/",
+    ".ai/outputs/",
     ".ai/skills/",
     ".ai/precall_rules/",
     ".ai/agents_catalog/",
@@ -121,6 +122,8 @@ SKIP_SUFFIXES = {
 TEXT_SUFFIXES = {
     ".md",
     ".py",
+    ".cs",
+    ".csx",
     ".js",
     ".jsx",
     ".ts",
@@ -311,6 +314,11 @@ def _is_outdated_schema_error(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "outdated search index schema" in str(exc)
 
 
+def _is_future_schema_error(exc: BaseException) -> bool:
+    """True when an older runtime opens an index created by a newer runtime."""
+    return isinstance(exc, RuntimeError) and "future search index schema" in str(exc)
+
+
 def _is_index_size_error(exc: BaseException) -> bool:
     message = str(exc).casefold()
     return any(
@@ -334,6 +342,10 @@ def init_schema(conn: sqlite3.Connection, *, migrate_legacy: bool = False) -> No
     conn.execute("pragma journal_mode=WAL")
     conn.execute("pragma busy_timeout=5000")
     current_version = int(conn.execute("pragma user_version").fetchone()[0])
+    if current_version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"future search index schema v{current_version}; restart with Code Brain v{SCHEMA_VERSION} or newer"
+        )
     existing_chunk_columns = [
         str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
         for row in conn.execute("pragma table_info(chunks)").fetchall()
@@ -533,7 +545,9 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
     with _connection_scope(root) as conn:
         try:
             init_schema(conn, migrate_legacy=False)
-        except RuntimeError:
+        except RuntimeError as exc:
+            if _is_future_schema_error(exc):
+                raise
             # legacy schema → caller must do a full rebuild
             return _rebuild_inner(root)
         existing = {
@@ -1255,7 +1269,7 @@ def _looks_like_code_symbol(q: str) -> bool:
         return True
     if "_" in q and " " not in q.strip():
         return True
-    if "/" in q or q.endswith((".py", ".ts", ".tsx", ".js", ".rs", ".go", ".md")):
+    if "/" in q or q.endswith((".py", ".cs", ".csx", ".ts", ".tsx", ".js", ".rs", ".go", ".md")):
         return True
     if re.match(r"^[A-Z]+-?\d+", q):
         return True
@@ -1840,21 +1854,45 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
         r.pop("id", None)
         r.pop("_rrf", None)
     fallback_used = False
-    if _rg_fallback_enabled() and (not fts_results or _looks_like_code_symbol(text)):
+    symbol_query = _looks_like_code_symbol(text)
+    if _rg_fallback_enabled() and (not fts_results or symbol_query):
         rg_hits = _rg_fallback(root, text, limit=limit)
         if rg_hits:
-            existing_paths = {item["path"] for item in fts_results}
-            for hit in rg_hits:
-                if hit["path"] in existing_paths:
-                    continue
-                fts_results.append({
+            indexed_by_path = {str(item.get("path") or ""): item for item in fts_results}
+            live_results = [
+                {
                     "path": hit["path"],
-                    "snippet": hit["snippet"],
+                    "snippet": (
+                        indexed_by_path[hit["path"]]["snippet"]
+                        if str(indexed_by_path.get(hit["path"], {}).get("snippet") or "").startswith("[stale index:")
+                        else hit["snippet"]
+                    ),
                     "provenance": hit["provenance"],
-                })
-                existing_paths.add(hit["path"])
-                if len(fts_results) >= limit:
+                }
+                for hit in rg_hits
+            ]
+            if symbol_query:
+                needle = text.casefold()
+                documentation_suffixes = {".md", ".txt", ".json", ".jsonl", ".toml", ".yaml", ".yml"}
+                live_results.sort(
+                    key=lambda item: (
+                        needle not in Path(str(item["path"])).stem.casefold(),
+                        Path(str(item["path"])).suffix.casefold() in documentation_suffixes,
+                        str(item["path"]),
+                    )
+                )
+            ordered = [*live_results, *fts_results] if symbol_query else [*fts_results, *live_results]
+            merged: list[dict[str, Any]] = []
+            seen_paths: set[str] = set()
+            for item in ordered:
+                path = str(item.get("path") or "")
+                if not path or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                merged.append(item)
+                if len(merged) >= limit:
                     break
+            fts_results = merged
             fallback_used = True
     actual_policy = "bm25"
     if dense_used:
@@ -1906,6 +1944,8 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
             # here also spares the second index open below: the query is about
             # to fail deterministically anyway.
             return {"enabled": True, "rebuilt": False, "reason": "legacy_requires_explicit_rebuild"}
+        if dirty_status.get("reason") == "future_schema":
+            return {"enabled": True, "rebuilt": False, "reason": "future_requires_restart"}
         changed_dirty = set(dirty_status.get("changed_paths") or [])
         if changed_dirty:
             result = rebuild(root, single_flight=True, incremental=True, paths=changed_dirty)
@@ -1920,34 +1960,30 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
     if not db.exists():
         result = rebuild(root, single_flight=True, incremental=True)
         return {"enabled": True, "rebuilt": True, "reason": "missing", "result": result}
-    try:
-        source_mtime = max((state.st_mtime for _path, state in iter_text_file_states(root)), default=0.0)
-        db_mtime = db.stat().st_mtime
-    except OSError as exc:
-        return {"enabled": True, "rebuilt": False, "reason": f"stat_error:{exc}"}
-    if source_mtime >= db_mtime or 0 <= db_mtime - source_mtime <= MTIME_STALE_GRACE_SECONDS:
-        hash_status = index_hash_status(root, use_metadata=True, refresh_metadata=True, use_candidate_cache=True)
-        if hash_status.get("reason") == "legacy_schema":
-            # Same -012 contract as the dirty branch above.
-            return {"enabled": True, "rebuilt": False, "reason": "legacy_requires_explicit_rebuild"}
-        changed_paths = set(hash_status.get("changed_paths") or [])
-        if changed_paths:
-            result = rebuild(root, single_flight=True, incremental=True, paths=changed_paths)
-            return {
-                "enabled": True,
-                "rebuilt": True,
-                "reason": "hash_mismatch",
-                "path_count": len(changed_paths),
-                "result": result,
-            }
-        if not hash_status.get("ok") and hash_status.get("reason") not in {"current"}:
-            result = rebuild(root, single_flight=True, incremental=True)
-            return {
-                "enabled": True,
-                "rebuilt": True,
-                "reason": str(hash_status.get("reason") or "hash_check_failed"),
-                "result": result,
-            }
+    hash_status = index_hash_status(root, use_metadata=True, refresh_metadata=True, use_candidate_cache=True)
+    if hash_status.get("reason") == "legacy_schema":
+        # Same -012 contract as the dirty branch above.
+        return {"enabled": True, "rebuilt": False, "reason": "legacy_requires_explicit_rebuild"}
+    if hash_status.get("reason") == "future_schema":
+        return {"enabled": True, "rebuilt": False, "reason": "future_requires_restart"}
+    changed_paths = set(hash_status.get("changed_paths") or [])
+    if changed_paths:
+        result = rebuild(root, single_flight=True, incremental=True, paths=changed_paths)
+        return {
+            "enabled": True,
+            "rebuilt": True,
+            "reason": "hash_mismatch",
+            "path_count": len(changed_paths),
+            "result": result,
+        }
+    if not hash_status.get("ok") and hash_status.get("reason") not in {"current"}:
+        result = rebuild(root, single_flight=True, incremental=True)
+        return {
+            "enabled": True,
+            "rebuilt": True,
+            "reason": str(hash_status.get("reason") or "hash_check_failed"),
+            "result": result,
+        }
     return {"enabled": True, "rebuilt": False, "reason": "current"}
 
 
@@ -1998,6 +2034,8 @@ def index_hash_status(
             if "legacy" in detail and "index schema" in detail
             else "outdated_schema"
             if "outdated" in detail and "index schema" in detail
+            else "future_schema"
+            if "future" in detail and "index schema" in detail
             else "unreadable"
         )
         return {
@@ -2008,9 +2046,10 @@ def index_hash_status(
             "indexed_files": 0,
         }
     except (OSError, sqlite3.Error) as exc:
+        corrupt = isinstance(exc, sqlite3.Error) and _is_corrupt_index_error(exc)
         return {
             "ok": False,
-            "reason": "unreadable",
+            "reason": "corrupt_index" if corrupt else "unreadable",
             "detail": f"index unreadable: {exc}",
             "changed_paths": [],
             "indexed_files": 0,
@@ -2175,11 +2214,15 @@ def observability(root: Path, *, query_text: str | None = None, limit: int = 5) 
     except RuntimeError as exc:
         # Read-only observability must not crash a report on a pre-rebuild index;
         # degrade like missing_index and let query()/rebuild heal the schema.
-        if not (_is_legacy_schema_error(exc) or _is_outdated_schema_error(exc)):
+        if not (_is_legacy_schema_error(exc) or _is_outdated_schema_error(exc) or _is_future_schema_error(exc)):
             raise
         payload["ok"] = False
         payload["reason"] = (
-            "legacy_schema" if _is_legacy_schema_error(exc) else "outdated_schema"
+            "legacy_schema"
+            if _is_legacy_schema_error(exc)
+            else "future_schema"
+            if _is_future_schema_error(exc)
+            else "outdated_schema"
         )
         return payload
     if query_text:
@@ -2319,6 +2362,9 @@ def _candidate_policy_fingerprint(root: Path) -> str:
     payload = {
         "skip_dirs": sorted(SKIP_DIRS),
         "skip_path_prefixes": list(_skip_path_prefixes(root)),
+        "skip_names": sorted(SKIP_NAMES),
+        "skip_suffixes": sorted(SKIP_SUFFIXES),
+        "text_suffixes": sorted(TEXT_SUFFIXES),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

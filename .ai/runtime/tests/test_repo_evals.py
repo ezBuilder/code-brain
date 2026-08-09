@@ -57,8 +57,8 @@ def test_autoresearch_retrieval_axis_measures_ranking_quality() -> None:
 def test_code_retrieval_axis_measures_production_search_quality_and_latency() -> None:
     runner = _load_runner()
     report = runner.run_axis("code_retrieval", wired=True)
-    assert report["measured"] == report["cases"] == 4
-    assert report["passed"] == 4
+    assert report["measured"] == report["cases"] == 5
+    assert report["passed"] == 5
     assert report["failed"] == []
     baseline = report["case_results"][0]["observed"]
     assert len(baseline["corpus_sha256"]) == 64
@@ -141,9 +141,9 @@ def test_cli_is_a_strict_complete_gate_for_supported_axes() -> None:
     payload = json.loads(completed.stdout)
     assert payload["summary"] == {
         "axes": 6,
-        "cases": 27,
-        "measured": 27,
-        "passed": 27,
+        "cases": 28,
+        "measured": 28,
+        "passed": 28,
         "failed": 0,
         "skipped": 0,
     }

@@ -67,6 +67,21 @@ def test_codebase_map_detects_local_instructions_and_scoped_commands(tmp_path: P
     assert "코드베이스 지도:" in payload["additionalContext"]
 
 
+def test_codebase_map_detects_unity_csharp(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    runtime = repo / "Assets" / "RouteFoundry" / "Runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "TransportSimulation.cs").write_text(
+        "public sealed class TransportSimulation {}\n",
+        encoding="utf-8",
+    )
+
+    payload = build_codebase_map(repo)
+    by_path = {entry["path"]: entry for entry in payload["entries"]}
+
+    assert "csharp" in by_path["Assets"]["languages"]
+
+
 def test_code_map_cli_outputs_json(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
 

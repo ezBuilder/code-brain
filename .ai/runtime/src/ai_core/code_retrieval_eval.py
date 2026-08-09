@@ -10,7 +10,7 @@ from .ranking_metrics import evaluate_ranked_retrieval
 from .search import query
 
 _FUNCTION_CHUNK_RE = re.compile(
-    r"^(.+\.(?:py|js|jsx|ts|tsx|go|rs)):{1,2}(.+)$",
+    r"^(.+\.(?:py|cs|csx|js|jsx|ts|tsx|go|rs)):{1,2}(.+)$",
     flags=re.IGNORECASE,
 )
 

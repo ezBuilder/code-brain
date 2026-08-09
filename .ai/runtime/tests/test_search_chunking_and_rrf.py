@@ -52,9 +52,9 @@ def _count_candidate_discovery(monkeypatch: pytest.MonkeyPatch) -> dict[str, int
     return calls
 
 
-def test_schema_version_is_ten() -> None:
-    """v9 added subtoken dual emission; v10 excludes vendored runtime in installs."""
-    assert SCHEMA_VERSION == 10
+def test_schema_version_is_eleven() -> None:
+    """v11 adds Unity C# coverage and excludes generated agent outputs."""
+    assert SCHEMA_VERSION == 11
 
 
 def test_escape_fts_query_splits_natural_language_punctuation() -> None:

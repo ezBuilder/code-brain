@@ -2,6 +2,30 @@
 
 All notable Code Brain changes are recorded here.
 
+## 0.7.2 - 2026-08-09
+
+Agentic code-retrieval round: live exact search now complements indexed semantic
+discovery instead of forcing BM25-first behavior onto every lookup.
+
+### Added
+
+- Unity C# coverage across indexing, exact `rg` fallback, codebase maps, autonomous-harness source detection, and the production retrieval eval axis (`.cs` and `.csx`).
+- A measured C# exact-symbol regression where live source must rank ahead of a documentation mention.
+- Deep-research evidence and adoption decisions in `.ai/outputs/research-2026-08-09-agentic-code-retrieval.md`.
+
+### Changed
+
+- Exact symbol/path checks route to targeted live-native search; fresh Code Brain retrieval remains the semantic-discovery path, while `context_pack` is on-demand rather than an automatic second call.
+- Schema v11 excludes high-churn `.ai/outputs/` artifacts from code indexing and freshness scans. Candidate-cache fingerprints now include all file-policy inputs so policy changes invalidate safely.
+- Symbol queries place exact live hits before indexed results, prefer matching source filenames over docs, and keep stale-index warnings visible when auto-refresh is disabled.
+- Freshness checks use cheap candidate metadata on every query instead of an mtime gate, detecting newly added source files even when copied with timestamps older than the index.
+
+### Fixed
+
+- Corrupt indexes preserve the `corrupt_index` recovery reason through the new always-on freshness path.
+- Older running MCP processes refuse a newer index schema instead of silently lowering `user_version`; restart remains required after an upgrade that changes the index contract.
+- `modern-transport-tycoon` C# files are no longer silently absent from both BM25 and exact fallback results.
+
 ## 0.7.1 - 2026-08-01
 
 ### Fixed

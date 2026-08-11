@@ -1175,8 +1175,8 @@ def test_federated_summary_context_renders_top_patterns(tmp_root: Path, monkeypa
     assert "compound_pipeline(2)" in out
 
 
-def test_stop_hook_triggers_bash_head_cache_rebuild(tmp_root: Path, monkeypatch):
-    """Stop hook should fire-and-forget a bash_heads cache rebuild so subsequent SessionStart sees fresh data."""
+def test_session_end_hook_triggers_bash_head_cache_rebuild(tmp_root: Path, monkeypatch):
+    """SessionEnd should rebuild bash_heads without burdening every Stop event."""
     import ai_core.hooks as hooksmod
 
     spawned: list[bool] = []
@@ -1185,12 +1185,12 @@ def test_stop_hook_triggers_bash_head_cache_rebuild(tmp_root: Path, monkeypatch)
     import ai_core.recommend as recmod
     monkeypatch.setattr(recmod, "_spawn_bash_head_cache_rebuild", lambda *_: spawned.append(True))
 
-    hooksmod.handle_hook(tmp_root, "Stop", {"session_id": "x"})
-    assert spawned == [True], "Stop hook must spawn bash_heads cache rebuild"
+    hooksmod.handle_hook(tmp_root, "SessionEnd", {"session_id": "x"})
+    assert spawned == [True], "SessionEnd hook must spawn bash_heads cache rebuild"
 
 
-def test_auto_session_note_appends_on_stop_when_enabled(tmp_root: Path, monkeypatch):
-    """AI_AUTO_SESSION_NOTE=1 must persist Stop hook's last_assistant_message first line."""
+def test_auto_session_note_appends_on_session_end_when_enabled(tmp_root: Path, monkeypatch):
+    """AI_AUTO_SESSION_NOTE=1 persists the final message at SessionEnd."""
     import ai_core.hooks as hooksmod
 
     monkeypatch.setattr(hooksmod, "_spawn_background_rebuild", lambda *_: None)
@@ -1198,7 +1198,7 @@ def test_auto_session_note_appends_on_stop_when_enabled(tmp_root: Path, monkeypa
     monkeypatch.setattr(recmod, "_spawn_bash_head_cache_rebuild", lambda *_: None)
     monkeypatch.setenv("AI_AUTO_SESSION_NOTE", "1")
 
-    hooksmod.handle_hook(tmp_root, "Stop", {
+    hooksmod.handle_hook(tmp_root, "SessionEnd", {
         "session_id": "n",
         "last_assistant_message": "Iteration 24 complete: opt-in auto session note added.\n\nMore body...",
     })
@@ -1206,7 +1206,7 @@ def test_auto_session_note_appends_on_stop_when_enabled(tmp_root: Path, monkeypa
     assert note_file.exists()
     body = note_file.read_text(encoding="utf-8")
     assert "Iteration 24 complete" in body
-    assert "[Stop]" in body, "expected [Stop] prefix in auto note"
+    assert "[SessionEnd]" in body, "expected [SessionEnd] prefix in auto note"
 
 
 def test_auto_session_note_is_opt_in(tmp_root: Path, monkeypatch):
@@ -1218,7 +1218,7 @@ def test_auto_session_note_is_opt_in(tmp_root: Path, monkeypatch):
     monkeypatch.setattr(recmod, "_spawn_bash_head_cache_rebuild", lambda *_: None)
     monkeypatch.delenv("AI_AUTO_SESSION_NOTE", raising=False)
 
-    hooksmod.handle_hook(tmp_root, "Stop", {
+    hooksmod.handle_hook(tmp_root, "SessionEnd", {
         "session_id": "n",
         "last_assistant_message": "should not appear",
     })

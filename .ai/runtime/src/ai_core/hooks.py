@@ -94,7 +94,6 @@ def normalize_agent(payload: dict[str, Any]) -> str:
     if env.get("ANTIGRAVITY_CLI") or env.get("AGY_HOME"):
         return "antigravity"
     return "unknown"
-DELTA_NOTICE_SHORT = "cb-ctx: Δ"
 DELTA_NOTICE_VERBOSE = "Code Brain context unchanged since last injection (delta-skipped)."
 SKILL_RECOMMENDATION_DISABLE_VALUES = {"0", "false", "no", "off"}
 _ENV_ENABLE_VALUES = {"1", "true", "yes", "on"}
@@ -154,7 +153,7 @@ def _maybe_apply_delta(root: Path, hook_name: str, full_context: str) -> tuple[s
         pass
     if prev == sha and prev:
         verbose = _env_enabled("AI_DELTA_NOTICE_VERBOSE")
-        return (DELTA_NOTICE_VERBOSE if verbose else DELTA_NOTICE_SHORT), True, original_bytes
+        return (DELTA_NOTICE_VERBOSE if verbose else ""), True, original_bytes
     return full_context, False, original_bytes
 
 
@@ -1605,6 +1604,7 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             _spawn_agents_md_refresh(root)
         if effective_hook in AUTO_REBUILD_HOOKS:
             _spawn_background_rebuild(root)
+        if effective_hook == "SessionEnd":
             try:
                 from .recommend import _spawn_bash_head_cache_rebuild
 
@@ -1641,21 +1641,6 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                                 self_improve.enqueue_review(root, tier="cheap")
                             except Exception:
                                 pass
-                except Exception:
-                    pass
-            # T35 autonomous page-out: when MemGPT pressure breaches threshold,
-            # the agent should not wait for a human `ai memory page-out` call.
-            if not _env_disabled("AI_AUTO_PAGE_OUT"):
-                try:
-                    from .memory_tier import hot_pressure, page_out
-
-                    if hot_pressure(root).get("page_out_recommended"):
-                        page_out(root, dry_run=False)
-                        from .memory import append_audit
-                        append_audit(
-                            root, action="memtier.auto_page_out", category="memory",
-                            payload={"trigger": effective_hook},
-                        )
                 except Exception:
                     pass
             # T36 autonomous accept is write-class and therefore opt-in only.
@@ -2233,6 +2218,25 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     header = f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={writes}."
     if hook_name not in INJECTION_HOOKS or root is None:
         return ""
+    if hook_name == "UserPromptSubmit":
+        # Stable policy and repository memory are already delivered by AGENTS.md and
+        # SessionStart. Re-inject only an explicit, prompt-dependent harness directive.
+        # This keeps long sessions from accumulating near-identical developer messages.
+        prompt_sections: list[str] = []
+        try:
+            from .autonomous_harness import directive as _harness_directive, requested as _harness_requested
+
+            if _harness_requested(payload):
+                prompt_sections.append(_harness_directive(root, explicit=True, request=payload))
+        except Exception:
+            pass
+        if not prompt_sections:
+            return ""
+        composed = "\n\n".join([header, *prompt_sections])
+        max_bytes = _max_injection_bytes_for(hook_name)
+        if len(composed.encode("utf-8")) > max_bytes:
+            return composed.encode("utf-8")[: max_bytes - 3].decode("utf-8", errors="ignore") + "..."
+        return composed
     sections = [header]
     sections.append("Response: match the user's language; self-output <=10 words; answers concise by default; expand for explicit detail or severe risk. No next-step outro; keep working.")
     if _env_enabled("AI_ROUTING_HINT_COMPACT"):
@@ -2255,17 +2259,7 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         if map_context:
             sections.append(map_context)
         sections.append(_session_harness_context(root))
-    if hook_name == "UserPromptSubmit":
-        try:
-            from .autonomous_harness import directive as _harness_directive, requested as _harness_requested
-            if _harness_requested(payload):
-                sections.append(_harness_directive(root, explicit=True, request=payload))
-        except Exception:
-            pass
-        scope_line = _session_scope_summary(root)
-        if scope_line:
-            sections.append(scope_line)
-    elif hook_name == "SessionStart":
+    if hook_name == "SessionStart":
         try:
             from .session_resume import read_latest_snapshot
             current_sid = str(payload.get("session_id") or payload.get("sid") or "")

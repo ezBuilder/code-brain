@@ -4035,17 +4035,17 @@ def test_post_tool_use_hook_skips_injection(tmp_path: Path) -> None:
     assert "hookSpecificOutput" not in response
 
 
-def test_user_prompt_submit_hook_includes_routing_when_memory_empty(tmp_path: Path) -> None:
+def test_user_prompt_submit_hook_skips_stable_context(tmp_path: Path) -> None:
     repo = copy_repo(tmp_path)
     init_package_repo(repo)
+    (repo / ".ai" / "memory" / "session-current.md").write_text("volatile tail\n", encoding="utf-8")
     payload = json.dumps({"agent": "claude", "dry": True})
     result = run_ai_input("hook", "UserPromptSubmit", "--json", stdin=payload, cwd=repo)
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
-    ctx = response["additionalContext"]
-    assert "Search:" in ctx
-    assert "code_read_hashline" in ctx
-    assert "Recent decisions" not in ctx
+    assert response["additional_context_bytes"] == 0
+    assert response["additionalContext"] == ""
+    assert response["hookSpecificOutput"]["additionalContext"] == ""
 
 
 def test_user_prompt_submit_harness_request_injects_directive(tmp_path: Path) -> None:

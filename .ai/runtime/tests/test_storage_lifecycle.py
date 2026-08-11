@@ -125,6 +125,10 @@ def _workspace_storage_fixture(monkeypatch) -> None:
     monkeypatch.setattr(storage_lifecycle, "_tracked_top_entries", lambda _root, _directory: (set(), True))
 
 
+def test_tmp_default_budget_is_scratch_sized() -> None:
+    assert storage_lifecycle.TMP_MAX_TOTAL_BYTES == 256 * 1024 * 1024
+
+
 def test_workspace_storage_prunes_tmp_by_age_and_size(tmp_path: Path, monkeypatch) -> None:
     _workspace_storage_fixture(monkeypatch)
     monkeypatch.setattr(storage_lifecycle, "TMP_RETENTION_DAYS", 1)

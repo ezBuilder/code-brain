@@ -254,8 +254,8 @@ def test_spawn_sleep_time_jobs_page_in_opt_out() -> None:
                 assert not any("page_in" in s for s in result["spawned"])
 
 
-def test_stop_hook_with_sleep_time_enabled_mocked() -> None:
-    """Test that Stop hook calls _spawn_sleep_time_jobs (mocked subprocess)."""
+def test_stop_hook_does_not_spawn_idle_maintenance() -> None:
+    """Per-turn Stop stays bounded; idle maintenance belongs to SessionEnd."""
     from ai_core import hooks
     import tempfile
 
@@ -274,22 +274,39 @@ def test_stop_hook_with_sleep_time_enabled_mocked() -> None:
         # Mock subprocess and process_janitor; patch at module import site
         with mock.patch.dict(os.environ, {"AI_SLEEP_TIME": "1"}):
             with mock.patch("subprocess.Popen") as mock_popen:
-                with mock.patch("ai_core.process_janitor.register_child"):
-                    with mock.patch("ai_core.process_janitor.cleanup_children"):
-                        mock_proc = mock.Mock()
-                        mock_proc.pid = 8888
-                        mock_popen.return_value = mock_proc
+                with mock.patch.object(hooks, "_spawn_sleep_time_jobs") as mock_idle_jobs:
+                    with mock.patch.object(hooks, "_spawn_agents_md_refresh") as mock_agents_refresh:
+                        with mock.patch("ai_core.process_janitor.register_child"):
+                            with mock.patch("ai_core.process_janitor.cleanup_children"):
+                                mock_proc = mock.Mock()
+                                mock_proc.pid = 8888
+                                mock_popen.return_value = mock_proc
 
-                        result = hooks.handle_hook(
-                            tmproot,
-                            "Stop",
-                            {"agent": "test", "session_id": "test-123"},
-                        )
+                                result = hooks.handle_hook(
+                                    tmproot,
+                                    "Stop",
+                                    {"agent": "test", "session_id": "test-123"},
+                                )
 
-                        assert result["ok"] is True
-                        assert result["hook"] == "Stop"
-                        # Subprocess should have been called for sleep-time jobs
-                        assert mock_popen.call_count >= 1
+                                assert result["ok"] is True
+                                assert result["hook"] == "Stop"
+                                mock_idle_jobs.assert_not_called()
+                                mock_agents_refresh.assert_not_called()
+
+
+def test_session_boundaries_enforce_workspace_storage() -> None:
+    from ai_core import hooks
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmproot = Path(tmpdir)
+        (tmproot / ".ai" / "cache").mkdir(parents=True, exist_ok=True)
+        with mock.patch("ai_core.storage_lifecycle.enforce_workspace_storage") as enforce:
+            with mock.patch.object(hooks, "_spawn_sleep_time_jobs"):
+                hooks.handle_hook(tmproot, "SessionStart", {"agent": "test"})
+                hooks.handle_hook(tmproot, "SessionEnd", {"agent": "test"})
+
+        assert enforce.call_count == 2
 
 
 def test_session_end_hook_with_sleep_time_enabled_mocked() -> None:

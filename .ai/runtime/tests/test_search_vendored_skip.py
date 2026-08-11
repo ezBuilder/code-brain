@@ -46,6 +46,19 @@ def test_consumer_repo_skips_vendored_runtime(tmp_path: Path) -> None:
     assert not any(path.startswith(".ai/evals/") for path in paths)
 
 
+def test_operational_tmp_is_never_indexed(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, opt_in=True)
+    _write(repo, ".ai/tmp/external-clone/source.py", "def tmpNeedleMarker():\n    pass\n")
+    _write(repo, "src/app.py", "def tmpNeedleMarker():\n    return 'project code'\n")
+
+    rebuild(repo)
+
+    payload = query(repo, "tmpNeedleMarker", limit=10)
+    paths = [item["path"] for item in payload["results"]]
+    assert any(path.startswith("src/app.py") for path in paths)
+    assert not any(path.startswith(".ai/tmp/") for path in paths)
+
+
 def test_source_repo_opt_in_keeps_runtime_indexed(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path, opt_in=True)
     _write(repo, ".ai/runtime/src/ai_core/vendored.py", "def vendoredNeedleMarker():\n    pass\n")

@@ -42,7 +42,7 @@ def _read_hook_state_text(
 HOT_PATH_TARGET_MS = 200
 SESSION_START_TARGET_MS = 1500
 INJECTION_HOOKS = {"SessionStart", "UserPromptSubmit", "SubagentStart"}
-AUTO_REBUILD_HOOKS = {"Stop", "SubagentStop", "FileChanged"}
+AUTO_REBUILD_HOOKS = {"SubagentStop", "FileChanged"}
 CONTEXT_INJECTION_HOOKS = {"UserPromptSubmit", "SessionStart", "SubagentStart"}
 SKILL_RECOMMENDATION_HOOKS = {"SessionStart"}
 
@@ -1588,13 +1588,20 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         append_event(root, event)
         mode = "local-append"
         persisted = True
+        if effective_hook in {"SessionStart", "SessionEnd"}:
+            try:
+                from .storage_lifecycle import enforce_workspace_storage
+
+                enforce_workspace_storage(root)
+            except Exception:
+                pass
         # Spawn the AGENTS.md memory refresh EARLY and detached. Stop/SessionEnd are
         # the natural triggers for Claude/Codex, but Antigravity kills its Stop hook
         # before the work runs (its Stop never reaches append_event) — so we also fire
         # on PostToolUse, which Antigravity DOES complete. A cooldown in the helper
         # bounds frequency; the refresh is write-on-change and detached so it finishes
         # even if the host kills the parent hook.
-        if effective_hook in {"Stop", "SessionEnd", "PostToolUse"}:
+        if effective_hook in {"SessionEnd", "PostToolUse"}:
             _spawn_agents_md_refresh(root)
         if effective_hook in AUTO_REBUILD_HOOKS:
             _spawn_background_rebuild(root)
@@ -1663,8 +1670,9 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             _handle_lifecycle_event(root, effective_hook, payload)
         except Exception:
             pass
-        # T6: spawn sleep-time idle jobs after SessionEnd/Stop (memory page-out, audit fold, index refresh)
-        if effective_hook in {"Stop", "SessionEnd"}:
+        # Per-turn Stop must stay bounded. Run idle maintenance only when the
+        # host actually ends the session; Stop still handles plan continuation.
+        if effective_hook == "SessionEnd":
             try:
                 _spawn_sleep_time_jobs(root)
             except Exception:

@@ -59,6 +59,7 @@ SKIP_PATH_PREFIXES = (
     ".ai/memory/",
     ".ai/cache/",
     ".ai/outputs/",
+    ".ai/tmp/",
     ".ai/skills/",
     ".ai/precall_rules/",
     ".ai/agents_catalog/",

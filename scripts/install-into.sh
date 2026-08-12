@@ -496,8 +496,15 @@ servers = payload.setdefault("mcpServers", {})
 if not isinstance(servers, dict):
     raise SystemExit(f"install-into failed: existing {dst}.mcpServers must be a JSON object")
 servers["code-brain"] = desired
+rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+# Skip the write when the file already says exactly this. An upgrade that changes
+# nothing here should not need write permission on the path: hosts and MDM policies
+# routinely protect agent config files, and a no-op write would fail the whole
+# upgrade over a byte-identical result.
+if dst.exists() and dst.read_text(encoding="utf-8") == rendered:
+    raise SystemExit(0)
 dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+dst.write_text(rendered, encoding="utf-8")
 PY
 }
 
@@ -744,8 +751,12 @@ for hook_name, managed_entries in managed.items():
     existing = hooks.get(hook_name) if isinstance(hooks.get(hook_name), list) else []
     cleaned = _strip_code_brain(existing)
     hooks[hook_name] = cleaned + managed_entries
+rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+# See merge_mcp_json: a byte-identical result must not require write permission.
+if dst.exists() and dst.read_text(encoding="utf-8") == rendered:
+    raise SystemExit(0)
 dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+dst.write_text(rendered, encoding="utf-8")
 PY
 }
 

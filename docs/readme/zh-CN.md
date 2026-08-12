@@ -126,6 +126,8 @@ obs_usage               actual Claude/Codex usage and Code Brain overhead
 tool_search             discover hidden MCP tool schemas
 ```
 
+MCP 参数在任何 handler 运行之前完成校验。必填字段必须存在，必填字符串不得为空或仅含空白 —— `tools/list` 会为每个必填字符串公布 `minLength: 1`，行为规范的客户端因此可以在本地就拒绝该调用。拒绝信息只会指出 schema 声明的字段名（绝不包含调用方提供的文本）；同一调用连续被拒 3 次后，错误会升级为明确的停止指令，因此即使客户端自身没有循环检测，也无法在同一个错误调用上空转。
+
 常用斜杠/源命令：
 
 ```text

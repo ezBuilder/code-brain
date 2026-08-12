@@ -126,6 +126,13 @@ obs_usage               actual Claude/Codex usage and Code Brain overhead
 tool_search             discover hidden MCP tool schemas
 ```
 
+MCP arguments are validated before any handler runs. Required fields must be present, and a
+required string may not be empty or whitespace — `tools/list` publishes `minLength: 1` for
+every one of them, so a well-behaved client can refuse the call locally. Rejections name the
+offending schema field (never caller-supplied text), and after 3 consecutive identical
+rejected calls the error escalates to an explicit stop order, so a client without its own
+loop detection cannot spin on the same malformed call.
+
 Common slash/source commands:
 
 ```text

@@ -150,9 +150,44 @@ def _coerce_bool(value: object, default: bool = False) -> bool:
             return False
     return bool(default)
 
+def _stamp_required_string_bounds(
+    tools: tuple[dict[str, Any], ...],
+) -> tuple[dict[str, Any], ...]:
+    """Publish ``minLength: 1`` for every required string field in the catalog.
+
+    The validator already rejects blank required strings, but clients only see the
+    schema. Making the constraint explicit lets a well-behaved client refuse the call
+    locally instead of burning a round trip — and stops a misbehaving one from reading
+    ``{"type": "string"}`` as "empty is fine".
+    """
+    stamped: list[dict[str, Any]] = []
+    for tool in tools:
+        schema = tool.get("inputSchema")
+        required = schema.get("required") if isinstance(schema, dict) else None
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if not isinstance(required, list) or not isinstance(properties, dict):
+            stamped.append(tool)
+            continue
+        new_properties = dict(properties)
+        changed = False
+        for key in required:
+            prop = new_properties.get(key)
+            if not isinstance(prop, dict) or prop.get("type") != "string":
+                continue
+            if "minLength" in prop:
+                continue
+            new_properties[key] = {**prop, "minLength": 1}
+            changed = True
+        if not changed:
+            stamped.append(tool)
+            continue
+        stamped.append({**tool, "inputSchema": {**schema, "properties": new_properties}})
+    return tuple(stamped)
+
+
 # Tool catalog. Each entry is exposed via tools/list and dispatched via tools/call.
 # Description text is short; the inputSchema follows JSON Schema (draft 2020-12 compatible).
-TOOLS: tuple[dict[str, Any], ...] = (
+_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "name": "memory_query",
         "description": "인덱싱된 소스를 BM25로 검색. 출처가 붙은 상위 K개 스니펫 반환.",
@@ -806,6 +841,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
 )
 
+TOOLS: tuple[dict[str, Any], ...] = _stamp_required_string_bounds(_TOOL_DEFINITIONS)
+
 
 MCP_METHODS = tuple(tool["name"] for tool in TOOLS)
 TOOL_NAMES = frozenset(MCP_METHODS)
@@ -961,6 +998,15 @@ def _argument_shape_error(
         )
         if len(value) > maximum:
             return f"{path}: text too long"
+        # A declared minLength is a contract, not decoration: an empty/blank string for a
+        # required field is a client bug that used to reach the handler and come back as a
+        # soft {"ok": false, "reason": "empty_query"} payload — which some clients retry
+        # forever. Reject it at the schema boundary instead.
+        minimum_length = _coerce_int(schema.get("minLength"), 0, minimum=0, maximum=maximum)
+        if minimum_length >= 1 and not value.strip():
+            return f"{path}: must not be blank"
+        if len(value) < minimum_length:
+            return f"{path}: text too short"
         return None
     if isinstance(value, float) and not math.isfinite(value):
         return f"{path}: non-finite number"
@@ -993,6 +1039,18 @@ def _argument_shape_error(
         properties = schema.get("properties")
         if not isinstance(properties, dict):
             properties = {}
+        required = schema.get("required")
+        if isinstance(required, list):
+            for key in required:
+                if not isinstance(key, str):
+                    continue
+                if key not in value:
+                    return f"{path}.{key}: required"
+                # Covers plain strings and `oneOf` string branches (e.g. sandbox_execute
+                # command) without duplicating per-branch minLength bookkeeping.
+                child = value[key]
+                if isinstance(child, str) and not child.strip():
+                    return f"{path}.{key}: must not be blank"
         for key, item in value.items():
             if not isinstance(key, str) or len(key) > MCP_ARGUMENT_MAX_KEY_CHARS:
                 return f"{path}: invalid key"
@@ -1025,6 +1083,90 @@ def _validate_tool_arguments(name: str, arguments: object) -> str | None:
         state={"nodes": 0, "chars": 0},
         path="arguments",
     )
+
+
+# A rejected call is cheap; a client that reissues the same rejected call forever is not.
+# Observed in the wild: a routed model called code_query with an empty query ~17 times in
+# one turn, each rejection reading to it like a retryable blank result. After this many
+# consecutive identical rejections the error text stops being advice and becomes a stop
+# order, which is the only signal that reaches a client with no loop detection of its own.
+MCP_REPEATED_REJECTION_LIMIT = 3
+# Bounded so a client cycling through distinct bad payloads cannot grow this without limit.
+MCP_REPEATED_REJECTION_TRACKED_KEYS = 64
+_REPEATED_REJECTIONS: dict[str, int] = {}
+
+
+def _rejection_key(name: str, arguments: dict[str, Any]) -> str:
+    try:
+        signature = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=repr)
+    except (TypeError, ValueError):  # pragma: no cover - default=repr makes this unreachable
+        signature = repr(sorted(arguments))
+    return f"{name}\x00{signature[:512]}"
+
+
+def _note_rejection(key: str) -> int:
+    """Count consecutive identical rejections, evicting the oldest key when full."""
+    count = _REPEATED_REJECTIONS.pop(key, 0) + 1
+    _REPEATED_REJECTIONS[key] = count
+    while len(_REPEATED_REJECTIONS) > MCP_REPEATED_REJECTION_TRACKED_KEYS:
+        _REPEATED_REJECTIONS.pop(next(iter(_REPEATED_REJECTIONS)))
+    return count
+
+
+def _clear_rejections_for_tool(name: str) -> None:
+    """A call that validates proves the client can form this tool's arguments.
+
+    Clearing the whole tool (not just the exact payload that succeeded) means a client
+    that recovers is no longer one stale counter away from a stop order.
+    """
+    prefix = f"{name}\x00"
+    for key in [key for key in _REPEATED_REJECTIONS if key.startswith(prefix)]:
+        del _REPEATED_REJECTIONS[key]
+
+
+def reset_repeated_rejections() -> None:
+    """Drop all loop-guard state. For tests and long-lived host processes."""
+    _REPEATED_REJECTIONS.clear()
+
+
+class ToolArgumentError(ValueError):
+    """A schema rejection whose message is safe to hand back to the caller verbatim.
+
+    ``_safe_handler_error`` flattens every other exception to a fixed string so no
+    caller-supplied value can escape. That is right for handler failures and wrong here:
+    a client told only "invalid arguments" cannot tell a blank query from a malformed
+    limit, and retries. The message is admissible only because ``_client_safe_detail``
+    proves it names schema-declared fields and nothing else.
+    """
+
+
+def _client_safe_detail(name: str, message: str) -> str | None:
+    """Return ``message`` when it references only this tool's declared field names.
+
+    Validation errors are formatted ``arguments.<field>: <reason>``. ``<field>`` is a key
+    from the caller's payload, so echoing it blindly would leak an arbitrary caller-chosen
+    string. Declared property names are ours, published in tools/list, and safe.
+    """
+    path, separator, _detail = message.partition(": ")
+    if not separator:
+        return None
+    if path == "arguments":
+        return message
+    if not path.startswith("arguments."):
+        return None
+    tool = _TOOL_BY_NAME.get(name)
+    schema = tool.get("inputSchema") if isinstance(tool, dict) else None
+    if not isinstance(schema, dict):
+        return None
+    properties = schema.get("properties")
+    declared = set(properties) if isinstance(properties, dict) else set()
+    required = schema.get("required")
+    if isinstance(required, list):
+        declared.update(key for key in required if isinstance(key, str))
+    segments = path[len("arguments.") :].split(".")
+    if all(segment in declared for segment in segments):
+        return message
+    return None
 
 
 def _tool_search_tokens(value: object) -> list[str]:
@@ -1092,9 +1234,19 @@ def _search_tool_catalog(query_text: str, *, limit: int) -> list[dict[str, Any]]
 def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run the underlying handler for a tool by name. Raises KeyError if unknown."""
     args = arguments or {}
+    rejection_key = _rejection_key(name, args)
     argument_error = _validate_tool_arguments(name, args)
     if argument_error:
-        raise ValueError(f"invalid tool arguments: {argument_error}")
+        repeats = _note_rejection(rejection_key)
+        safe_detail = _client_safe_detail(name, argument_error)
+        message = f"invalid tool arguments: {safe_detail or 'schema validation failed'}"
+        if repeats >= MCP_REPEATED_REJECTION_LIMIT:
+            message += (
+                f" (rejected {repeats}x with identical arguments — stop retrying this call; "
+                "fix the arguments or use a different tool)"
+            )
+        raise ToolArgumentError(message)
+    _clear_rejections_for_tool(name)
     if name == "autoresearch_search":
         from .autoresearch import storage as _ars, hybrid as _arh
         return {"results": _arh.search(
@@ -1858,6 +2010,10 @@ def _err(request_id: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def _safe_handler_error(exc: BaseException) -> str:
+    # Constructed by _dispatch_tool from schema-declared field names only — see
+    # ToolArgumentError. Everything below is caller/handler text and stays generic.
+    if isinstance(exc, ToolArgumentError):
+        return str(exc)[:MCP_SCALAR_TEXT_MAX_CHARS * 8]
     if isinstance(exc, PermissionError):
         return "operation not permitted"
     if isinstance(exc, (ValueError, TypeError, OverflowError)):

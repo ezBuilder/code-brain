@@ -126,6 +126,8 @@ obs_usage               actual Claude/Codex usage and Code Brain overhead
 tool_search             discover hidden MCP tool schemas
 ```
 
+MCP 인자는 핸들러 실행 전에 검증됩니다. 필수 필드는 반드시 있어야 하고, 필수 문자열은 빈 문자열이나 공백일 수 없습니다 — `tools/list`가 모든 필수 문자열에 `minLength: 1`을 공개하므로, 정상적인 클라이언트는 호출 자체를 로컬에서 거절할 수 있습니다. 거절 메시지는 스키마에 선언된 필드명만 밝히며(호출자가 준 텍스트는 절대 포함하지 않음), 동일한 호출이 연속 3회 거절되면 오류는 명시적 중단 지시로 격상됩니다. 자체 루프 감지가 없는 클라이언트도 같은 잘못된 호출을 반복할 수 없습니다.
+
 자주 쓰는 슬래시/소스 명령:
 
 ```text

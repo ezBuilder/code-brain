@@ -17,6 +17,16 @@ All notable Code Brain changes are recorded here.
 - Generic secret detection keeps high-signal literals while rejecting ordinary identifier expressions and deterministic repeated-character test placeholders that previously caused false strict-doctor failures.
 - Consumer propagation excludes source-owned `.ai/eval` scratch data and preserves project branch, HEAD, and user-owned files.
 
+## 0.7.4 - 2026-08-12
+
+MCP argument contract: malformed tool calls now fail at the schema boundary with an actionable reason instead of returning a soft empty-result body that loop-prone clients retry indefinitely.
+
+### Added
+
+- Required-field enforcement and blank-string rejection before handler dispatch, with `minLength: 1` published for every required string field.
+- A bounded repeated-rejection loop guard that escalates after three identical invalid calls and clears after a valid call.
+- Client-visible, schema-field-restricted `ToolArgumentError` details that avoid echoing caller-controlled values.
+
 ## 0.7.2 - 2026-08-09
 
 Agentic code-retrieval round: live exact search now complements indexed semantic

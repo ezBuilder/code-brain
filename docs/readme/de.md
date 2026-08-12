@@ -126,6 +126,8 @@ obs_usage               actual Claude/Codex usage and Code Brain overhead
 tool_search             discover hidden MCP tool schemas
 ```
 
+MCP-Argumente werden validiert, bevor ein Handler läuft. Pflichtfelder müssen vorhanden sein, und ein Pflicht-String darf nicht leer sein oder nur aus Leerraum bestehen — `tools/list` veröffentlicht für jeden davon `minLength: 1`, sodass ein gut erzogener Client den Aufruf lokal ablehnen kann. Ablehnungen benennen nur das schemadeklarierte Feld (nie vom Aufrufer geliefertem Text), und nach 3 aufeinanderfolgenden identischen abgelehnten Aufrufen wird der Fehler zu einer expliziten Stopp-Anweisung. So kann sich auch ein Client ohne eigene Schleifenerkennung nicht auf demselben fehlerhaften Aufruf festfahren.
+
 Gängige Slash-/Source-Befehle:
 
 ```text

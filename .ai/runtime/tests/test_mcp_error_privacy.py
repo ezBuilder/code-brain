@@ -137,9 +137,75 @@ def test_audit_normalizes_unknown_method_and_tool(
     assert supplied not in json.dumps(captured)
 
 
+def test_schema_rejection_reason_reaches_the_client(tmp_path: Path) -> None:
+    """The client must learn *why* the call was rejected, or it just retries."""
+    response = mcp_server.handle_request(
+        tmp_path,
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "code_query", "arguments": {"query": ""}},
+        },
+    )
+
+    payload = response["result"]
+    assert payload["isError"] is True
+    assert payload["content"] == [
+        {"type": "text", "text": "invalid tool arguments: arguments.query: must not be blank"}
+    ]
+
+
+def test_schema_rejection_never_echoes_an_undeclared_field_name(tmp_path: Path) -> None:
+    """An unknown key is caller-chosen text and must not survive into the reply."""
+    supplied = _sensitive_value()
+
+    response = mcp_server.handle_request(
+        tmp_path,
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "code_query",
+                "arguments": {"query": "needle", supplied: "x" * 2_000_000},
+            },
+        },
+    )
+
+    serialized = json.dumps(response)
+    payload = response["result"]
+    assert payload["isError"] is True
+    assert payload["content"] == [
+        {"type": "text", "text": "invalid tool arguments: schema validation failed"}
+    ]
+    assert supplied not in serialized
+
+
+def test_repeated_rejection_stop_order_reaches_the_client(tmp_path: Path) -> None:
+    mcp_server.reset_repeated_rejections()
+    request = {
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {"name": "code_query", "arguments": {"query": "  "}},
+    }
+
+    for _attempt in range(mcp_server.MCP_REPEATED_REJECTION_LIMIT - 1):
+        mcp_server.handle_request(tmp_path, dict(request))
+
+    response = mcp_server.handle_request(tmp_path, dict(request))
+
+    text = response["result"]["content"][0]["text"]
+    assert "stop retrying this call" in text
+    mcp_server.reset_repeated_rejections()
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [
+        (mcp_server.ToolArgumentError("invalid tool arguments: arguments.query: required"),
+         "invalid tool arguments: arguments.query: required"),
         (PermissionError("private"), "operation not permitted"),
         (ValueError("private"), "invalid arguments"),
         (TypeError("private"), "invalid arguments"),

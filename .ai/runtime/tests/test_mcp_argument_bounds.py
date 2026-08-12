@@ -14,6 +14,11 @@ def _nested_mapping(depth: int):
     return value
 
 
+@pytest.fixture(autouse=True)
+def _reset_loop_guard() -> None:
+    mcp_server.reset_repeated_rejections()
+
+
 def test_schema_specific_string_bound_rejects_before_handler(tmp_path: Path) -> None:
     marker = "SensitivePatternMarkerQ7"
     oversized = marker + "x" * 5000
@@ -156,6 +161,149 @@ def test_global_array_and_object_key_bounds_apply_to_unknown_fields() -> None:
 
     assert array_error == "arguments.extra: too many items"
     assert object_error == "arguments.extra: too many keys"
+
+
+@pytest.mark.parametrize("tool_name", ["memory_query", "code_query", "context_pack", "obs_search"])
+@pytest.mark.parametrize("blank", ["", " ", "\n\t "])
+def test_blank_required_query_is_rejected_before_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    blank: str,
+) -> None:
+    """An empty query must fail loudly, not return a soft ``reason: empty_query`` body.
+
+    A soft body is indistinguishable from a normal empty result to a naive client, which
+    is exactly how a model ends up calling the same broken search a dozen times in a row.
+    """
+
+    def unreachable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("handler must not run for a blank required query")
+
+    monkeypatch.setattr(mcp_server, "query", unreachable)
+    monkeypatch.setattr(mcp_server, "context_pack", unreachable)
+
+    with pytest.raises(ValueError, match=r"arguments\.query: must not be blank"):
+        mcp_server._dispatch_tool(tmp_path, tool_name, {"query": blank})
+
+
+@pytest.mark.parametrize("tool_name", ["memory_query", "code_query", "context_pack"])
+def test_missing_required_query_is_rejected_before_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    def unreachable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("handler must not run when a required field is absent")
+
+    monkeypatch.setattr(mcp_server, "query", unreachable)
+    monkeypatch.setattr(mcp_server, "context_pack", unreachable)
+
+    with pytest.raises(ValueError, match=r"arguments\.query: required"):
+        mcp_server._dispatch_tool(tmp_path, tool_name, {"limit": 5})
+
+
+def test_blank_sandbox_command_is_rejected() -> None:
+    assert mcp_server._validate_tool_arguments(
+        "sandbox_execute",
+        {"command": "   "},
+    ) == "arguments.command: must not be blank"
+
+
+def test_every_required_string_field_publishes_min_length() -> None:
+    """tools/list must advertise the constraint the validator enforces."""
+    offenders: list[str] = []
+    for tool in mcp_server.TOOLS:
+        schema = tool.get("inputSchema") or {}
+        properties = schema.get("properties") or {}
+        for key in schema.get("required") or []:
+            prop = properties.get(key)
+            if not isinstance(prop, dict) or prop.get("type") != "string":
+                continue
+            if prop.get("minLength", 0) < 1:
+                offenders.append(f"{tool['name']}.{key}")
+    assert offenders == []
+
+
+def test_blank_required_string_rejected_across_whole_catalog(tmp_path: Path) -> None:
+    """No tool in the catalog may accept a blank value for a required string field."""
+    accepted: list[str] = []
+    for tool in mcp_server.TOOLS:
+        schema = tool.get("inputSchema") or {}
+        properties = schema.get("properties") or {}
+        required = [
+            key
+            for key in schema.get("required") or []
+            if isinstance(properties.get(key), dict) and properties[key].get("type") == "string"
+        ]
+        if not required:
+            continue
+        payload = {key: "" for key in schema.get("required") or []}
+        error = mcp_server._validate_tool_arguments(str(tool["name"]), payload)
+        if error is None or "must not be blank" not in error:
+            accepted.append(str(tool["name"]))
+    assert accepted == []
+
+
+def test_non_required_empty_string_still_allowed() -> None:
+    """Optional free-text fields keep accepting empty values."""
+    assert mcp_server._validate_tool_arguments(
+        "evidence_record",
+        {"query": "needle", "path": "src/a.py", "note": ""},
+    ) is None
+
+
+def test_repeated_identical_rejection_escalates_to_a_stop_order(tmp_path: Path) -> None:
+    """The Nth identical bad call must read as "stop", not as another retryable error."""
+    payload = {"query": ""}
+
+    for _attempt in range(mcp_server.MCP_REPEATED_REJECTION_LIMIT - 1):
+        with pytest.raises(ValueError) as early:
+            mcp_server._dispatch_tool(tmp_path, "code_query", payload)
+        assert "stop retrying" not in str(early.value)
+
+    with pytest.raises(ValueError, match=r"stop retrying this call") as final:
+        mcp_server._dispatch_tool(tmp_path, "code_query", payload)
+    assert "rejected 3x" in str(final.value)
+
+
+def test_loop_guard_counts_each_argument_shape_separately(tmp_path: Path) -> None:
+    """Distinct bad payloads are distinct mistakes, not one loop."""
+    for index in range(mcp_server.MCP_REPEATED_REJECTION_LIMIT + 2):
+        with pytest.raises(ValueError) as exc_info:
+            mcp_server._dispatch_tool(tmp_path, "code_query", {"query": "", "limit": index})
+        assert "stop retrying" not in str(exc_info.value)
+
+
+def test_loop_guard_resets_after_a_valid_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        mcp_server,
+        "query",
+        lambda *_args, **_kwargs: {"ok": True, "results": []},
+    )
+    for _attempt in range(mcp_server.MCP_REPEATED_REJECTION_LIMIT - 1):
+        with pytest.raises(ValueError):
+            mcp_server._dispatch_tool(tmp_path, "code_query", {"query": ""})
+
+    mcp_server._dispatch_tool(tmp_path, "code_query", {"query": "needle"})
+
+    with pytest.raises(ValueError) as exc_info:
+        mcp_server._dispatch_tool(tmp_path, "code_query", {"query": ""})
+    assert "stop retrying" not in str(exc_info.value)
+
+
+def test_loop_guard_tracking_table_stays_bounded(tmp_path: Path) -> None:
+    for index in range(mcp_server.MCP_REPEATED_REJECTION_TRACKED_KEYS * 2):
+        with pytest.raises(ValueError):
+            mcp_server._dispatch_tool(tmp_path, "code_query", {"query": "", "limit": index})
+
+    assert (
+        len(mcp_server._REPEATED_REJECTIONS)
+        <= mcp_server.MCP_REPEATED_REJECTION_TRACKED_KEYS
+    )
 
 
 def test_unknown_tool_still_gets_global_shape_validation() -> None:

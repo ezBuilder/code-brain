@@ -126,6 +126,8 @@ obs_usage               actual Claude/Codex usage and Code Brain overhead
 tool_search             discover hidden MCP tool schemas
 ```
 
+Les arguments MCP sont validés avant l'exécution de tout handler. Les champs requis doivent être présents, et une chaîne requise ne peut être vide ni composée d'espaces — `tools/list` publie `minLength: 1` pour chacune d'elles, si bien qu'un client correct peut refuser l'appel localement. Les refus nomment uniquement le champ déclaré dans le schéma (jamais du texte fourni par l'appelant), et après 3 appels rejetés identiques consécutifs l'erreur devient un ordre d'arrêt explicite : un client sans détection de boucle ne peut pas s'acharner sur le même appel malformé.
+
 Commandes slash/source courantes :
 
 ```text

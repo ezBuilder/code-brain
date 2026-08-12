@@ -126,6 +126,8 @@ obs_usage               actual Claude/Codex usage and Code Brain overhead
 tool_search             discover hidden MCP tool schemas
 ```
 
+Los argumentos MCP se validan antes de ejecutar cualquier handler. Los campos requeridos deben estar presentes, y una cadena requerida no puede estar vacía ni ser solo espacios — `tools/list` publica `minLength: 1` para cada una, así que un cliente correcto puede rechazar la llamada localmente. Los rechazos nombran solo el campo declarado en el esquema (nunca texto suministrado por quien llama), y tras 3 llamadas rechazadas idénticas consecutivas el error se convierte en una orden explícita de detenerse: un cliente sin detección de bucles propia no puede insistir en la misma llamada malformada.
+
 Comandos slash/source comunes:
 
 ```text

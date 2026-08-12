@@ -2,6 +2,39 @@
 
 All notable Code Brain changes are recorded here.
 
+## 0.7.4 - 2026-08-12
+
+MCP argument contract: a malformed tool call now fails at the schema boundary with a
+reason the caller can act on, instead of returning a soft empty-result body that a
+client with no loop detection retries indefinitely.
+
+### Added
+
+- `required` enforcement and blank-string rejection in MCP argument validation. A missing
+  required field, or a required string that is empty/whitespace, is refused before the
+  handler runs — previously `code_query`/`context_pack` accepted `query: ""` and answered
+  `{"ok": false, "reason": "empty_query"}`.
+- `minLength: 1` published on every required string field in `tools/list`, derived from the
+  catalog so new tools inherit it.
+- A repeated-rejection loop guard: after 3 consecutive identical rejected calls the error
+  text escalates to an explicit stop order. Counters are per tool + argument shape, bounded
+  to 64 tracked keys, and clear once any call to that tool validates.
+- Schema rejection reasons now reach the client verbatim (`ToolArgumentError`), restricted
+  to schema-declared field names so no caller-supplied text can leak.
+
+## 0.7.3 - 2026-08-11
+
+Context-bloat remediation: repeated hook injection and unbounded Stop-hook work were
+inflating transcripts across long sessions.
+
+### Fixed
+
+- `UserPromptSubmit` no longer re-injects stable policy and repository memory on every
+  prompt — `AGENTS.md` and `SessionStart` already deliver it, so ordinary turns inject
+  zero bytes while explicit harness directives are preserved.
+- Stop-hook maintenance moved to `SessionEnd`, keeping the per-turn Stop path bounded.
+- Workspace storage lifecycle enforcement runs on session boundaries.
+
 ## 0.7.2 - 2026-08-09
 
 Agentic code-retrieval round: live exact search now complements indexed semantic

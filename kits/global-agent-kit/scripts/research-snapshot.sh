@@ -9,12 +9,12 @@ OUT_FILE="$OUT_DIR/$(date +%Y%m%d-%H%M%S).md"
 mkdir -p "$OUT_DIR"
 
 sources=(
-  "Claude Code settings|https://docs.anthropic.com/en/docs/claude-code/settings"
-  "Claude Code hooks|https://docs.anthropic.com/en/docs/claude-code/hooks"
-  "Claude Code slash commands|https://docs.anthropic.com/en/docs/claude-code/slash-commands"
-  "Claude Code subagents|https://docs.anthropic.com/en/docs/claude-code/sub-agents"
-  "Claude Code MCP|https://docs.anthropic.com/en/docs/claude-code/mcp"
-  "Claude Code memory|https://docs.anthropic.com/en/docs/claude-code/memory"
+  "Claude Code settings|https://code.claude.com/docs/en/settings"
+  "Claude Code hooks|https://code.claude.com/docs/en/hooks"
+  "Claude Code commands|https://code.claude.com/docs/en/commands"
+  "Claude Code subagents|https://code.claude.com/docs/en/sub-agents"
+  "Claude Code MCP|https://code.claude.com/docs/en/mcp"
+  "Claude Code memory|https://code.claude.com/docs/en/memory"
   "OpenAI Codex CLI|https://github.com/openai/codex"
   "OpenAI Codex CLI help|https://help.openai.com/en/articles/11096431-openai-codex-cli-getting-started"
 )

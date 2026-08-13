@@ -97,6 +97,7 @@ check_managed_rule "$ROOT_DIR/rules/CLAUDE.md" "$HOME/.claude/CLAUDE.md" "Claude
 check_managed_rule "$ROOT_DIR/rules/AGENTS.md" "$HOME/.codex/AGENTS.md" "Codex global rule"
 check_file "$HOME/.claude/settings.json" "Claude settings"
 check_executable "$HOME/.claude/hooks/block-dangerous.sh" "dangerous command hook"
+check_executable "$HOME/.claude/hooks/block-secret-commit.sh" "secret commit hook"
 check_executable "$HOME/.claude/hooks/protect-secrets.sh" "secret protection hook"
 check_executable "$HOME/.claude/hooks/session-context.sh" "session context hook"
 check_executable "$HOME/.claude/hooks/user-prompt-submit.sh" "user prompt dispatcher hook"
@@ -106,6 +107,10 @@ check_file "$HOME/.claude/agents/security-reviewer.md" "security reviewer agent"
 check_file "$HOME/.claude/skills/implement-feature/SKILL.md" "implement-feature skill"
 check_file "$HOME/.claude/skills/lean-review/SKILL.md" "lean-review skill"
 check_file "$HOME/.claude/skills/lean-debt/SKILL.md" "lean-debt skill"
+check_file "$HOME/.claude/skills/billing-integrity/SKILL.md" "billing-integrity skill"
+check_file "$HOME/.claude/skills/billing-integrity/references/playbook.md" "billing-integrity playbook"
+check_file "$HOME/.claude/skills/billing-integrity/references/audit.md" "billing-integrity audit"
+check_file "$HOME/.claude/skills/billing-integrity/references/incidents.md" "billing-integrity incidents"
 check_file "$HOME/.claude/commands/kit-upgrade-loop.md" "kit upgrade loop command"
 
 if [[ -f "$HOME/.claude/settings.json" ]]; then
@@ -126,6 +131,7 @@ for entries in settings.get("hooks", {}).values():
 
 required = {
     str(hook_dir / "block-dangerous.sh"),
+    str(hook_dir / "block-secret-commit.sh"),
     str(hook_dir / "protect-secrets.sh"),
     str(hook_dir / "session-context.sh"),
     str(hook_dir / "user-prompt-submit.sh"),

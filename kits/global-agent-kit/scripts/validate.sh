@@ -23,6 +23,7 @@ required_files=(
   ".claudeignore"
   ".claude/settings.json"
   ".claude/hooks/block-dangerous.sh"
+  ".claude/hooks/block-secret-commit.sh"
   ".claude/hooks/protect-secrets.sh"
   ".claude/hooks/session-context.sh"
   ".claude/hooks/user-prompt-submit.sh"
@@ -32,6 +33,10 @@ required_files=(
   ".claude/commands/kit-upgrade-loop.md"
   ".claude/skills/lean-review/SKILL.md"
   ".claude/skills/lean-debt/SKILL.md"
+  ".claude/skills/billing-integrity/SKILL.md"
+  ".claude/skills/billing-integrity/references/playbook.md"
+  ".claude/skills/billing-integrity/references/audit.md"
+  ".claude/skills/billing-integrity/references/incidents.md"
   "scripts/doctor.sh"
   "scripts/codex-doctor.sh"
   "scripts/harness.sh"
@@ -61,6 +66,7 @@ bash -n scripts/evolve-promote.sh
 bash -n scripts/evolve-snapshot.sh
 python3 -m py_compile scripts/evolve-score.py
 bash -n .claude/hooks/block-dangerous.sh
+bash -n .claude/hooks/block-secret-commit.sh
 bash -n .claude/hooks/protect-secrets.sh
 bash -n .claude/hooks/session-context.sh
 bash -n .claude/hooks/user-prompt-submit.sh
@@ -129,9 +135,9 @@ python3 - <<'PY'
 from pathlib import Path
 
 required_phrases = [
-    "Prefer no code, stdlib/native, installed dependency, one-liner",
-    "never remove validation, security, accessibility, data-loss handling, or explicit requirements",
-    "cb-simplify: <ceiling>; revisit when <trigger>",
+    "Preserve unrelated user changes and dirty worktrees.",
+    "Do not read, edit, print, or commit real secrets",
+    "Verify before claiming success",
 ]
 
 claude = Path("rules/CLAUDE.md").read_text(encoding="utf-8")
@@ -153,7 +159,7 @@ def comparable(text):
 if comparable(claude) != comparable(agents):
     raise SystemExit("rules/CLAUDE.md and rules/AGENTS.md drifted beyond title")
 
-for skill in ("lean-review", "lean-debt"):
+for skill in ("lean-review", "lean-debt", "billing-integrity"):
     path = Path(".claude/skills") / skill / "SKILL.md"
     if not path.is_file():
         raise SystemExit(f"missing lean skill: {path}")
@@ -190,6 +196,9 @@ mkdir -p "$tmp_home/.claude" "$tmp_home/.codex"
 cat >"$tmp_home/.claude/settings.json" <<'JSON'
 {
   "autoMemoryEnabled": true,
+  "env": {
+    "CUSTOM_SETTING": "kept"
+  },
   "permissions": {
     "deny": [
       "Bash(git branch -D *)",
@@ -231,9 +240,10 @@ grep -q "Keep this custom Codex instruction." "$tmp_home/.codex/AGENTS.md"
 test "$(grep -c 'code-brain-global-kit:start' "$tmp_home/.claude/CLAUDE.md")" -eq 1
 test "$(grep -c 'code-brain-global-kit:start' "$tmp_home/.codex/AGENTS.md")" -eq 1
 # Rule body must survive exactly once: legacy markerless copy collapsed, not duplicated.
-test "$(grep -c 'If Code Brain is missing or stale, fall back and say so.' "$tmp_home/.claude/CLAUDE.md")" -eq 1
-test "$(grep -c 'If Code Brain is missing or stale, fall back and say so.' "$tmp_home/.codex/AGENTS.md")" -eq 1
+test "$(grep -c 'Follow the applicable project instructions for the current tool' "$tmp_home/.claude/CLAUDE.md")" -eq 1
+test "$(grep -c 'Follow the applicable project instructions for the current tool' "$tmp_home/.codex/AGENTS.md")" -eq 1
 test -x "$tmp_home/.claude/hooks/block-dangerous.sh"
+test -x "$tmp_home/.claude/hooks/block-secret-commit.sh"
 test -x "$tmp_home/.claude/hooks/protect-secrets.sh"
 test -x "$tmp_home/.claude/hooks/session-context.sh"
 test -x "$tmp_home/.claude/hooks/user-prompt-submit.sh"
@@ -244,6 +254,10 @@ test -f "$tmp_home/.claude/agents/security-reviewer.md"
 test -f "$tmp_home/.claude/skills/implement-feature/SKILL.md"
 test -f "$tmp_home/.claude/skills/lean-review/SKILL.md"
 test -f "$tmp_home/.claude/skills/lean-debt/SKILL.md"
+test -f "$tmp_home/.claude/skills/billing-integrity/SKILL.md"
+test -f "$tmp_home/.claude/skills/billing-integrity/references/playbook.md"
+test -f "$tmp_home/.claude/skills/billing-integrity/references/audit.md"
+test -f "$tmp_home/.claude/skills/billing-integrity/references/incidents.md"
 test -f "$tmp_home/.claude/commands/kit-upgrade-loop.md"
 
 python3 - "$tmp_home/.claude/settings.json" "$tmp_home/.claude/hooks" <<'PY'
@@ -263,13 +277,15 @@ if "Bash(custom deploy *)" not in ask:
     raise SystemExit("installer did not preserve existing permission ask rules")
 
 deny = perms.get("deny", [])
-if "Bash(git push * --force*)" not in deny:
-    raise SystemExit("installer did not preserve force-push deny rules")
-if "Bash(git branch -D *)" in deny or "Bash(git push * --delete *)" in deny:
-    raise SystemExit("broad branch-deletion deny rules must be handled semantically by the hook")
+if deny:
+    raise SystemExit("retired broad branch-deletion deny rules were not removed")
 
 if perms.get("defaultMode") != "bypassPermissions":
     raise SystemExit("installer did not carry the bypassPermissions default mode")
+
+environment = settings.get("env", {})
+if environment.get("CUSTOM_SETTING") != "kept" or environment.get("AI_LOOP_CONTINUATION") != "1":
+    raise SystemExit("installer did not merge Code Brain environment settings")
 
 notification = settings.get("hooks", {}).get("Notification", [])
 if not notification:
@@ -285,6 +301,7 @@ for entries in settings.get("hooks", {}).values():
 
 required = {
     str(hook_dir / "block-dangerous.sh"),
+    str(hook_dir / "block-secret-commit.sh"),
     str(hook_dir / "protect-secrets.sh"),
     str(hook_dir / "session-context.sh"),
     str(hook_dir / "user-prompt-submit.sh"),

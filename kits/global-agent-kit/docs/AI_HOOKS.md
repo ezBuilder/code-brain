@@ -6,7 +6,7 @@ Hook-first plan for Claude Code and Codex-adjacent workflows.
 
 - Hooks protect the session before prompts, skills, MCP, or agents optimize it.
 - Default hooks may block secret reads and destructive shell actions, but must not block normal `Read`, `Edit`, `Write`, or shell diagnostics.
-- `SessionStart` context stays short: installed kit, available commands, and approval boundaries only.
+- Code Brain `SessionStart`, `UserPromptSubmit`, and `PostToolUse` hooks stay bounded and deterministic.
 - Project-local rules may add stricter hooks, but cannot weaken secret, credential, destructive, deployment, or billing approval boundaries.
 
 ## 현재 기본값
@@ -14,8 +14,11 @@ Hook-first plan for Claude Code and Codex-adjacent workflows.
 | Hook | Event | 목적 | 실패 기준 |
 | --- | --- | --- | --- |
 | `block-dangerous.sh` | `PreToolUse:Bash` | hard-block protected branch deletion and other irreversible commands | blocking non-protected worktree/session branch cleanup or bypass guidance |
+| `block-secret-commit.sh` | `PreToolUse:Bash` | block commits that add likely credentials | blocking ordinary commits or printing detected secret values |
 | `protect-secrets.sh` | `PreToolUse:Read/Edit/Write` | real secrets and credential files are not read or changed | `.env`, keys, tokens, certs exposed |
-| `session-context.sh` | `SessionStart` | concise kit usage context injection | long context, stale commands, hidden policy changes |
+| `session-context.sh` | `SessionStart` | concise kit and evolution context injection | long context, stale commands, hidden policy changes |
+| `user-prompt-submit.sh` | `UserPromptSubmit` | add bounded risk context and enforce explicit security bypass blocks | broad false positives |
+| `post-tool-use.sh` | `PostToolUse` | add concise verification reminders after relevant tools | routine output noise |
 
 ## 채택 기준
 

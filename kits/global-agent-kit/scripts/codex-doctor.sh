@@ -72,14 +72,17 @@ status = 0
 warn_count = 0
 
 HOOK_EVENTS = {
-    "preToolUse",
-    "postToolUse",
-    "permissionRequest",
-    "preCompact",
-    "postCompact",
-    "sessionStart",
-    "userPromptSubmit",
-    "stop",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "UserPromptSubmit",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+    "SessionStart",
+    "SessionEnd",
 }
 HOOK_METADATA_KEYS = {"state"}
 VALID_APPROVAL = {"untrusted", "on-request", "on-failure", "never"}
@@ -154,34 +157,10 @@ def check_mode(table, key, valid, label):
 
 
 def check_profiles(config):
-    profiles = config.get("profiles")
-    selected = config.get("profile")
-
-    if selected is not None:
-        if not isinstance(selected, str) or not selected.strip():
-            fail("profile must be a non-empty string when set")
-        elif not is_table(profiles) or selected not in profiles:
-            fail(f"profile points to missing [profiles.{selected}]")
-        else:
-            ok(f"default profile exists: {selected}")
-
-    if profiles is None:
-        return
-    if not is_table(profiles):
-        fail("profiles must be a TOML table")
-        return
-
-    for name, profile in profiles.items():
-        if not isinstance(name, str) or not name.strip():
-            fail("profile names must be non-empty")
-            continue
-        if not is_table(profile):
-            fail(f"[profiles.{name}] must be a TOML table")
-            continue
-        check_mode(profile, "approval_policy", VALID_APPROVAL, "approval policy")
-        check_mode(profile, "sandbox_mode", VALID_SANDBOX, "sandbox mode")
-        if "ask_for_approval" in profile:
-            warn(f"[profiles.{name}].ask_for_approval looks like a CLI flag name; use approval_policy")
+    if "profile" in config:
+        warn("top-level profile is no longer supported; use --profile with ~/.codex/<name>.config.toml")
+    if "profiles" in config:
+        warn("[profiles] tables are no longer supported; move each profile to ~/.codex/<name>.config.toml")
 
 
 def validate_handler(handler, location):
@@ -256,8 +235,10 @@ def check_config(config):
         warn("hooks appear disabled by feature flag")
     check_profiles(config)
     if "hooks" in config:
-        validate_hooks_table(config["hooks"], "config.toml hooks")
-        if hooks_path.exists():
+        config_hooks = config["hooks"]
+        validate_hooks_table(config_hooks, "config.toml hooks")
+        has_event_hooks = is_table(config_hooks) and any(event in HOOK_EVENTS for event in config_hooks)
+        if has_event_hooks and hooks_path.exists():
             warn("hooks are configured in both config.toml and hooks.json; keep one source of truth when possible")
 
 
@@ -287,11 +268,9 @@ def check_hooks_json(data):
     misplaced = sorted(key for key in data if key in HOOK_EVENTS)
     if misplaced:
         fail(f"hooks.json event keys must be nested under top-level 'hooks': {misplaced}")
-    # Codex's parser accepts ONLY a top-level `hooks` key; any extra (e.g. a `_note`
-    # annotation) makes it fail to load the whole file ("unknown field ...").
-    unknown = sorted(key for key in data if key != "hooks" and key not in HOOK_EVENTS)
+    unknown = sorted(key for key in data if key not in {"description", "hooks"} and key not in HOOK_EVENTS)
     if unknown:
-        fail(f"hooks.json: Codex rejects top-level keys other than 'hooks': {unknown}")
+        fail(f"hooks.json has unsupported top-level keys: {unknown}")
     if hooks is None:
         warn("hooks.json has no top-level 'hooks' object")
         return
@@ -331,8 +310,9 @@ sandbox_mode = "read-only"
 TOML
   cat >"$tmp_home/.codex/hooks.json" <<'JSON'
 {
+  "description": "self-test hooks",
   "hooks": {
-    "sessionStart": [
+    "SessionStart": [
       {
         "matcher": "",
         "hooks": [
@@ -343,7 +323,7 @@ TOML
         ]
       }
     ],
-    "preToolUse": [
+    "PreToolUse": [
       {
         "matcher": "Bash",
         "hooks": [
@@ -362,7 +342,7 @@ JSON
 
   cat >"$tmp_home/.codex/hooks.json" <<'JSON'
 {
-  "preToolUse": []
+  "PreToolUse": []
 }
 JSON
   if HOME_DIR="$tmp_home" run_diagnostics >/dev/null 2>&1; then

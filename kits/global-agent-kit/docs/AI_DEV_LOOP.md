@@ -17,7 +17,7 @@
 | 항목 | 근거 | 결정 | 이유 |
 | --- | --- | --- | --- |
 | Claude user slash commands | Claude Code slash commands docs | 채택 | `/kit-*` 명령으로 진단, 연구, 업그레이드 루프를 바로 호출할 수 있다. |
-| Claude SessionStart hook | Claude Code hooks docs | 채택 | 새 세션에 kit 사용 맥락을 짧게 주입해 별도 세팅 필요성을 줄인다. |
+| Claude SessionStart hook | Claude Code hooks docs | 채택 | Code Brain kit 사용 맥락을 bounded context로 주입한다. |
 | MCP 자동 등록 | Claude Code MCP docs | 보류 | OAuth/token/원격 권한 설정이 필요할 수 있어 install-once 기본값으로 위험하다. |
 | Codex sandbox full-auto 강제 | Codex CLI docs | 보류 | 사용자 환경의 approval/sandbox 정책을 전역 installer가 강제하면 위험하다. |
 | Code Brain Skill Router | workflow routing pattern | 조건부 채택 | 반복 품질을 높이는 짧은 라우팅만 채택하고 background mutation은 거부한다. |
@@ -28,6 +28,8 @@
 | Codex Skills/MCP prompts | Codex skill and MCP prompt patterns | 조건부 채택 | 문서/선택형 project-local prompt만 채택하고 OAuth/token 기반 전역 MCP 자동 등록은 거부한다. |
 | Codex doctor Python fallback | Codex config diagnostics + macOS Python baseline | 채택 | macOS 기본 Python 3.9에서도 설치된 3.12/3.11을 찾아 TOML 진단을 통과시킨다. |
 | Protected-branch semantic guard | Claude Code PreToolUse hook contract | 채택 | 영구 브랜치는 계속 차단하면서 worktree/session 쓰레기 브랜치 삭제 오탐을 제거한다. |
+| Global billing-integrity skill | Claude Code personal skill scope + production incident proof | 채택 | 한 canonical skill과 references를 전 프로젝트에서 재사용하고 installer/doctor가 설치 상태를 검증한다. |
+| Duplicate billing skill into every repo | local convention only | 거부 | 복사본 drift가 생기므로 global skill + global rule pointer를 단일 소스로 유지한다. |
 
 ## 다음 후보
 

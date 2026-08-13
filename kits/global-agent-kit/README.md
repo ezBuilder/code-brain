@@ -15,8 +15,8 @@ gh auth status
 권장 설치 위치:
 
 ```bash
-gh repo clone ezBuilder/code-brain-global-kit ~/.local/share/code-brain-global-kit
-cd ~/.local/share/code-brain-global-kit
+gh repo clone ezBuilder/code-brain ~/workspace/code-brain
+cd ~/workspace/code-brain/kits/global-agent-kit
 ./scripts/validate.sh
 ```
 
@@ -40,7 +40,7 @@ Codex 전역 규칙만 설치:
 
 `--all`은 다음을 한 번에 설치한다.
 
-- Claude: `~/.claude/CLAUDE.md`, `~/.claude/settings.json`, `~/.claude/hooks/`, `~/.claude/policies/`, `~/.claude/agents/`, `~/.claude/skills/`, `~/.claude/commands/`
+- Claude: concise `~/.claude/CLAUDE.md`, `bypassPermissions`, Code Brain hooks, policies, agents, skills, and commands
 - Codex: `~/.codex/AGENTS.md`
 
 기존 `CLAUDE.md`/`AGENTS.md`는 덮어쓰지 않는다. 설치기는 파일을 백업한 뒤 `code-brain-global-kit` managed block만 추가하거나 갱신한다.
@@ -60,7 +60,8 @@ Codex 전역 규칙만 설치:
 ## 설치 대상
 
 - Claude: `~/.claude/CLAUDE.md`
-- Claude Code assets: `~/.claude/settings.json`, `~/.claude/hooks/`, `~/.claude/agents/`, `~/.claude/skills/`
+- Claude Code assets: `~/.claude/settings.json`, Code Brain hooks, `~/.claude/agents/`, `~/.claude/skills/`
+- 공용 결제 감사: `~/.claude/skills/billing-integrity/`(Claude 전역 skill, Codex 전역 규칙에서 동일 원본 참조)
 - Claude hook policy: `~/.claude/policies/hook-policy.json`
 - Claude Code commands: `~/.claude/commands/kit-doctor.md`, `~/.claude/commands/kit-research.md`, `~/.claude/commands/kit-upgrade-loop.md`
 - Codex: `~/.codex/AGENTS.md`

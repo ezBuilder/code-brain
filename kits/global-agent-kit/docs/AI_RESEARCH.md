@@ -29,24 +29,29 @@ Codex CLI:
 
 ## 이 키트에 반영한 결정
 
-- `./install.sh --all --yes`는 Claude 규칙, Claude settings, hooks, agents, skills, Codex 규칙을 한 번에 설치한다.
+- `./install.sh --all --yes`는 짧은 Claude/Codex 규칙, Claude `bypassPermissions`, Code Brain hooks, agents, skills를 한 번에 설치한다.
 - `./scripts/harness.sh --once --install`은 설치 품질 루프를 한 번 실행하고, `--forever --install`은 명시적인 tmux/장시간 세션에서 반복 실행한다.
 - 기존 파일이나 디렉터리는 `~/.local/state/code-brain-global-kit/backups/` 아래에 백업한다. 전역 `CLAUDE.md`/`AGENTS.md`는 덮어쓰기보다 managed block을 추가/갱신한다.
 - 반복 하네스 실행으로 백업이 무한 증가하지 않게 기본 20개만 보존한다.
-- 기존 Claude user settings는 덮어쓰기보다 permissions/hooks를 병합한다.
+- 기존 Claude user settings는 덮어쓰기보다 보존하되, 이 키트가 과거에 설치한 중복 deny는 제거한다.
 - Claude hooks는 user-level 설치 후에도 동작하도록 `~/.claude/hooks/` 절대 경로로 변환한다.
+- Code Brain `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` hooks는 유지하고 installer smoke test로 wiring을 검증한다.
 - Branch deletion hard-deny is scoped to exact long-lived protected names; worktree/session/feature cleanup remains available and is covered by install smoke tests.
 - 실제 credential, OAuth, MCP token, production secret은 자동 설정하지 않는다.
 - Claude/Codex 공통 규칙은 짧게 유지하고, 조사 근거와 운영 정책은 `docs/AI_*.md`에 둔다.
+- 개인 범위 Claude skill은 `~/.claude/skills/`에 한 번 설치해 모든 프로젝트에서 재사용한다.
+  결제 무결성처럼 supporting references가 필요한 절차는 프로젝트별 복제 대신 이 경로를 단일 배포점으로 둔다.
+- Codex는 전역 `~/.codex/AGENTS.md`에서 같은 canonical skill을 읽도록 포인터를 유지한다. 별도 skill
+  디렉터리 복제는 공식 지원과 설치 검증이 확정되기 전까지 보류한다.
 
 ## 재조사할 때 볼 공식 위치
 
-- Claude Code settings: `https://docs.anthropic.com/en/docs/claude-code/settings`
-- Claude Code hooks: `https://docs.anthropic.com/en/docs/claude-code/hooks`
-- Claude Code skills/slash commands: `https://docs.anthropic.com/en/docs/claude-code/slash-commands`
-- Claude Code subagents: `https://docs.anthropic.com/en/docs/claude-code/sub-agents`
-- Claude Code MCP: `https://docs.anthropic.com/en/docs/claude-code/mcp`
-- Claude Code memory: `https://docs.anthropic.com/en/docs/claude-code/memory`
+- Claude Code settings: `https://code.claude.com/docs/en/settings`
+- Claude Code hooks: `https://code.claude.com/docs/en/hooks`
+- Claude Code skills/commands: `https://code.claude.com/docs/en/commands`
+- Claude Code subagents: `https://code.claude.com/docs/en/sub-agents`
+- Claude Code MCP: `https://code.claude.com/docs/en/mcp`
+- Claude Code memory: `https://code.claude.com/docs/en/memory`
 - Codex CLI repo: `https://github.com/openai/codex`
 - Codex configuration reference: `https://developers.openai.com/codex/config-reference`
 - Codex security/sandbox: `https://developers.openai.com/codex/security`

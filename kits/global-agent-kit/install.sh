@@ -283,6 +283,24 @@ merged = dict(current)
 permissions = dict(current.get("permissions", {}))
 incoming_permissions = incoming.get("permissions", {})
 retired_permission_denies = {
+    "Read(./.env)",
+    "Read(./secrets/**)",
+    "Read(./config/credentials.json)",
+    "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
+    "Bash(git reset --hard *)",
+    "Bash(git clean -fd *)",
+    "Bash(git clean -fdx *)",
+    "Bash(git push * --force*)",
+    "Bash(git push --force*)",
+    "Bash(git filter-branch *)",
+    "Bash(git filter-repo *)",
+    "Bash(git update-ref -d *)",
+    "Bash(git reflog expire *)",
+    "Bash(dropdb *)",
+    "Bash(kubectl delete *)",
+    "Bash(terraform destroy *)",
+    "Bash(pulumi destroy *)",
     "Bash(git branch -D *)",
     "Bash(git push * --delete *)",
 }
@@ -298,6 +316,8 @@ for key in ("deny", "ask", "allow"):
             values.append(item)
     if values:
         permissions[key] = values
+    else:
+        permissions.pop(key, None)
 # Carry scalar permission settings (e.g. defaultMode) from the kit, but never override a
 # choice the user already made in their own settings.
 for key in ("defaultMode",):
@@ -305,6 +325,14 @@ for key in ("defaultMode",):
         permissions[key] = incoming_permissions[key]
 if permissions:
     merged["permissions"] = permissions
+
+environment = dict(current.get("env", {}))
+for key, value in incoming.get("env", {}).items():
+    if key not in environment:
+        environment[key] = value
+if environment:
+    merged["env"] = environment
+
 
 def _dedupe_event(entry_list):
     # Merge entries that share a matcher (dedupe hook commands within) so an updated
@@ -335,9 +363,13 @@ for event in incoming.get("hooks", {}):
         events.append(event)
 for event in events:
     combined = list(current.get("hooks", {}).get(event, [])) + list(incoming.get("hooks", {}).get(event, []))
-    hooks[event] = _dedupe_event(combined)
+    deduped = _dedupe_event(combined)
+    if deduped:
+        hooks[event] = deduped
 if hooks:
     merged["hooks"] = hooks
+else:
+    merged.pop("hooks", None)
 
 for key, value in incoming.items():
     if key not in {"permissions", "hooks"} and key not in merged:
@@ -381,6 +413,7 @@ verify_install() {
 
   if [[ "$INSTALL_CLAUDE_ASSETS" -eq 1 ]]; then
     test -x "$HOME/.claude/hooks/block-dangerous.sh"
+    test -x "$HOME/.claude/hooks/block-secret-commit.sh"
     test -x "$HOME/.claude/hooks/protect-secrets.sh"
     test -x "$HOME/.claude/hooks/session-context.sh"
     test -x "$HOME/.claude/hooks/user-prompt-submit.sh"
@@ -390,6 +423,10 @@ verify_install() {
     test -f "$HOME/.claude/skills/implement-feature/SKILL.md"
     test -f "$HOME/.claude/skills/lean-review/SKILL.md"
     test -f "$HOME/.claude/skills/lean-debt/SKILL.md"
+    test -f "$HOME/.claude/skills/billing-integrity/SKILL.md"
+    test -f "$HOME/.claude/skills/billing-integrity/references/playbook.md"
+    test -f "$HOME/.claude/skills/billing-integrity/references/audit.md"
+    test -f "$HOME/.claude/skills/billing-integrity/references/incidents.md"
     test -f "$HOME/.claude/commands/kit-upgrade-loop.md"
     python3 -m json.tool "$HOME/.claude/settings.json" >/dev/null
     python3 - "$HOME/.claude/settings.json" "$HOME/.claude/hooks" <<'PY'
@@ -409,6 +446,7 @@ for entries in settings.get("hooks", {}).values():
 
 required = {
     str(hook_dir / "block-dangerous.sh"),
+    str(hook_dir / "block-secret-commit.sh"),
     str(hook_dir / "protect-secrets.sh"),
     str(hook_dir / "session-context.sh"),
     str(hook_dir / "user-prompt-submit.sh"),

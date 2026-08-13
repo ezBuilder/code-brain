@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+if [ -n "${AI_UNITY_ASSET_SKILL_DIR:-}" ]; then
+  SKILL_DIR=$AI_UNITY_ASSET_SKILL_DIR
+elif [ -f "${HOME}/.agents/skills/ai-unity-asset-pipeline/scripts/asset_pipeline.py" ]; then
+  SKILL_DIR=${HOME}/.agents/skills/ai-unity-asset-pipeline
+elif [ -f "${HOME}/.claude/skills/ai-unity-asset-pipeline/scripts/asset_pipeline.py" ]; then
+  SKILL_DIR=${HOME}/.claude/skills/ai-unity-asset-pipeline
+else
+  SKILL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+fi
+
+exec python3 "$SKILL_DIR/scripts/asset_pipeline.py" "$@"

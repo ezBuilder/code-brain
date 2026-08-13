@@ -1,0 +1,21 @@
+PROMPT_VERSION: RF-IMAGEGEN-MULTIVIEW-1.2
+
+Create one production-grade multi-view reference sheet for a single game-ready 3D asset.
+
+ASSET_ID: {asset_id}
+SUBJECT: {subject}
+DESIGN_YEAR: {year}
+REGION_AND_DESIGN_LANGUAGE: {region}
+PROPULSION_AND_TECHNOLOGY: {technology}
+LIVERY_AND_MATERIALS: {livery}
+FUNCTIONAL_DETAILS: {details}
+ASSET_STATE: {asset_state}
+STATE_GEOMETRY_CONTRACT: {state_instructions}
+
+Use an exact square 2 x 2 layout. Set GPT Image 2 output options in the client or API to 2048 x 2048, quality high, PNG, and an opaque background; do not fake resolution with text inside the image. Show the same object at the same scale in four isolated orthographic views: front in the upper-left, left side in the upper-right, rear in the lower-left, and top in the lower-right. Use true orthographic projection, zero perspective, zero lens distortion, zero camera roll, and generous equal padding. Keep every component fully inside its quadrant.
+
+The geometry must be identical in every view: same proportions, wheelbase, axle count, roofline, windows, doors, lights, fixtures, cargo, panel seams, and state-specific deformation. Use physically plausible construction and period-correct details. For the base state, keep all movable parts closed and neutral. For damaged or wrecked states, keep deformation identical in every view and preserve enough silhouette and hard-surface structure for reconstruction. Keep all symmetry-critical running and control components fully visible and consistent: wheels and bogies for ground vehicles, landing gear and control surfaces for aircraft, hull appendages and propulsors for watercraft, grips and suspension for cable vehicles, and engines, radiators, tanks, docking hardware, and landing gear for spacecraft. For wheeled assets use straight steering unless the state contract explicitly requires disabled running gear; intact wheels are perfectly circular with smooth sidewalls, restrained tread depth, recessed rims, and no protruding gear-like tread blocks.
+
+Render as a clean high-resolution PBR asset reference with neutral studio illumination, readable material separation, controlled roughness, and crisp edges. Use a flat neutral light-gray background (#E8E8E8), no floor plane, no cast shadow, no horizon, no environment, and no atmospheric effects. Use dark neutral window glass with minimal reflections so the cabin silhouette remains readable.
+
+Do not add text, labels, logos, badges, watermarks, people, scenery, roads, buildings, props, duplicate objects, alternate designs, exploded parts, active fire, smoke, sparks, fluid spray, explosion flashes, motion blur, depth of field, dramatic lighting, perspective views, cropped components, inconsistent wheels, or view-to-view design changes. Fire, smoke, leaks, sparks, explosions, wakes, contrails, rotor wash, and day/night illumination are shared runtime VFX or material states, never baked into a mesh-reconstruction image.

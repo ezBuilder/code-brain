@@ -41,7 +41,7 @@ Architecture snapshot for the Code Brain runtime. ai_core source, scripts, and G
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
 │  │  hooks.py    │  │ mcp_server.py│  │   cli.py     │  │  doctor.py   │    │
 │  │ handle_hook  │  │ handle_req   │  │ argparse     │  │ run_checks() │    │
-│  │ ≤200ms SLO   │  │ JSON-RPC 2.0 │  │ +reject_ci   │  │ 28 checks    │    │
+│  │ ≤200ms SLO   │  │ JSON-RPC 2.0 │  │ +reject_ci   │  │ 29 checks    │    │
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘    │
 │         │                 │                 │                 │            │
 │  ┌──────┴─────────────────┴─────────────────┴─────────────────┴───────┐    │
@@ -60,7 +60,7 @@ Architecture snapshot for the Code Brain runtime. ai_core source, scripts, and G
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-<!-- code-brain-contract: doctor-check-count=28 -->
+<!-- code-brain-contract: doctor-check-count=29 -->
 
 ## 2. Hook hot-path (Claude/Codex 공통)
 

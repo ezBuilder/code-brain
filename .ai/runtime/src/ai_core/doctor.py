@@ -264,7 +264,43 @@ def check_layout(root: Path) -> Check:
         ".ai/memory/queue/dead/.gitkeep",
     ]
     missing = [item for item in required if not (root / item).exists()]
-    return Check("layout", not missing, "ok" if not missing else "missing: " + ", ".join(missing))
+    if missing:
+        return Check("layout", False, "missing: " + ", ".join(missing))
+
+    docs_check_script = root / "scripts" / "docs-check.sh"
+    if docs_check_script.is_file() and not os.access(docs_check_script, os.X_OK):
+        data = docs_check_script.read_bytes()
+        blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        return Check(
+            "layout",
+            False,
+            "scripts/docs-check.sh is not executable; "
+            f"bytes={len(data)} blob={blob} sha256={hashlib.sha256(data).hexdigest()}",
+        )
+
+    # Source checkouts ship the architecture/upgrade contract documents. Keep
+    # their doctor/eval inventory claims tied to source without imposing those
+    # repository-only documents on consumer installs.
+    source_contract_docs = (root / "ARCHITECTURE.md", root / "docs" / "WORLD_CLASS_AUTONOMOUS_UPGRADE.md")
+    source_contract_present = tuple(path.is_file() for path in source_contract_docs)
+    if any(source_contract_present) and not all(source_contract_present):
+        missing_contract_docs = [
+            str(path.relative_to(root))
+            for path, present in zip(source_contract_docs, source_contract_present)
+            if not present
+        ]
+        return Check("layout", False, "docs contract source incomplete: " + ", ".join(missing_contract_docs))
+    if all(source_contract_present):
+        try:
+            from .docs_contract import DocsContractSourceError, load_source_contract, validate_docs_contract
+
+            contract = load_source_contract(root)
+            issues = validate_docs_contract(root, contract)
+        except DocsContractSourceError as exc:
+            return Check("layout", False, f"docs contract source error: {exc}")
+        if issues:
+            return Check("layout", False, "docs contract drift: " + "; ".join(issues[:3]))
+    return Check("layout", True, "ok")
 
 
 def check_config(root: Path) -> Check:

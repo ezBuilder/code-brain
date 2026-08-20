@@ -290,3 +290,17 @@ print(sbom_path)
 print(provenance_path)
 print(release_notes_path)
 PY
+
+# Generated release artifacts are bounded to the current version family. Run a
+# no-mutation planning pass first so malformed/non-regular candidates fail
+# before any cleanup occurs, then apply exactly that retention policy.
+py - "$OUT_DIR" "$VERSION" <<'PY' >/dev/null
+import sys
+from pathlib import Path
+from ai_core.report import apply_release_retention, release_retention_plan
+
+dist = Path(sys.argv[1])
+version = sys.argv[2]
+release_retention_plan(dist, version)
+apply_release_retention(dist, version)
+PY

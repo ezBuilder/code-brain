@@ -36,6 +36,16 @@ if [[ -z "$ARCHIVE" || ! -f "$ARCHIVE" ]]; then
   echo "release gate failed: package script did not emit an archive path" >&2
   exit 1
 fi
+CURRENT_VERSION="$("$ROOT/.ai/bin/ai" --json version | py -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+py - "$ROOT/dist" "$CURRENT_VERSION" <<'PY' >/dev/null
+import sys
+from pathlib import Path
+from ai_core.report import release_retention_plan
+
+plan = release_retention_plan(Path(sys.argv[1]), sys.argv[2])
+if not plan["clean"]:
+    raise SystemExit("release gate failed: stale Code Brain release artifacts remain")
+PY
 ./scripts/verify-artifacts.sh "$ARCHIVE" >/dev/null
 ./scripts/install-check.sh "$ARCHIVE"
 ./scripts/reproducibility-check.sh "$ARCHIVE" >/dev/null

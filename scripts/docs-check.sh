@@ -9,6 +9,19 @@ trap 'rm -rf "$TMP"' EXIT
 cd "$ROOT"
 unset CI GITHUB_ACTIONS GITLAB_CI AI_CI
 
+if ! grep -Fq 'doctor-check-count=32' docs/WORLD_CLASS_AUTONOMOUS_UPGRADE.md; then
+  echo "doctor inventory contract drift" >&2
+  exit 1
+fi
+if ! grep -Fq 'eval-axes=precall_routing,context_budget,tool_discovery,autoresearch_retrieval,code_retrieval,memory_retrieval' docs/WORLD_CLASS_AUTONOMOUS_UPGRADE.md; then
+  echo "eval inventory contract drift" >&2
+  exit 1
+fi
+if ! grep -Fq '32 checks' ARCHITECTURE.md; then
+  echo "architecture doctor inventory drift" >&2
+  exit 1
+fi
+
 if [[ ! -f OPERATIONS.md ]]; then
   echo "OPERATIONS.md is missing" >&2
   exit 1

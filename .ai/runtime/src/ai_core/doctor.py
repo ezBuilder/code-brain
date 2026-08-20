@@ -68,6 +68,7 @@ def run_checks(
         check_trust(root),
         check_jsonl(root),
         check_autonomous_round_completeness(root),
+        check_injected_context_budget(root),
         check_generated_artifacts_bounded(root),
         check_storage_limits(root),
         check_audit_index(root),
@@ -93,6 +94,48 @@ def run_checks(
         check_pilots(root),
     ]
     return checks
+
+
+def check_injected_context_budget(_root: Path) -> Check:
+    """Validate the bounded context-injection contract exposed by hooks."""
+    from .hooks import (
+        CONTEXT_INJECTION_HOOKS,
+        INJECTION_HOOKS,
+        MAX_INJECTION_BYTES,
+        SESSION_START_MAX_INJECTION_BYTES,
+        _max_injection_bytes_for,
+    )
+
+    expected_hooks = {"SessionStart", "UserPromptSubmit", "SubagentStart"}
+    issues: list[str] = []
+    if INJECTION_HOOKS != expected_hooks:
+        issues.append(f"injection hooks={sorted(INJECTION_HOOKS)!r}")
+    if CONTEXT_INJECTION_HOOKS != expected_hooks:
+        issues.append(f"context hooks={sorted(CONTEXT_INJECTION_HOOKS)!r}")
+    if not 256 <= MAX_INJECTION_BYTES <= 8192:
+        issues.append(f"general budget out of bounds: {MAX_INJECTION_BYTES}")
+    if not MAX_INJECTION_BYTES <= SESSION_START_MAX_INJECTION_BYTES <= 32768:
+        issues.append(f"session budget out of bounds: {SESSION_START_MAX_INJECTION_BYTES}")
+    for hook_name in sorted(expected_hooks):
+        expected_limit = (
+            SESSION_START_MAX_INJECTION_BYTES
+            if hook_name == "SessionStart"
+            else MAX_INJECTION_BYTES
+        )
+        actual_limit = _max_injection_bytes_for(hook_name)
+        if actual_limit != expected_limit:
+            issues.append(f"{hook_name} budget={actual_limit}, expected={expected_limit}")
+
+    if issues:
+        return Check("injected_context_budget", False, "; ".join(issues))
+    return Check(
+        "injected_context_budget",
+        True,
+        (
+            f"general={MAX_INJECTION_BYTES}B; "
+            f"session_start={SESSION_START_MAX_INJECTION_BYTES}B; hooks=3"
+        ),
+    )
 
 
 def check_autonomous_round_completeness(root: Path) -> Check:

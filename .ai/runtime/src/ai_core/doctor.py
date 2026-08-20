@@ -69,6 +69,8 @@ def run_checks(
         check_jsonl(root),
         check_autonomous_round_completeness(root),
         check_injected_context_budget(root),
+        check_global_kit_source_health(root),
+        check_global_kit_install_drift(root),
         check_generated_artifacts_bounded(root),
         check_storage_limits(root),
         check_audit_index(root),
@@ -136,6 +138,22 @@ def check_injected_context_budget(_root: Path) -> Check:
             f"session_start={SESSION_START_MAX_INJECTION_BYTES}B; hooks=3"
         ),
     )
+
+
+def check_global_kit_source_health(root: Path) -> Check:
+    """Validate the repo-owned global-agent-kit source inventory without writes."""
+    from .global_kit_health import check_global_kit_source
+
+    result = check_global_kit_source(root)
+    return Check("global_kit_source_health", result.ok, result.detail)
+
+
+def check_global_kit_install_drift(root: Path) -> Check:
+    """Compare an installed global-agent-kit against source without mutating HOME."""
+    from .global_kit_health import check_global_kit_install
+
+    result = check_global_kit_install(root)
+    return Check("global_kit_install_drift", result.ok, result.detail)
 
 
 def check_autonomous_round_completeness(root: Path) -> Check:

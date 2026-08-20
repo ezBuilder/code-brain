@@ -25,14 +25,14 @@
 
 ### 2.1 검증된 강점
 
-<!-- code-brain-contract: doctor-check-count=30 -->
+<!-- code-brain-contract: doctor-check-count=32 -->
 <!-- code-brain-contract: eval-axes=precall_routing,context_budget,tool_discovery,autoresearch_retrieval,code_retrieval,memory_retrieval -->
 
 | 품질 표면 | 현재 근거 | 유지할 계약 |
 | --- | --- | --- |
 | Repo-local 탐색 | `code query`, `context pack`, call graph, hashline read/verify | 편집 전 좁은 탐색과 정확한 읽기 |
 | 안전한 기본값 | 원격 LLM, 외부 알림, 원격 메모리, AutoResearch web ingest 및 코드 실행 루프가 기본 OFF | 네트워크·원격 mutation은 opt-in |
-| Strict doctor | 현재 체크아웃에서 source-derived 30개 check를 강제 | 배포 상태와 `secret_scan`·`index_freshness` 같은 건강 상태를 분리 보고 |
+| Strict doctor | 현재 체크아웃에서 source-derived 32개 check를 강제 | 배포 상태와 `secret_scan`·`index_freshness` 같은 건강 상태를 분리 보고 |
 | 결정론 평가 | `make eval`이 source-derived 6개 축을 `--require-complete`로 강제 | 검색·라우팅 변경은 자체 코퍼스 회귀로 판정 |
 | 완료 게이트 | `loop submit --require-acceptance`, sandbox 재실행, typed verdict evidence | 모델의 “완료” 텍스트보다 exit code와 증거 우선 |
 | 증거·진행 상태 | evidence ledger, memory todo, durable plan, loop request/lease | 모든 라운드를 ID로 연결 |
@@ -67,7 +67,7 @@ git diff --check
 1. `autonomous_harness`는 95% 목표, 예산, 보호 경로, 증거 수준을 지시하지만 연구를 작업으로 컴파일하거나 구현을 실행하는 오케스트레이터는 아니다.
 2. kit의 `dev-loop.sh`는 공식 URL freshness snapshot, 후보 capture/score, dry-run promotion, validate/doctor를 수행하지만 코드 변경은 active agent에 맡긴다.
 3. typed round report와 `autonomous_round_completeness`가 round ID·기준선·연구·task·acceptance·review verdict·종료 상태를 묶어 검증한다. todo/plan/loop ledger의 producer-side round ID 강제는 후속 통합 과제다.
-4. strict doctor는 프로젝트 건강, 자율 라운드 완결성, 주입 컨텍스트 예산 계약을 검증한다. global-kit 소스와 설치물의 통합 drift는 아직 별도 후속 과제다.
+4. strict doctor는 프로젝트 건강, 자율 라운드 완결성, 주입 컨텍스트 예산 계약을 검증하고, global-kit source health와 설치 HOME drift를 별도 read-only check로 구분한다.
 5. eval 기반이 생겼지만 code navigation, memory retrieval, 실제 decision logging 등 후속 품질축은 아직 빈칸이다.
 6. `ARCHITECTURE.md` 같은 일부 설명은 현재 doctor check 수와 최신 표면을 따라가지 못할 수 있다. 문서 truth도 doctor 가능한 계약으로 바꿔야 한다.
 

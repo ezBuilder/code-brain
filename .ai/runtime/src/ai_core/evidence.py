@@ -16,6 +16,11 @@ MAX_NOTE_CHARS = 512
 MAX_SYMBOL_CHARS = 240
 EVIDENCE_MAX_BYTES = 4_000_000
 EVIDENCE_KEEP = 5000
+AUTONOMOUS_ROUND_PREFIX = "autonomous-round-"
+AUTONOMOUS_ROUND_MAX_BYTES = 256_000
+AUTONOMOUS_ROUND_MAX_FILES = 200
+_ROUND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 _DENIED_NAMES = {
     ".env",
@@ -72,6 +77,162 @@ def _split_search_path(raw_value: Any) -> tuple[str | None, str | None]:
     if lowered[-1] in _DENIED_NAMES or lowered[-1].endswith(_DENIED_SUFFIXES):
         return None, None
     return rel.as_posix(), symbol or None
+
+
+def _round_required_text(
+    container: dict[str, Any],
+    key: str,
+    *,
+    field: str,
+    issues: list[str],
+) -> str:
+    value = container.get(key)
+    if not isinstance(value, str) or not value.strip():
+        issues.append(f"{field}: required_text")
+        return ""
+    return value.strip()
+
+
+def _round_required_mapping(
+    container: dict[str, Any],
+    key: str,
+    *,
+    field: str,
+    issues: list[str],
+) -> dict[str, Any]:
+    value = container.get(key)
+    if not isinstance(value, dict):
+        issues.append(f"{field}: required_object")
+        return {}
+    return value
+
+
+def _round_path_list(
+    value: Any,
+    *,
+    field: str,
+    issues: list[str],
+    require_nonempty: bool = False,
+) -> list[str]:
+    if not isinstance(value, list):
+        issues.append(f"{field}: required_list")
+        return []
+    if require_nonempty and not value:
+        issues.append(f"{field}: empty")
+        return []
+    paths: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str):
+            issues.append(f"{field}[{index}]: invalid_path")
+            continue
+        parsed, symbol = _split_search_path(item)
+        if parsed is None or symbol is not None:
+            issues.append(f"{field}[{index}]: invalid_path")
+            continue
+        paths.append(parsed)
+    return paths
+
+
+def validate_autonomous_round_record(record: Any) -> dict[str, Any]:
+    """Validate one typed autonomous-round report without mutating any ledger.
+
+    Error details intentionally contain schema coordinates only. Untrusted report
+    values are never reflected into doctor output, which keeps this validation
+    safe for reports assembled from research and tool observations.
+    """
+    issues: list[str] = []
+    if not isinstance(record, dict):
+        return {"ok": False, "round_id": "", "issues": ["record: required_object"]}
+
+    round_id = _round_required_text(record, "round_id", field="round_id", issues=issues)
+    if round_id and _ROUND_ID_RE.fullmatch(round_id) is None:
+        issues.append("round_id: invalid_format")
+
+    start = _round_required_mapping(record, "start", field="start", issues=issues)
+    if start:
+        sha = _round_required_text(start, "sha", field="start.sha", issues=issues)
+        if sha and _GIT_SHA_RE.fullmatch(sha) is None:
+            issues.append("start.sha: invalid_git_sha")
+        _round_required_text(start, "branch", field="start.branch", issues=issues)
+        _round_path_list(start.get("dirty_paths"), field="start.dirty_paths", issues=issues)
+
+    research = _round_required_mapping(record, "research", field="research", issues=issues)
+    if research:
+        _round_required_text(research, "question", field="research.question", issues=issues)
+        sources = research.get("sources")
+        if not isinstance(sources, list) or not sources:
+            issues.append("research.sources: required_nonempty_list")
+        else:
+            for index, source in enumerate(sources):
+                prefix = f"research.sources[{index}]"
+                if not isinstance(source, dict):
+                    issues.append(f"{prefix}: required_object")
+                    continue
+                _round_required_text(source, "source", field=f"{prefix}.source", issues=issues)
+                _round_required_text(source, "freshness", field=f"{prefix}.freshness", issues=issues)
+                _round_required_text(source, "local_repro", field=f"{prefix}.local_repro", issues=issues)
+
+    task = _round_required_mapping(record, "task", field="task", issues=issues)
+    if task:
+        _round_required_text(task, "task_id", field="task.task_id", issues=issues)
+        _round_path_list(
+            task.get("owned_paths"),
+            field="task.owned_paths",
+            issues=issues,
+            require_nonempty=True,
+        )
+        _round_path_list(task.get("protected_paths"), field="task.protected_paths", issues=issues)
+        _round_path_list(task.get("changed_paths"), field="task.changed_paths", issues=issues)
+        acceptance = task.get("acceptance")
+        if not isinstance(acceptance, list) or not acceptance:
+            issues.append("task.acceptance: required_nonempty_list")
+        else:
+            for index, item in enumerate(acceptance):
+                prefix = f"task.acceptance[{index}]"
+                if not isinstance(item, dict):
+                    issues.append(f"{prefix}: required_object")
+                    continue
+                _round_required_text(item, "command", field=f"{prefix}.command", issues=issues)
+                _round_required_text(item, "observed", field=f"{prefix}.observed", issues=issues)
+                artifact_path = _round_required_text(
+                    item,
+                    "artifact_path",
+                    field=f"{prefix}.artifact_path",
+                    issues=issues,
+                )
+                if artifact_path:
+                    parsed, symbol = _split_search_path(artifact_path)
+                    if parsed is None or symbol is not None:
+                        issues.append(f"{prefix}.artifact_path: invalid_path")
+                exit_code = item.get("exit_code")
+                if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+                    issues.append(f"{prefix}.exit_code: required_integer")
+
+    reviewer = _round_required_mapping(record, "reviewer", field="reviewer", issues=issues)
+    if reviewer:
+        _round_required_text(reviewer, "verdict", field="reviewer.verdict", issues=issues)
+        evidence = reviewer.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            issues.append("reviewer.evidence: required_nonempty_list")
+        else:
+            for index, item in enumerate(evidence):
+                prefix = f"reviewer.evidence[{index}]"
+                if not isinstance(item, dict):
+                    issues.append(f"{prefix}: required_object")
+                    continue
+                _round_required_text(item, "type", field=f"{prefix}.type", issues=issues)
+                _round_required_text(item, "ref", field=f"{prefix}.ref", issues=issues)
+
+    end = _round_required_mapping(record, "end", field="end", issues=issues)
+    if end:
+        _round_required_text(end, "status", field="end.status", issues=issues)
+        _round_required_text(end, "next_trigger", field="end.next_trigger", issues=issues)
+
+    return {
+        "ok": not issues,
+        "round_id": round_id if round_id and _ROUND_ID_RE.fullmatch(round_id) else "",
+        "issues": issues,
+    }
 
 
 def evidence_id(*, source: str, query: str, path: str, snippet: str, symbol: str | None = None) -> str:

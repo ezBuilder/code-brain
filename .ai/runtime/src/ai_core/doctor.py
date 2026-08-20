@@ -67,6 +67,7 @@ def run_checks(
         check_manifest(root),
         check_trust(root),
         check_jsonl(root),
+        check_autonomous_round_completeness(root),
         check_generated_artifacts_bounded(root),
         check_storage_limits(root),
         check_audit_index(root),
@@ -92,6 +93,68 @@ def run_checks(
         check_pilots(root),
     ]
     return checks
+
+
+def check_autonomous_round_completeness(root: Path) -> Check:
+    """Read-only validation of bounded typed autonomous-round reports."""
+    from .evidence import (
+        AUTONOMOUS_ROUND_MAX_BYTES,
+        AUTONOMOUS_ROUND_MAX_FILES,
+        AUTONOMOUS_ROUND_PREFIX,
+        validate_autonomous_round_record,
+    )
+
+    outputs = root / ".ai" / "outputs"
+    try:
+        outputs.lstat()
+    except FileNotFoundError:
+        return Check("autonomous_round_completeness", True, "no typed round reports")
+    except OSError as exc:
+        return Check("autonomous_round_completeness", False, f"outputs probe failed: {redact_value(str(exc))}")
+
+    try:
+        names = list_root_confined_directory(outputs, root=root, max_entries=1_000)
+    except OSError as exc:
+        return Check("autonomous_round_completeness", False, f"outputs unreadable: {redact_value(str(exc))}")
+
+    reports = sorted(
+        name
+        for name in names
+        if name.startswith(AUTONOMOUS_ROUND_PREFIX) and name.endswith(".json")
+    )
+    if not reports:
+        return Check("autonomous_round_completeness", True, "no typed round reports")
+    if len(reports) > AUTONOMOUS_ROUND_MAX_FILES:
+        return Check(
+            "autonomous_round_completeness",
+            False,
+            f"typed round report limit exceeded: {len(reports)}>{AUTONOMOUS_ROUND_MAX_FILES}",
+        )
+
+    failures: list[str] = []
+    for index, name in enumerate(reports):
+        path = outputs / name
+        try:
+            text, _state = read_root_confined_text(
+                path,
+                root=root,
+                max_bytes=AUTONOMOUS_ROUND_MAX_BYTES,
+                require_private=False,
+                require_owner=True,
+                reject_group_other_writable=True,
+            )
+            payload = json.loads(text)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            failures.append(f"report[{index}]: unreadable_or_invalid_json")
+            continue
+        result = validate_autonomous_round_record(payload)
+        if not result["ok"]:
+            issue_text = ",".join(str(issue) for issue in result["issues"][:4])
+            failures.append(f"report[{index}]: {issue_text}")
+
+    if failures:
+        return Check("autonomous_round_completeness", False, "; ".join(failures[:4]))
+    return Check("autonomous_round_completeness", True, f"reports={len(reports)} complete")
 
 
 def check_pilots(root: Path) -> Check:

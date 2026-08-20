@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,16 @@ from .redact import redact_value
 from .worker.ipc import PROTOCOL_VERSION
 
 RELEASE_GATE_SUMMARY_SCHEMA_VERSION = 2
+RELEASE_ARTIFACT_PREFIX = "code-brain-"
+RELEASE_ARTIFACT_SUFFIXES = (
+    ".tar.gz.sha256",
+    ".release-notes.md",
+    ".provenance.json",
+    ".manifest.json",
+    ".sbom.json",
+    ".tar.gz",
+)
+RELEASE_RETENTION_MAX_DIST_ENTRIES = 4096
 RELEASE_GATE_SUMMARY_FIELDS = frozenset(
     {
         "schema_version",
@@ -34,6 +45,95 @@ def git_output(root: Path, *args: str) -> str:
         return subprocess.check_output(["git", *args], cwd=root, text=True, stderr=subprocess.DEVNULL).strip()
     except (OSError, subprocess.CalledProcessError):
         return ""
+
+
+def _release_artifact_version(name: str) -> str | None:
+    if not name.startswith(RELEASE_ARTIFACT_PREFIX):
+        return None
+    for suffix in RELEASE_ARTIFACT_SUFFIXES:
+        if name.endswith(suffix):
+            version = name[len(RELEASE_ARTIFACT_PREFIX) : -len(suffix)]
+            return version or None
+    return None
+
+
+def _release_retention_entries(dist: Path) -> list[Path]:
+    try:
+        entries = sorted(dist.iterdir(), key=lambda path: path.name)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ValueError(f"cannot read dist directory {dist}: {exc}") from exc
+    if len(entries) > RELEASE_RETENTION_MAX_DIST_ENTRIES:
+        raise ValueError(
+            "dist entry limit exceeded: "
+            f"{len(entries)}>{RELEASE_RETENTION_MAX_DIST_ENTRIES}"
+        )
+    return entries
+
+
+def _require_regular_release_artifact(path: Path) -> None:
+    try:
+        state = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"cannot inspect artifact {path.name}: {exc}") from exc
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
+        raise ValueError(
+            f"refusing non-regular release artifact candidate: {path.name}"
+        )
+
+
+def release_retention_plan(dist: Path, current_version: str) -> dict[str, Any]:
+    """Return a bounded dry-run plan for generated Code Brain release families."""
+    current_version = current_version.strip()
+    if not current_version:
+        raise ValueError("current version is required")
+    dist = dist.resolve()
+    current_files: list[str] = []
+    stale_files: list[str] = []
+    unrelated_files: list[str] = []
+    stale_versions: set[str] = set()
+    for path in _release_retention_entries(dist):
+        version = _release_artifact_version(path.name)
+        if version is None:
+            unrelated_files.append(path.name)
+            continue
+        _require_regular_release_artifact(path)
+        if version == current_version:
+            current_files.append(path.name)
+        else:
+            stale_files.append(path.name)
+            stale_versions.add(version)
+    return {
+        "dist": str(dist),
+        "current_version": current_version,
+        "current_files": current_files,
+        "stale_versions": sorted(stale_versions),
+        "stale_files": stale_files,
+        "unrelated_files": unrelated_files,
+        "clean": not stale_files,
+    }
+
+
+def apply_release_retention(dist: Path, current_version: str) -> dict[str, Any]:
+    """Remove only stale generated release-family files after a full safe plan."""
+    plan = release_retention_plan(dist, current_version)
+    dist_path = Path(str(plan["dist"]))
+    removed: list[str] = []
+    for name in plan["stale_files"]:
+        if not isinstance(name, str):
+            raise ValueError("invalid retention plan entry")
+        version = _release_artifact_version(name)
+        if version is None or version == current_version:
+            raise ValueError(f"retention plan drift for {name}")
+        path = dist_path / name
+        _require_regular_release_artifact(path)
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise ValueError(f"cannot remove stale artifact {name}: {exc}") from exc
+        removed.append(name)
+    return {**plan, "removed": removed, "clean": True}
 
 
 def status_report(root: Path) -> dict[str, Any]:

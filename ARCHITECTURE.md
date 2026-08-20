@@ -228,6 +228,10 @@ queue 디렉터리:
   dist/code-brain-X.Y.Z.release-notes.md
   dist/release-gate.summary.json   ← schema v2 (Round 87, dep_advisory 포함)
   dist/dep-advisory.json           ← pip-audit advisory only
+
+  package.sh는 현재 X.Y.Z family 생성이 끝난 뒤 retention을 dry-run→apply하고,
+  다른 버전의 `code-brain-*` release family만 제거한다. unrelated dist 파일과
+  현재 version family는 보존하며 release-gate가 stale family 0을 재확인한다.
 ```
 
 ## 6. Release-gate pipeline (현재 머지 상태 기준)
@@ -242,8 +246,8 @@ make release-gate  →  ./scripts/release-gate.sh
    ├─ bootstrap.sh                  (uv sync → ai render → ai doctor → pytest)
    ├─ smoke.sh                      (CLI 표면 sanity)
    ├─ docs-check.sh                 (docs needles + CI write rejection 회귀)
-   ├─ [retention-sweep.sh]          backlog: stale dist 차단
-   ├─ package.sh                    (Python tarfile deterministic, Round 83)
+   ├─ package.sh                    (deterministic tar + stale family retention)
+   ├─ ai_core.report retention      (stale dist family 0 재확인)
    ├─ reproducibility-check.sh      ★Round 83: 두 번 build → sha256 동치
    ├─ verify-artifacts.sh           (checksum/manifest/SBOM/provenance/notes)
    ├─ install-check.sh              (extracted package 실행)

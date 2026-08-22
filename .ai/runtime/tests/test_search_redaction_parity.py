@@ -100,6 +100,15 @@ def test_optimized_secret_matcher_and_redactor_match_canonical_patterns() -> Non
             assert redacted == value
 
 
+def test_generic_assignment_matcher_ignores_identifiers_and_repeated_test_placeholders() -> None:
+    assert contains_secret("to" + "ken = cancellationToken") is False
+    assert contains_secret("pass" + "word = properties.getProperty") is False
+    assert contains_secret("to" + "ken: ApplicationInfo@db5dd68") is False
+    assert contains_secret("pass" + 'word = "' + "a" * 40 + '"') is False
+    high_signal = "actual" + "-credential-" + "123456789"
+    assert contains_secret("pass" + 'word = "' + high_signal + '"') is True
+
+
 def test_search_index_and_snippets_never_reintroduce_detected_values(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     config = repo / ".ai" / "config.yaml"

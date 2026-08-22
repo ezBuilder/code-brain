@@ -135,6 +135,7 @@ tool_search             discover hidden MCP tool schemas
 /cb-doctor   strict diagnostics
 /cb-exec     bounded sandbox output
 /cb-upgrade  upgrade from the public repo
+/cb-proof    legacy/v2 retrieval A/B and durability proof
 ```
 
 ## 实证要点

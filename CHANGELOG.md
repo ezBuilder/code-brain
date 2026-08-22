@@ -2,6 +2,21 @@
 
 All notable Code Brain changes are recorded here.
 
+## 0.8.0 - 2026-08-22
+
+### Added
+
+- Default bounded structural context with exact function spans, typed graph provenance, deterministic one-hop personalized PageRank, and fail-soft stale-edge suppression.
+- `ai context prove` plus `/cb-proof` wrappers for legacy/v2 A/B checks, graph activation, determinism, bounded context, latency, and post-warmup retrieval-file no-growth proof.
+- Production line-span retrieval evals and the Graft/TurboVec/Semantica adoption record.
+
+### Fixed
+
+- Public and direct upgrades now self-heal bounded `.ai/tmp`/`.ai/outputs` storage and audit-chain splice damage before strict doctor certification.
+- Consumer installs no longer fail source-only architecture/global-kit checks; `/kit-doctor` remains the authority for the separately installed global kit.
+- Generic secret detection keeps high-signal literals while rejecting ordinary identifier expressions and deterministic repeated-character test placeholders that previously caused false strict-doctor failures.
+- Consumer propagation excludes source-owned `.ai/eval` scratch data and preserves project branch, HEAD, and user-owned files.
+
 ## 0.7.2 - 2026-08-09
 
 Agentic code-retrieval round: live exact search now complements indexed semantic

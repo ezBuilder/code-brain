@@ -618,6 +618,43 @@ def test_rg_fallback_does_not_enumerate_all_repository_candidates(
     assert [item["path"] for item in results] == ["src/match.py"]
 
 
+def test_rg_fallback_is_deterministic_across_process_event_order(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AI_SEARCH_RG_FALLBACK", "1")
+    monkeypatch.setattr(search_mod.shutil, "which", lambda _name: "/usr/bin/rg")
+    repo = _make_repo(tmp_path)
+    _write(repo, "src/z.py", "Needle\nNeedle\n")
+    _write(repo, "src/a.py", "Needle\n")
+
+    def event(path: str, line: int) -> str:
+        return json.dumps(
+            {
+                "type": "match",
+                "data": {
+                    "path": {"text": str(repo / path)},
+                    "lines": {"text": "Needle\n"},
+                    "line_number": line,
+                },
+            }
+        )
+
+    forward = [event("src/z.py", 2), event("src/a.py", 1), event("src/z.py", 1)]
+    orders = iter((forward, list(reversed(forward))))
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs) -> list[str]:
+        commands.append(command)
+        return next(orders)
+
+    monkeypatch.setattr(search_mod, "_run_process_lines_bounded", fake_run)
+
+    first = _rg_fallback(repo, "Needle", limit=10)
+    second = _rg_fallback(repo, "Needle", limit=10)
+
+    assert first == second
+    assert [(item["path"], item["line"]) for item in first] == [("src/a.py", 1), ("src/z.py", 1)]
+    assert all(command[command.index("--sort") + 1] == "path" for command in commands)
+
+
 def test_rg_fallback_validates_only_paths_returned_by_ripgrep(
     tmp_path: Path,
     monkeypatch,

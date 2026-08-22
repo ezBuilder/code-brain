@@ -44,6 +44,9 @@ SEARCH_QUERY_ECHO_MAX_CHARS = 512
 SEARCH_RESULT_DEFAULT = 5
 SEARCH_RESULT_MAX = 100
 SEARCH_DENSE_CANDIDATE_MAX = SEARCH_RESULT_MAX * 8
+CONTEXT_PACK_REPRESENTATIONS = ("legacy", "v2", "skeleton", "refs-only")
+CONTEXT_PACK_DEFAULT_REPRESENTATION = "v2"
+CONTEXT_PACK_GRAPH_MAX_RESULTS = 20
 RG_OUTPUT_MAX_BYTES = 256 * 1024
 RG_OUTPUT_MAX_EVENTS = 512
 RG_TIMEOUT_SECONDS = 10.0
@@ -353,6 +356,35 @@ def init_schema(conn: sqlite3.Connection, *, migrate_legacy: bool = False) -> No
     legacy_schema = "content" in existing_chunk_columns or (
         existing_chunk_columns and "summary" not in existing_chunk_columns
     )
+    required_schema_objects = {
+        "chunks",
+        "chunks_fts",
+        "chunk_meta",
+        "summaries",
+        "provenance",
+        "file_state",
+        "embeddings_vec0",
+        "code_symbols",
+        "code_calls",
+        "embeddings_vec0_model_idx",
+        "code_symbols_path_idx",
+        "code_symbols_qualname_idx",
+        "code_symbols_lang_idx",
+        "code_calls_callee_idx",
+        "code_calls_caller_idx",
+        "code_calls_lang_idx",
+    }
+    existing_schema_objects = {
+        str(row[0])
+        for row in conn.execute("select name from sqlite_master where type in ('table', 'index')").fetchall()
+    }
+    if (
+        current_version == SCHEMA_VERSION
+        and existing_chunk_columns
+        and not legacy_schema
+        and required_schema_objects <= existing_schema_objects
+    ):
+        return
     needs_migration = (current_version and current_version < SCHEMA_VERSION) or legacy_schema
     if needs_migration and not migrate_legacy:
         if legacy_schema:
@@ -1575,6 +1607,8 @@ def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[s
             "--pcre2",
             "--multiline",
             "--smart-case",
+            "--sort",
+            "path",
             "--max-count",
             "3",
             "--max-columns",
@@ -1591,11 +1625,10 @@ def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[s
     )
     if not raw_events:
         return []
-    results: list[dict[str, Any]] = []
-    seen_paths: set[str] = set()
+    results_by_path: dict[str, dict[str, Any]] = {}
     path_allowed: dict[str, bool] = {}
     policy_root = Path(os.path.abspath(root))
-    for idx, raw_event in enumerate(raw_events):
+    for raw_event in raw_events:
         if not raw_event:
             continue
         try:
@@ -1628,18 +1661,15 @@ def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[s
             path_allowed[rel_path] = allowed
         if not allowed:
             continue
-        if rel_path in seen_paths:
-            continue
-        seen_paths.add(rel_path)
         preview_clean = _redacted_rg_preview(root, rel_path, lineno, preview)
         if len(preview_clean) > SNIPPET_MAX_BYTES:
             preview_clean = preview_clean[:SNIPPET_MAX_BYTES]
-        results.append({
+        candidate = {
             "path": rel_path,
             "snippet": f"L{lineno}: {preview_clean}",
             "line": lineno,
             "content": preview_clean,
-            "rank": -0.0001 * (idx + 1),
+            "rank": 0.0,
             "source": "rg",
             "provenance": {
                 "processor": "ripgrep-fallback",
@@ -1648,9 +1678,16 @@ def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[s
                 "chunker_version": "rg-1",
                 "confidence": 0.5,
             },
-        })
-        if len(results) >= limit:
-            break
+        }
+        previous = results_by_path.get(rel_path)
+        if previous is None or (lineno, preview_clean) < (int(previous["line"]), str(previous["content"])):
+            results_by_path[rel_path] = candidate
+    results = sorted(
+        results_by_path.values(),
+        key=lambda item: (str(item["path"]), int(item["line"]), str(item["content"])),
+    )[:limit]
+    for index, item in enumerate(results, start=1):
+        item["rank"] = -0.0001 * index
     return results
 
 
@@ -1708,11 +1745,24 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
             state = _index_state_from_conn(conn)
             loaded_rows = conn.execute(
                 """
-                select c.id, c.path, c.sha256, c.summary, p.processor,
-                       p.model_hash, p.prompt_version, p.chunker_version, p.confidence
+                select c.id, c.path, c.sha256, c.summary,
+                       coalesce(p.processor, 'code-brain-local') as processor,
+                       p.model_hash,
+                       coalesce(p.prompt_version, 'extractive-v1') as prompt_version,
+                       coalesce(p.chunker_version, '1') as chunker_version,
+                       coalesce(p.confidence, 1.0) as confidence,
+                       m.kind, m.qualname, m.start_line, m.end_line,
+                       src_chunk.path as source_path, src_chunk.sha256 as source_sha256
                 from chunks_fts
                 join chunks c on c.id = chunks_fts.rowid
-                join provenance p on p.path = c.path
+                left join chunk_meta m on m.chunk_id = c.id
+                left join chunks src_chunk on src_chunk.path = case
+                  when m.qualname is not null
+                    and substr(c.path, -(length(m.qualname) + 1)) = ':' || m.qualname
+                    then substr(c.path, 1, length(c.path) - length(m.qualname) - 1)
+                  else c.path
+                end
+                left join provenance p on p.path = src_chunk.path
                 where chunks_fts match ?
                 order by bm25(chunks_fts, ?, ?)
                 limit ?
@@ -1789,11 +1839,23 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
     recommended_policy = retrieval_policy_for_query(text, index_state)
     fts_results: list[dict[str, Any]] = []
     for row in rows:
-        fts_results.append({
+        chunk_path = str(row["path"])
+        source_path = str(row["source_path"] or chunk_path)
+        result = {
             "id": int(row["id"]),
-            "path": row["path"],
-            "scope": _result_scope(row["path"], row["summary"]),
-            "snippet": snippet_from_file(root, row["path"], text, fallback=row["summary"], expected_sha=row["sha256"]),
+            "path": source_path,
+            "scope": (
+                f"{source_path} › {row['qualname']}"[:160]
+                if row["qualname"]
+                else _result_scope(source_path, row["summary"])
+            ),
+            "snippet": snippet_from_file(
+                root,
+                source_path,
+                text,
+                fallback=row["summary"],
+                expected_sha=row["source_sha256"] or row["sha256"],
+            ),
             "provenance": {
                 "processor": row["processor"],
                 "model_hash": row["model_hash"],
@@ -1801,7 +1863,18 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
                 "chunker_version": row["chunker_version"],
                 "confidence": row["confidence"],
             },
-        })
+        }
+        if row["qualname"]:
+            result.update(
+                {
+                    "chunk_path": chunk_path,
+                    "qualname": str(row["qualname"]),
+                    "kind": str(row["kind"] or "symbol"),
+                    "start_line": int(row["start_line"]),
+                    "end_line": int(row["end_line"]),
+                }
+            )
+        fts_results.append(result)
 
     dense_used = False
     if dense_active and vectors_by_id:
@@ -1858,9 +1931,29 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
     if _rg_fallback_enabled() and (not fts_results or symbol_query):
         rg_hits = _rg_fallback(root, text, limit=limit)
         if rg_hits:
-            indexed_by_path = {str(item.get("path") or ""): item for item in fts_results}
+            indexed_by_path: dict[str, dict[str, Any]] = {}
+            for item in fts_results:
+                indexed_by_path.setdefault(str(item.get("path") or ""), item)
             live_results = [
                 {
+                    **(
+                        indexed_by_path[hit["path"]]
+                        if hit["path"] in indexed_by_path
+                        and not str(indexed_by_path[hit["path"]].get("snippet") or "").startswith(
+                            "[stale index:"
+                        )
+                        else {}
+                    ),
+                    **(
+                        {
+                            "span_provenance": dict(
+                                indexed_by_path[hit["path"]].get("provenance") or {}
+                            )
+                        }
+                        if hit["path"] in indexed_by_path
+                        and indexed_by_path[hit["path"]].get("chunk_path")
+                        else {}
+                    ),
                     "path": hit["path"],
                     "snippet": (
                         indexed_by_path[hit["path"]]["snippet"]
@@ -1914,12 +2007,377 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
     return payload
 
 
-def context_pack(root: Path, text: str, *, limit: int = 5, mode: str = "balanced") -> dict[str, Any]:
+def normalize_context_pack_representation(value: object) -> str:
+    """Normalize the active context-pack shape before any read-side work."""
+
+    normalized = str(value or CONTEXT_PACK_DEFAULT_REPRESENTATION).strip().lower().replace("_", "-")
+    if normalized not in CONTEXT_PACK_REPRESENTATIONS:
+        raise ValueError(f"invalid context pack representation: {value}")
+    return normalized
+
+
+def _context_source_path(chunk_path: object, qualname: object = None) -> str | None:
+    """Map an indexed chunk identifier back to a safe repo-relative source path."""
+
+    raw = str(chunk_path or "").strip()
+    symbol = str(qualname or "").strip()
+    if symbol and raw.endswith(f":{symbol}"):
+        raw = raw[: -(len(symbol) + 1)]
+    elif "::" in raw:
+        raw = raw.split("::", 1)[0]
+    if not raw or "\x00" in raw or len(raw) > 1024 or ":" in raw:
+        return None
+    path = Path(raw)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    parts = tuple(part for part in path.parts if part not in ("", "."))
+    if not parts:
+        return None
+    return Path(*parts).as_posix()
+
+
+def _context_pack_refs(root: Path, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return deterministic path/span qrefs for lexical results.
+
+    Function chunks already carry exact spans in ``chunk_meta``. File-level or
+    live-rg hits intentionally keep a null span instead of inventing line proof.
+    """
+
+    raw_paths = [
+        str(item.get("chunk_path") or item.get("path") or "")
+        for item in results[:SEARCH_RESULT_MAX]
+    ]
+    unique_paths = sorted({path for path in raw_paths if path})
+    metadata: dict[str, dict[str, Any]] = {}
+    if unique_paths:
+        try:
+            with _connection_scope(root) as conn:
+                init_schema(conn)
+                for offset in range(0, len(unique_paths), 100):
+                    chunk = unique_paths[offset : offset + 100]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"""
+                        select c.path, m.kind, m.qualname, m.start_line, m.end_line
+                        from chunks c
+                        left join chunk_meta m on m.chunk_id = c.id
+                        where c.path in ({placeholders})
+                        order by c.path
+                        """,
+                        chunk,
+                    ).fetchall()
+                    metadata.update({str(row["path"]): dict(row) for row in rows})
+        except (OSError, RuntimeError, sqlite3.Error):
+            metadata = {}
+
+    refs: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for context_rank, item in enumerate(results[:SEARCH_RESULT_MAX], start=1):
+        chunk_path = str(item.get("chunk_path") or item.get("path") or "")
+        meta = metadata.get(chunk_path, {})
+        qualname = str(meta.get("qualname") or "") or None
+        source_path = _context_source_path(chunk_path, qualname)
+        if source_path is None:
+            continue
+        start_line: int | None = None
+        end_line: int | None = None
+        try:
+            parsed_start = int(meta.get("start_line") or 0)
+            parsed_end = int(meta.get("end_line") or 0)
+            if 1 <= parsed_start <= parsed_end <= 10_000_000:
+                start_line, end_line = parsed_start, parsed_end
+        except (TypeError, ValueError, OverflowError):
+            pass
+        kind = str(meta.get("kind") or "file")[:64]
+        reason = "lexical_symbol_chunk" if qualname else "lexical_file"
+        key = (source_path, start_line, end_line, qualname, reason)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(
+            {
+                "path": source_path,
+                "chunk_path": chunk_path,
+                "start_line": start_line,
+                "end_line": end_line,
+                "qualname": qualname,
+                "kind": kind,
+                "reason": reason,
+                "context_rank": context_rank,
+            }
+        )
+    return refs
+
+
+def _context_graph_symbol_query(text: str) -> str | None:
+    """Extract one bounded symbol seed without forwarding arbitrary raw queries."""
+
+    query_text = str(text or "").strip()
+    if not query_text or len(query_text) > 512 or _safe_query_echo(query_text) != query_text:
+        return None
+    if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_.$:]*", query_text):
+        return query_text
+    match = re.search(
+        r"(?i)\b(?:callers?|callees?|symbols?|definitions?|references?)"
+        r"(?:\s+(?:of|for))?\s+([A-Za-z_$][A-Za-z0-9_.$:]*)\s*$",
+        query_text,
+    )
+    return match.group(1) if match else None
+
+
+def _context_ref_lines(refs: list[dict[str, Any]], *, representation: str) -> str:
+    lines: list[str] = []
+    for ref in refs:
+        path = str(ref["path"])
+        start = ref.get("start_line")
+        end = ref.get("end_line")
+        location = f"{path}:{start}-{end}" if start is not None and end is not None else path
+        if representation == "skeleton":
+            label = str(ref.get("qualname") or ref.get("kind") or "file")
+            lines.append(f"- outline {label} {location}")
+        else:
+            lines.append(f"- ref {location} reason={ref.get('reason', 'lexical')}")
+    return "\n".join(lines)
+
+
+def _append_context_bounded(primary: str, secondary: str, *, max_bytes: int) -> tuple[str, bool]:
+    """Append whole graph lines while respecting the existing context byte cap."""
+
+    if not secondary:
+        return primary, False
+    current = str(primary or "")
+    if len(current.encode("utf-8")) >= max_bytes:
+        return current, True
+    lines = current.splitlines() if current else []
+    secondary_lines = secondary.splitlines()
+    if not secondary_lines:
+        return current, False
+    first_block = "\n".join([*lines, "## graph context", secondary_lines[0]])
+    if len(first_block.encode("utf-8")) > max_bytes:
+        return current, True
+    lines.extend(["## graph context", secondary_lines[0]])
+    candidates = secondary_lines[1:]
+    truncated = False
+    for line in candidates:
+        proposal = "\n".join([*lines, line])
+        if len(proposal.encode("utf-8")) > max_bytes:
+            truncated = True
+            break
+        lines.append(line)
+    return "\n".join(lines), truncated
+
+
+def _context_receipt(
+    *,
+    representation: str,
+    mode: str,
+    limit: int,
+    lexical_refs: list[dict[str, Any]],
+    graph_payload: dict[str, Any],
+    retrieval_trace: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a deterministic replay receipt without query text or source bodies."""
+
+    references: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def append_reference(
+        *,
+        source: str,
+        rank: int,
+        path_value: object,
+        start_value: object,
+        end_value: object,
+        reason_value: object,
+    ) -> None:
+        path = _context_source_path(path_value)
+        if path is None:
+            return
+        start_line: int | None = None
+        end_line: int | None = None
+        try:
+            parsed_start = int(start_value or 0)
+            parsed_end = int(end_value or 0)
+            if 1 <= parsed_start <= parsed_end <= 10_000_000:
+                start_line, end_line = parsed_start, parsed_end
+        except (TypeError, ValueError, OverflowError):
+            pass
+        reason = str(redact_value(str(reason_value or source)))[:64]
+        key = (source, path, start_line, end_line, reason)
+        if key in seen:
+            return
+        seen.add(key)
+        references.append(
+            {
+                "source": source,
+                "rank": rank,
+                "path": path,
+                "start_line": start_line,
+                "end_line": end_line,
+                "reason": reason,
+            }
+        )
+
+    for rank, ref in enumerate(lexical_refs[:SEARCH_RESULT_MAX], start=1):
+        append_reference(
+            source="lexical",
+            rank=rank,
+            path_value=ref.get("path"),
+            start_value=ref.get("start_line"),
+            end_value=ref.get("end_line"),
+            reason_value=ref.get("reason"),
+        )
+    graph_results = graph_payload.get("results")
+    if isinstance(graph_results, list):
+        for rank, item in enumerate(graph_results[:CONTEXT_PACK_GRAPH_MAX_RESULTS], start=1):
+            if not isinstance(item, dict):
+                continue
+            span = item.get("span") if isinstance(item.get("span"), dict) else {}
+            source_status = str(item.get("source_status") or "")
+            if source_status == "stale":
+                reason_value: object = "stale_source"
+            elif source_status == "unknown":
+                reason_value = "unverified_source"
+            else:
+                reason_value = item.get("reason") or item.get("role") or item.get("relation")
+            append_reference(
+                source="graph",
+                rank=rank,
+                path_value=item.get("path"),
+                start_value=span.get("start_line", item.get("line")),
+                end_value=span.get("end_line", item.get("end_line", item.get("line"))),
+                reason_value=reason_value,
+            )
+
+    canonical = {
+        "schema_version": 1,
+        "context_pack_version": 2,
+        "representation": representation,
+        "budget_mode": str(mode),
+        "limit": limit,
+        "lexical_policy": str(retrieval_trace.get("lexical_policy") or "none"),
+        "dense_rerank": bool(retrieval_trace.get("dense_rerank")),
+        "graph": {
+            "schema_version": graph_payload.get("schema_version"),
+            "ranking_policy": str(graph_payload.get("ranking_policy") or "unavailable")[:64],
+            "ranking_applied": bool(graph_payload.get("ranking_applied")),
+            "source_generation": graph_payload.get("source_generation"),
+            "status": str(retrieval_trace.get("graph_status") or "empty")[:64],
+        },
+        "references": references,
+    }
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        **canonical,
+        "receipt_id": f"sha256:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}",
+    }
+
+
+def context_pack(
+    root: Path,
+    text: str,
+    *,
+    limit: int = 5,
+    mode: str = "balanced",
+    representation: str = CONTEXT_PACK_DEFAULT_REPRESENTATION,
+    evidence_source: str | None = "context_pack",
+) -> dict[str, Any]:
     from .context_budget import apply as apply_context_budget
 
+    representation = normalize_context_pack_representation(representation)
     limit = normalize_result_limit(limit)
-    payload = query(root, text, limit=limit, evidence_source="context_pack")
+    payload = query(root, text, limit=limit, evidence_source=evidence_source)
     payload.update(apply_context_budget(payload["results"], mode=mode, limit=limit))
+    if representation == "legacy":
+        return payload
+
+    refs = _context_pack_refs(root, payload["results"])
+    seed_paths = sorted({str(ref["path"]) for ref in refs})
+    symbol_query = _context_graph_symbol_query(text)
+    graph_representation = "full" if representation == "v2" else representation
+    graph_limit = min(limit, CONTEXT_PACK_GRAPH_MAX_RESULTS)
+    if payload.get("ok"):
+        try:
+            from .graph_context import pack_graph_context
+
+            graph_payload = pack_graph_context(
+                root,
+                seed_paths=seed_paths,
+                symbol_query=symbol_query,
+                limit=graph_limit,
+                representation=graph_representation,
+            )
+        except (OSError, RuntimeError, sqlite3.Error, ValueError):
+            graph_payload = {
+                "ok": False,
+                "reason": "graph_context_unavailable",
+                "count": 0,
+                "results": [],
+                "additionalContext": "",
+            }
+    else:
+        graph_payload = {
+            "ok": False,
+            "reason": "query_rejected",
+            "count": 0,
+            "results": [],
+            "additionalContext": "",
+        }
+
+    lexical_context = str(payload.get("additionalContext") or "")
+    if representation in {"skeleton", "refs-only"}:
+        lexical_context = _context_ref_lines(refs, representation=representation)
+        payload["results"] = [dict(ref) for ref in refs]
+    combined, graph_truncated = _append_context_bounded(
+        lexical_context,
+        str(graph_payload.get("additionalContext") or ""),
+        max_bytes=int(payload["context_budget"]["max_bytes"]),
+    )
+    payload["additionalContext"] = combined
+    payload["context_budget"] = {
+        **payload["context_budget"],
+        "bytes": len(combined.encode("utf-8")),
+        "truncated": bool(payload["context_budget"].get("truncated")) or graph_truncated,
+        "representation": representation,
+        "graph_results": int(graph_payload.get("count") or 0),
+        "graph_truncated": graph_truncated,
+    }
+    retrieval_trace = {
+        "schema_version": 1,
+        "lexical_policy": payload.get("retrieval_policy", "none"),
+        "lexical_results": len(refs),
+        "graph_status": (
+            "used"
+            if graph_payload.get("ok") and graph_payload.get("count")
+            else str(graph_payload.get("reason") or "empty")
+        ),
+        "graph_results": int(graph_payload.get("count") or 0),
+        "graph_seed_path_count": len(seed_paths),
+        "graph_symbol_seeded": symbol_query is not None,
+        "fusion": "bounded_context_append",
+        "ranking_mutated": False,
+        "lexical_ranking_mutated": False,
+        "graph_ranking_applied": bool(graph_payload.get("ranking_applied")),
+        "graph_ranking_policy": str(graph_payload.get("ranking_policy") or "unavailable")[:64],
+        "dense_rerank": bool(payload.get("dense_rerank")),
+    }
+    payload.update(
+        {
+            "context_pack_version": 2,
+            "representation": representation,
+            "lexical_refs": refs,
+            "graph_context": graph_payload,
+            "retrieval_trace": retrieval_trace,
+            "context_receipt": _context_receipt(
+                representation=representation,
+                mode=mode,
+                limit=limit,
+                lexical_refs=refs,
+                graph_payload=graph_payload,
+                retrieval_trace=retrieval_trace,
+            ),
+        }
+    )
     return payload
 
 

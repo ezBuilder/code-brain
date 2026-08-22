@@ -48,6 +48,33 @@ def test_doctor_layout_surfaces_docs_contract_drift(monkeypatch) -> None:
     assert "docs contract drift: fixture docs drift" in check.detail
 
 
+def test_consumer_owned_upgrade_doc_does_not_trigger_source_contract(tmp_path: Path) -> None:
+    for relative in (
+        ".ai/AGENTS.md",
+        ".ai/config.yaml",
+        ".ai/.gitignore",
+        ".ai/.gitattributes",
+        ".ai/runtime/pyproject.toml",
+        ".ai/runtime/.python-version",
+        ".ai/bin/ai",
+        ".ai/memory/queue/.tmp/.gitkeep",
+        ".ai/memory/queue/processing/.gitkeep",
+        ".ai/memory/queue/dead/.gitkeep",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture\n", encoding="utf-8")
+    (tmp_path / ".ai/generated").mkdir(parents=True)
+    (tmp_path / ".ai/memory/audit").mkdir(parents=True)
+    upgrade_doc = tmp_path / "docs/WORLD_CLASS_AUTONOMOUS_UPGRADE.md"
+    upgrade_doc.parent.mkdir(parents=True)
+    upgrade_doc.write_text("consumer-owned\n", encoding="utf-8")
+
+    check = check_layout(tmp_path)
+
+    assert check.ok, check.detail
+
+
 def test_doctor_count_marker_drift_is_rejected() -> None:
     contract = load_source_contract(ROOT)
     architecture = (ROOT / ARCHITECTURE_PATH).read_text(encoding="utf-8")

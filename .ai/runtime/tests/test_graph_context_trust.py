@@ -46,6 +46,17 @@ def test_symbol_query_like_metacharacters_are_literal(tmp_path: Path) -> None:
     assert [item["qualname"] for item in underscore["seed_symbols"]] == ["alpha_percent"]
 
 
+def test_symbol_query_echo_is_redacted_and_bounded(tmp_path: Path) -> None:
+    _build_repo(tmp_path)
+    secret = "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"
+
+    payload = graph_context.pack_graph_context(tmp_path, symbol_query=secret, limit=5)
+
+    assert secret not in payload["symbol_query"]
+    assert payload["symbol_query"] == "[REDACTED]"
+    assert len(payload["symbol_query"]) <= graph_context.MAX_SYMBOL_QUERY_CHARS
+
+
 def test_symbol_query_is_bounded_before_database_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -65,6 +76,25 @@ def test_symbol_query_is_bounded_before_database_access(
 
     assert payload["ok"] is False
     assert payload["reason"] == "invalid_symbol_query"
+
+
+def test_invalid_representation_rejects_before_source_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        graph_context,
+        "_load_source_generation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid representation must stop before source reads")
+        ),
+    )
+
+    payload = graph_context.pack_graph_context(tmp_path, representation="unknown")
+
+    assert payload["ok"] is False
+    assert payload["reason"] == "invalid_representation"
+    assert payload["source_generation"] is None
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
@@ -119,6 +149,63 @@ def test_snippet_source_is_read_once_per_path(
 
     assert payload["ok"] is True
     assert calls.count(tmp_path / "src" / "service.py") == 1
+
+
+def test_source_generation_marker_is_exposed_and_invalid_marker_fails_soft(tmp_path: Path) -> None:
+    _build_repo(tmp_path)
+    marker = tmp_path / ".ai" / "cache" / "code-index-generation"
+
+    known = graph_context.pack_graph_context(tmp_path, seed_paths=["src/service.py"], limit=5)
+    assert known["source_generation"]
+    assert known["source_generation_status"] == "known"
+
+    marker.write_text("\x00invalid\n", encoding="utf-8")
+    unknown = graph_context.pack_graph_context(tmp_path, seed_paths=["src/service.py"], limit=5)
+    assert unknown["source_generation"] is None
+    assert unknown["source_generation_status"] == "unknown"
+
+
+def test_stale_source_suppresses_snippet_and_marks_result(tmp_path: Path) -> None:
+    _build_repo(tmp_path)
+    source = tmp_path / "src" / "service.py"
+    source.write_text("def alpha():\n    return 'changed after indexing'\n", encoding="utf-8")
+
+    payload = graph_context.pack_graph_context(tmp_path, symbol_query="alpha", limit=5)
+
+    assert payload["ok"] is True
+    assert payload["results"]
+    stale = [item for item in payload["results"] if item["path"] == "src/service.py"]
+    assert stale
+    assert all(item["source_status"] == "stale" for item in stale)
+    assert all(item["stale_marker"] == graph_context.STALE_SOURCE_MARKER for item in stale)
+    assert all(item["snippet"] == "" for item in stale)
+    assert all(item["summary"] == "" for item in stale)
+    assert "return 1" not in payload["additionalContext"]
+    assert graph_context.STALE_SOURCE_MARKER in payload["additionalContext"]
+    references = graph_context.pack_graph_context(
+        tmp_path,
+        symbol_query="alpha",
+        limit=5,
+        representation="refs-only",
+    )
+    assert all(item["reason"] == "stale_source" for item in references["results"])
+
+
+def test_source_hash_matches_redacted_index_without_leaking_secret(tmp_path: Path) -> None:
+    secret = "ghp_" + "a" * 36
+    source = tmp_path / "src" / "service.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(f"def alpha():\n    return '{secret}'\n", encoding="utf-8")
+    (tmp_path / ".ai" / "cache").mkdir(parents=True)
+    rebuild(tmp_path)
+
+    payload = graph_context.pack_graph_context(tmp_path, symbol_query="alpha", limit=5)
+
+    matching = [item for item in payload["results"] if item["path"] == "src/service.py"]
+    assert matching
+    assert all(item["source_status"] == "current" for item in matching)
+    assert secret not in payload["additionalContext"]
+    assert "[REDACTED]" in payload["additionalContext"]
 
 
 def test_malicious_database_paths_are_dropped(tmp_path: Path) -> None:

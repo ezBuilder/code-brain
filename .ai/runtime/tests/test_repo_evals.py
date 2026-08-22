@@ -112,6 +112,7 @@ def test_cli_is_a_strict_complete_gate_for_supported_axes() -> None:
         "tool_discovery",
         "autoresearch_retrieval",
         "code_retrieval",
+        "line_span_retrieval",
         "memory_retrieval",
     ]
     assert [part for part in eval_line.split() if part in set(axes) or part == "--axis"].count("--axis") == len(axes)
@@ -140,10 +141,10 @@ def test_cli_is_a_strict_complete_gate_for_supported_axes() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
     payload = json.loads(completed.stdout)
     assert payload["summary"] == {
-        "axes": 6,
-        "cases": 28,
-        "measured": 28,
-        "passed": 28,
+        "axes": 7,
+        "cases": 31,
+        "measured": 31,
+        "passed": 31,
         "failed": 0,
         "skipped": 0,
     }

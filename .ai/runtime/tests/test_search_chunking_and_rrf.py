@@ -713,8 +713,13 @@ def another_func():
     # Query for function name
     result = query(repo, "helper_func")
     assert result["ok"] is True
-    # Should find the function
-    assert any("src/utils.py" in item["path"] for item in result["results"])
+    # The exact function chunk must be queryable, not merely its file-level twin.
+    function = next(item for item in result["results"] if item.get("qualname") == "helper_func")
+    assert function["path"] == "src/utils.py"
+    assert function["chunk_path"] == "src/utils.py:helper_func"
+    assert function["start_line"] == 1
+    assert function["end_line"] == 3
+    assert function["span_provenance"]["processor"] == "code-brain-local"
 
 
 def test_hybrid_chunking_preserves_file_chunks(tmp_path: Path) -> None:

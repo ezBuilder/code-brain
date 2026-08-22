@@ -44,12 +44,29 @@ def _contains_assignment_secret(value: str, lowered: str) -> bool:
             cursor += 1
             while cursor < length and value[cursor].isspace():
                 cursor += 1
-            if cursor < length and value[cursor] in {"'", '"'}:
+            quoted = cursor < length and value[cursor] in {"'", '"'}
+            if quoted:
                 cursor += 1
             start = cursor
             while cursor < length and value[cursor] in _ASSIGNMENT_VALUE_CHARS:
                 cursor += 1
-            if cursor - start >= 20:
+            candidate = value[start:cursor]
+            # Avoid treating ordinary program expressions such as
+            # ``token = cancellationToken`` or ``password = props.getValue``
+            # as credentials. Unquoted all-letter/dotted values are identifiers,
+            # and a quoted one-character repetition is a deterministic test
+            # placeholder. Real generic credentials remain detected when quoted
+            # or when an unquoted value contains digits/symbols.
+            identifier_expression = (
+                not quoted
+                and all(character.isalpha() or character == "." for character in candidate)
+                and (
+                    "." in candidate
+                    or (cursor < length and value[cursor] in {"(", ";", ",", "@", "["})
+                )
+            )
+            repeated_placeholder = quoted and len(set(candidate)) <= 1
+            if len(candidate) >= 20 and not identifier_expression and not repeated_placeholder:
                 return True
             offset = found + 1
     return False

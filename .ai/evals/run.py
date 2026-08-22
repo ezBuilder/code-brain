@@ -22,6 +22,8 @@ EVALS_DIR = pathlib.Path(__file__).resolve().parent
 CASES_DIR = EVALS_DIR / "cases"
 REPO_ROOT = EVALS_DIR.parents[1]
 RUNTIME_SRC = REPO_ROOT / ".ai" / "runtime" / "src"
+if str(EVALS_DIR) not in sys.path:
+    sys.path.insert(0, str(EVALS_DIR))
 if str(RUNTIME_SRC) not in sys.path:
     sys.path.insert(0, str(RUNTIME_SRC))
 
@@ -180,12 +182,72 @@ def _observe_memory_retrieval(case: dict[str, Any]) -> Observed:
         return memory_retrieval_eval.evaluate(repo, golden, k=int(case.get("k") or 5), now=moment)
 
 
+def _observe_line_span_retrieval(case: dict[str, Any]) -> Observed:
+    """Evaluate verified spans emitted by the production context-pack path."""
+    from ai_core.search import context_pack, rebuild
+    from line_span_eval import evaluate
+
+    corpus = case.get("corpus")
+    if not isinstance(corpus, list) or not all(isinstance(item, dict) for item in corpus):
+        raise ValueError("line_span_retrieval case requires an object list in corpus")
+    query_text = str(case.get("query") or "").strip()
+    if not query_text:
+        raise ValueError("line_span_retrieval case requires a non-empty query")
+    bounded_k = int(case.get("k") or 5)
+
+    with tempfile.TemporaryDirectory(prefix="codebrain_line_span_eval_") as tmpdir:
+        repo = pathlib.Path(tmpdir) / "repo"
+        (repo / ".ai").mkdir(parents=True)
+        (repo / ".ai" / "config.yaml").write_text(
+            "project_name: line-span-retrieval-eval\n",
+            encoding="utf-8",
+        )
+        for item in corpus:
+            rel = pathlib.PurePosixPath(str(item.get("path") or ""))
+            if not rel.parts or rel.is_absolute() or ".." in rel.parts or rel.parts[0] == ".ai":
+                raise ValueError(f"invalid corpus path: {rel}")
+            destination = repo.joinpath(*rel.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(str(item.get("content") or ""), encoding="utf-8")
+        rebuilt = rebuild(repo)
+        if rebuilt.get("ok") is not True:
+            raise RuntimeError(f"line/span index rebuild failed: {rebuilt.get('error') or rebuilt}")
+        payload = context_pack(
+            repo,
+            query_text,
+            limit=bounded_k,
+            representation="refs-only",
+        )
+        ranked = [
+            {
+                "path": ref["path"],
+                **(
+                    {"start_line": ref["start_line"], "end_line": ref["end_line"]}
+                    if ref.get("start_line") is not None and ref.get("end_line") is not None
+                    else {}
+                ),
+            }
+            for ref in payload.get("lexical_refs", [])
+        ]
+        report = evaluate(case.get("qrels"), ranked, k=bounded_k)
+        report.update(
+            {
+                "evaluation_mode": "production_context_pack_v2",
+                "context_pack_version": payload.get("context_pack_version"),
+                "retrieval_policy": payload.get("retrieval_policy"),
+                "representation": payload.get("representation"),
+            }
+        )
+        return report
+
+
 ADAPTERS: dict[str, Adapter] = {
     "precall_routing": _observe_precall,
     "context_budget": _observe_context_budget,
     "tool_discovery": _observe_tool_discovery,
     "autoresearch_retrieval": _observe_autoresearch_retrieval,
     "code_retrieval": _observe_code_retrieval,
+    "line_span_retrieval": _observe_line_span_retrieval,
     "memory_retrieval": _observe_memory_retrieval,
 }
 

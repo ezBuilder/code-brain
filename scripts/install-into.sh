@@ -93,13 +93,14 @@ managed_files() {
           [[ -f "$path" ]] && printf '%s\n' "$path"
         done
       fi
-    } | grep -vxE "\.ai/secret_scan_allowlist\.txt|\.ai/generated/install-manifest\.json" \
+    } | grep -vxE "\.ai/secret_scan_allowlist\.txt|\.ai/generated/install-manifest\.json|\.ai/eval(/.*)?" \
       | awk '!(($0 ~ /^\.ai\/memory\// || $0 ~ /^\.ai\/runtime\/state\//) && $0 !~ /\.gitkeep$/)' \
       | while IFS= read -r rel; do
         [[ -f "$rel" ]] && printf '%s\n' "$rel"
       done
   ) || true
-  # ^ never propagate the SOURCE repo's private runtime memory/state DATA (audit chain, decisions,
+  # ^ never propagate the SOURCE repo's private runtime memory/state DATA or user-owned .ai/eval scratch
+  #   (audit chain, decisions,
   #   sessions, evidence, prompt-growth, worker heartbeats). Seeding it pollutes the target project
   #   and corrupts its audit chain. Directory structure still propagates via the .gitkeep files,
   #   which ARE kept; the runtime creates each project's own memory on first use.
@@ -1077,6 +1078,10 @@ install_or_upgrade() {
       rm -rf "$TARGET_ROOT/.ai/runtime/.venv"
     fi
   fi
+  # Explicit installs/upgrades self-heal a spliced audit chain before the
+  # session writes another event. GitHub upgrades use the deferred path and
+  # perform the same repair in upgrade.py after bootstrap.
+  $_run_as .ai/bin/ai audit repair-chain --json >/dev/null
   # session start below runs the complete doctor checks after rebuilding the
   # code and audit indexes, so avoid separate CLI startup and doctor scans.
   $_run_as env AI_BOOTSTRAP_LOW_MEMORY=1 ./bootstrap-code-brain.sh --skip-doctor --skip-render --low-memory

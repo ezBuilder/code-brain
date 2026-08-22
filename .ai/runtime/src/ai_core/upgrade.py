@@ -187,6 +187,7 @@ def upgrade_latest(
         "checkout": ref,
         "install": "<tmp>/code-brain/scripts/install-into.sh upgrade " + str(root),
         "bootstrap": "bash ./bootstrap-code-brain.sh",
+        "storage": "enforce bounded .ai/tmp/.ai/outputs storage",
         "audit_repair": ".ai/bin/ai audit repair-chain --json",
         "doctor": ".ai/bin/ai doctor --strict --json",
     }
@@ -248,6 +249,7 @@ def upgrade_latest(
                     "bootstrap": bootstrap_payload,
                 }
         ai_bin = root / ".ai" / "bin" / "ai"
+        storage = enforce_workspace_storage(root)
         audit_repair = _run([str(ai_bin), "audit", "repair-chain", "--json"], cwd=root)
         doctor = _run([str(ai_bin), "doctor", "--strict", "--json"], cwd=root)
         payload = {
@@ -261,6 +263,7 @@ def upgrade_latest(
             "clone_path": str(temp_root) if keep_clone else None,
             "install": _command_result(install),
             "bootstrap": bootstrap_payload,
+            "storage": storage,
             "audit_repair": _command_result(audit_repair),
             "doctor": _command_result(doctor),
         }

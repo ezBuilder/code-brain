@@ -41,10 +41,31 @@ def test_pack_graph_context_expands_symbol_to_callers_callees_and_related_symbol
 
     assert payload["ok"] is True
     assert payload["symbol_query"] == "alpha"
+    assert payload["representation"] == "full"
+    assert payload["schema_version"] == 2
+    assert payload["ranking_policy"] == "bounded-personalized-pagerank-over-one-hop"
+    assert payload["ranking_applied"] is True
+    assert payload["ranked_node_count"] >= 3
+    assert payload["ranking_parameters"]["max_edges"] == 1_600
+    assert payload["source_generation_status"] == "known"
     assert any(item["kind"] == "symbol" and item["qualname"] == "alpha" for item in payload["results"])
     assert any(item["kind"] == "edge" and item["relation"] == "caller" and item["caller"] == "gamma" for item in payload["results"])
     assert any(item["kind"] == "edge" and item["relation"] == "callee" and item["callee"] == "helper" for item in payload["results"])
     assert any(item["kind"] == "symbol" and item["role"] == "related" and item["qualname"] == "helper" for item in payload["results"])
+    symbol = next(item for item in payload["results"] if item.get("qualname") == "alpha")
+    assert symbol["provenance"] == {
+        "origin": "python_ast",
+        "evidence_kind": "extracted",
+        "confidence": "high",
+    }
+    assert symbol["source_generation"] == payload["source_generation"]
+    assert symbol["invalidated"] is False
+    assert symbol["graph_distance"] == 0
+    assert symbol["graph_score"] > 0
+    edge = next(item for item in payload["results"] if item["kind"] == "edge")
+    assert edge["target_resolution"] == "lexical"
+    assert edge["provenance"]["evidence_kind"] == "extracted"
+    assert edge["provenance"]["confidence"] == "high"
     assert "gamma -> alpha" in payload["additionalContext"]
 
 
@@ -80,3 +101,25 @@ def test_pack_graph_context_redacts_snippets(tmp_path: Path):
 
     assert "ghp_" not in rendered
     assert "[REDACTED]" in rendered
+
+
+def test_pack_graph_context_representations_are_bounded_and_deterministic(tmp_path: Path):
+    root = _build_repo(tmp_path)
+
+    skeleton = pack_graph_context(root, symbol_query="alpha", limit=20, representation="skeleton")
+    references = pack_graph_context(root, symbol_query="alpha", limit=20, representation="refs-only")
+
+    assert skeleton["representation"] == "skeleton"
+    assert skeleton["count"] > 0
+    assert all("snippet" not in item for item in skeleton["results"])
+    assert all("span" in item and len(item["summary"]) <= 240 for item in skeleton["results"])
+    assert references["representation"] == "refs-only"
+    assert references["results"]
+    assert all({"path", "span", "reason"} <= set(item) for item in references["results"])
+    assert all(
+        {"graph_score", "graph_distance"} <= set(item)
+        for item in references["results"]
+        if "graph_score" in item
+    )
+    assert all("snippet" not in item and "secret" not in str(item).lower() for item in references["results"])
+    assert len(references["additionalContext"].encode("utf-8")) <= 64 * 1024

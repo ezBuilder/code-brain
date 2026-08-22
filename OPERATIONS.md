@@ -427,7 +427,7 @@ make clean-all
 
 ## Slash Commands and MCP
 
-Code Brain ships four read-only slash commands per agent client plus a project-local MCP server registration. The same backend (`ai obs usage`, `ai obs health-summary`, `ai obs search`, `ai doctor --strict`) is reachable from both Claude Code and Codex CLI.
+Code Brain ships seven slash commands per agent client plus a project-local MCP server registration. The retrieval proof backend performs bounded local A/B calls and may refresh a stale index during warm-up; its measured repetition phase must not mutate retrieval files.
 
 ### Claude Code (`/cb-*`)
 
@@ -439,12 +439,13 @@ Project-level slash commands live under `.claude/commands/cb-*.md`:
 | `/cb-health` | `ai obs health-summary --json` | yes |
 | `/cb-search [query]` | `ai obs search --query "$ARGUMENTS" --json` (exit `13` on stale) | yes |
 | `/cb-doctor` | `ai doctor --strict --json` | yes |
+| `/cb-proof [query]` | `ai context prove [query] --json` | after warm-up |
 
-Each markdown file forbids the agent from auto-rebuilding the index, auto-running `--refresh-stale`, or fabricating token-saving estimates. The Code Brain doctor `mcp_methods_registered` check fails if any of the four files are missing.
+Command markdown forbids fabricated measurements and requires direct backend output. The Code Brain doctor `mcp_methods_registered` check fails if any required command is missing.
 
 ### Codex CLI (`.codex/prompts/cb-*.md`)
 
-The same four operations are mirrored under `.codex/prompts/cb-*.md`. Codex CLI command-registration conventions vary by version — verify your version's prompt-discovery path matches `.codex/prompts/` and adjust `.codex/config.toml` if needed.
+The same seven operations are mirrored under `.codex/prompts/cb-*.md`. Codex CLI command-registration conventions vary by version — verify your version's prompt-discovery path matches `.codex/prompts/` and adjust `.codex/config.toml` if needed.
 
 ### MCP server (both clients)
 

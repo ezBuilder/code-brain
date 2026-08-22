@@ -349,6 +349,11 @@ def test_install_into_writes_antigravity_mcp_config(install_into_target: Path) -
     assert payload["mcpServers"]["code-brain"]["command"] == ".ai/bin/ai-mcp"
 
 
+def test_install_into_excludes_source_user_eval_scratch(install_into_target: Path) -> None:
+    assert not (install_into_target / ".ai" / "eval").exists()
+    assert (install_into_target / ".ai" / "evals").is_dir()
+
+
 def test_install_into_writes_antigravity_hooks(install_into_target: Path) -> None:
     hooks = install_into_target / ".agents" / "hooks.json"
     assert hooks.exists(), "expected .agents/hooks.json"

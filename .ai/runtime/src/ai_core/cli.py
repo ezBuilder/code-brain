@@ -16,7 +16,7 @@ from .obs import diagnostics, health_summary, metrics, prune_diagnostics, search
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, MANIFEST_DRIFT, OK, PERMISSION_DENIED, PolicyDenied, USAGE_ERROR, WORKER_UNAVAILABLE, reject_ci_write
 from .render import render
-from .search import context_pack, query, rebuild
+from .search import CONTEXT_PACK_DEFAULT_REPRESENTATION, CONTEXT_PACK_REPRESENTATIONS, context_pack, query, rebuild
 from .secrets_store import status as secrets_status
 from .trust import init_machine, list_machines, revoke_machine
 
@@ -734,7 +734,21 @@ def build_parser() -> argparse.ArgumentParser:
     context_pack_parser.add_argument("query")
     context_pack_parser.add_argument("--limit", type=int, default=5)
     context_pack_parser.add_argument("--mode", choices=["high_fidelity", "balanced", "aggressive"], default="balanced")
+    context_pack_parser.add_argument(
+        "--representation",
+        choices=CONTEXT_PACK_REPRESENTATIONS,
+        default=CONTEXT_PACK_DEFAULT_REPRESENTATION,
+        help="기본 v2 graph/PPR pack; legacy는 명시적 롤백 호환",
+    )
     context_pack_parser.add_argument("--json", action="store_true", dest="command_json")
+    context_prove = context_sub.add_parser("prove", help="A/B proof for legacy versus graph/PPR retrieval")
+    context_prove.add_argument("query", nargs="?")
+    context_prove.add_argument("--expected-path")
+    context_prove.add_argument("--start-line", type=int)
+    context_prove.add_argument("--end-line", type=int)
+    context_prove.add_argument("--repeats", type=int, default=5)
+    context_prove.add_argument("--limit", type=int, default=10)
+    context_prove.add_argument("--json", action="store_true", dest="command_json")
     evidence = sub.add_parser("evidence")
     evidence_sub = evidence.add_subparsers(dest="evidence_command", required=True)
     evidence_record = evidence_sub.add_parser("record")
@@ -1843,9 +1857,29 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "context" and args.context_command == "pack":
-            payload = context_pack(root, args.query, limit=args.limit, mode=args.mode)
+            payload = context_pack(
+                root,
+                args.query,
+                limit=args.limit,
+                mode=args.mode,
+                representation=args.representation,
+            )
             emit(payload, as_json=as_json)
             return OK
+        if args.command == "context" and args.context_command == "prove":
+            from .retrieval_proof import prove_retrieval
+
+            payload = prove_retrieval(
+                root,
+                query=args.query,
+                expected_path=args.expected_path,
+                start_line=args.start_line,
+                end_line=args.end_line,
+                repeats=args.repeats,
+                limit=args.limit,
+            )
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "evidence":
             from .evidence import list_evidence, record_evidence, set_evidence_status
             if args.evidence_command == "record":

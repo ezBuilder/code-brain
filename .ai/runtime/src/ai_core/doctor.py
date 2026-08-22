@@ -144,6 +144,9 @@ def check_global_kit_source_health(root: Path) -> Check:
     """Validate the repo-owned global-agent-kit source inventory without writes."""
     from .global_kit_health import check_global_kit_source
 
+    kit_root = root / "kits" / "global-agent-kit"
+    if not kit_root.exists():
+        return Check("global_kit_source_health", True, "not applicable: consumer install has no global kit source")
     result = check_global_kit_source(root)
     return Check("global_kit_source_health", result.ok, result.detail)
 
@@ -152,6 +155,9 @@ def check_global_kit_install_drift(root: Path) -> Check:
     """Compare an installed global-agent-kit against source without mutating HOME."""
     from .global_kit_health import check_global_kit_install
 
+    kit_root = root / "kits" / "global-agent-kit"
+    if not kit_root.exists():
+        return Check("global_kit_install_drift", True, "not applicable: use /kit-doctor for the global install")
     result = check_global_kit_install(root)
     return Check("global_kit_install_drift", result.ok, result.detail)
 
@@ -405,16 +411,17 @@ def check_layout(root: Path) -> Check:
     # Source checkouts ship the architecture/upgrade contract documents. Keep
     # their doctor/eval inventory claims tied to source without imposing those
     # repository-only documents on consumer installs.
+    source_checkout = (root / "kits" / "global-agent-kit").is_dir() and (root / "scripts" / "package.sh").is_file()
     source_contract_docs = (root / "ARCHITECTURE.md", root / "docs" / "WORLD_CLASS_AUTONOMOUS_UPGRADE.md")
     source_contract_present = tuple(path.is_file() for path in source_contract_docs)
-    if any(source_contract_present) and not all(source_contract_present):
+    if source_checkout and not all(source_contract_present):
         missing_contract_docs = [
             str(path.relative_to(root))
             for path, present in zip(source_contract_docs, source_contract_present)
             if not present
         ]
         return Check("layout", False, "docs contract source incomplete: " + ", ".join(missing_contract_docs))
-    if all(source_contract_present):
+    if source_checkout and all(source_contract_present):
         try:
             from .docs_contract import DocsContractSourceError, load_source_contract, validate_docs_contract
 
@@ -1122,6 +1129,7 @@ REQUIRED_SLASH_COMMAND_FILES = (
     ".claude/commands/cb-doctor.md",
     ".claude/commands/cb-exec.md",
     ".claude/commands/cb-upgrade.md",
+    ".claude/commands/cb-proof.md",
 )
 
 REQUIRED_CODEX_PROMPT_FILES = (
@@ -1131,6 +1139,7 @@ REQUIRED_CODEX_PROMPT_FILES = (
     ".codex/prompts/cb-doctor.md",
     ".codex/prompts/cb-exec.md",
     ".codex/prompts/cb-upgrade.md",
+    ".codex/prompts/cb-proof.md",
 )
 
 

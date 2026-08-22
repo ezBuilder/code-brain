@@ -64,6 +64,14 @@ def test_install_drift_is_not_asserted_for_empty_home(tmp_path: Path) -> None:
     assert "not installed" in result.detail
 
 
+def test_doctor_skips_source_owned_global_kit_checks_in_consumer(tmp_path: Path) -> None:
+    source = check_global_kit_source_health(tmp_path)
+    installed = check_global_kit_install_drift(tmp_path)
+
+    assert source.ok and "consumer install" in source.detail
+    assert installed.ok and "/kit-doctor" in installed.detail
+
+
 def test_current_temp_home_install_is_green(tmp_path: Path) -> None:
     _seed_installed_home(tmp_path)
 

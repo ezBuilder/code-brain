@@ -13,7 +13,7 @@ if ! grep -Fq 'doctor-check-count=32' docs/WORLD_CLASS_AUTONOMOUS_UPGRADE.md; th
   echo "doctor inventory contract drift" >&2
   exit 1
 fi
-if ! grep -Fq 'eval-axes=precall_routing,context_budget,tool_discovery,autoresearch_retrieval,code_retrieval,memory_retrieval' docs/WORLD_CLASS_AUTONOMOUS_UPGRADE.md; then
+if ! grep -Fq 'eval-axes=precall_routing,context_budget,tool_discovery,autoresearch_retrieval,code_retrieval,line_span_retrieval,memory_retrieval' docs/WORLD_CLASS_AUTONOMOUS_UPGRADE.md; then
   echo "eval inventory contract drift" >&2
   exit 1
 fi

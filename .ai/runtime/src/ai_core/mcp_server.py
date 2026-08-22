@@ -28,7 +28,7 @@ from .private_write import (
 )
 from .redact import redact_value
 from .sandbox import execute as sandbox_execute, fetch as sandbox_fetch, list_executions as sandbox_list
-from .search import context_pack, query, rebuild
+from .search import CONTEXT_PACK_DEFAULT_REPRESENTATION, CONTEXT_PACK_REPRESENTATIONS, context_pack, query, rebuild
 from .worker.ipc import health
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -179,7 +179,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "context_pack",
-        "description": "BM25 검색 결과에 훅 주입에 적합한 additionalContext 문자열을 더해 반환.",
+        "description": "BM25 context와 bounded graph/span/PPR context pack을 반환. v2가 기본이며 legacy는 롤백 호환.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -189,6 +189,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
                     "type": "string",
                     "enum": ["high_fidelity", "balanced", "aggressive"],
                     "default": "balanced",
+                },
+                "representation": {
+                    "type": "string",
+                    "enum": list(CONTEXT_PACK_REPRESENTATIONS),
+                    "default": CONTEXT_PACK_DEFAULT_REPRESENTATION,
+                    "description": "legacy|v2|skeleton|refs-only; v2 graph/PPR가 기본 활성화.",
                 },
             },
             "required": ["query"],
@@ -1222,6 +1228,10 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             str(args.get("query", "")),
             limit=_coerce_int(args.get("limit"), 5, minimum=1, maximum=100),
             mode=str(args.get("mode", "balanced") or "balanced"),
+            representation=str(
+                args.get("representation", CONTEXT_PACK_DEFAULT_REPRESENTATION)
+                or CONTEXT_PACK_DEFAULT_REPRESENTATION
+            ),
         )
     if name == "code_graph_callers":
         from .codegraph import query_callers

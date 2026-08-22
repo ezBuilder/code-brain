@@ -1391,7 +1391,15 @@ def test_context_pack_and_mcp_once(tmp_path: Path) -> None:
     assert run_ai("index", "rebuild", cwd=repo).returncode == 0
     context_result = run_ai("context", "pack", "manifest", "--json", cwd=repo)
     assert context_result.returncode == 0, context_result.stdout + context_result.stderr
-    assert json.loads(context_result.stdout)["additionalContext"]
+    context_payload = json.loads(context_result.stdout)
+    assert context_payload["additionalContext"]
+    assert context_payload["representation"] == "v2"
+    proof_result = run_ai("context", "prove", "manifest", "--repeats", "2", "--json", cwd=repo)
+    assert proof_result.returncode == 0, proof_result.stdout + proof_result.stderr
+    proof = json.loads(proof_result.stdout)
+    assert proof["ok"] is True
+    assert proof["v2"]["receipt_count"] == 1
+    assert proof["durability"]["unchanged"] is True
     request = {"jsonrpc": "2.0", "id": 1, "method": "code_query", "params": {"query": "manifest", "limit": 2}}
     mcp_result = run_ai("mcp", "--once-json", json.dumps(request), cwd=repo)
     assert mcp_result.returncode == 0, mcp_result.stdout + mcp_result.stderr
@@ -3029,6 +3037,8 @@ def test_upgrade_latest_from_local_repo_updates_install_manifest(tmp_path: Path)
     assert payload["channel"] == "github"
     assert payload["repo_url"] == str(source)
     assert payload["source_git_sha"]
+    assert payload["storage"]["ok"] is True
+    assert payload["audit_repair"]["returncode"] == 0
     manifest = json.loads((target / ".ai" / "generated" / "install-manifest.json").read_text(encoding="utf-8"))
     assert manifest["schema_version"] == 2
     assert manifest["source_repo_url"] == str(source)
@@ -3266,8 +3276,8 @@ def test_mcp_methods_registered_invariant(tmp_path: Path) -> None:
     check = next(c for c in payload["checks"] if c["name"] == "mcp_methods_registered")
     assert check["ok"] is True
     assert "mcp_methods=" in check["detail"]
-    assert "claude_commands=6" in check["detail"]
-    assert "codex_prompts=6" in check["detail"]
+    assert "claude_commands=7" in check["detail"]
+    assert "codex_prompts=7" in check["detail"]
 
 
 def test_mcp_methods_registered_fails_when_command_file_missing(tmp_path: Path) -> None:

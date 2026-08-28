@@ -1,14 +1,9 @@
 #!/usr/bin/env pwsh
-# Code Brain Windows installer. Mirrors scripts/install-into.sh on Unix.
+# Code Brain Windows installer.
 #
-# Usage:
-#   scripts\install-into.ps1 <target-git-repo>
-#   scripts\install-into.ps1 install <target>
-#   scripts\install-into.ps1 upgrade <target>
-#   scripts\install-into.ps1 uninstall <target>
-#
-# Reuses Python merge logic via inline scripts. Prefers `uv` managed Python so
-# Windows Store python/python3 execution aliases are never treated as valid.
+# Git for Windows ships the POSIX tools required by install-into.sh. Delegate
+# mutation to that single transactional implementation so Windows cannot drift
+# into a second, weaker ownership/config/uninstall contract.
 
 param(
     [Parameter(Position = 0)] [string] $Action = "",
@@ -16,8 +11,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
 $SourceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+
+function Fail-Install {
+    param([string] $Message, [int] $Code = 2)
+    [Console]::Error.WriteLine("install-into failed: $Message")
+    exit $Code
+}
 
 if ($Action -eq "-h" -or $Action -eq "--help") {
     Write-Host "usage:"
@@ -29,456 +29,91 @@ if ($Action -eq "-h" -or $Action -eq "--help") {
 }
 
 if ($Action -in @("install", "upgrade", "uninstall")) {
-    if (-not $TargetArg) {
-        Write-Error "install-into failed: target argument required"
-        exit 2
-    }
+    if (-not $TargetArg) { Fail-Install "target argument required" }
+}
+elseif ($Action) {
+    $TargetArg = $Action
+    $Action = "install"
 }
 else {
-    if ($Action) {
-        $TargetArg = $Action
-        $Action = "install"
-    }
-    else {
-        Write-Error "install-into failed: target argument required"
-        exit 2
-    }
+    Fail-Install "target argument required"
 }
 
-if (-not (Test-Path $TargetArg)) {
-    Write-Error "install-into failed: target does not exist: $TargetArg"
-    exit 2
+if (-not (Test-Path -LiteralPath $TargetArg -PathType Container)) {
+    Fail-Install "target does not exist: $TargetArg"
 }
-$TargetRoot = (Resolve-Path $TargetArg).Path
+$TargetRoot = (Resolve-Path -LiteralPath $TargetArg).Path
 
-# Verify git repo
-$gitTop = ""
+$Git = Get-Command git.exe -ErrorAction SilentlyContinue
+if (-not $Git) { $Git = Get-Command git -ErrorAction SilentlyContinue }
+if (-not $Git) { Fail-Install "git is required" }
+
+$GitTop = (& $Git.Source -C $TargetRoot rev-parse --show-toplevel 2>$null)
+if ($LASTEXITCODE -ne 0 -or -not $GitTop) {
+    Fail-Install "target is not inside a git repository: $TargetRoot"
+}
+$GitTopPath = [System.IO.Path]::GetFullPath(($GitTop | Select-Object -First 1).Trim())
+$TargetPath = [System.IO.Path]::GetFullPath($TargetRoot)
+if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals(
+    $GitTopPath.TrimEnd([char[]]"\/"),
+    $TargetPath.TrimEnd([char[]]"\/")
+)) {
+    Fail-Install "pass the git repository root: $GitTopPath"
+}
+
+$GitDir = Split-Path $Git.Source -Parent
+$BashCandidates = @(
+    (Join-Path $GitDir "bash.exe"),
+    (Join-Path $GitDir "..\bin\bash.exe"),
+    (Join-Path $GitDir "..\usr\bin\bash.exe"),
+    (Join-Path $env:ProgramFiles "Git\bin\bash.exe"),
+    (Join-Path $env:ProgramFiles "Git\usr\bin\bash.exe")
+)
+if (${env:ProgramFiles(x86)}) {
+    $BashCandidates += Join-Path ${env:ProgramFiles(x86)} "Git\bin\bash.exe"
+}
+$Bash = $BashCandidates |
+    Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
+    Select-Object -First 1
+if (-not $Bash) {
+    Fail-Install "Git for Windows bash.exe was not found; repair the Git for Windows installation"
+}
+$Bash = (Resolve-Path -LiteralPath $Bash).Path
+
+$BashDir = Split-Path $Bash -Parent
+$CygpathCandidates = @(
+    (Join-Path $BashDir "cygpath.exe"),
+    (Join-Path $BashDir "..\usr\bin\cygpath.exe")
+)
+$Cygpath = $CygpathCandidates |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+    Select-Object -First 1
+if (-not $Cygpath) {
+    Fail-Install "Git for Windows cygpath.exe was not found"
+}
+$Cygpath = (Resolve-Path -LiteralPath $Cygpath).Path
+
+$SourceUnix = (& $Cygpath -u $SourceRoot)
+if ($LASTEXITCODE -ne 0 -or -not $SourceUnix) { Fail-Install "could not convert source path for Git Bash" }
+$TargetUnix = (& $Cygpath -u $TargetRoot)
+if ($LASTEXITCODE -ne 0 -or -not $TargetUnix) { Fail-Install "could not convert target path for Git Bash" }
+$SourceUnix = ($SourceUnix | Select-Object -First 1).Trim()
+$TargetUnix = ($TargetUnix | Select-Object -First 1).Trim()
+$InstallScript = "$SourceUnix/scripts/install-into.sh"
+
+$PreviousTargetWindows = $env:AI_INSTALL_TARGET_WINDOWS
 try {
-    Push-Location $TargetRoot
-    $gitTop = (git rev-parse --show-toplevel 2>$null).Trim()
-    Pop-Location
+    $env:AI_INSTALL_TARGET_WINDOWS = "1"
+    & $Bash "--noprofile" "--norc" $InstallScript $Action $TargetUnix
+    $Code = $LASTEXITCODE
 }
-catch {
-    Pop-Location
-    Write-Error "install-into failed: target is not inside a git repository: $TargetRoot"
-    exit 2
-}
-if (-not $gitTop -or (Resolve-Path $gitTop).Path -ne $TargetRoot) {
-    Write-Error "install-into failed: pass the git repository root"
-    exit 2
-}
-
-function Get-ManagedFiles {
-    Push-Location $SourceRoot
-    try {
-        $tracked = @()
-        cmd /c "git rev-parse --show-toplevel >NUL 2>NUL"
-        if ($LASTEXITCODE -eq 0) {
-            $tracked = git ls-files --cached --others --exclude-standard `
-                -- .ai .githooks .claude/commands .codex/prompts .agents/skills `
-                scripts/env-check.sh scripts/preflight.sh 2>$null
-        } else {
-            $roots = @(".ai", ".githooks", ".claude/commands", ".codex/prompts", ".agents/skills")
-            foreach ($root in $roots) {
-                if (Test-Path $root) {
-                    $tracked += Get-ChildItem -Recurse -File $root | ForEach-Object {
-                        $_.FullName.Substring($SourceRoot.Length).TrimStart("\", "/").Replace("\", "/")
-                    }
-                }
-            }
-            foreach ($path in @("scripts/env-check.sh", "scripts/preflight.sh")) {
-                if (Test-Path $path) { $tracked += $path }
-            }
-        }
-        return $tracked | Where-Object {
-            $_ -and
-            -not $_.StartsWith(".ai/runtime/.venv") -and
-            (Test-Path -LiteralPath (Join-Path $SourceRoot $_) -PathType Leaf)
-        }
-    }
-    finally {
-        Pop-Location
-    }
-}
-
-function Copy-ManagedFile {
-    param([string]$RelPath)
-    $src = Join-Path $SourceRoot $RelPath
-    $dst = Join-Path $TargetRoot $RelPath
-    if (-not (Test-Path $src)) { return }
-    $dstDir = Split-Path $dst -Parent
-    if (-not (Test-Path $dstDir)) {
-        New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-    }
-    Copy-Item -Force -LiteralPath $src -Destination $dst
-}
-
-function Invoke-Python {
-    param([string]$Script, [string]$Argument)
-    $scriptFile = New-TemporaryFile
-    $scriptPath = [System.IO.Path]::ChangeExtension($scriptFile.FullName, ".py")
-    Move-Item -Force -LiteralPath $scriptFile.FullName -Destination $scriptPath
-    Set-Content -LiteralPath $scriptPath -Value $Script -Encoding UTF8
-    try {
-        $uv = Get-Command uv -ErrorAction SilentlyContinue
-        if ($uv) {
-            & $uv.Path "run" "--project" (Join-Path $SourceRoot ".ai/runtime") "python" $scriptPath $Argument
-            return
-        }
-        foreach ($name in @("python", "python3")) {
-            $py = Get-Command $name -ErrorAction SilentlyContinue
-            if (-not $py) { continue }
-            & $py.Path -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" *> $null
-            if ($LASTEXITCODE -eq 0) {
-                & $py.Path $scriptPath $Argument
-                return
-            }
-        }
-        Write-Error "install-into failed: uv unavailable and no real Python 3.11+ interpreter found"
-        exit 2
-    }
-    finally {
-        Remove-Item -Force -LiteralPath $scriptPath -ErrorAction SilentlyContinue
-    }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "install-into failed: python merge script returned $LASTEXITCODE"
-        exit $LASTEXITCODE
-    }
-}
-
-function Merge-McpJson {
-    $dst = Join-Path $TargetRoot ".mcp.json"
-    $py = @'
-import json, sys
-from pathlib import Path
-dst = Path(sys.argv[1])
-managed = {"mcpServers": {"code-brain": {"command": "powershell", "args": ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"]}}}
-existing = {}
-if dst.exists():
-    try:
-        existing = json.loads(dst.read_text(encoding="utf-8"))
-    except Exception:
-        existing = {}
-if not isinstance(existing, dict):
-    existing = {}
-servers = existing.setdefault("mcpServers", {})
-servers["code-brain"] = managed["mcpServers"]["code-brain"]
-dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(existing, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-'@
-    Invoke-Python -Script $py -Argument $dst
-}
-
-function Merge-CodexConfig {
-    $dst = Join-Path $TargetRoot ".codex/config.toml"
-    $py = @'
-import sys
-from pathlib import Path
-dst = Path(sys.argv[1])
-block = ('[mcp_servers.code-brain]\n'
-         'command = "powershell"\n'
-         'args = ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"]\n'
-         'env = { AI_CODE_BRAIN_PROFILE = "usage", AI_MCP_COMPACT_TOOLS = "1" }\n')
-text = dst.read_text(encoding="utf-8") if dst.exists() else ""
-def strip_section(t, header):
-    lines = t.splitlines(); out = []; i = 0
-    while i < len(lines):
-        if lines[i].strip() == header:
-            i += 1
-            while i < len(lines):
-                nxt = lines[i].lstrip()
-                if nxt.startswith("[") and not nxt.startswith("[]"):
-                    break
-                i += 1
-            while out and out[-1].strip() == "":
-                out.pop()
-            continue
-        out.append(lines[i]); i += 1
-    return "\n".join(out)
-cleaned = strip_section(text, "[mcp_servers.code-brain]").rstrip()
-cleaned = "\n".join(l for l in cleaned.splitlines() if l.strip() != "[]").rstrip()
-new_text = cleaned + "\n\n" + block if cleaned else block
-def ensure_features(t):
-    lines = t.splitlines(); out = []; i = 0; found = False
-    while i < len(lines):
-        if lines[i].strip() == "[features]":
-            found = True; out.append(lines[i]); i += 1
-            section = []
-            while i < len(lines):
-                if lines[i].lstrip().startswith("[") and not lines[i].lstrip().startswith("[]"):
-                    break
-                section.append(lines[i]); i += 1
-            section = [sl for sl in section if not (sl.strip().startswith("codex_hooks") and "=" in sl)]
-            replaced = False
-            for j, sl in enumerate(section):
-                if sl.strip().startswith("hooks") and "=" in sl:
-                    section[j] = "hooks = true"; replaced = True; break
-            if not replaced:
-                while section and section[-1].strip() == "": section.pop()
-                section.append("hooks = true")
-            out.extend(section); continue
-        out.append(lines[i]); i += 1
-    if not found:
-        joined = "\n".join(out).rstrip()
-        return (joined + "\n\n[features]\nhooks = true\n") if joined else "[features]\nhooks = true\n"
-    return "\n".join(out).rstrip() + "\n"
-new_text = ensure_features(new_text)
-without_managed = strip_section(new_text, "[mcp_servers.code-brain]").rstrip()
-new_text = without_managed + "\n\n" + block if without_managed else block
-dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(new_text, encoding="utf-8")
-'@
-    Invoke-Python -Script $py -Argument $dst
-}
-
-function Merge-ClaudeSettings {
-    $dst = Join-Path $TargetRoot ".claude/settings.json"
-    $py = @'
-import json, sys
-from pathlib import Path
-dst = Path(sys.argv[1])
-hooks_dir = "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook"
-events = ["PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop", "SubagentStop",
-          "PreCompact", "SessionEnd", "Notification", "PostCompact", "CwdChanged", "ConfigChange",
-          "PermissionDenied", "InstructionsLoaded"]
-matchers = {"PreToolUse": "Bash", "PostToolUse": "Edit|Write|MultiEdit|NotebookEdit", "SessionStart": "startup|resume|clear|compact"}
-managed = {}
-for ev in events:
-    entry = {"hooks": [{"type": "command", "command": f"{hooks_dir} {ev}"}]}
-    if ev in matchers:
-        entry["matcher"] = matchers[ev]
-    managed[ev] = [entry]
-payload = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
-if not isinstance(payload, dict):
-    raise SystemExit("settings.json is not an object")
-hooks = payload.setdefault("hooks", {})
-def strip(entries):
-    out = []
-    for e in entries or []:
-        if not isinstance(e, dict): out.append(e); continue
-        new_h = [h for h in e.get("hooks", []) or [] if not (isinstance(h, dict) and ".ai/bin/ai-hook" in str(h.get("command", "")))]
-        if new_h:
-            ne = dict(e); ne["hooks"] = new_h; out.append(ne)
-        elif "hooks" not in e:
-            out.append(e)
-    return out
-for name, entries in managed.items():
-    existing = hooks.get(name) if isinstance(hooks.get(name), list) else []
-    hooks[name] = strip(existing) + entries
-dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-'@
-    Invoke-Python -Script $py -Argument $dst
-}
-
-function Merge-CodexHooksJson {
-    $dst = Join-Path $TargetRoot ".codex/hooks.json"
-    $py = @'
-import json, sys
-from pathlib import Path
-dst = Path(sys.argv[1])
-def cb(ev, status):
-    return {"type": "command", "command": f'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" {ev}', "statusMessage": status}
-managed = {
-    "PreToolUse": [{"matcher": "Bash", "hooks": [cb("PreToolUse", "Checking Code Brain command routing")]}],
-    "PostToolUse": [{"matcher": "Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep", "hooks": [cb("PostToolUse", "Recording Code Brain tool result")]}],
-    "SessionStart": [{"matcher": "startup|resume|clear|compact", "hooks": [cb("SessionStart", "Loading Code Brain session context")]}],
-    "UserPromptSubmit": [{"hooks": [cb("UserPromptSubmit", "Loading Code Brain prompt context")]}],
-    "Stop": [{"hooks": [cb("Stop", "Recording Code Brain stop event")]}],
-    "SubagentStop": [{"hooks": [cb("SubagentStop", "Recording Code Brain subagent stop")]}],
-    "PreCompact": [{"hooks": [cb("PreCompact", "Saving Code Brain compact snapshot")]}],
-    "PostCompact": [{"hooks": [cb("PostCompact", "Recording Code Brain compact completion")]}],
-    "PermissionRequest": [{"matcher": "Bash", "hooks": [cb("PermissionRequest", "Checking Code Brain approval policy")]}],
-}
-existing_payload = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
-if not isinstance(existing_payload, dict):
-    raise SystemExit("hooks.json is not an object")
-existing_hooks = existing_payload.get("hooks", {})
-if not isinstance(existing_hooks, dict):
-    raise SystemExit("hooks.json .hooks must be an object")
-# Codex's hooks parser accepts ONLY a top-level `hooks` key; a `_note` annotation makes it
-# reject the file. Rebuild with hooks only, dropping any stale top-level keys.
-payload = {"hooks": existing_hooks}
-hooks = payload["hooks"]
-def has_cb(v):
-    if not isinstance(v, dict):
-        return False
-    if ".ai/bin/ai-hook" in str(v.get("command", "")):
-        return True
-    return any(isinstance(h, dict) and ".ai/bin/ai-hook" in str(h.get("command", "")) for h in v.get("hooks", []) or [])
-for name, entries in managed.items():
-    existing = hooks.get(name)
-    kept = [e for e in existing if not has_cb(e)] if isinstance(existing, list) else []
-    hooks[name] = kept + entries
-dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-'@
-    Invoke-Python -Script $py -Argument $dst
-}
-
-function Write-InstallManifest {
-    $dst = Join-Path $TargetRoot ".ai/generated/install-manifest.json"
-    $sourceSha = ""
-    $sourceRepoUrl = $env:CODE_BRAIN_REPO_URL
-    $sourceRef = $env:CODE_BRAIN_REF
-    Push-Location $SourceRoot
-    try {
-        cmd /c "git rev-parse --is-inside-work-tree >NUL 2>NUL"
-        if ($LASTEXITCODE -eq 0) {
-            $sourceSha = (git rev-parse HEAD 2>$null).Trim()
-            if (-not $sourceRepoUrl) { $sourceRepoUrl = (git config --get remote.origin.url 2>$null).Trim() }
-            if (-not $sourceRef) { $sourceRef = (git rev-parse --abbrev-ref HEAD 2>$null).Trim() }
-        }
-    } catch {}
-    Pop-Location
-    $files = Get-ManagedFiles
-    $project = Split-Path $TargetRoot -Leaf
-    $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $manifest = @{
-        files                = $files
-        installed_at         = $now
-        merged_config_files  = @(".mcp.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json")
-        project              = $project
-        schema_version       = 2
-        source_git_sha       = $sourceSha
-        source_ref           = $sourceRef
-        source_repo_url      = $sourceRepoUrl
-        tool                 = "code-brain"
-        upgrade_channel      = $(if ($sourceRepoUrl) { "github" } else { "local" })
-        upgrade_command      = ".ai/bin/ai upgrade latest --json"
-    }
-    $json = $manifest | ConvertTo-Json -Depth 6
-    $dstDir = Split-Path $dst -Parent
-    if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
-    Set-Content -LiteralPath $dst -Value $json -Encoding UTF8
-}
-
-function Get-AgentContractContent {
-    $source = Join-Path $SourceRoot ".ai/AGENTS.md"
-    if (Test-Path $source) {
-        $text = Get-Content -LiteralPath $source -Raw
-        if ($text.EndsWith("`n")) { return $text }
-        return $text + "`n"
-    }
-    return "# Code Brain Agent Contract`n`nRepo-local agent contract missing: ``.ai/AGENTS.md``.`n"
-}
-
-function Test-CodeBrainAgentStub {
-    param([string] $Path, [string] $Line)
-    if (-not (Test-Path $Path)) { return $false }
-    $existing = Get-Content -LiteralPath $Path -Raw
-    return $existing.Contains($Line)
-}
-
-function Seed-RootAgentFile {
-    param([string] $FileName)
-    $dst = Join-Path $TargetRoot $FileName
-    $write = $false
-    if (-not (Test-Path $dst)) {
-        $write = $true
-    }
-    elseif ($FileName -eq "AGENTS.md" -and (Test-CodeBrainAgentStub -Path $dst -Line "Canonical agent instructions live in `.ai/AGENTS.md`.")) {
-        $write = $true
-    }
-    elseif ($FileName -eq "CLAUDE.md" -and (
-        (Test-CodeBrainAgentStub -Path $dst -Line "Canonical Claude instructions live in `.ai/AGENTS.md`.") -or
-        (Test-CodeBrainAgentStub -Path $dst -Line "Full repo-local contract: `.ai/AGENTS.md`.")
-    )) {
-        $write = $true
-    }
-    if ($write) {
-        Set-Content -LiteralPath $dst -Value (Get-AgentContractContent) -Encoding UTF8
-    }
-}
-
-function Ensure-PersistentScaffold {
-    $dirs = @(
-        ".ai/generated",
-        ".ai/memory/audit",
-        ".ai/memory/queue/.tmp",
-        ".ai/memory/queue/processing",
-        ".ai/memory/queue/dead"
-    )
-    foreach ($dir in $dirs) {
-        $path = Join-Path $TargetRoot $dir
-        if (-not (Test-Path $path)) { New-Item -ItemType Directory -Force -Path $path | Out-Null }
-    }
-    foreach ($file in @(
-        ".ai/memory/audit-index.jsonl",
-        ".ai/memory/queue/.tmp/.gitkeep",
-        ".ai/memory/queue/processing/.gitkeep",
-        ".ai/memory/queue/dead/.gitkeep"
-    )) {
-        $path = Join-Path $TargetRoot $file
-        if (-not (Test-Path $path)) { New-Item -ItemType File -Force -Path $path | Out-Null }
-    }
-}
-
-function Invoke-Bootstrap {
-    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
-        return
-    }
-    Push-Location $TargetRoot
-    try {
-        $bootstrap = Join-Path $TargetRoot "bootstrap-code-brain.sh"
-        if (-not (Test-Path $bootstrap)) {
-            # Fallback: copy bootstrap.sh wrapper if absent
-            $src = Join-Path $SourceRoot "bootstrap.sh"
-            if (Test-Path $src) { Copy-Item -Force -LiteralPath $src -Destination $bootstrap }
-        }
-        # Bootstrap script invokes uv sync; re-run via bash if available, else skip silently.
-        if (Get-Command bash -ErrorAction SilentlyContinue) {
-            bash $bootstrap | Out-Null
-        }
-        else {
-            Write-Warning "bash not found; skipping bootstrap-code-brain.sh. Run manually if needed."
-        }
-    }
-    finally {
-        Pop-Location
-    }
-}
-
-function Install-OrUpgrade {
-    foreach ($rel in Get-ManagedFiles) {
-        Copy-ManagedFile -RelPath $rel
-    }
-    Merge-McpJson
-    Merge-CodexConfig
-    Merge-ClaudeSettings
-    Merge-CodexHooksJson
-    Ensure-PersistentScaffold
-    Seed-RootAgentFile -FileName "AGENTS.md"
-    Seed-RootAgentFile -FileName "CLAUDE.md"
-    Write-InstallManifest
-    if ($env:AI_INSTALL_DEFER_RUNTIME -match '^(1|true|yes|on)$') {
-        Write-Host "install-into: runtime activation deferred; run bootstrap-code-brain.sh and session start in the target"
+finally {
+    if ($null -eq $PreviousTargetWindows) {
+        Remove-Item Env:AI_INSTALL_TARGET_WINDOWS -ErrorAction SilentlyContinue
     }
     else {
-        Invoke-Bootstrap
+        $env:AI_INSTALL_TARGET_WINDOWS = $PreviousTargetWindows
     }
-    Write-Host "code-brain $Action`: $TargetRoot"
 }
 
-function Uninstall {
-    # Uninstall reverses managed file copy. We rely on manifest's `files` list.
-    $manifest = Join-Path $TargetRoot ".ai/generated/install-manifest.json"
-    if (-not (Test-Path $manifest)) {
-        Write-Error "uninstall failed: no manifest at $manifest"
-        exit 2
-    }
-    $data = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-    foreach ($rel in $data.files) {
-        $path = Join-Path $TargetRoot $rel
-        if (Test-Path $path) { Remove-Item -Force -LiteralPath $path }
-    }
-    Write-Host "code-brain uninstalled: $TargetRoot"
-}
-
-switch ($Action) {
-    "install"   { Install-OrUpgrade }
-    "upgrade"   { Install-OrUpgrade }
-    "uninstall" { Uninstall }
-    default     { Install-OrUpgrade }
-}
-exit 0
+exit $Code

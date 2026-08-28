@@ -90,6 +90,7 @@ SKIP_DIRS = {
     ".pytest_cache",
     "cache",
     "node_modules",
+    "target",
     "site-packages",
     "vendor",
     ".next",
@@ -366,6 +367,7 @@ def init_schema(conn: sqlite3.Connection, *, migrate_legacy: bool = False) -> No
         "embeddings_vec0",
         "code_symbols",
         "code_calls",
+        "chunks_path_idx",
         "embeddings_vec0_model_idx",
         "code_symbols_path_idx",
         "code_symbols_qualname_idx",
@@ -425,6 +427,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
           summary text not null,
           updated_at text default current_timestamp
         );
+        create index if not exists chunks_path_idx on chunks(path);
         create virtual table if not exists chunks_fts using fts5(path, content, content='', contentless_delete=1, tokenize="porter unicode61 remove_diacritics 2");
         create table if not exists chunk_meta (
           chunk_id integer primary key,
@@ -601,8 +604,22 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
         changed = 0
         added = 0
         unchanged = 0
+        # Rows that still parse as indexable text on disk but that git no longer
+        # reports as candidates. They are retired below instead of being
+        # re-affirmed, which is what lets a polluted index converge.
+        retire: set[str] = set()
+        if paths is not None:
+            stale_targets = {
+                rel
+                for rel in paths
+                if rel in existing and _is_indexable_text_file(root, root / rel)
+            }
+            if stale_targets:
+                git_candidates = _git_candidate_rels(root)
+                if git_candidates is not None:
+                    retire = stale_targets - git_candidates
         candidate_paths = (
-            _target_text_files(root, paths)
+            _target_text_files(root, paths - retire)
             if paths is not None
             else (
                 (path.relative_to(root).as_posix(), path)
@@ -678,7 +695,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             if existing_pair is None or rel in seen:
                 continue
             cid, _digest = existing_pair
-            if paths is not None:
+            if paths is not None and rel not in retire:
                 target = root / rel
                 if _is_indexable_text_file(root, target):
                     continue
@@ -952,7 +969,8 @@ def _insert_function_chunks_for_python(
 def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text: str, abs_path: Path) -> None:
     """Insert function/class symbols + call edges for Python and multi-language source files.
 
-    Default ON (AI_SEARCH_CODEGRAPH=1). Supports Python, JS, TS, Go, Rust via ast-grep.
+    Default ON (AI_SEARCH_CODEGRAPH=1). Python uses the stdlib ast module; JS, TS, Go,
+    Rust, Kotlin, and Dart use the optional ast-grep binary and yield nothing when absent.
     Skips unsupported files and any file the AST parser rejects (best-effort indexer behavior).
     """
     if not _codegraph_enabled():
@@ -1003,6 +1021,22 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
             extract_calls_func = extract_calls_rs
         except Exception:
             return
+    elif rel.endswith((".kt", ".kts")):
+        lang = "kotlin"
+        try:
+            from .astgrep_integration import extract_symbols_kt, extract_calls_kt
+            extract_symbols_func = extract_symbols_kt
+            extract_calls_func = extract_calls_kt
+        except Exception:
+            return
+    elif rel.endswith(".dart"):
+        lang = "dart"
+        try:
+            from .astgrep_integration import extract_symbols_dart, extract_calls_dart
+            extract_symbols_func = extract_symbols_dart
+            extract_calls_func = extract_calls_dart
+        except Exception:
+            return
     else:
         # Unsupported language
         return
@@ -1039,10 +1073,31 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
                         (rel, s.get("qualname"), s.get("kind"), s.get("lineno"), s.get("end_lineno"), lang),
                     )
                 calls = extract_calls_func(str(trusted_path))
+                # Attribute each call to the innermost enclosing declaration.
+                # Previously every non-Python caller was hardcoded "<module>",
+                # which made code_graph_callers useless for those languages:
+                # it could say a callee is called but never by which function.
+                # The Python extractor already records real caller names, so
+                # this brings ast-grep languages to the same contract.
+                caller_spans = sorted(
+                    (
+                        (int(sym["lineno"]), int(sym["end_lineno"]), str(sym["qualname"]))
+                        for sym in syms
+                        if sym.get("lineno") and sym.get("end_lineno") and sym.get("qualname")
+                    ),
+                    # Narrowest span last so the innermost enclosing wins.
+                    key=lambda item: (item[1] - item[0]),
+                    reverse=True,
+                )
                 for c in calls:
+                    call_line = c.get("lineno") or 0
+                    caller = "<module>"
+                    for start_line, end_line, qualname in caller_spans:
+                        if start_line <= call_line <= end_line:
+                            caller = qualname
                     conn.execute(
                         "insert into code_calls(path, caller, callee, lineno, lang) values (?, ?, ?, ?, ?)",
-                        (rel, "<module>", c.get("callee"), c.get("lineno"), lang),
+                        (rel, caller, c.get("callee"), c.get("lineno"), lang),
                     )
     except Exception:
         # Indexer must continue even if one file misbehaves.
@@ -2393,7 +2448,14 @@ def _auto_refresh_if_stale(root: Path) -> dict[str, Any]:
         return {"enabled": False, "rebuilt": False, "reason": "ci_read_only"}
     dirty_paths = _git_dirty_paths(root)
     if dirty_paths:
-        dirty_status = index_hash_status(root, paths=dirty_paths)
+        dirty_status = (
+            index_hash_status(
+                root,
+                paths=dirty_paths,
+                use_metadata=True,
+                refresh_metadata=True,
+            )
+        )
         if dirty_status.get("reason") == "legacy_schema":
             # Structural pre-v2 index: NEVER migrated from a read path (-012).
             # Without this skip a stale-looking worktree rebuilt (= migrated)
@@ -2616,14 +2678,16 @@ def _git_dirty_paths(root: Path) -> set[str]:
         item = parts[idx]
         status = item[:2]
         rel = item[3:] if len(item) > 3 else ""
-        if rel:
+        # Deletions and the old side of rename/copy records are retired by the
+        # authoritative full pass below. A staged deletion may have an ignored
+        # working-tree copy; treating that copy as dirty source resurrects it on
+        # every query and causes an add/remove generation loop.
+        if rel and "D" not in status:
             paths.add(rel)
         if status.startswith(("R", "C")) or len(status) > 1 and status[1] in {"R", "C"}:
+            # The following NUL field is the old path, never a current dirty
+            # candidate. The full candidate comparison retires it.
             idx += 1
-            if idx < len(parts):
-                old_rel = parts[idx]
-                if old_rel:
-                    paths.add(old_rel)
         idx += 1
     return paths
 
@@ -3073,16 +3137,21 @@ def _filesystem_candidate_files(
     return sorted(found)
 
 
-def candidate_files(
-    root: Path,
-    *,
-    use_cache: bool = True,
-    update_cache: bool = True,
-) -> list[Path]:
-    if use_cache:
-        cached = _candidate_cache_load(root)
-        if cached is not None:
-            return cached
+def _git_candidate_rels(root: Path) -> set[str] | None:
+    """Authoritative git-visible candidate paths, or ``None`` when git cannot answer.
+
+    ``candidate_files`` treats ``git ls-files`` as the source of truth for what
+    belongs in the index, but ``_filesystem_candidate_files`` (its fallback) and
+    ``_is_indexable_text_file`` do not consult gitignore. A path that git stops
+    reporting -- a directory that became ignored, or a leftover linked-worktree
+    copy picked up by an earlier fallback scan -- therefore stays in the index
+    while being unreachable from discovery. ``index_hash_status`` then reports it
+    as changed on every query, the targeted rebuild re-affirms it as unchanged,
+    and the pair never converges.
+
+    Returning ``None`` means "git could not answer authoritatively"; callers must
+    not retire any row in that case.
+    """
     rels = _run_process_lines_bounded(
         ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=root,
@@ -3098,8 +3167,24 @@ def candidate_files(
         or len(rels) > GIT_CANDIDATE_MAX_PATHS
         or any("\ufffd" in rel for rel in rels)
     ):
+        return None
+    return {rel for rel in rels if _candidate_rel_allowed(rel, root)}
+
+
+def candidate_files(
+    root: Path,
+    *,
+    use_cache: bool = True,
+    update_cache: bool = True,
+) -> list[Path]:
+    if use_cache:
+        cached = _candidate_cache_load(root)
+        if cached is not None:
+            return cached
+    git_rels = _git_candidate_rels(root)
+    if git_rels is None:
         return _filesystem_candidate_files(root)
-    rels = [rel for rel in rels if _candidate_rel_allowed(rel, root)]
+    rels = list(git_rels)
     if update_cache and not is_ci():
         _candidate_cache_write(root, rels)
     return sorted(root / rel for rel in rels)

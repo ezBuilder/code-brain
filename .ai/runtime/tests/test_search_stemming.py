@@ -56,6 +56,22 @@ def test_schema_version_is_eleven(tmp_path: Path) -> None:
     assert version == 11
 
 
+def test_chunks_path_join_has_supporting_index(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "doc.md", "hello world\n")
+    rebuild(repo)
+
+    with connect(repo) as conn:
+        chunk_count = int(conn.execute("select count(*) from chunks").fetchone()[0])
+        conn.execute("drop index chunks_path_idx")
+        init_schema(conn)
+        indexes = {str(row[1]) for row in conn.execute("pragma index_list('chunks')").fetchall()}
+        chunk_count_after = int(conn.execute("select count(*) from chunks").fetchone()[0])
+
+    assert "chunks_path_idx" in indexes
+    assert chunk_count_after == chunk_count
+
+
 def test_porter_stemming_matches_inflected_forms(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _write(repo, "doc.md", "indexing\n")

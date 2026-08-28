@@ -80,6 +80,25 @@ def test_auto_refresh_does_not_rebuild_for_mtime_only_drift(
     assert result == {"enabled": True, "rebuilt": False, "reason": "current"}
 
 
+def test_auto_refresh_uses_metadata_for_large_unchanged_dirty_sets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_repo(tmp_path)
+    source = _write(repo, "src/main.py", "VALUE = 1\n")
+    rebuild(repo)
+    monkeypatch.setattr(search_mod, "_git_dirty_paths", lambda _root: {"src/main.py"})
+
+    def unexpected_redaction(_value):
+        raise AssertionError("unchanged dirty metadata must avoid hashing file content")
+
+    monkeypatch.setattr(search_mod, "redact_value", unexpected_redaction)
+    result = search_mod._auto_refresh_if_stale(repo)
+
+    assert source.is_file()
+    assert result == {"enabled": True, "rebuilt": False, "reason": "current"}
+
+
 def test_git_dirty_paths_ignores_untracked_files_but_keeps_tracked_drift(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     tracked = _write(repo, "src/tracked.py", "VALUE = 1\n")
@@ -428,6 +447,7 @@ def test_filesystem_candidate_fallback_prunes_skipped_and_linked_directories(
     repo = _make_repo(tmp_path)
     source = _write(repo, "src/main.py", "VALUE = 1\n")
     skipped = _write(repo, "node_modules/pkg/hidden.py", "HIDDEN = True\n")
+    rust_artifact = _write(repo, "target/debug/build/generated.rs", "HIDDEN = True\n")
     external = tmp_path / "external-source"
     external.mkdir()
     external_file = external / "outside.py"
@@ -439,8 +459,18 @@ def test_filesystem_candidate_fallback_prunes_skipped_and_linked_directories(
 
     assert source in paths
     assert skipped not in paths
+    assert rust_artifact not in paths
     assert linked / "outside.py" not in paths
     assert external_file not in paths
+
+
+def test_candidate_cache_tree_state_prunes_rust_target(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _write(repo, "target/debug/build/generated.txt", "artifact\n")
+
+    directories, _ignore_files = search_mod._candidate_cache_tree_state(repo)
+
+    assert all(rel != "target" and not rel.startswith("target/") for rel in directories)
 
 
 def test_filesystem_candidate_fallback_respects_visit_and_result_caps(

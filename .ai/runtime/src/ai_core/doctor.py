@@ -90,9 +90,11 @@ def run_checks(
         check_queue_age(root),
         diagnostics_check,
         check_skills_catalog(root),
+        check_completion_guard(root),
         check_precall_rules(root),
         check_antigravity_artifacts(root),
         check_lsp_available(root),
+        check_codegraph_coverage(root),
         check_pilots(root),
     ]
     return checks
@@ -258,6 +260,112 @@ def check_lsp_available(root: Path) -> Check:
     return Check("lsp_available", True, f"optional, inactive: {info.get('reason', 'unknown')}")
 
 
+def check_codegraph_coverage(root: Path) -> Check:
+    """INFO-only probe for graph-layer (code_symbols/code_calls) language coverage.
+
+    NEVER fails the gate. Its purpose is to make an otherwise SILENT no-op visible:
+    multi-language symbol/call extraction (JS/TS/Go/Rust) requires the optional
+    ``ast-grep`` binary on PATH. When it is absent the indexer's extractors return
+    ``[]`` without error, so ``code_graph_*`` tools and PageRank-personalised
+    ranking degrade to empty results while every existing doctor check stays green.
+    Python extraction uses the stdlib ``ast`` module and always works.
+    """
+    # AI_ASTGREP_DISABLE short-circuits every extractor, so treat it as "absent"
+    # rather than reporting a present binary that cannot possibly have run.
+    astgrep_disabled = os.environ.get("AI_ASTGREP_DISABLE") == "1"
+    try:
+        from .astgrep_integration import astgrep_available
+        has_astgrep = astgrep_available() and not astgrep_disabled
+    except Exception:
+        has_astgrep = False
+
+    db = root / ".ai" / "cache" / "code.sqlite"
+    if not db.exists():
+        state = (
+            "ast-grep present"
+            if has_astgrep
+            else "ast-grep disabled via AI_ASTGREP_DISABLE (Python-only graph)"
+            if astgrep_disabled
+            else "ast-grep absent (Python-only graph)"
+        )
+        return Check("codegraph_coverage", True, f"not indexed; {state}")
+
+    # ast-grep-dependent source extensions, by indexer language mapping.
+    astgrep_exts = {
+        ".js": "javascript", ".jsx": "javascript",
+        ".ts": "typescript", ".tsx": "typescript",
+        ".go": "go", ".rs": "rust",
+        ".kt": "kotlin", ".kts": "kotlin",
+        ".dart": "dart",
+    }
+
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return Check("codegraph_coverage", True, f"probe skipped: {exc}")
+    try:
+        try:
+            rows = conn.execute("select path from chunks where kind = 'file'").fetchall()
+        except sqlite3.Error:
+            try:
+                rows = conn.execute("select distinct path from chunks").fetchall()
+            except sqlite3.Error as exc:
+                return Check("codegraph_coverage", True, f"probe skipped: {exc}")
+        try:
+            symbol_langs = {
+                str(lang) for (lang,) in conn.execute("select distinct lang from code_symbols")
+            }
+        except sqlite3.Error:
+            symbol_langs = set()
+        # A file can legitimately declare no NAMED function while still containing
+        # calls (an eslint config of object literals, a tracking script that is one
+        # anonymous IIFE). Both were observed in real consumer repos. Call edges
+        # prove extraction ran, so treat them as evidence of coverage too;
+        # otherwise the probe reports a defect where the source simply has
+        # nothing to name.
+        try:
+            call_langs = {
+                str(lang) for (lang,) in conn.execute("select distinct lang from code_calls")
+            }
+        except sqlite3.Error:
+            call_langs = set()
+    finally:
+        conn.close()
+
+    affected: dict[str, int] = {}
+    for (raw_path,) in rows:
+        rel = str(raw_path or "")
+        for ext, lang in astgrep_exts.items():
+            if rel.endswith(ext):
+                affected[lang] = affected.get(lang, 0) + 1
+                break
+
+    extracted_langs = symbol_langs | call_langs
+    missing = sorted(lang for lang in affected if lang not in extracted_langs)
+    binary_state = (
+        "ast-grep present"
+        if has_astgrep
+        else "ast-grep disabled via AI_ASTGREP_DISABLE"
+        if astgrep_disabled
+        else "ast-grep absent"
+    )
+    if not affected:
+        return Check("codegraph_coverage", True, f"ok python-only workspace; {binary_state}")
+    if not missing:
+        summary = ", ".join(f"{lang}={affected[lang]}" for lang in sorted(affected))
+        return Check("codegraph_coverage", True, f"ok covered={summary}; {binary_state}")
+
+    gap = ", ".join(f"{lang}:{affected[lang]} files" for lang in missing)
+    if astgrep_disabled:
+        hint = "unset AI_ASTGREP_DISABLE then run ai index rebuild"
+    elif not has_astgrep:
+        hint = "install ast-grep (brew install ast-grep | cargo install ast-grep) then run ai index rebuild"
+    else:
+        hint = "ast-grep is installed but produced no symbols; run ai index rebuild"
+    detail = f"optional, degraded: no graph symbols for {gap}; {hint}"
+    return Check("codegraph_coverage", True, str(redact_value(detail)))
+
+
 def check_antigravity_artifacts(root: Path) -> Check:
     """Verify the workspace's Antigravity wiring is internally consistent.
 
@@ -284,11 +392,11 @@ def check_antigravity_artifacts(root: Path) -> Check:
         try:
             import json as _json
             payload = _json.loads(hooks.read_text(encoding="utf-8"))
-            # Antigravity 1.0.x schema: top-level {name: spec}; spec carries the
+            # Antigravity 2.0 / CLI 1.1.x schema: top-level {name: spec}; spec carries the
             # native events. NOT the Claude {"hooks": {...}} wrapper (Antigravity
             # cannot parse that — it errors "string into jsonhook.JSONHookSpec").
-            # Antigravity has no SessionStart/UserPromptSubmit; injection for agy is
-            # delivered via the managed AGENTS.md block, not these hooks.
+            # Antigravity has no SessionStart/UserPromptSubmit; PreInvocation supplies the
+            # request-start baseline while prompt injection still comes from AGENTS.md.
             if not isinstance(payload, dict):
                 issues.append("hooks.json is not a JSON object")
             elif "hooks" in payload or "_note" in payload:
@@ -298,18 +406,145 @@ def check_antigravity_artifacts(root: Path) -> Check:
                 if not isinstance(spec, dict):
                     issues.append("hooks.json missing code-brain entry")
                 else:
-                    # PreToolUse is intentionally omitted for Antigravity (its jsonhook contract
-                    # is deny-by-default and would block every agy tool call); only the working
-                    # side-effect events are required.
-                    for required in ("PostToolUse", "Stop"):
-                        ev = spec.get(required)
-                        if not isinstance(ev, list) or not ev:
-                            issues.append(f"hooks.json code-brain missing event {required}")
+                    post = spec.get("PostToolUse")
+                    if not isinstance(post, list) or not post:
+                        issues.append("hooks.json code-brain missing event PostToolUse")
+                    pre = spec.get("PreInvocation")
+                    if not isinstance(pre, list) or not pre:
+                        issues.append("hooks.json code-brain missing event PreInvocation")
+                    elif any(
+                        not isinstance(handler, dict)
+                        or handler.get("type", "command") != "command"
+                        or ".ai/bin/ai-hook" not in str(handler.get("command") or "")
+                        or "PreInvocation" not in str(handler.get("command") or "")
+                        or "matcher" in handler
+                        or "hooks" in handler
+                        for handler in pre
+                    ):
+                        issues.append("hooks.json code-brain PreInvocation must use direct handlers")
+                    stop = spec.get("Stop")
+                    if not isinstance(stop, list) or not stop:
+                        issues.append("hooks.json code-brain missing event Stop")
+                    elif any(
+                        not isinstance(handler, dict)
+                        or handler.get("type", "command") != "command"
+                        or ".ai/bin/ai-hook" not in str(handler.get("command") or "")
+                        or "matcher" in handler
+                        or "hooks" in handler
+                        for handler in stop
+                    ):
+                        # Stop uses a DIRECT handler list. A matcher-group is Claude-shaped
+                        # and Antigravity ignores/rejects it, silently killing continuation.
+                        issues.append("hooks.json code-brain Stop must use direct handlers")
         except Exception as exc:
             issues.append(f"hooks.json unreadable: {exc}")
     if issues:
         return Check("antigravity_artifacts", False, "; ".join(issues[:5]))
     return Check("antigravity_artifacts", True, "ok")
+
+
+def check_completion_guard(root: Path) -> Check:
+    """Prove the premature-stop guard is wired end to end, not merely present on disk.
+
+    This check exists because the PREVIOUS guard (`loop_continuation`) passed every doctor
+    check while being completely dead: its `AI_LOOP_CONTINUATION` flag lived only in the
+    source kit and the installer merged `hooks` without `env`, so consumers had the Stop hook
+    registered and the flag absent. Nothing surfaced that. A guard that cannot be observed is
+    a guard nobody can trust, so liveness is asserted here on three axes:
+
+      1. the module imports, exposes its activity observer, and the kill switch is not engaged;
+      2. `detect()` runs against the real tree without raising (the signal probes touch git);
+      3. PostToolUse plus the Stop-like events the guard rides on are registered for each host
+         config present in this workspace.
+
+    Reporting only — the guard's own decisions are never made here.
+    """
+    import json as _json
+
+    notes: list[str] = []
+    issues: list[str] = []
+    try:
+        from . import completion_guard
+    except Exception as exc:
+        return Check("completion_guard", False, f"module unavailable: {exc}")
+
+    enabled = completion_guard._enabled()
+    notes.append("enabled" if enabled else "disabled via AI_COMPLETION_GUARD")
+    if not enabled:
+        issues.append("disabled via AI_COMPLETION_GUARD")
+    if not callable(getattr(completion_guard, "observe_tool_event", None)):
+        issues.append("PostToolUse activity observer unavailable")
+
+    try:
+        signal = completion_guard.detect(root)
+    except Exception as exc:
+        # A raising probe would be swallowed by guard_directive's fail-soft and the guard
+        # would silently never fire again. That is precisely the class of defect this
+        # check exists to surface.
+        return Check("completion_guard", False, f"detect() raised: {exc}")
+    notes.append(f"signal={signal.get('kind') if signal else 'none'}")
+
+    # Stop wiring per host. Each file is optional (a workspace need not install every host),
+    # but when present it must carry the events the guard is delivered through.
+    claude_settings = root / ".claude" / "settings.json"
+    if claude_settings.exists():
+        try:
+            payload = _json.loads(claude_settings.read_text(encoding="utf-8"))
+            hooks = payload.get("hooks") if isinstance(payload, dict) else None
+            hooks = hooks if isinstance(hooks, dict) else {}
+            for event in ("PostToolUse", "Stop", "SubagentStop"):
+                if not isinstance(hooks.get(event), list) or not hooks.get(event):
+                    issues.append(f".claude/settings.json missing {event}")
+        except Exception as exc:
+            issues.append(f".claude/settings.json unreadable: {exc}")
+
+    codex_hooks = root / ".codex" / "hooks.json"
+    if codex_hooks.exists():
+        try:
+            payload = _json.loads(codex_hooks.read_text(encoding="utf-8"))
+            hooks = payload.get("hooks") if isinstance(payload, dict) else None
+            hooks = hooks if isinstance(hooks, dict) else {}
+            for event in ("PostToolUse", "Stop", "SubagentStop"):
+                if not isinstance(hooks.get(event), list) or not hooks.get(event):
+                    issues.append(f".codex/hooks.json missing {event}")
+        except Exception as exc:
+            issues.append(f".codex/hooks.json unreadable: {exc}")
+
+    agent_hooks = root / ".agents" / "hooks.json"
+    if agent_hooks.exists():
+        try:
+            payload = _json.loads(agent_hooks.read_text(encoding="utf-8"))
+            spec = payload.get("code-brain") if isinstance(payload, dict) else None
+            stop = spec.get("Stop") if isinstance(spec, dict) else None
+            pre = spec.get("PreInvocation") if isinstance(spec, dict) else None
+            post = spec.get("PostToolUse") if isinstance(spec, dict) else None
+            if not isinstance(pre, list) or not pre:
+                issues.append(".agents/hooks.json missing PreInvocation")
+            elif any(
+                not isinstance(handler, dict)
+                or ".ai/bin/ai-hook" not in str(handler.get("command") or "")
+                or "PreInvocation" not in str(handler.get("command") or "")
+                or "hooks" in handler
+                or "matcher" in handler
+                for handler in pre
+            ):
+                issues.append(".agents/hooks.json PreInvocation is not a direct handler list")
+            if not isinstance(stop, list) or not stop:
+                issues.append(".agents/hooks.json missing Stop")
+            elif any(
+                not isinstance(handler, dict)
+                or ".ai/bin/ai-hook" not in str(handler.get("command") or "")
+                or "hooks" in handler
+                for handler in stop
+            ):
+                issues.append(".agents/hooks.json Stop is not a direct handler list")
+            if not isinstance(post, list) or not post:
+                issues.append(".agents/hooks.json missing PostToolUse")
+        except Exception as exc:
+            issues.append(f".agents/hooks.json unreadable: {exc}")
+    if issues:
+        return Check("completion_guard", False, "; ".join(issues[:5]))
+    return Check("completion_guard", True, ", ".join(notes))
 
 
 def check_precall_rules(root: Path) -> Check:
@@ -736,19 +971,26 @@ def check_storage_limits(root: Path) -> Check:
     workspace = workspace_storage_status(root)
     if not workspace["complete"] or workspace["errors"]:
         bad.append(".ai:scan-incomplete")
-    if int(workspace["tmp_bytes"]) > TMP_MAX_TOTAL_BYTES:
+    # Caps apply to RECLAIMABLE bytes. Pinned entries (tracked, referenced by tracked
+    # source, or an explicit .keep) cannot be deleted by the enforcer, so counting them
+    # produced a failure the user could never clear except by deleting their own fixtures.
+    if int(workspace.get("tmp_reclaimable_bytes", workspace["tmp_bytes"])) > TMP_MAX_TOTAL_BYTES:
         bad.append(".ai/tmp:total-bytes")
     if int(workspace["tmp_top_entries"]) > TMP_MAX_ENTRIES:
         bad.append(".ai/tmp:file-count")
-    if int(workspace["output_bytes"]) > OUTPUT_MAX_TOTAL_BYTES:
+    if int(workspace.get("output_reclaimable_bytes", workspace["output_bytes"])) > OUTPUT_MAX_TOTAL_BYTES:
         bad.append(".ai/outputs:total-bytes")
     if int(workspace["output_top_entries"]) > OUTPUT_MAX_ENTRIES:
         bad.append(".ai/outputs:file-count")
-    if int(workspace["ai_bytes"]) > AI_MAX_TOTAL_BYTES:
+    if int(workspace.get("ai_reclaimable_bytes", workspace["ai_bytes"])) > AI_MAX_TOTAL_BYTES:
         bad.append(".ai:total-bytes")
+    pinned_note = ""
+    pinned_total = int(workspace.get("tmp_pinned_bytes", 0)) + int(workspace.get("output_pinned_bytes", 0))
+    if pinned_total:
+        pinned_note = f" pinned_bytes={pinned_total}"
     detail = (
         f"ok checked={checked} ai_bytes={workspace['ai_bytes']} tmp_bytes={workspace['tmp_bytes']} "
-        f"output_bytes={workspace['output_bytes']}"
+        f"output_bytes={workspace['output_bytes']}{pinned_note}"
     )
     return Check("storage_limits", not bad, detail if not bad else "invalid: " + ", ".join(bad[:10]))
 

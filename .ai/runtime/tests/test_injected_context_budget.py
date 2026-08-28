@@ -33,12 +33,20 @@ def _subprocess_limits(general: str, session: str) -> tuple[int, int]:
 
 
 def test_general_injection_budget_is_a_hard_utf8_boundary(tmp_path: Path, monkeypatch) -> None:
+    """The budget is a hard ceiling, not a quota to fill exactly.
+
+    This used to assert ``== 256`` because the composer truncated the joined string blindly,
+    which always landed mid-section. Composition is now section-aware, so it stops at the
+    last section that fits rather than emitting a half-sentence directive. The invariant
+    that matters to the host is the ceiling.
+    """
     monkeypatch.setattr(hooks, "MAX_INJECTION_BYTES", 256)
 
     context = hooks.build_context("UserPromptSubmit", {"dry": True}, root=tmp_path)
 
-    assert len(context.encode("utf-8")) == 256
-    assert context.endswith("...")
+    assert len(context.encode("utf-8")) <= 256
+    # Whatever survives must be whole: never a dangling partial directive.
+    assert not context.rstrip().endswith(("hook=", "agent=", "network=", "writes="))
 
 
 def test_session_start_uses_its_separate_larger_budget(tmp_path: Path, monkeypatch) -> None:
@@ -48,8 +56,8 @@ def test_session_start_uses_its_separate_larger_budget(tmp_path: Path, monkeypat
     prompt_context = hooks.build_context("UserPromptSubmit", {"dry": True}, root=tmp_path)
     session_context = hooks.build_context("SessionStart", {"dry": True}, root=tmp_path)
 
-    assert len(prompt_context.encode("utf-8")) == 256
-    assert 256 < len(session_context.encode("utf-8")) <= 1024
+    assert len(prompt_context.encode("utf-8")) <= 256
+    assert len(prompt_context.encode("utf-8")) < len(session_context.encode("utf-8")) <= 1024
 
 
 def test_injection_budget_environment_values_are_clamped() -> None:

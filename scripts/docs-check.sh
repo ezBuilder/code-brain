@@ -9,16 +9,11 @@ trap 'rm -rf "$TMP"' EXIT
 cd "$ROOT"
 unset CI GITHUB_ACTIONS GITLAB_CI AI_CI
 
-if ! grep -Fq 'doctor-check-count=32' docs/WORLD_CLASS_AUTONOMOUS_UPGRADE.md; then
-  echo "doctor inventory contract drift" >&2
-  exit 1
-fi
-if ! grep -Fq 'eval-axes=precall_routing,context_budget,tool_discovery,autoresearch_retrieval,code_retrieval,line_span_retrieval,memory_retrieval' docs/WORLD_CLASS_AUTONOMOUS_UPGRADE.md; then
-  echo "eval inventory contract drift" >&2
-  exit 1
-fi
-if ! grep -Fq '32 checks' ARCHITECTURE.md; then
-  echo "architecture doctor inventory drift" >&2
+# Doctor/eval inventory markers are DERIVED from source (doctor.run_checks, Makefile eval axes)
+# by ai_core.docs_contract. Hardcoding the count here caused double bookkeeping: adding a doctor
+# check made docs-check fail with a stale literal even after the docs were correctly updated.
+if ! uv run --project .ai/runtime python -m ai_core.docs_contract >/dev/null; then
+  echo "doctor/eval inventory contract drift; run: uv run --project .ai/runtime python -m ai_core.docs_contract" >&2
   exit 1
 fi
 

@@ -16,6 +16,7 @@ Hard guarantees:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -178,9 +179,64 @@ def violation_signals(root: Path, *, window: int = WINDOW) -> dict[str, Any]:
 
 # --- 2. measurement (real tokens only, no estimates) ---
 
-def _output_tokens(root: Path) -> int:
-    # Transcript aggregation scans agent homes and is meaningful only for a real
-    # Code Brain installation. Minimal/test roots have no config and must stay fast.
+# `_output_tokens` reads every agent transcript on the host, so it is the single most
+# expensive call in the Stop path. Measured inline on blurivo: 8.06s per call, 623,836
+# JSON lines re-parsed across 507 codex + 125 claude session files; code-brain 6.5s.
+# `tick` calls it every RATCHET/growth step (cooldown 5), so one turn in five stalled the
+# hook for 6-8s. It is used only as recorded provenance on a rule (`baseline_tokens`) —
+# never a decision input; the ratchet judges `baseline_obs_avg` / `_recent_output_avg`,
+# which read the local prompt_growth jsonl. So the value is cached with a TTL instead of
+# recomputed, and a cold cache returns 0 (same as the fail-soft path) while a detached
+# refresh fills it for the next turn.
+_TOKENS_CACHE_PARTS = (".ai", "cache", "prompt_growth_tokens.json")
+# One hour: `baseline_tokens` is provenance for a rule that needs RATCHET_WINDOW turns to
+# graduate, so hour-scale staleness cannot change any outcome.
+_TOKENS_CACHE_TTL_SECONDS = 3600
+
+
+def _tokens_cache_path(root: Path) -> Path:
+    return Path(root).joinpath(*_TOKENS_CACHE_PARTS)
+
+
+def _read_tokens_cache(root: Path, *, now: float | None = None) -> int | None:
+    """Cached output-token total, or ``None`` when absent/stale/corrupt."""
+    try:
+        raw = _tokens_cache_path(root).read_text(encoding="utf-8")
+        obj = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    try:
+        ts = float(obj.get("ts") or 0.0)
+        value = int(obj.get("output_tokens") or 0)
+    except (TypeError, ValueError):
+        return None
+    current = time.time() if now is None else now
+    if ts <= 0 or (current - ts) > _TOKENS_CACHE_TTL_SECONDS:
+        return None
+    return value
+
+
+def _write_tokens_cache(root: Path, value: int, *, now: float | None = None) -> None:
+    path = _tokens_cache_path(root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps({"ts": time.time() if now is None else now, "output_tokens": int(value)}),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def compute_output_tokens(root: Path) -> int:
+    """Aggregate real output tokens from agent transcripts. SLOW — never call inline.
+
+    Kept public so the detached refresher and `ai prompt-growth` can force a fresh read.
+    """
     if not (Path(root) / ".ai" / "config.yaml").is_file():
         return 0
     try:
@@ -196,6 +252,22 @@ def _output_tokens(root: Path) -> int:
         return total
     except Exception:
         return 0
+
+
+def refresh_output_tokens_cache(root: Path) -> int:
+    """Recompute and persist the token total. Entry point for the detached refresher."""
+    value = compute_output_tokens(root)
+    _write_tokens_cache(root, value)
+    return value
+
+
+def _output_tokens(root: Path) -> int:
+    """Non-blocking read of the output-token total: cache hit, else 0 (never scans inline)."""
+    # Minimal/test roots have no config and must stay fast.
+    if not (Path(root) / ".ai" / "config.yaml").is_file():
+        return 0
+    cached = _read_tokens_cache(root)
+    return cached if cached is not None else 0
 
 
 def _eval_pass_rate(root: Path) -> tuple[bool, float]:

@@ -47,7 +47,15 @@ make upgrade-in TARGET=/path/to/project
 make uninstall-from TARGET=/path/to/project
 ```
 
-The installer records managed files in `.ai/generated/install-manifest.json`, refuses to overwrite unrelated existing files, preserves target `.ai/memory/` during upgrades, rebuilds the audit index, installs git pull/checkout hooks, and runs a forced session rebuild once. It does not commit `.ai/cache/` or `.ai/runtime/.venv/`; each Mac/VPS regenerates those local artifacts after `git pull`.
+Windows uses the same commands through PowerShell (Git for Windows is required and supplies the delegated Bash runtime):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-into.ps1 install C:\path\to\project
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-into.ps1 upgrade C:\path\to\project
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-into.ps1 uninstall C:\path\to\project
+```
+
+The installer records managed files in `.ai/generated/install-manifest.json`, preflights ownership and path confinement, refuses unrelated existing files and symlink escapes, and skips byte-identical protected files. Install, upgrade, and uninstall use a write-ahead journal at `.code-brain-install-transaction`: every managed/config path, prior `core.hooksPath`, and runtime-venv intent is durable before mutation; file backups carry SHA-256/size receipts. ERR/INT/TERM rolls back immediately, while a later invocation recovers an interrupted READY journal after SIGKILL/power loss before parsing or changing target config. COMMITTED is fsynced before old backups are removed. A corrupt/untrusted journal or backup fails closed and remains for forensics. Uninstall removes managed wires but preserves `.ai/memory/`, `.ai/runtime/state/`, `.ai/eval/`, and the user-owned secret allowlist. Windows delegates file/config mutation to this same transaction, then activates the native PowerShell shims before commit. It rebuilds the audit index, installs git pull/checkout hooks, and runs one forced session rebuild. Local `.ai/cache/` and `.ai/runtime/.venv/` artifacts are regenerated per machine.
 
 The default install keeps the runtime dependency-light and uses BM25 search. Provision the optional ONNX dense-search dependencies only when required:
 
@@ -88,7 +96,7 @@ Normal `session start` is the low-latency attachment path. It may reuse root-con
 ## Search Cache Profile
 
 `.ai/cache/code.sqlite` uses SQLite FTS5 for lexical code search. The cache stores file paths, hashes, summaries, provenance, and a contentless FTS index; it does not store duplicate full source bodies in the `chunks` table. Query snippets are read lazily from the current source file and redacted before output.
-If a source file changes after indexing, local query paths auto-refresh before searching: tracked dirty/deleted paths from `git status` are hash-checked directly, while new untracked files and clean-tree checkout/pull drift are detected by metadata-triggered hash comparison. The interactive path can reuse a private candidate-list cache and per-file size/mtime_ns/ctime_ns state. Strict freshness checks and full rebuilds bypass that candidate cache and query Git directly. Internal runtime state under `.ai/memory/`, `.ai/cache/`, and `.chatgpt2codex/` is excluded from the code index. CI remains read-only; set `AI_SEARCH_AUTO_REFRESH=0` to force stale-report-only behavior.
+If a source file changes after indexing, local query paths auto-refresh before searching: current tracked dirty paths from `git status` reuse per-file size/mtime_ns/ctime_ns state and hash only on metadata drift, while deletions, rename sources, newly untracked files, and clean-tree checkout/pull drift are reconciled by the authoritative Git-candidate comparison. A staged deletion with an ignored working-tree copy is never re-indexed, preventing an add/remove generation loop. The interactive path can reuse a private candidate-list cache. Strict freshness checks and full rebuilds bypass that cache and query Git directly. Internal runtime state under `.ai/memory/`, `.ai/cache/`, and `.chatgpt2codex/` is excluded from the code index. CI remains read-only; set `AI_SEARCH_AUTO_REFRESH=0` to force stale-report-only behavior.
 
 ### Stale Index Handling
 
@@ -172,6 +180,8 @@ Artifact verification checks release files without executing package code:
 - SBOM lockfile and dependency package list when `dist/code-brain-<version>.sbom.json` exists;
 - provenance subjects when `dist/code-brain-<version>.provenance.json` exists;
 - release notes contents and provenance subject when `dist/code-brain-<version>.release-notes.md` exists.
+
+`scripts/package.sh` archives exactly `git ls-files`, rejects tracked symlinks, and normalizes path order, ownership, mode, and timestamps. Ignored runtime memory, `.ai/tmp`, local `.claude/settings.json`, and generated root instruction mirrors can neither leak into an archive nor make its size grow with ordinary use.
 
 Install verification then extracts the latest `dist/code-brain-<version>.tar.gz` into a temporary directory and verifies:
 
@@ -482,6 +492,33 @@ Allowed (passes through to Bash):
 When intercepted, the hook returns `decision: "block"` with a reason instructing the agent to retry via `ai exec run -- <original>` or MCP `sandbox_execute`. The agent normally re-issues the call against Code Brain's sandbox, which stores full output to `.ai/cache/sandbox/<exec_id>.txt` and returns only a short summary (first 30 + last 5 lines, ≤4 KB) to the context window.
 
 Disable: remove the `PreToolUse` block from `.claude/settings.json` (Claude Code) or the `PreToolUse` key from `.codex/hooks.json` (Codex CLI). The `precall` heuristic itself stays loaded but never fires without hook registration.
+
+### Completion Guard And Turn Summary
+
+`AI_COMPLETION_GUARD` defaults to enabled. At `UserPromptSubmit` (or Antigravity's first
+`PreInvocation`) Code Brain captures a bounded request baseline. `PostToolUse` records a private,
+bounded mutation/check ledger without Git/network: host call identity, successful exit provenance,
+and cumulative edit-target content hashes. Stop/SubagentStop is continued when new
+machine evidence remains unfinished, including an edit without a later successful relevant
+test, lint, build, doctor, docs check, or `git diff --check`. Code edits require the stronger
+static/build/test class; a failed command, a test name printed with `echo`, or a check run
+before the last edit does not satisfy the gate. Content changed after verification invalidates that
+proof. Missing/stale/corrupt baseline or ledger, unbindable tool/path evidence, and a marker scan over
+the 40-path bound all yield instead of turning partial evidence into a loop.
+
+Safety is bounded: authenticated user-input/context-pressure/terminal host stops yield,
+security decisions take precedence, identical evidence yields after two nudges, and all
+continuations share an eight-attempt/30-minute repository/worktree + host-session budget. Cap release
+is recorded and Claude receives one user-visible, non-reentrant system warning. For the defined
+evidence classes, golden tests require cross-host decision equivalence; detection remains partial to
+observable PostToolUse and bounded tree evidence. It is not a semantic oracle for requirements that
+were never represented by a plan, edit, marker, conflict, or acceptance record.
+
+Broad-change reporting uses the standing Response rule in the generated agent contract.
+`turn_report` measures Git facts in a detached child at Stop/SessionEnd and injects one terse
+next-turn nudge only above eight files or 200 churned lines. A hard prose-only Stop continuation
+is intentionally not used: Claude/Antigravity can re-enter, but that spends the same bounded
+budget as correctness/security and adds another model turn.
 
 ## Browser Extension Dogfood Runbook (target = WXT/Manifest V3)
 

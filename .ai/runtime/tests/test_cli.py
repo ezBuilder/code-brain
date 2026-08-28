@@ -486,7 +486,7 @@ def test_summary_parity_canonical_subset_passes_with_different_timestamps(tmp_pa
     left.write_text(json.dumps(payload), encoding="utf-8")
     changed = dict(payload, generated_at="2026-01-01T00:01:00Z")
     right.write_text(json.dumps(changed), encoding="utf-8")
-    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(right), "--json"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
+    result = subprocess.run([PYTHON, "scripts/summary-parity.py", str(left), str(right), "--json"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
     assert result.returncode == 0, result.stdout
     assert json.loads(result.stdout) == {"mismatches": [], "ok": True}
 
@@ -507,7 +507,7 @@ def test_summary_parity_release_ready_mismatch_fails(tmp_path: Path) -> None:
     left.write_text(json.dumps(base), encoding="utf-8")
     changed = dict(base, release_ready=False)
     right.write_text(json.dumps(changed), encoding="utf-8")
-    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(right), "--json"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
+    result = subprocess.run([PYTHON, "scripts/summary-parity.py", str(left), str(right), "--json"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
     assert result.returncode == 1
     payload = json.loads(result.stdout)
     assert payload["ok"] is False
@@ -530,7 +530,7 @@ def test_summary_parity_check_set_mismatch_fails(tmp_path: Path) -> None:
     left.write_text(json.dumps(base), encoding="utf-8")
     changed = dict(base, checks=[{"name": "layout", "ok": True}])
     right.write_text(json.dumps(changed), encoding="utf-8")
-    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(right)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
+    result = subprocess.run([PYTHON, "scripts/summary-parity.py", str(left), str(right)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
     assert result.returncode == 1
     assert "queue_age" in result.stderr
 
@@ -553,12 +553,12 @@ def test_summary_parity_missing_or_invalid_file_returns_two(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
-    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(missing)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
+    result = subprocess.run([PYTHON, "scripts/summary-parity.py", str(left), str(missing)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
     assert result.returncode == 2
     assert str(missing) in result.stderr
 
     left.write_text("not json", encoding="utf-8")
-    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(missing)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
+    result = subprocess.run([PYTHON, "scripts/summary-parity.py", str(left), str(missing)], cwd=ROOT, text=True, stderr=subprocess.PIPE)
     assert result.returncode == 2
 
 
@@ -577,7 +577,7 @@ def test_summary_parity_schema_drift_returns_two(tmp_path: Path) -> None:
     }
     left.write_text(json.dumps(dict(payload, unexpected=True)), encoding="utf-8")
     right.write_text(json.dumps(payload), encoding="utf-8")
-    result = subprocess.run(["python", "scripts/summary-parity.py", str(left), str(right), "--json"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
+    result = subprocess.run([PYTHON, "scripts/summary-parity.py", str(left), str(right), "--json"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
     assert result.returncode == 2
     assert json.loads(result.stdout)["ok"] is False
     assert "release gate summary schema fields mismatch" in json.loads(result.stdout)["error"]
@@ -1405,7 +1405,7 @@ def test_context_pack_and_mcp_once(tmp_path: Path) -> None:
     assert mcp_result.returncode == 0, mcp_result.stdout + mcp_result.stderr
     response = json.loads(mcp_result.stdout)
     assert response["jsonrpc"] == "2.0"
-    assert response["result"]["results"]
+    assert response["result"]["hits"]
 
     secret_value = "secret=" + "abcdefghijklmnopqrstuv" + "wxyz"
     bad_request = {"jsonrpc": "2.0", "id": 2, "method": "code_query", "params": {"query": "manifest", "limit": secret_value}}
@@ -2953,6 +2953,49 @@ def test_package_archive_is_reproducible_and_normalized(tmp_path: Path) -> None:
             assert "mtime" not in member.pax_headers
             assert "atime" not in member.pax_headers
             assert "ctime" not in member.pax_headers
+
+
+def test_package_archive_excludes_ignored_runtime_and_private_files(tmp_path: Path) -> None:
+    repo = copy_repo(tmp_path)
+    bash = usable_bash_or_skip()
+    init_package_repo(repo)
+    sentinel = "PRIVATE-PACKAGE-" + os.urandom(16).hex()
+    private_files = (
+        repo / ".ai" / "memory" / "private-session.txt",
+        repo / ".ai" / "tmp" / "large-scratch.bin",
+        repo / ".claude" / "settings.json",
+        repo / "AGENTS.md",
+    )
+    for path in private_files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(sentinel, encoding="utf-8")
+    out = tmp_path / "private-exclusion-dist"
+    env = os.environ.copy()
+    env["DIST_OVERRIDE"] = str(out)
+    package = subprocess.run(
+        [bash, "scripts/package.sh"],
+        cwd=repo,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert package.returncode == 0, package.stdout + package.stderr
+    archive_path = Path(package.stdout.splitlines()[0])
+    with tarfile.open(archive_path, "r:gz") as archive:
+        names = {member.name for member in archive.getmembers()}
+        assert not any(name.endswith("private-session.txt") for name in names)
+        assert not any(name.endswith("large-scratch.bin") for name in names)
+        assert not any(name.endswith(".claude/settings.json") for name in names)
+        archive_root = archive.getmembers()[0].name.split("/", 1)[0]
+        assert f"{archive_root}/AGENTS.md" not in names
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            fh = archive.extractfile(member)
+            assert fh is not None
+            assert sentinel.encode() not in fh.read()
 
 
 def test_reproducibility_check_script_detects_drift(tmp_path: Path) -> None:

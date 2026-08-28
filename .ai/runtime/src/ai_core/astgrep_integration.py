@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -387,376 +388,355 @@ def ast_grep_search(
         return {"ok": True, "count": len(matches), "lang": lang_norm, "matches": matches}
 
 
-def extract_symbols_js(file_path: str) -> list[dict]:
-    """Extract function/class symbols from JS/TS file using ast-grep.
+# ---------------------------------------------------------------------------
+# Multi-language symbol / call extraction
+#
+# HISTORY (why this is kind-based and table-driven):
+# The first implementation used `pattern:` rules like `fn $FUNC_NAME($_) { $$$BODY }`
+# and then read `finding["matches"][*]["start"]`. Both halves were wrong:
+#
+#   1. `$_` matches exactly ONE node, so an arity-1 pattern silently skipped
+#      zero-arg and multi-arg functions. Measured against a 5-function Rust file
+#      the old rule matched 0.
+#   2. ast-grep `--json=stream` emits ONE object per match with the location under
+#      `range.start` / `range.end`. There is no `matches` key at all, so every
+#      extractor returned [] even with the binary installed.
+#
+# The combination meant the graph layer was a no-op for JS/TS/Go/Rust whether or
+# not ast-grep was present, and nothing failed loudly. Node `kind` (tree-sitter
+# node type) is arity-independent and covers methods, so we match on kind and
+# recover the identifier from the matched text.
+# ---------------------------------------------------------------------------
 
-    Returns list of dicts with keys: qualname, kind, lineno, end_lineno.
-    Returns [] if ast-grep is unavailable or parse fails.
+# `const f = (x) => ...` / `const f = function (x) {}` declare a callable but are
+# `variable_declarator` nodes. `has:` restricts the match to declarators whose
+# value is a function, so plain `const x = 1` is not mistaken for a symbol.
+_JS_FUNCTION_VALUED_VARIABLE_RULE = """\
+---
+id: cb-{language}-function-valued-variable
+language: {language}
+rule:
+  kind: variable_declarator
+  has:
+    any:
+      - kind: arrow_function
+      - kind: function_expression
+severity: info
+message: node
+"""
+
+# Alternatives, in priority order: `function foo`/`class Foo`; then `foo = (x) =>`
+# for function-valued variables; then a bare `foo(` for method definitions.
+_JS_NAME_RE = (
+    r"(?:function|class)\s+([A-Za-z_$][\w$]*)"
+    r"|^\s*([A-Za-z_$][\w$]*)\s*(?::[^=]+)?="
+    r"|^\s*(?:static\s+|async\s+|public\s+|private\s+|protected\s+|readonly\s+|get\s+|set\s+)*"
+    r"([A-Za-z_$][\w$]*)\s*[(<]"
+)
+
+# tree-sitter node kinds per language, verified empirically against ast-grep 0.45.2.
+# symbol_kinds: node kinds that denote a declared function/method.
+# name_re:      first non-empty capturing group yields the declared identifier.
+# extra_rules:  optional additional rule documents appended to the generated rule
+#               file. Needed for JS/TS, where `const f = (x) => ...` is an
+#               extremely common declaration style that no function/method node
+#               kind covers; a bare `variable_declarator` kind would also match
+#               plain data like `const x = 1`, so it is constrained with `has:`
+#               to declarators that actually contain a function body.
+_SYMBOL_SPECS: dict[str, dict[str, Any]] = {
+    "JavaScript": {
+        "symbol_kinds": ("function_declaration", "method_definition", "class_declaration"),
+        "name_re": _JS_NAME_RE,
+        "extra_rules": _JS_FUNCTION_VALUED_VARIABLE_RULE.format(language="JavaScript"),
+    },
+    "TypeScript": {
+        "symbol_kinds": ("function_declaration", "method_definition", "class_declaration"),
+        "name_re": _JS_NAME_RE,
+        "extra_rules": _JS_FUNCTION_VALUED_VARIABLE_RULE.format(language="TypeScript"),
+    },
+    "Go": {
+        "symbol_kinds": ("function_declaration", "method_declaration"),
+        "name_re": r"func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)",
+    },
+    "Rust": {
+        "symbol_kinds": ("function_item",),
+        "name_re": r"fn\s+([A-Za-z_]\w*)",
+    },
+    "Kotlin": {
+        "symbol_kinds": ("function_declaration",),
+        "name_re": r"fun\s+(?:<[^>]*>\s*)?(?:[A-Za-z_][\w.]*\.)?([A-Za-z_]\w*)",
+    },
+    # Dart is a first-class ast-grep built-in language. `function_signature` is the
+    # declaration header for BOTH top-level functions and class methods, including
+    # `=>` arrow bodies, which `function_declaration`/`method_declaration` miss.
+    #
+    # A signature spans only the header line, so on its own it cannot enclose the
+    # body and caller attribution collapses to "<module>". An `inside:` constraint
+    # was tried and rejected: it only inspects the direct parent, so class methods
+    # (whose parent differs from a top-level function's) were dropped entirely.
+    # `body_kind` instead collects body nodes in a second pass and widens each
+    # signature to the body that starts on or just after it — see `_extract_symbols`.
+    "Dart": {
+        "symbol_kinds": ("function_signature",),
+        "name_re": r"(?:[\w<>,?\[\]. ]+?\s+)?([A-Za-z_]\w*)\s*\(",
+        "body_kind": "function_body",
+    },
+}
+
+# `call_expression` is the call node kind in every language above (verified).
+_CALL_KIND = "call_expression"
+
+# Bound per-file extraction so a pathological file cannot dominate an index run.
+AST_EXTRACT_MAX_SYMBOLS = 2_000
+AST_EXTRACT_MAX_CALLS = 5_000
+AST_EXTRACT_TIMEOUT_SECONDS = 10.0
+
+_CALLEE_RE = re.compile(r"([A-Za-z_$][\w$]*(?:\s*(?:\.|::)\s*[A-Za-z_$][\w$]*)*)\s*[(<]")
+
+
+def _kind_rule(language: str, kinds: tuple[str, ...]) -> str:
+    """Build an ast-grep rule matching any of ``kinds`` in ``language``."""
+    if len(kinds) == 1:
+        body = f"  kind: {kinds[0]}\n"
+    else:
+        body = "  any:\n" + "".join(f"    - kind: {kind}\n" for kind in kinds)
+    return f"id: cb-{language.lower()}-nodes\nlanguage: {language}\nrule:\n{body}severity: info\nmessage: node\n"
+
+
+def _finding_span(finding: dict[str, Any]) -> tuple[int, int] | None:
+    """1-indexed (start_line, end_line) from a `--json=stream` finding.
+
+    ast-grep reports 0-indexed lines under ``range``. Older code looked for a
+    non-existent ``matches`` list; keep reading ``range`` only.
     """
+    rng = finding.get("range")
+    if not isinstance(rng, dict):
+        return None
+    start = rng.get("start")
+    end = rng.get("end")
+    if not isinstance(start, dict):
+        return None
+    try:
+        start_line = int(start.get("line", 0)) + 1
+    except (TypeError, ValueError):
+        return None
+    end_line = start_line
+    if isinstance(end, dict):
+        try:
+            end_line = int(end.get("line", start_line - 1)) + 1
+        except (TypeError, ValueError):
+            end_line = start_line
+    start_line = max(1, start_line)
+    return start_line, max(start_line, end_line)
+
+
+def _meta_var_text(finding: dict[str, Any], name: str) -> str | None:
+    meta = finding.get("metaVariables")
+    if not isinstance(meta, dict):
+        return None
+    single = meta.get("single")
+    if not isinstance(single, dict):
+        return None
+    entry = single.get(name)
+    if not isinstance(entry, dict):
+        return None
+    text = entry.get("text")
+    return text if isinstance(text, str) and text else None
+
+
+def _extract_symbols(file_path: str, language: str) -> list[dict]:
+    """Kind-based symbol extraction for one ast-grep language."""
     if os.environ.get("AI_ASTGREP_DISABLE") == "1":
         return []
-    binary = _binary()
-    if not binary:
+    spec = _SYMBOL_SPECS.get(language)
+    if spec is None or not _binary():
         return []
 
     p = Path(file_path)
-    if not p.exists():
+    if not p.is_file():
         return []
 
-    # ast-grep pattern for function declarations and arrow functions
-    rule_yaml = """\
-id: js-functions
-language: JavaScript
-rule:
-  pattern: |
-    function $FUNC_NAME($_) {
-      $$$BODY
-    }
-severity: info
-message: function
----
-id: js-arrow-functions
-language: JavaScript
-rule:
-  pattern: const $VAR = $_
-severity: info
-message: arrow-function
----
-id: js-class
-language: JavaScript
-rule:
-  pattern: |
-    class $CLASS_NAME {
-      $$$BODY
-    }
-severity: info
-message: class
-"""
+    rule_yaml = _kind_rule(language, spec["symbol_kinds"]) + spec.get("extra_rules", "")
+    findings = scan_path(p, rule_yaml, timeout_seconds=AST_EXTRACT_TIMEOUT_SECONDS)
+    name_re = re.compile(spec["name_re"], re.MULTILINE)
 
-    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
-
-    # Transform ast-grep findings into symbol records
     symbols: list[dict] = []
+    seen: set[tuple[str, int]] = set()
     for finding in findings:
         if not isinstance(finding, dict):
             continue
-        matches = finding.get("matches", [])
-        if not isinstance(matches, list):
+        span = _finding_span(finding)
+        if span is None:
             continue
-        for match in matches:
-            if not isinstance(match, dict):
-                continue
-            # Attempt to extract function/class name from matched text
-            start = match.get("start", {})
-            end = match.get("end", {})
-            lineno = start.get("line", 0) if isinstance(start, dict) else 0
-            end_lineno = end.get("line", lineno) if isinstance(end, dict) else lineno
-            # Increment because ast-grep uses 0-indexed lines, we want 1-indexed
-            lineno = max(1, lineno + 1)
-            end_lineno = max(lineno, end_lineno + 1)
+        lineno, end_lineno = span
+        text = finding.get("text")
+        text = text if isinstance(text, str) else ""
 
-            # Best-effort: extract identifier from matched region
-            text = match.get("text", "")
-            kind = finding.get("message", "function").lower()
+        qualname = None
+        match = name_re.search(text)
+        if match:
+            qualname = next((g for g in match.groups() if g), None)
+        if not qualname:
+            qualname = f"<anonymous at {lineno}>"
 
-            # Heuristic: try to extract function name
-            import re as _re
-            name_match = _re.search(r'(?:function|const|class)\s+(\w+)', text)
-            if name_match:
-                qualname = name_match.group(1)
-            else:
-                qualname = f"<anonymous at {lineno}>"
+        key = (qualname, lineno)
+        if key in seen:
+            continue
+        seen.add(key)
 
-            symbols.append({
-                "qualname": qualname,
-                "kind": kind,
-                "lineno": lineno,
-                "end_lineno": end_lineno,
-            })
+        kind = "class" if text.lstrip().startswith("class") else "function"
+        symbols.append(
+            {"qualname": qualname, "kind": kind, "lineno": lineno, "end_lineno": end_lineno}
+        )
+        if len(symbols) >= AST_EXTRACT_MAX_SYMBOLS:
+            break
 
+    body_kind = spec.get("body_kind")
+    if body_kind and symbols:
+        symbols = _widen_to_bodies(p, language, body_kind, symbols)
     return symbols
+
+
+def _widen_to_bodies(
+    path: Path, language: str, body_kind: str, symbols: list[dict]
+) -> list[dict]:
+    """Extend header-only declarations to cover their body.
+
+    Dart's ``function_signature`` ends at the header, so a call inside the body
+    falls outside the symbol span and caller attribution degrades to "<module>".
+    Bodies are matched in a second scan and each signature adopts the first body
+    that starts on or after its own start line.
+    """
+    bodies = []
+    for finding in scan_path(
+        path, _kind_rule(language, (body_kind,)), timeout_seconds=AST_EXTRACT_TIMEOUT_SECONDS
+    ):
+        if not isinstance(finding, dict):
+            continue
+        span = _finding_span(finding)
+        if span is not None:
+            bodies.append(span)
+    if not bodies:
+        return symbols
+    bodies.sort()
+
+    for record in symbols:
+        start = record["lineno"]
+        for body_start, body_end in bodies:
+            if body_start >= start:
+                if body_end > record["end_lineno"]:
+                    record["end_lineno"] = body_end
+                break
+    return symbols
+
+
+def _extract_calls(file_path: str, language: str) -> list[dict]:
+    """Kind-based call-site extraction for one ast-grep language."""
+    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
+        return []
+    if language not in _SYMBOL_SPECS or not _binary():
+        return []
+
+    p = Path(file_path)
+    if not p.is_file():
+        return []
+
+    findings = scan_path(
+        p,
+        _kind_rule(language, (_CALL_KIND,)),
+        timeout_seconds=AST_EXTRACT_TIMEOUT_SECONDS,
+    )
+
+    calls: list[dict] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        span = _finding_span(finding)
+        if span is None:
+            continue
+        lineno = span[0]
+        text = finding.get("text")
+        text = text if isinstance(text, str) else ""
+
+        callee = _meta_var_text(finding, "FUNC")
+        if not callee:
+            match = _CALLEE_RE.match(text.lstrip())
+            if match:
+                callee = match.group(1)
+            else:
+                callee = text.split("(", 1)[0].strip()
+        callee = re.sub(r"\s+", "", callee or "")
+        # Keep only the final segment so `self.foo()` / `mod::foo()` join on `foo`,
+        # matching how the Python extractor records callees.
+        if callee:
+            callee = re.split(r"\.|::", callee)[-1]
+        if not callee or not callee.isidentifier():
+            continue
+
+        calls.append({"callee": callee, "lineno": lineno})
+        if len(calls) >= AST_EXTRACT_MAX_CALLS:
+            break
+    return calls
+
+
+def extract_symbols_js(file_path: str) -> list[dict]:
+    """Extract function/class symbols from a JavaScript file."""
+    return _extract_symbols(file_path, "JavaScript")
 
 
 def extract_calls_js(file_path: str) -> list[dict]:
-    """Extract function call sites from JS/TS file using ast-grep.
-
-    Returns list of dicts with keys: callee, lineno.
-    Returns [] if ast-grep is unavailable or parse fails.
-    """
-    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
-        return []
-    binary = _binary()
-    if not binary:
-        return []
-
-    p = Path(file_path)
-    if not p.exists():
-        return []
-
-    # Pattern to match function calls
-    rule_yaml = """\
-id: js-calls
-language: JavaScript
-rule:
-  pattern: $FUNC($_)
-severity: info
-message: call
-"""
-
-    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
-
-    calls: list[dict] = []
-    for finding in findings:
-        if not isinstance(finding, dict):
-            continue
-        matches = finding.get("matches", [])
-        if not isinstance(matches, list):
-            continue
-        for match in matches:
-            if not isinstance(match, dict):
-                continue
-            start = match.get("start", {})
-            lineno = start.get("line", 0) if isinstance(start, dict) else 0
-            lineno = max(1, lineno + 1)
-
-            # Extract callee name from matched text
-            text = match.get("text", "")
-            # Heuristic: function call pattern "name(...)" → extract "name"
-            import re as _re
-            callee_match = _re.search(r'(\w+(?:\.\w+)*)\s*\(', text)
-            if callee_match:
-                callee = callee_match.group(1)
-            else:
-                callee = text.split('(')[0].strip()
-
-            if callee:
-                calls.append({
-                    "callee": callee,
-                    "lineno": lineno,
-                })
-
-    return calls
+    """Extract call sites from a JavaScript file."""
+    return _extract_calls(file_path, "JavaScript")
 
 
 def extract_symbols_ts(file_path: str) -> list[dict]:
-    """Extract symbols from TypeScript file. Delegates to JS extraction."""
-    return extract_symbols_js(file_path)
+    """Extract function/class symbols from a TypeScript file."""
+    return _extract_symbols(file_path, "TypeScript")
 
 
 def extract_calls_ts(file_path: str) -> list[dict]:
-    """Extract calls from TypeScript file. Delegates to JS extraction."""
-    return extract_calls_js(file_path)
+    """Extract call sites from a TypeScript file."""
+    return _extract_calls(file_path, "TypeScript")
 
 
 def extract_symbols_go(file_path: str) -> list[dict]:
-    """Extract function/method symbols from Go file using ast-grep.
-
-    Returns [] if ast-grep unavailable.
-    """
-    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
-        return []
-    binary = _binary()
-    if not binary:
-        return []
-
-    p = Path(file_path)
-    if not p.exists():
-        return []
-
-    rule_yaml = """\
-id: go-functions
-language: Go
-rule:
-  pattern: |
-    func $FUNC_NAME($_) {
-      $$$BODY
-    }
-severity: info
-message: function
-"""
-
-    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
-
-    symbols: list[dict] = []
-    for finding in findings:
-        matches = finding.get("matches", [])
-        for match in matches:
-            if not isinstance(match, dict):
-                continue
-            start = match.get("start", {})
-            end = match.get("end", {})
-            lineno = start.get("line", 0) if isinstance(start, dict) else 0
-            end_lineno = end.get("line", lineno) if isinstance(end, dict) else lineno
-            lineno = max(1, lineno + 1)
-            end_lineno = max(lineno, end_lineno + 1)
-
-            text = match.get("text", "")
-            import re as _re
-            name_match = _re.search(r'func\s+\(?\s*\w+\s*\)?\s*(\w+)', text)
-            if name_match:
-                qualname = name_match.group(1)
-            else:
-                qualname = f"<anonymous at {lineno}>"
-
-            symbols.append({
-                "qualname": qualname,
-                "kind": "function",
-                "lineno": lineno,
-                "end_lineno": end_lineno,
-            })
-
-    return symbols
+    """Extract function/method symbols from a Go file."""
+    return _extract_symbols(file_path, "Go")
 
 
 def extract_calls_go(file_path: str) -> list[dict]:
-    """Extract call sites from Go file using ast-grep."""
-    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
-        return []
-    binary = _binary()
-    if not binary:
-        return []
-
-    p = Path(file_path)
-    if not p.exists():
-        return []
-
-    rule_yaml = """\
-id: go-calls
-language: Go
-rule:
-  pattern: $FUNC($_)
-severity: info
-message: call
-"""
-
-    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
-
-    calls: list[dict] = []
-    for finding in findings:
-        matches = finding.get("matches", [])
-        for match in matches:
-            if not isinstance(match, dict):
-                continue
-            start = match.get("start", {})
-            lineno = start.get("line", 0) if isinstance(start, dict) else 0
-            lineno = max(1, lineno + 1)
-
-            text = match.get("text", "")
-            import re as _re
-            callee_match = _re.search(r'(\w+(?:\.\w+)*)\s*\(', text)
-            if callee_match:
-                callee = callee_match.group(1)
-            else:
-                callee = text.split('(')[0].strip()
-
-            if callee:
-                calls.append({"callee": callee, "lineno": lineno})
-
-    return calls
+    """Extract call sites from a Go file."""
+    return _extract_calls(file_path, "Go")
 
 
 def extract_symbols_rs(file_path: str) -> list[dict]:
-    """Extract function/method symbols from Rust file using ast-grep."""
-    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
-        return []
-    binary = _binary()
-    if not binary:
-        return []
-
-    p = Path(file_path)
-    if not p.exists():
-        return []
-
-    rule_yaml = """\
-id: rust-functions
-language: Rust
-rule:
-  pattern: |
-    fn $FUNC_NAME($_) {
-      $$$BODY
-    }
-severity: info
-message: function
-"""
-
-    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
-
-    symbols: list[dict] = []
-    for finding in findings:
-        matches = finding.get("matches", [])
-        for match in matches:
-            if not isinstance(match, dict):
-                continue
-            start = match.get("start", {})
-            end = match.get("end", {})
-            lineno = start.get("line", 0) if isinstance(start, dict) else 0
-            end_lineno = end.get("line", lineno) if isinstance(end, dict) else lineno
-            lineno = max(1, lineno + 1)
-            end_lineno = max(lineno, end_lineno + 1)
-
-            text = match.get("text", "")
-            import re as _re
-            name_match = _re.search(r'fn\s+(\w+)', text)
-            if name_match:
-                qualname = name_match.group(1)
-            else:
-                qualname = f"<anonymous at {lineno}>"
-
-            symbols.append({
-                "qualname": qualname,
-                "kind": "function",
-                "lineno": lineno,
-                "end_lineno": end_lineno,
-            })
-
-    return symbols
+    """Extract function/method symbols from a Rust file."""
+    return _extract_symbols(file_path, "Rust")
 
 
 def extract_calls_rs(file_path: str) -> list[dict]:
-    """Extract call sites from Rust file using ast-grep."""
-    if os.environ.get("AI_ASTGREP_DISABLE") == "1":
-        return []
-    binary = _binary()
-    if not binary:
-        return []
+    """Extract call sites from a Rust file."""
+    return _extract_calls(file_path, "Rust")
 
-    p = Path(file_path)
-    if not p.exists():
-        return []
 
-    rule_yaml = """\
-id: rust-calls
-language: Rust
-rule:
-  pattern: $FUNC($_)
-severity: info
-message: call
-"""
+def extract_symbols_kt(file_path: str) -> list[dict]:
+    """Extract function symbols from a Kotlin file."""
+    return _extract_symbols(file_path, "Kotlin")
 
-    findings = scan_path(p, rule_yaml, timeout_seconds=10.0)
 
-    calls: list[dict] = []
-    for finding in findings:
-        matches = finding.get("matches", [])
-        for match in matches:
-            if not isinstance(match, dict):
-                continue
-            start = match.get("start", {})
-            lineno = start.get("line", 0) if isinstance(start, dict) else 0
-            lineno = max(1, lineno + 1)
+def extract_calls_kt(file_path: str) -> list[dict]:
+    """Extract call sites from a Kotlin file."""
+    return _extract_calls(file_path, "Kotlin")
 
-            text = match.get("text", "")
-            import re as _re
-            callee_match = _re.search(r'(\w+(?::\w+)*)\s*\(', text)
-            if callee_match:
-                callee = callee_match.group(1)
-            else:
-                callee = text.split('(')[0].strip()
 
-            if callee:
-                calls.append({"callee": callee, "lineno": lineno})
+def extract_symbols_dart(file_path: str) -> list[dict]:
+    """Extract function/method symbols from a Dart file."""
+    return _extract_symbols(file_path, "Dart")
 
-    return calls
+
+def extract_calls_dart(file_path: str) -> list[dict]:
+    """Extract call sites from a Dart file."""
+    return _extract_calls(file_path, "Dart")
 
 
 __all__ = [
@@ -770,4 +750,8 @@ __all__ = [
     "extract_calls_go",
     "extract_symbols_rs",
     "extract_calls_rs",
+    "extract_symbols_kt",
+    "extract_calls_kt",
+    "extract_symbols_dart",
+    "extract_calls_dart",
 ]

@@ -92,12 +92,25 @@ if not powershell["ok"]:
 powershell["required"] = False
 checks["powershell"] = powershell
 
+# ast-grep powers the multi-language graph layer (code_symbols/code_calls for
+# JS/TS/Go/Rust). Python uses the stdlib ast module and never needs it. When the
+# binary is absent the indexer's extractors return [] SILENTLY, so code_graph_*
+# and PageRank-personalised ranking degrade to empty without any error. Reported
+# as optional here so the gap is visible at install time; doctor's
+# codegraph_coverage check reports the same gap against the actual index.
+astgrep = command_version("ast-grep", "--version")
+if not astgrep["ok"]:
+    astgrep = command_version("sg", "--version")
+astgrep["required"] = False
+astgrep["enables"] = "multi-language code graph (JS/TS/Go/Rust symbols and call edges)"
+checks["ast-grep"] = astgrep
+
 required = ("bash", "git", "make", "uv", "python")
 ok = all(checks[name]["ok"] for name in required)
 payload = {
     "ok": ok,
     "required": list(required),
-    "optional": ["powershell"],
+    "optional": ["powershell", "ast-grep"],
     "checks": checks,
 }
 print(json.dumps(payload, indent=2, sort_keys=True))

@@ -50,6 +50,7 @@ import json
 import hashlib
 import gzip
 import pathlib
+import os
 import subprocess
 import sys
 import tarfile
@@ -112,8 +113,32 @@ def normalized_info(path: pathlib.Path, arcname: str) -> tarfile.TarInfo:
 
 
 def build_archive() -> None:
-    paths = [path.relative_to(root) for path in root.rglob("*") if not excluded(path.relative_to(root))]
-    members = sorted(paths, key=lambda item: item.as_posix())
+    # Release exactly the Git index, never the ambient checkout. `rglob()` previously swept
+    # ignored runtime memory, .ai/tmp, local Claude settings and generated AGENTS.md session
+    # context into public archives even though `git status` was clean. Besides leaking private
+    # data, those files made package size grow with ordinary use. A clean tracked tree plus
+    # `git ls-files -z` is the reproducible source of truth.
+    raw = subprocess.check_output(["git", "ls-files", "-z"], cwd=root)
+    tracked: list[pathlib.Path] = []
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        rel = pathlib.Path(os.fsdecode(item))
+        if rel.is_absolute() or ".." in rel.parts or excluded(rel):
+            raise SystemExit(f"unsafe tracked archive path: {rel.as_posix()}")
+        source = root / rel
+        if source.is_symlink():
+            raise SystemExit(f"tracked symlink is not allowed in release archives: {rel.as_posix()}")
+        if not source.exists():
+            raise SystemExit(f"tracked archive member missing: {rel.as_posix()}")
+        tracked.append(rel)
+    directories = {
+        parent
+        for rel in tracked
+        for parent in rel.parents
+        if parent != pathlib.Path(".")
+    }
+    members = sorted(directories | set(tracked), key=lambda item: item.as_posix())
     with archive.open("wb") as raw:
         with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
             with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:

@@ -85,23 +85,10 @@ try {
   Pop-Location
 }
 
-# 2. Copy + wire repo-local config (repo-local only; never global).
+# 2. Transactionally copy, wire, activate, and verify (repo-local only; never global).
 Write-Host "[code-brain] installing into: $Target"
+$env:AI_INSTALL_STRICT = "1"
 Invoke-Checked "powershell" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$SourceRoot/scripts/install-into.ps1", "install", "$Target")
-
-# 3. Bootstrap the runtime, verify strict health, and create the first session snapshot.
-Push-Location $Target
-try {
-  Invoke-Checked "uv" @("sync", "--project", ".ai/runtime", "--extra", "dense")
-  Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "render", "--manifest-only", "--json") | Out-Null
-  Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "index", "rebuild", "--json") | Out-Null
-  Invoke-CheckedRetry "uv" @("run", "--project", ".ai/runtime", "ai", "doctor", "--strict", "--json") -BeforeRetry {
-    Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "index", "rebuild", "--json") | Out-Null
-  } | Out-Null
-  Invoke-Checked "uv" @("run", "--project", ".ai/runtime", "ai", "session", "start", "--agent", "installer", "--query", "initial Code Brain setup", "--json") | Out-Null
-} finally {
-  Pop-Location
-}
 
 Write-Host "[code-brain] installed. New AI sessions in $Target now load Code Brain memory, search, hooks, and MCP automatically."
 if ($UvInstalledByInstaller) {

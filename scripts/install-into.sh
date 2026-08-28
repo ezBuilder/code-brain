@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eEuo pipefail
 umask 077
 
 SOURCE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -158,7 +158,9 @@ is_code_brain_claude_stub() {
 write_agent_contract() {
   local dst="$1"
   if [[ -f "$SOURCE_ROOT/.ai/AGENTS.md" ]]; then
-    cp "$SOURCE_ROOT/.ai/AGENTS.md" "$dst"
+    if [[ ! -f "$dst" ]] || ! cmp -s "$SOURCE_ROOT/.ai/AGENTS.md" "$dst"; then
+      cp "$SOURCE_ROOT/.ai/AGENTS.md" "$dst"
+    fi
   else
     cat >"$dst" <<'MD'
 # Code Brain Agent Contract
@@ -193,7 +195,7 @@ copy_managed_files() {
   # which dominated fresh-install time on macOS. This preserves the existing
   # manifest/legacy/marker overwrite rules while adding symlink confinement.
   py -c '
-import filecmp
+import hashlib
 import json
 import os
 import shutil
@@ -249,6 +251,27 @@ def is_managed_existing(rel: str, dst: Path) -> bool:
         return False
 
 
+def desired_bytes(rel: str, src: Path) -> bytes:
+    data = src.read_bytes()
+    if rel != ".ai/config.yaml":
+        return data
+    text = data.decode("utf-8")
+    lines = []
+    replaced = False
+    for line in text.splitlines():
+        if line.startswith("project_name:"):
+            lines.append(f"project_name: {target_root.name}")
+            replaced = True
+        elif "index_vendored_runtime" in line:
+            continue
+        else:
+            lines.append(line)
+    if not replaced:
+        lines.insert(1, f"project_name: {target_root.name}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+pending: list[tuple[str, Path, Path, bytes]] = []
 for rel in rels:
     rel_path = Path(rel)
     if rel == "bootstrap-code-brain.sh":
@@ -267,19 +290,32 @@ for rel in rels:
     if not src.is_file():
         print(f"install-into failed: missing source file {rel}", file=sys.stderr)
         raise SystemExit(2)
+    desired = desired_bytes(rel, src)
     if dst.exists():
         if not dst.is_file():
             print(f"install-into failed: refusing to overwrite non-file target {rel}", file=sys.stderr)
             raise SystemExit(3)
-        identical = filecmp.cmp(src, dst, shallow=False)
+        identical = dst.read_bytes() == desired
+        if identical:
+            continue
         if not identical and not is_managed_existing(rel, dst):
             print(
                 f"install-into failed: refusing to overwrite existing untracked target file {rel}",
                 file=sys.stderr,
             )
             raise SystemExit(3)
+    pending.append((rel, src, dst, desired))
+
+# Do not mutate until every source, destination, ownership, and confinement check passed.
+# The transaction below remains the late-I/O/runtime rollback rail; this pass prevents a
+# predictable conflict near the end of the list from ever creating an intermediate splice.
+for rel, src, dst, desired in pending:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst, follow_symlinks=True)
+    if rel == ".ai/config.yaml":
+        dst.write_bytes(desired)
+        shutil.copymode(src, dst, follow_symlinks=True)
+    else:
+        shutil.copy2(src, dst, follow_symlinks=True)
 ' "$SOURCE_ROOT" "$TARGET_ROOT" "$ACTION" "$(manifest_path)" < <(managed_files)
 }
 
@@ -289,8 +325,10 @@ write_bootstrap() {
     echo "install-into failed: missing source file bootstrap-code-brain.sh" >&2
     exit 2
   fi
-  cp "$src" "$TARGET_ROOT/bootstrap-code-brain.sh"
-  chmod +x "$TARGET_ROOT/bootstrap-code-brain.sh"
+  if [[ ! -f "$TARGET_ROOT/bootstrap-code-brain.sh" ]] || ! cmp -s "$src" "$TARGET_ROOT/bootstrap-code-brain.sh"; then
+    cp "$src" "$TARGET_ROOT/bootstrap-code-brain.sh"
+  fi
+  [[ -x "$TARGET_ROOT/bootstrap-code-brain.sh" ]] || chmod +x "$TARGET_ROOT/bootstrap-code-brain.sh"
 }
 
 write_install_manifest() {
@@ -318,10 +356,10 @@ if not source_repo_url:
         source_repo_url = None
 source_ref = os.environ.get("CODE_BRAIN_REF")
 if not source_ref:
-    try:
-        source_ref = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=source_root, text=True).strip() or None
-    except Exception:
-        source_ref = None
+    # Public upgrades must follow the stable branch, not whichever development
+    # branch happened to build the local installer. Branch-specific channels
+    # remain available through the explicit CODE_BRAIN_REF contract.
+    source_ref = "main"
 payload = {
     "schema_version": 2,
     "tool": "code-brain",
@@ -448,11 +486,13 @@ restore_managed_owner_if_root() {
 }
 
 configure_project() {
-  py - "$TARGET_ROOT" <<'PY'
+  py - "$TARGET_ROOT" "$SOURCE_ROOT" <<'PY'
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+source_root = Path(sys.argv[2])
+self_install = root.resolve() == source_root.resolve()
 config = root / ".ai" / "config.yaml"
 text = config.read_text(encoding="utf-8")
 lines = []
@@ -461,7 +501,7 @@ for line in text.splitlines():
     if line.startswith("project_name:"):
         lines.append(f"project_name: {root.name}")
         replaced = True
-    elif "index_vendored_runtime" in line:
+    elif "index_vendored_runtime" in line and not self_install:
         # Source-repo-only flag: consumer installs must not index the vendored
         # .ai/runtime payload, so the opt-in never propagates to targets.
         continue
@@ -469,7 +509,9 @@ for line in text.splitlines():
         lines.append(line)
 if not replaced:
     lines.insert(1, f"project_name: {root.name}")
-config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+rendered = "\n".join(lines) + "\n"
+if config.read_text(encoding="utf-8") != rendered:
+    config.write_text(rendered, encoding="utf-8")
 PY
 }
 
@@ -477,13 +519,19 @@ merge_mcp_json() {
   local dst="$TARGET_ROOT/.mcp.json"
   py - "$dst" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
+target_windows = os.environ.get("AI_INSTALL_TARGET_WINDOWS", "").lower() in {"1", "true", "yes", "on"}
 # Compact tools on by default: tools/list ships only the ~15 hot core tools; the rest load on
 # demand via tool_search. Big per-session schema-token cut, no capability loss. (AI_MCP_COMPACT_TOOLS)
-desired = {"command": ".ai/bin/ai-mcp", "args": [], "env": {"AI_MCP_COMPACT_TOOLS": "1"}}
+desired = {
+    "command": "powershell" if target_windows else ".ai/bin/ai-mcp",
+    "args": ["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"] if target_windows else [],
+    "env": {"AI_CODE_BRAIN_PROFILE": "usage", "AI_MCP_COMPACT_TOOLS": "1"},
+}
 if dst.exists():
     try:
         payload = json.loads(dst.read_text(encoding="utf-8"))
@@ -497,23 +545,30 @@ servers = payload.setdefault("mcpServers", {})
 if not isinstance(servers, dict):
     raise SystemExit(f"install-into failed: existing {dst}.mcpServers must be a JSON object")
 servers["code-brain"] = desired
-dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+if not dst.exists() or dst.read_text(encoding="utf-8") != rendered:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(rendered, encoding="utf-8")
 PY
 }
 
 merge_codex_config() {
   local dst="$TARGET_ROOT/.codex/config.toml"
   py - "$dst" <<'PY'
+import os
 import re
+import os
 import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
+target_windows = os.environ.get("AI_INSTALL_TARGET_WINDOWS", "").lower() in {"1", "true", "yes", "on"}
+command = "powershell" if target_windows else ".ai/bin/ai-mcp"
+args = '["-NoProfile", "-File", ".ai/bin/ai-mcp.ps1"]' if target_windows else "[]"
 block = (
     "[mcp_servers.code-brain]\n"
-    "command = \".ai/bin/ai-mcp\"\n"
-    "args = []\n"
+    f"command = \"{command}\"\n"
+    f"args = {args}\n"
     # Compact tools on by default (parity with .mcp.json): only hot core tools in tools/list,
     # rest load on demand via tool_search. Per-session schema-token cut, no capability loss.
     "env = { AI_CODE_BRAIN_PROFILE = \"usage\", AI_MCP_COMPACT_TOOLS = \"1\" }\n"
@@ -613,8 +668,9 @@ new_text = ensure_features_hooks(new_text)
 without_managed = strip_section(new_text, "[mcp_servers.code-brain]").rstrip()
 new_text = without_managed + "\n\n" + block if without_managed else block
 
-dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(new_text, encoding="utf-8")
+if not dst.exists() or dst.read_text(encoding="utf-8") != new_text:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(new_text, encoding="utf-8")
 PY
 }
 
@@ -622,6 +678,7 @@ merge_claude_settings() {
   local dst="$TARGET_ROOT/.claude/settings.json"
   py - "$dst" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -745,8 +802,24 @@ for hook_name, managed_entries in managed.items():
     existing = hooks.get(hook_name) if isinstance(hooks.get(hook_name), list) else []
     cleaned = _strip_code_brain(existing)
     hooks[hook_name] = cleaned + managed_entries
+# Env keys the runtime needs in order for the Stop-hook guards to do anything at all.
+# Before this, the source kit's .claude/settings.json carried env.AI_LOOP_CONTINUATION=1 but
+# the installer only ever merged `hooks`, so consumer settings ended up with the Stop hook
+# registered and env absent — the premature-stop guard was dead in every installed project.
+# Additive only: an existing user value is never overwritten.
+_managed_env = {"AI_LOOP_CONTINUATION": "1"}
+_env = payload.setdefault("env", {})
+if isinstance(_env, dict):
+    for _k, _v in _managed_env.items():
+        _env.setdefault(_k, _v)
+else:
+    raise SystemExit(f"install-into failed: existing {dst}.env must be a JSON object")
 dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+_rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+# Byte-identical renders must not be written: agent settings files are commonly protected by
+# the host sandbox/MDM, and a no-op write would fail an otherwise clean upgrade.
+if not dst.exists() or dst.read_text(encoding="utf-8") != _rendered:
+    dst.write_text(_rendered, encoding="utf-8")
 PY
 }
 
@@ -828,23 +901,27 @@ for name, managed_entries in managed_codex_hooks.items():
         # Legacy: a single object value (older buggy install). Replace entirely.
         kept = []
     hooks[name] = kept + managed_entries
-dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+if not dst.exists() or dst.read_text(encoding="utf-8") != rendered:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(rendered, encoding="utf-8")
 PY
 }
 
 merge_antigravity_mcp_json() {
   local dst="$TARGET_ROOT/.agents/mcp_config.json"
   py - "$dst" "$SOURCE_ROOT" <<'PY'
+import os
 import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
 source_root = Path(sys.argv[2])
 sys.path.insert(0, str(source_root / ".ai" / "runtime" / "src"))
-from ai_core.mcp_config import merge_antigravity_mcp_json
+from ai_core.mcp_config import code_brain_stdio_entry, merge_antigravity_mcp_json
 
-merge_antigravity_mcp_json(dst)
+target_windows = os.environ.get("AI_INSTALL_TARGET_WINDOWS", "").lower() in {"1", "true", "yes", "on"}
+merge_antigravity_mcp_json(dst, server_entry=code_brain_stdio_entry(windows=target_windows))
 PY
 }
 
@@ -852,19 +929,21 @@ merge_antigravity_hooks_json() {
   local dst="$TARGET_ROOT/.agents/hooks.json"
   py - "$dst" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
-# Antigravity 1.0.x hooks.json schema (verified against the agy hooks UI, which
-# writes ~/.gemini/antigravity-cli/hooks.json): the file is a top-level map of
+target_windows = os.environ.get("AI_INSTALL_TARGET_WINDOWS", "").lower() in {"1", "true", "yes", "on"}
+# Antigravity 2.0 / CLI 1.1.x hooks.json schema (official hooks reference,
+# verified 2026-08-28): the file is a top-level map of
 # {"<hook-name>": JSONHookSpec}. A JSONHookSpec has one field per supported
 # lifecycle EVENT, and Antigravity supports exactly five:
 #   PreToolUse, PostToolUse, PreInvocation, PostInvocation, Stop
 # There is NO SessionStart / UserPromptSubmit — those Claude events are unknown to
 # Antigravity (they parse as a named hook with zero handlers). Each event maps to
-# null or a list of matcher-groups: [{"matcher": <regex>, "hooks": [{"type":
-# "command", "command": <shell>, "timeout": <int>}]}]. The legacy Claude-shaped
+# null. PreToolUse/PostToolUse use matcher-groups; PreInvocation/PostInvocation/Stop
+# use a DIRECT handler list and ignore matchers. The legacy Claude-shaped
 # wrapper ({"_note":..., "hooks": {...}}) is unparseable by Antigravity
 # ("cannot unmarshal string into jsonhook.JSONHookSpec") and is dropped here.
 #
@@ -873,8 +952,16 @@ dst = Path(sys.argv[1])
 # (ai_core.agents_md), NOT these hooks: Antigravity command-hook stdout cannot
 # inject model context. These hooks cover the side effects that do work —
 # command routing (PreToolUse), tool-result recording (PostToolUse), and
-# session-end recording + AGENTS.md memory refresh (Stop).
+# request-baseline capture (PreInvocation), and session-end recording + AGENTS.md refresh
+# (Stop). PreInvocation runs the baseline only when invocationNum=0; later invocations are
+# cheap no-ops, and its native output is {"injectSteps": []}.
 def cmd(event: str) -> str:
+    if target_windows:
+        return (
+            'powershell -NoProfile -Command "$ROOT = (git rev-parse --show-toplevel 2>$null); '
+            'if (-not $ROOT) { $ROOT = (Get-Location).Path }; '
+            '& \\"$ROOT/.ai/bin/ai-hook.ps1\\" ' + event + '"'
+        )
     return (
         'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
         f'"$ROOT/.ai/bin/ai-hook" {event}'
@@ -882,6 +969,9 @@ def cmd(event: str) -> str:
 
 def matchers(event: str, timeout: int):
     return [{"matcher": "", "hooks": [{"type": "command", "command": cmd(event), "timeout": timeout}]}]
+
+def handlers(event: str, timeout: int):
+    return [{"type": "command", "command": cmd(event), "timeout": timeout}]
 
 # NOTE: no PreToolUse hook for Antigravity. Its jsonhook contract is deny-by-default —
 # unless the hook returns an approve schema agy recognizes, EVERY tool call is denied
@@ -892,18 +982,18 @@ def matchers(event: str, timeout: int):
 code_brain_spec = {
     "PreToolUse": None,
     "PostToolUse": matchers("PostToolUse", 15),
-    "PreInvocation": None,
+    "PreInvocation": handlers("PreInvocation", 15),
     "PostInvocation": None,
-    "Stop": matchers("Stop", 20),
+    "Stop": handlers("Stop", 20),
 }
 
 if dst.exists():
     try:
         payload = json.loads(dst.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        payload = {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"install-into failed: existing {dst} is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict):
-        payload = {}
+        raise SystemExit(f"install-into failed: existing {dst} is not a JSON object")
 else:
     payload = {}
 
@@ -916,8 +1006,10 @@ cleaned = {
 }
 cleaned["code-brain"] = code_brain_spec
 
-dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+rendered = json.dumps(cleaned, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+if not dst.exists() or dst.read_text(encoding="utf-8") != rendered:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(rendered, encoding="utf-8")
 PY
 }
 
@@ -1004,7 +1096,448 @@ PY
   rm -f "$newlist"
 }
 
-install_or_upgrade() {
+install_transaction_dir() {
+  printf '%s\n' "$TARGET_ROOT/.code-brain-install-transaction"
+}
+
+write_install_transaction_phase() {
+  local txn="$1"
+  local phase="$2"
+  py - "$txn" "$phase" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+txn = Path(sys.argv[1])
+phase = sys.argv[2]
+tmp = txn / ".phase.tmp"
+with tmp.open("w", encoding="utf-8") as handle:
+    handle.write(phase + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(tmp, txn / "phase")
+if hasattr(os, "O_DIRECTORY"):
+    fd = os.open(txn, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
+}
+
+write_install_transaction_marker() {
+  local txn="$1"
+  local marker="$2"
+  py - "$txn" "$marker" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+txn = Path(sys.argv[1])
+marker = sys.argv[2]
+if not marker or "/" in marker or "\\" in marker:
+    raise SystemExit("invalid transaction marker")
+path = txn / marker
+with path.open("wb") as handle:
+    handle.write(b"1\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+}
+
+begin_install_transaction() {
+  local txn
+  txn="$(install_transaction_dir)"
+  if [[ -e "$txn" || -L "$txn" ]]; then
+    echo "install-into failed: unresolved install transaction exists: $txn" >&2
+    return 6
+  fi
+  mkdir "$txn"
+  chmod 700 "$txn"
+  py - "$TARGET_ROOT" "$txn" "$$" "$ACTION" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+txn = Path(sys.argv[2]).resolve()
+payload = {"schema": 1, "target": str(root), "pid": int(sys.argv[3]), "action": sys.argv[4]}
+tmp = txn / ".owner.tmp"
+with tmp.open("w", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(tmp, txn / "owner.json")
+PY
+  write_install_transaction_phase "$txn" "SNAPSHOTTING"
+  local prior_hooks_path
+  if prior_hooks_path="$(git -C "$TARGET_ROOT" config --get core.hooksPath)"; then
+    printf '%s' "$prior_hooks_path" >"$txn/core-hooks-path.value"
+    : >"$txn/core-hooks-path.present"
+  else
+    local hooks_read_rc=$?
+    if [[ "$hooks_read_rc" != "1" ]]; then
+      echo "install-into failed: cannot read existing core.hooksPath" >&2
+      rm -rf "$txn"
+      return "$hooks_read_rc"
+    fi
+    : >"$txn/core-hooks-path.absent"
+  fi
+  {
+    managed_files
+    printf '%s\n' \
+      ".ai/secret_scan_allowlist.txt" \
+      ".ai/generated/install-manifest.json" \
+      ".mcp.json" \
+      ".codex/config.toml" \
+      ".codex/hooks.json" \
+      ".claude/settings.json" \
+      ".agents/mcp_config.json" \
+      ".agents/hooks.json" \
+      ".gitignore" \
+      "AGENTS.md" \
+      "CLAUDE.md" \
+      "bootstrap-code-brain.sh"
+  } | awk 'NF && !seen[$0]++' >"$txn/paths.txt"
+  if py - "$TARGET_ROOT" "$txn" <<'PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+txn = Path(sys.argv[2]).resolve()
+paths = {
+    line.strip()
+    for line in (txn / "paths.txt").read_text(encoding="utf-8").splitlines()
+    if line.strip()
+}
+install_manifest = root / ".ai" / "generated" / "install-manifest.json"
+if install_manifest.is_file():
+    try:
+        prior = json.loads(install_manifest.read_text(encoding="utf-8"))
+        paths.update(item for item in prior.get("files", []) if isinstance(item, str))
+    except Exception:
+        pass
+for rel_dir in (".claude/commands", ".codex/prompts", ".agents/skills"):
+    base = root / rel_dir
+    if base.is_dir():
+        paths.update(p.relative_to(root).as_posix() for p in base.rglob("*") if p.is_file())
+
+records = []
+absent_dirs: set[str] = set()
+files_root = txn / "files"
+for rel in sorted(paths):
+    rp = Path(rel)
+    if rp.is_absolute() or ".." in rp.parts:
+        print(f"install-into failed: unsafe transaction path {rel}", file=sys.stderr)
+        raise SystemExit(3)
+    path = root / rp
+    for parent in path.parents:
+        if parent == root:
+            break
+        if not parent.exists():
+            absent_dirs.add(parent.relative_to(root).as_posix())
+    resolved_parent = path.parent.resolve(strict=False)
+    try:
+        resolved_parent.relative_to(root)
+    except ValueError:
+        print(f"install-into failed: target path escapes project root: {rel}", file=sys.stderr)
+        raise SystemExit(3)
+    if path.is_symlink():
+        records.append({"rel": rel, "kind": "symlink", "target": os.readlink(path)})
+    elif path.is_file():
+        backup = files_root / rp
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, backup, follow_symlinks=False)
+        backup.chmod(0o600)
+        data = backup.read_bytes()
+        with backup.open("rb") as handle:
+            os.fsync(handle.fileno())
+        records.append({
+            "rel": rel,
+            "kind": "file",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        })
+    elif path.exists():
+        print(f"install-into failed: transaction target is not a file {rel}", file=sys.stderr)
+        raise SystemExit(3)
+    else:
+        records.append({"rel": rel, "kind": "absent"})
+snapshot = txn / "snapshot.json"
+temporary = txn / ".snapshot.tmp"
+with temporary.open("w", encoding="utf-8") as handle:
+    json.dump(
+        {"schema": 1, "target": str(root), "records": records, "absent_dirs": sorted(absent_dirs)},
+        handle,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(temporary, snapshot)
+if hasattr(os, "O_DIRECTORY"):
+    fd = os.open(txn, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
+  then
+    :
+  else
+    local rc=$?
+    rm -rf "$txn"
+    return "$rc"
+  fi
+  write_install_transaction_phase "$txn" "READY"
+  printf '%s\n' "$txn"
+}
+
+rollback_install_transaction() {
+  local txn="$1"
+  py - "$TARGET_ROOT" "$txn" <<'PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+txn = Path(sys.argv[2]).resolve()
+payload = json.loads((txn / "snapshot.json").read_text(encoding="utf-8"))
+if payload.get("schema") != 1 or Path(str(payload.get("target") or "")).resolve() != root:
+    raise SystemExit("install-into failed: rollback snapshot target/schema mismatch")
+for row in payload.get("records", []):
+    if row.get("kind") != "file":
+        continue
+    rel = str(row.get("rel") or "")
+    rp = Path(rel)
+    if not rel or rp.is_absolute() or ".." in rp.parts:
+        raise SystemExit("install-into failed: unsafe rollback record")
+    backup = txn / "files" / rp
+    if backup.is_symlink() or not backup.is_file():
+        raise SystemExit(f"install-into failed: rollback backup missing: {rel}")
+    data = backup.read_bytes()
+    if len(data) != int(row.get("size", -1)) or hashlib.sha256(data).hexdigest() != row.get("sha256"):
+        raise SystemExit(f"install-into failed: rollback backup integrity mismatch: {rel}")
+for row in payload.get("records", []):
+    rel = str(row.get("rel") or "")
+    rp = Path(rel)
+    if not rel or rp.is_absolute() or ".." in rp.parts:
+        continue
+    path = root / rp
+    kind = row.get("kind")
+    if kind == "absent":
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        continue
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    if kind == "file":
+        shutil.copy2(txn / "files" / rp, path, follow_symlinks=False)
+    elif kind == "symlink":
+        os.symlink(str(row.get("target") or ""), path)
+for rel in sorted(payload.get("absent_dirs", []), key=lambda item: item.count("/"), reverse=True):
+    rp = Path(str(rel))
+    if rp.is_absolute() or ".." in rp.parts:
+        continue
+    path = root / rp
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+PY
+  local files_rc=$?
+  local hooks_rc=0
+  if [[ -f "$txn/core-hooks-path.present" ]]; then
+    local prior_hooks_path
+    prior_hooks_path="$(cat "$txn/core-hooks-path.value")"
+    git -C "$TARGET_ROOT" config core.hooksPath "$prior_hooks_path" || hooks_rc=$?
+    if [[ "$hooks_rc" == "0" && "$(git -C "$TARGET_ROOT" config --get core.hooksPath || true)" != "$prior_hooks_path" ]]; then
+      hooks_rc=1
+    fi
+  else
+    git -C "$TARGET_ROOT" config --unset-all core.hooksPath >/dev/null 2>&1 || true
+    if git -C "$TARGET_ROOT" config --get core.hooksPath >/dev/null 2>&1; then
+      hooks_rc=1
+    fi
+  fi
+  [[ "$files_rc" == "0" && "$hooks_rc" == "0" ]]
+}
+
+_INSTALL_TXN_DIR=""
+_INSTALL_VENV_BACKUP=""
+_INSTALL_RUNTIME_PREPARED=0
+
+prepare_runtime_transaction() {
+  # The source repository's own venv hosts this installer's inline Python. Moving it out
+  # from under a self-upgrade would also remove the rollback interpreter mid-transaction.
+  [[ "$TARGET_ROOT" != "$SOURCE_ROOT" ]] || return 0
+  local venv="$TARGET_ROOT/.ai/runtime/.venv"
+  local backup="$TARGET_ROOT/.ai/runtime/.venv.code-brain-rollback"
+  mkdir -p "$TARGET_ROOT/.ai/runtime"
+  if [[ -L "$venv" || -L "$backup" ]]; then
+    echo "install-into failed: refusing symlinked runtime environment transaction" >&2
+    return 3
+  fi
+  if [[ -e "$backup" && ! -d "$backup" ]]; then
+    echo "install-into failed: runtime rollback path is not a directory: $backup" >&2
+    return 3
+  fi
+  if [[ -n "${_INSTALL_TXN_DIR:-}" ]]; then
+    [[ -d "$venv" ]] && write_install_transaction_marker "$_INSTALL_TXN_DIR" "runtime-had-venv"
+    write_install_transaction_marker "$_INSTALL_TXN_DIR" "runtime-prepared"
+  fi
+  if [[ -d "$backup" ]]; then
+    # A prior process may have died after moving the old venv. Keep that known-good backup,
+    # discard only the interrupted replacement, and retry from a fresh environment.
+    [[ -e "$venv" ]] && rm -rf "$venv"
+  elif [[ -d "$venv" ]]; then
+    mv "$venv" "$backup"
+  fi
+  _INSTALL_VENV_BACKUP="$backup"
+  _INSTALL_RUNTIME_PREPARED=1
+}
+
+rollback_runtime_transaction() {
+  [[ "${_INSTALL_RUNTIME_PREPARED:-0}" == "1" ]] || return 0
+  local venv="$TARGET_ROOT/.ai/runtime/.venv"
+  [[ -e "$venv" ]] && rm -rf "$venv"
+  if [[ -n "${_INSTALL_VENV_BACKUP:-}" && -d "$_INSTALL_VENV_BACKUP" ]]; then
+    mv "$_INSTALL_VENV_BACKUP" "$venv"
+  fi
+  _INSTALL_RUNTIME_PREPARED=0
+  _INSTALL_VENV_BACKUP=""
+}
+
+commit_runtime_transaction() {
+  [[ "${_INSTALL_RUNTIME_PREPARED:-0}" == "1" ]] || return 0
+  if [[ -n "${_INSTALL_VENV_BACKUP:-}" && -d "$_INSTALL_VENV_BACKUP" ]]; then
+    rm -rf "$_INSTALL_VENV_BACKUP"
+  fi
+  _INSTALL_RUNTIME_PREPARED=0
+  _INSTALL_VENV_BACKUP=""
+}
+
+mark_install_transaction_committed() {
+  [[ -n "${_INSTALL_TXN_DIR:-}" ]] || return 0
+  write_install_transaction_phase "$_INSTALL_TXN_DIR" "COMMITTED"
+}
+
+recover_interrupted_install_transaction() {
+  local txn
+  txn="$(install_transaction_dir)"
+  [[ -e "$txn" || -L "$txn" ]] || return 0
+  local phase
+  phase="$(py - "$TARGET_ROOT" "$txn" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+raw = Path(sys.argv[2])
+if raw.is_symlink() or not raw.is_dir():
+    raise SystemExit("install-into failed: transaction journal is not a trusted directory")
+state = raw.stat()
+if os.name != "nt":
+    if state.st_uid != os.geteuid() or stat.S_IMODE(state.st_mode) & 0o077:
+        raise SystemExit("install-into failed: transaction journal owner/mode is unsafe")
+txn = raw.resolve()
+try:
+    owner = json.loads((txn / "owner.json").read_text(encoding="utf-8"))
+    phase = (txn / "phase").read_text(encoding="utf-8").strip()
+except (OSError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("install-into failed: transaction journal is incomplete or corrupt") from exc
+if owner.get("schema") != 1 or Path(str(owner.get("target") or "")).resolve() != root:
+    raise SystemExit("install-into failed: transaction journal target/schema mismatch")
+pid = int(owner.get("pid") or 0)
+if pid > 0:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        raise SystemExit(f"install-into failed: another install transaction may be active (pid {pid})") from exc
+    else:
+        raise SystemExit(f"install-into failed: another install transaction is active (pid {pid})")
+if phase not in {"SNAPSHOTTING", "READY", "COMMITTED"}:
+    raise SystemExit("install-into failed: transaction journal has an unknown phase")
+print(phase)
+PY
+)" || return $?
+
+  local venv="$TARGET_ROOT/.ai/runtime/.venv"
+  local backup="$TARGET_ROOT/.ai/runtime/.venv.code-brain-rollback"
+  if [[ "$phase" == "COMMITTED" ]]; then
+    if [[ -L "$backup" || ( -e "$backup" && ! -d "$backup" ) ]]; then
+      echo "install-into failed: committed runtime backup is unsafe: $backup" >&2
+      return 6
+    fi
+    [[ -d "$backup" ]] && rm -rf "$backup"
+    rm -rf "$txn"
+    echo "install-into: finalized a previously committed transaction" >&2
+    return 0
+  fi
+  if [[ "$phase" == "SNAPSHOTTING" ]]; then
+    # No target mutation starts until READY is durable.
+    rm -rf "$txn"
+    echo "install-into: discarded an interrupted pre-mutation snapshot" >&2
+    return 0
+  fi
+
+  rollback_install_transaction "$txn" || return $?
+  if [[ -f "$txn/runtime-prepared" ]]; then
+    if [[ -L "$venv" || -L "$backup" || ( -e "$backup" && ! -d "$backup" ) ]]; then
+      echo "install-into failed: interrupted runtime transaction contains an unsafe path" >&2
+      return 6
+    fi
+    if [[ -d "$backup" ]]; then
+      [[ -e "$venv" ]] && rm -rf "$venv"
+      mkdir -p "$(dirname "$venv")"
+      mv "$backup" "$venv"
+    elif [[ ! -f "$txn/runtime-had-venv" && -e "$venv" ]]; then
+      rm -rf "$venv"
+    fi
+  fi
+  rm -rf "$txn"
+  echo "install-into: recovered an interrupted transaction; previous files/settings restored" >&2
+}
+
+rollback_install_on_error() {
+  local rc="${1:-1}"
+  trap - ERR INT TERM
+  set +e
+  if [[ -n "${_INSTALL_TXN_DIR:-}" && -d "$_INSTALL_TXN_DIR" ]]; then
+    rollback_install_transaction "$_INSTALL_TXN_DIR"
+    local restore_rc=$?
+    rollback_runtime_transaction
+    local runtime_restore_rc=$?
+    if [[ "$runtime_restore_rc" != "0" ]]; then
+      restore_rc="$runtime_restore_rc"
+    fi
+    if [[ "$restore_rc" == "0" ]]; then
+      rm -rf "$_INSTALL_TXN_DIR"
+      echo "install-into: failed; previous managed files and user settings restored" >&2
+    else
+      echo "install-into: failed; automatic rollback also failed; backup: $_INSTALL_TXN_DIR" >&2
+    fi
+  fi
+  set -e
+  return "$rc"
+}
+
+install_or_upgrade_apply() {
   prune_orphans
   copy_managed_files
   seed_user_owned_files
@@ -1017,15 +1550,41 @@ install_or_upgrade() {
   configure_project
   ensure_persistent_scaffold
   write_bootstrap
-  chmod +x "$TARGET_ROOT/.ai/bin/ai" "$TARGET_ROOT/.ai/bin/ai-hook" "$TARGET_ROOT/.ai/bin/ai-mcp"
-  chmod +x "$TARGET_ROOT/.githooks/post-merge" "$TARGET_ROOT/.githooks/post-checkout"
-  chmod +x "$TARGET_ROOT/scripts/env-check.sh" "$TARGET_ROOT/scripts/preflight.sh"
+  local executable
+  for executable in \
+    "$TARGET_ROOT/.ai/bin/ai" \
+    "$TARGET_ROOT/.ai/bin/ai-hook" \
+    "$TARGET_ROOT/.ai/bin/ai-mcp" \
+    "$TARGET_ROOT/.githooks/post-merge" \
+    "$TARGET_ROOT/.githooks/post-checkout" \
+    "$TARGET_ROOT/scripts/env-check.sh" \
+    "$TARGET_ROOT/scripts/preflight.sh"
+  do
+    [[ -x "$executable" ]] || chmod +x "$executable"
+  done
   write_install_manifest
 
   case "${AI_INSTALL_DEFER_RUNTIME:-0}" in
     1|true|TRUE|yes|YES|on|ON)
       echo "install-into: runtime activation deferred; run bootstrap-code-brain.sh and session start in the target" >&2
       restore_managed_owner_if_root
+      return 0
+      ;;
+  esac
+
+  prepare_runtime_transaction
+
+  case "${AI_INSTALL_TARGET_WINDOWS:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      if ! command -v cygpath >/dev/null 2>&1 || ! command -v powershell.exe >/dev/null 2>&1; then
+        echo "install-into failed: Windows activation requires Git for Windows (cygpath and powershell.exe)" >&2
+        return 2
+      fi
+      local _source_windows _target_windows
+      _source_windows="$(cygpath -w "$SOURCE_ROOT")"
+      _target_windows="$(cygpath -w "$TARGET_ROOT")"
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File \
+        "$_source_windows/scripts/activate-windows.ps1" -TargetRoot "$_target_windows"
       return 0
       ;;
   esac
@@ -1097,15 +1656,25 @@ install_or_upgrade() {
   restore_managed_owner_if_root
 }
 
-uninstall() {
+install_or_upgrade() {
+  _INSTALL_TXN_DIR="$(begin_install_transaction)"
+  trap 'rollback_install_on_error $?' ERR
+  trap 'rollback_install_on_error 130; exit 130' INT
+  trap 'rollback_install_on_error 143; exit 143' TERM
+  install_or_upgrade_apply
+  mark_install_transaction_committed
+  commit_runtime_transaction
+  trap - ERR INT TERM
+  rm -rf "$_INSTALL_TXN_DIR"
+  _INSTALL_TXN_DIR=""
+}
+
+uninstall_apply() {
   local manifest
   manifest="$(manifest_path)"
   if [[ ! -f "$manifest" ]]; then
     echo "install-into failed: install manifest not found: $manifest" >&2
     exit 4
-  fi
-  if [[ "$(git -C "$TARGET_ROOT" config --get core.hooksPath || true)" == ".githooks" ]]; then
-    git -C "$TARGET_ROOT" config --unset core.hooksPath || true
   fi
   py - "$TARGET_ROOT" "$manifest" <<'PY'
 import json
@@ -1117,7 +1686,11 @@ from pathlib import Path
 root = Path(sys.argv[1])
 manifest = Path(sys.argv[2])
 payload = json.loads(manifest.read_text(encoding="utf-8"))
+protected_exact = {".ai/secret_scan_allowlist.txt"}
+protected_prefixes = (".ai/memory/", ".ai/runtime/state/", ".ai/eval/")
 for rel in sorted(payload.get("files", []), key=lambda item: item.count("/"), reverse=True):
+    if rel in protected_exact or rel.startswith(protected_prefixes):
+        continue
     path = root / rel
     if path.is_file() or path.is_symlink():
         path.unlink()
@@ -1221,6 +1794,7 @@ if agent_hooks.exists():
     except json.JSONDecodeError:
         cfg = None
     if isinstance(cfg, dict):
+        cfg.pop("code-brain", None)
         hb = cfg.get("hooks")
         if isinstance(hb, dict):
             for name in list(hb.keys()):
@@ -1253,7 +1827,17 @@ if codex_hooks.exists():
             for name in list(hb.keys()):
                 entries = hb.get(name)
                 if isinstance(entries, list):
-                    kept = [e for e in entries if not (isinstance(e, dict) and isinstance(e.get("command"), str) and "/.ai/bin/ai-hook" in e["command"])]
+                    kept = [e for e in entries if not (
+                        isinstance(e, dict) and (
+                            (isinstance(e.get("command"), str) and ".ai/bin/ai-hook" in e["command"])
+                            or any(
+                                isinstance(h, dict)
+                                and isinstance(h.get("command"), str)
+                                and ".ai/bin/ai-hook" in h["command"]
+                                for h in (e.get("hooks") or [])
+                            )
+                        )
+                    )]
                     if kept:
                         hb[name] = kept
                     else:
@@ -1267,10 +1851,19 @@ if codex_hooks.exists():
             codex_hooks.write_text(json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         else:
             codex_hooks.unlink()
+manifest.unlink(missing_ok=True)
 for rel in (".ai", ".githooks"):
     path = root / rel
-    if path.exists():
-        shutil.rmtree(path)
+    if path.is_dir():
+        for directory in sorted((p for p in path.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        try:
+            path.rmdir()
+        except OSError:
+            pass
 for rel in (".claude/commands", ".codex/prompts", ".agents/skills", ".agents"):
     path = root / rel
     if path.exists() and path.is_dir() and not any(path.iterdir()):
@@ -1287,6 +1880,25 @@ for rel in ("scripts",):
         pass
 PY
 }
+
+uninstall() {
+  _INSTALL_TXN_DIR="$(begin_install_transaction)"
+  trap 'rollback_install_on_error $?' ERR
+  trap 'rollback_install_on_error 130; exit 130' INT
+  trap 'rollback_install_on_error 143; exit 143' TERM
+  prepare_runtime_transaction
+  uninstall_apply
+  if [[ "$(git -C "$TARGET_ROOT" config --get core.hooksPath || true)" == ".githooks" ]]; then
+    git -C "$TARGET_ROOT" config --unset-all core.hooksPath
+  fi
+  mark_install_transaction_committed
+  commit_runtime_transaction
+  trap - ERR INT TERM
+  rm -rf "$_INSTALL_TXN_DIR"
+  _INSTALL_TXN_DIR=""
+}
+
+recover_interrupted_install_transaction
 
 case "$ACTION" in
   install)

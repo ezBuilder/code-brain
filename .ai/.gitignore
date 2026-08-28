@@ -1,8 +1,10 @@
 /runtime/.venv/
+/runtime/.venv.code-brain-rollback/
 /runtime/.pytest_cache/
 /runtime/**/__pycache__/
 /runtime/**/*.pyc
 /cache/
+/eval/
 /tools/
 /agents_catalog/
 /skills/

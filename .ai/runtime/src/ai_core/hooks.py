@@ -69,11 +69,11 @@ def normalize_agent(payload: dict[str, Any]) -> str:
     """Map a hook payload's agent identifier to one of the canonical names.
 
     Returns one of ``claude``, ``codex``, ``antigravity``, or ``unknown``. We
-    prefer an explicit ``agent`` (or ``agent_name``) field; otherwise we fall
-    back to environment variables each host sets (``CLAUDE_PROJECT_DIR`` for
-    Claude Code, ``CODEX_HOME`` for OpenAI Codex CLI, ``ANTIGRAVITY_CLI`` /
-    ``GEMINI_HOME`` for Google Antigravity). The result is used both for
-    inject-context headers and for obs/audit breakdown.
+    prefer an explicit ``agent`` (or ``agent_name``) field. Antigravity command
+    hooks do not provide one, so their documented camelCase payload signature
+    (``conversationId``/``workspacePaths``/``terminationReason``/``fullyIdle``)
+    is checked before host environment variables. The result is used both for
+    wire projection, inject-context headers and obs/audit breakdown.
     """
     raw = payload.get("agent") or payload.get("agent_name") or ""
     norm = str(raw).strip().lower()
@@ -86,6 +86,11 @@ def normalize_agent(payload: dict[str, Any]) -> str:
         return aliases[norm]
     if norm and norm != "unknown":
         return norm
+    if any(
+        key in payload
+        for key in ("conversationId", "workspacePaths", "terminationReason", "fullyIdle")
+    ):
+        return "antigravity"
     env = _os.environ
     if env.get("CLAUDE_PROJECT_DIR"):
         return "claude"
@@ -196,11 +201,11 @@ def _spawn_background_rebuild(root: Path) -> None:
 def _spawn_agents_md_refresh(root: Path) -> None:
     """Refresh the managed AGENTS.md memory block in a DETACHED process.
 
-    Antigravity fires its ``Stop`` hook but does not wait for / may kill the hook
-    process before a synchronous refresh (which calls build_context, ~1s) finishes
-    — so the block would never update from an agy turn. Running the refresh
-    detached (own session, like _spawn_background_rebuild) lets it complete even
-    if the host kills the parent hook. The refresh itself is write-on-change, so
+    Older Antigravity builds could end a slow ``Stop`` command before a synchronous
+    refresh (which calls build_context, ~1s) finished. Current 2.0/CLI 1.1.x waits
+    and supports continuation, but the Stop decision path must still stay fast.
+    Running the refresh detached (own session, like _spawn_background_rebuild)
+    keeps side effects out of that decision budget. The refresh is write-on-change, so
     repeated spawns don't churn AGENTS.md. Never raises into the hook hot path.
     """
     import os
@@ -230,6 +235,118 @@ def _spawn_agents_md_refresh(root: Path) -> None:
         "import sys;from pathlib import Path;"
         f"sys.path.insert(0,{src!r});"
         "from ai_core.agents_md import refresh;refresh(Path(sys.argv[1]))"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    try:
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [sys.executable, "-c", code, str(root)],
+                stdout=devnull,
+                stderr=devnull,
+                stdin=subprocess.DEVNULL,
+                cwd=str(root),
+                env=env,
+                **detached_popen_kwargs(),
+            )
+    except Exception:
+        pass
+
+
+def _spawn_turn_report(root: Path, agent: str) -> None:
+    """Snapshot what this turn changed in a DETACHED child (git facts only).
+
+    Measured cost of the git calls: 36ms on code-brain, 92ms on navio, 687ms on blurivo —
+    the last one alone blows the 200ms Stop budget, so this must never run inline. The
+    child writes .ai/cache/turn_report.json; the next UserPromptSubmit decides whether the
+    change was big enough to ask for a short summary. Never raises into the hot path.
+    """
+    import os
+    import subprocess
+    import sys
+
+    from .portable import detached_popen_kwargs
+
+    if _env_disabled("AI_TURN_REPORT", default="1"):
+        return
+    # PostToolUse/Stop can fire repeatedly; bound the spawn rate like the AGENTS.md refresh.
+    try:
+        cooldown = float(os.environ.get("AI_TURN_REPORT_COOLDOWN", "10"))
+    except (TypeError, ValueError):
+        cooldown = 10.0
+    lock = root / ".ai" / "cache" / "turn_report.lock"
+    try:
+        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
+            return
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(time.time()), encoding="utf-8")
+    except Exception:
+        pass
+    src = str(root / ".ai" / "runtime" / "src")
+    code = (
+        "import sys;from pathlib import Path;"
+        f"sys.path.insert(0,{src!r});"
+        "from ai_core.turn_report import write_snapshot;"
+        "write_snapshot(Path(sys.argv[1]), agent=sys.argv[2])"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    try:
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [sys.executable, "-c", code, str(root), str(agent or "")],
+                stdout=devnull,
+                stderr=devnull,
+                stdin=subprocess.DEVNULL,
+                cwd=str(root),
+                env=env,
+                **detached_popen_kwargs(),
+            )
+    except Exception:
+        pass
+
+
+def _spawn_tokens_cache_refresh(root: Path) -> None:
+    """Refresh the prompt_growth output-token total in a DETACHED child.
+
+    `prompt_growth._output_tokens` used to aggregate every agent transcript INLINE inside
+    the Stop hook. Measured: 8.06s on blurivo (623,836 JSON lines across 507 codex + 125
+    claude session files), 6.5s on code-brain — and `tick` hits it on its growth cooldown,
+    so one turn in five froze turn-end for 6-8s. The value is only recorded provenance on a
+    rule (`baseline_tokens`); every ratchet decision uses `_recent_output_avg`, which reads
+    the small local jsonl. So the hook now reads a TTL cache and this child fills it.
+
+    Hourly cooldown matches the cache TTL: a rule needs RATCHET_WINDOW turns to graduate,
+    so hour-scale staleness in a provenance field cannot change an outcome.
+    """
+    import os
+    import subprocess
+    import sys
+
+    from .portable import detached_popen_kwargs
+
+    if _env_disabled("AI_PROMPT_GROWTH"):
+        return
+    try:
+        cooldown = float(os.environ.get("AI_PROMPT_GROWTH_TOKENS_COOLDOWN", "3600"))
+    except (TypeError, ValueError):
+        cooldown = 3600.0
+    lock = root / ".ai" / "cache" / "prompt_growth_tokens.lock"
+    try:
+        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
+            return
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(time.time()), encoding="utf-8")
+    except Exception:
+        pass
+    src = str(root / ".ai" / "runtime" / "src")
+    code = (
+        "import sys;from pathlib import Path;"
+        f"sys.path.insert(0,{src!r});"
+        "from ai_core.prompt_growth import refresh_output_tokens_cache;"
+        "refresh_output_tokens_cache(Path(sys.argv[1]))"
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -292,6 +409,30 @@ def _spawn_memory_sync(root: Path, agent: str) -> None:
             )
     except Exception:
         pass
+
+
+SLEEP_TIME_HOOKS = {"Stop", "SessionEnd"}
+# Turn-start events used only as a fallback when turn-end events never arrive.
+SLEEP_TIME_FALLBACK_HOOKS = {"SessionStart", "UserPromptSubmit"}
+# Only treat a turn-start as idle-time catch-up once the last spawn is this old.
+SLEEP_TIME_FALLBACK_MIN_AGE_SECONDS = 6 * 60 * 60
+
+
+def _sleep_time_fallback_due(root: Path) -> bool:
+    """True when turn-start should stand in for a missing Stop/SessionEnd.
+
+    Uses the same lock file as the spawn cooldown as a last-run marker. Missing
+    lock means maintenance has never run here, so allow it. Any error is treated
+    as not-due: background maintenance must never break a hook.
+    """
+    lock_path = root / ".ai" / "cache" / "sleep-time.lock"
+    try:
+        if not lock_path.exists():
+            return True
+        age = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False
+    return age >= SLEEP_TIME_FALLBACK_MIN_AGE_SECONDS
 
 
 def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
@@ -1463,6 +1604,28 @@ def read_payload(stdin: str | None = None) -> dict[str, Any]:
 def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> dict[str, Any]:
     start = time.perf_counter()
     effective_hook = hook_name or payload.get("hook") or payload.get("event") or "unknown"
+    antigravity_first_invocation = (
+        effective_hook == "PreInvocation"
+        and str(payload.get("invocationNum", "")).strip() == "0"
+    )
+    if effective_hook == "UserPromptSubmit" or antigravity_first_invocation:
+        # Continuation budgets are per USER REQUEST, not per long-lived host session. Before
+        # this reset, one task could consume the cap/30-minute window and silently disable
+        # the guard for every later request in the same session.
+        sid = str(
+            payload.get("session_id")
+            or payload.get("sid")
+            or payload.get("conversationId")
+            or "default"
+        )
+        try:
+            from .completion_guard import begin_request
+            from .loop_continuation import reset_counter
+
+            begin_request(root, sid)
+            reset_counter(root, sid)
+        except Exception:
+            pass
     if effective_hook in {"SessionStart", "Stop", "SubagentStop"} and not (is_ci() or payload.get("dry") is True):
         try:
             from .process_janitor import cleanup_children
@@ -1588,14 +1751,34 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         append_event(root, event)
         mode = "local-append"
         persisted = True
+        # Completion proof ledger: metadata-only and lock-bounded. A successful relevant
+        # check must follow the latest edit before Stop is allowed to claim completion.
+        if effective_hook in {"PostToolUse", "PostToolUseFailure"}:
+            try:
+                from .completion_guard import observe_tool_event
+
+                observe_tool_event(
+                    root,
+                    payload,
+                    event_succeeded=effective_hook == "PostToolUse",
+                )
+            except Exception:
+                pass
         # Spawn the AGENTS.md memory refresh EARLY and detached. Stop/SessionEnd are
-        # the natural triggers for Claude/Codex, but Antigravity kills its Stop hook
-        # before the work runs (its Stop never reaches append_event) — so we also fire
-        # on PostToolUse, which Antigravity DOES complete. A cooldown in the helper
+        # the natural triggers; PostToolUse remains a fallback for interrupted turns and
+        # older hosts. A cooldown in the helper
         # bounds frequency; the refresh is write-on-change and detached so it finishes
         # even if the host kills the parent hook.
         if effective_hook in {"Stop", "SessionEnd", "PostToolUse"}:
             _spawn_agents_md_refresh(root)
+        # Turn-change snapshot: same trigger set as the AGENTS.md refresh. Detached;
+        # git facts only, never part of the synchronous Stop decision.
+        if effective_hook in {"Stop", "SessionEnd"}:
+            _spawn_turn_report(root, normalize_agent(payload))
+            # Same reason, different cost centre: the transcript aggregation that feeds
+            # prompt_growth's `baseline_tokens` is a multi-second scan, so it is refreshed
+            # out-of-band and the hook only ever reads its TTL cache.
+            _spawn_tokens_cache_refresh(root)
         if effective_hook in AUTO_REBUILD_HOOKS:
             _spawn_background_rebuild(root)
             try:
@@ -1663,15 +1846,29 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             _handle_lifecycle_event(root, effective_hook, payload)
         except Exception:
             pass
-        # T6: spawn sleep-time idle jobs after SessionEnd/Stop (memory page-out, audit fold, index refresh)
-        if effective_hook in {"Stop", "SessionEnd"}:
+        # T6: spawn sleep-time idle jobs (memory page-out, audit fold, index refresh).
+        #
+        # Originally gated on Stop/SessionEnd only. Some agent hosts never emit
+        # those events -- a real workspace went 12 days with an unexpired
+        # `sleep-time.lock` and zero background maintenance while still emitting
+        # SessionStart/UserPromptSubmit daily. Turn-START events are therefore a
+        # fallback trigger, admitted only when the previous run is old enough that
+        # this is genuinely idle-time catch-up rather than per-turn work. The
+        # 600s spawn cooldown inside _spawn_sleep_time_jobs still applies.
+        if effective_hook in SLEEP_TIME_HOOKS or (
+            effective_hook in SLEEP_TIME_FALLBACK_HOOKS
+            and _sleep_time_fallback_due(root)
+        ):
             try:
                 _spawn_sleep_time_jobs(root)
             except Exception:
                 pass
+        if effective_hook in SLEEP_TIME_HOOKS:
             # P4: opt-in cross-machine memory auto-sync. Detached + off the hot path; the
             # sync itself does git fetch/push but this hook only spawns it. Gated by
             # memory_sync.enabled and a cooldown so rapid turn-end Stops don't hammer git.
+            # Deliberately NOT extended to the fallback hooks: pushing at turn start
+            # would surprise the user mid-task.
             _spawn_memory_sync(root, normalize_agent(payload))
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     target_ms = _target_ms_for(effective_hook)
@@ -1818,7 +2015,7 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             response["dir_context"] = True
     # G3: Stop-hook plan continuation (opt-in via AI_LOOP_CONTINUATION, bounded). Only when NOT
     # already blocking for security — a security block must never be downgraded to a continuation.
-    if effective_hook == "Stop" and response.get("decision") != "block":
+    if effective_hook in _STOP_LIKE_HOOKS and response.get("decision") != "block":
         try:
             from .loop_continuation import continuation_directive
             cont = continuation_directive(payload, root)
@@ -1828,7 +2025,41 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                 response["continuation"] = True
         except Exception:
             pass
+    # Premature-stop guard: plan continuation only fires when an `ai plan` has unchecked
+    # steps, and measured across the installed projects almost nobody keeps one (blurivo 1 of
+    # 140 plans, navio 0 of 32, fluxwright 0). So the tree-evidence guard runs as the fallback
+    # — it reads conflict markers, broken syntax, self-introduced TODOs and failed acceptance
+    # instead of any self-report. Still second in line: an explicit plan names a better next
+    # action than a derived signal ever can.
+    if effective_hook in _STOP_LIKE_HOOKS and response.get("decision") != "block":
+        try:
+            from .completion_guard import guard_directive
+            guard = guard_directive(payload, root)
+            if guard:
+                response["decision"] = "block"
+                response["reason"] = guard
+                response["completion_guard"] = True
+        except Exception:
+            pass
+    if effective_hook in _STOP_LIKE_HOOKS and response.get("decision") != "block":
+        try:
+            from .completion_guard import _session_id, consume_degraded_notice
+            from .loop_continuation import consume_limit_notice
+
+            sid = _session_id(payload)
+            notices = [consume_limit_notice(root, sid), consume_degraded_notice(root, sid)]
+            notices = [notice for notice in notices if notice]
+            if notices:
+                response["completion_guard_notice"] = " ".join(notices)[:900]
+        except Exception:
+            pass
     return redact_value(response)
+
+
+# Turn-end events that can refuse to stop. SubagentStop uses the same decision contract as
+# Stop (Claude Code hooks reference, retrieved 2026-08-28), so a subagent that quits early is
+# caught by the same guard instead of silently handing back half-finished work.
+_STOP_LIKE_HOOKS = frozenset({"Stop", "SubagentStop"})
 
 
 def codex_wire_output(response: dict[str, Any]) -> dict[str, Any]:
@@ -1852,7 +2083,7 @@ def codex_wire_output(response: dict[str, Any]) -> dict[str, Any]:
                     "permissionDecisionReason": reason,
                 }
             }
-        if hook in {"UserPromptSubmit", "PostToolUse", "Stop"}:
+        if hook in {"UserPromptSubmit", "PostToolUse"} or hook in _STOP_LIKE_HOOKS:
             return {"decision": "block", "reason": reason}
 
     additional_context = hook_specific.get("additionalContext")
@@ -1873,9 +2104,55 @@ def codex_wire_output(response: dict[str, Any]) -> dict[str, Any]:
             if updated_tool_output is not None:
                 out["updatedToolOutput"] = updated_tool_output
             return {"hookSpecificOutput": out}
-    if hook == "Stop":
+    if hook in _STOP_LIKE_HOOKS:
         return {"continue": True}
     return {}
+
+
+def antigravity_wire_output(response: dict[str, Any]) -> dict[str, Any]:
+    """Project CB's internal decision to Antigravity 2.0 / CLI's native schema.
+
+    Antigravity's Stop polarity is the inverse of Claude/Codex: only
+    ``decision: \"continue\"`` prevents stopping; any other value allows it. Returning
+    Claude's ``decision: \"block\"`` therefore silently DID THE OPPOSITE of what CB meant.
+    The official contract also requires a decision on Stop, so ``{\"continue\": true}``
+    was invalid rather than a clean allow.
+
+    Current project wiring installs only PostToolUse and Stop for Antigravity. PreToolUse
+    projection is still defined defensively for a future/version-gated installer.
+    """
+    hook = str(response.get("hook") or "")
+    blocked = response.get("decision") == "block"
+    hook_specific = response.get("hookSpecificOutput")
+    hook_specific = hook_specific if isinstance(hook_specific, dict) else {}
+    reason = str(
+        response.get("reason")
+        or hook_specific.get("permissionDecisionReason")
+        or "Code Brain detected unfinished work."
+    )
+    if hook in _STOP_LIKE_HOOKS:
+        if blocked:
+            return {"decision": "continue", "reason": reason}
+        return {"decision": "stop"}
+    if hook == "PreToolUse":
+        return {"decision": "deny" if blocked else "allow", **({"reason": reason} if blocked else {})}
+    if hook == "PreInvocation":
+        return {"injectSteps": []}
+    # Antigravity's PostToolUse output contract is exactly an empty object. Codex-specific
+    # hookSpecificOutput fields are invalid there and must never leak across host schemas.
+    return {}
+
+
+def hook_wire_output(response: dict[str, Any], request_payload: dict[str, Any]) -> dict[str, Any]:
+    """Select the strict wire schema from the ORIGINAL host hook payload."""
+    if normalize_agent(request_payload) == "antigravity":
+        return antigravity_wire_output(response)
+    out = codex_wire_output(response)
+    # Claude's official universal `systemMessage` is user-visible without re-entering the model
+    # loop. Keep it host-gated: other Claude-compatible runtimes may enforce a narrower schema.
+    if normalize_agent(request_payload) == "claude" and response.get("completion_guard_notice"):
+        out["systemMessage"] = str(response["completion_guard_notice"])
+    return out
 
 
 LIFECYCLE_SNAPSHOT_HOOKS = {"PreCompact", "SessionEnd"}
@@ -2226,7 +2503,25 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if hook_name not in INJECTION_HOOKS or root is None:
         return ""
     sections = [header]
-    sections.append("Response: match the user's language; self-output <=10 words; answers concise by default; expand for explicit detail or severe risk. No next-step outro; keep working.")
+    sections.append("Response: match the user's language; self-output <=10 words; answers concise by default; broad changes end with a brief key-point summary; expand for explicit detail or severe risk. No next-step outro; keep working.")
+    # Bounded turn-summary nudge: only when the PREVIOUS turn's measured change was large.
+    # Injected from UserPromptSubmit, never Stop. Claude can attach Stop additionalContext
+    # while blocking and Antigravity can continue, but either route re-opens the model turn,
+    # consumes the shared bounded continuation budget, and is not portable across all Codex
+    # hosts. Reserve that scarce channel for correctness/security, not prose formatting.
+    # Placed HERE, next to the standing response rule, because
+    # build_context truncates from the TAIL once the budget is hit (measured: this repo,
+    # navio, blurivo and fluxwright all already fill 2048B exactly), and a directive that
+    # gets silently truncated away is worse than none.
+    if hook_name == "UserPromptSubmit":
+        try:
+            from .turn_report import nudge_line
+
+            turn_line = nudge_line(root)
+        except Exception:
+            turn_line = ""
+        if turn_line:
+            sections.append(turn_line)
     if _env_enabled("AI_ROUTING_HINT_COMPACT"):
         routing = "Search: MCP `code_query`/`context_pack` before grep."
     else:
@@ -2396,11 +2691,93 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if lessons:
         sections.append(lessons)
     # T37 — cloudflare remote_memory removed (.ai/ git sync handles cross-device).
-    composed = "\n\n".join(sections)
-    max_bytes = _max_injection_bytes_for(hook_name)
-    if len(composed.encode("utf-8")) > max_bytes:
-        truncated = composed.encode("utf-8")[: max_bytes - 3].decode("utf-8", errors="ignore") + "..."
-        composed = truncated
+    return _fit_sections(sections, _max_injection_bytes_for(hook_name))
+
+
+# Sections that must survive the budget even when earlier sections are large. These are
+# behavioural DIRECTIVES (how to answer, what rules were learned); the sections above them
+# are evidence (decisions/todos/history) that degrades gracefully when shortened. Naive
+# tail truncation dropped these entirely: measured 57% of the composed context discarded on
+# code-brain, 76% on navio, and on every project the auto-grown `learned_prompt` rules and
+# `session tail` were cut off completely — i.e. prompt_growth was writing rules that never
+# reached the model.
+_PROTECTED_SECTION_PREFIXES = (
+    "Code Brain fast_path:",
+    "Response:",
+    "Search:",
+    "Read:",
+    "cb-turn:",
+    "cb-stale:",
+    # prompt_growth.LEARNED_HEADER, inlined to keep this module import-cycle free and
+    # usable at import time. Guarded by test_hook_context_budget.
+    "# Learned project rules (auto-grown by Code Brain; do not edit by hand)",
+)
+_ELLIPSIS = "..."
+
+
+def _is_protected_section(section: str) -> bool:
+    return section.startswith(_PROTECTED_SECTION_PREFIXES)
+
+
+def _clip_section(section: str, budget: int) -> str:
+    """Shorten one section to `budget` bytes on a line boundary when possible."""
+    if budget <= len(_ELLIPSIS):
+        return ""
+    encoded = section.encode("utf-8")
+    if len(encoded) <= budget:
+        return section
+    head = encoded[: budget - len(_ELLIPSIS)].decode("utf-8", errors="ignore")
+    # Prefer cutting at the last newline so a section never ends mid-entry.
+    newline = head.rfind("\n")
+    if newline > len(section) // 4:
+        head = head[:newline]
+    return head.rstrip() + _ELLIPSIS
+
+
+def _fit_sections(sections: list[str], max_bytes: int) -> str:
+    """Compose sections within `max_bytes`, keeping directives and shrinking evidence.
+
+    Replaces a single tail truncation of the joined string. Protected sections are
+    reserved first; the remaining budget is spent on the evidence sections in order, and
+    the first evidence section that does not fit is clipped instead of dropping every
+    section after it. Deterministic: same input, same output.
+    """
+    sections = [s for s in sections if s]
+    if not sections:
+        return ""
+    joined = "\n\n".join(sections)
+    if len(joined.encode("utf-8")) <= max_bytes:
+        return joined
+
+    sep = 2  # "\n\n" between sections
+    protected_idx = [i for i, sec in enumerate(sections) if _is_protected_section(sec)]
+    protected_bytes = sum(len(sections[i].encode("utf-8")) + sep for i in protected_idx)
+    # A pathological protected set (huge learned rules) must not starve everything else,
+    # so protection is honoured only while it fits in most of the budget.
+    if protected_bytes > max_bytes:
+        protected_idx = []
+        protected_bytes = 0
+
+    keep: dict[int, str] = {i: sections[i] for i in protected_idx}
+    remaining = max_bytes - protected_bytes
+    for i, sec in enumerate(sections):
+        if i in keep:
+            continue
+        need = len(sec.encode("utf-8")) + sep
+        if need <= remaining:
+            keep[i] = sec
+            remaining -= need
+            continue
+        clipped = _clip_section(sec, max(0, remaining - sep))
+        if clipped:
+            keep[i] = clipped
+            remaining = 0
+        break
+
+    composed = "\n\n".join(keep[i] for i in sorted(keep))
+    encoded = composed.encode("utf-8")
+    if len(encoded) > max_bytes:  # belt-and-braces; must never exceed the host budget
+        composed = encoded[: max_bytes - len(_ELLIPSIS)].decode("utf-8", errors="ignore") + _ELLIPSIS
     return composed
 
 

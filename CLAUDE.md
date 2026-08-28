@@ -7,6 +7,7 @@
 - Match the user's language unless they request otherwise.
 - Keep self-initiated progress/output under 10 words.
 - Keep answers concise by default.
+- When changes are broad, end with a brief key-point summary of outcome, verification, and remaining risk; do not narrate every edit.
 - Expand beyond these defaults only for explicit detail, severe error/risk, or required question.
 - No progress narration or next-step outro; continue until done, blocked, or approval is required.
 

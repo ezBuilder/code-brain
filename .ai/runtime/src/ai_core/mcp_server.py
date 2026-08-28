@@ -190,31 +190,33 @@ def _stamp_required_string_bounds(
 _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "name": "memory_query",
-        "description": "인덱싱된 소스를 BM25로 검색. 출처가 붙은 상위 K개 스니펫 반환.",
+        "description": "인덱싱된 소스를 BM25로 검색. 기본 compact는 hits(path/lines/symbol/text)만 반환; detail=full은 진단용.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 100},
+                "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"},
             },
             "required": ["query"],
         },
     },
     {
         "name": "code_query",
-        "description": "memory_query 별칭 — BM25 코드 검색.",
+        "description": "memory_query 별칭. 기본 compact는 hits(path/lines/symbol/text)만 반환; detail=full은 진단용.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 100},
+                "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"},
             },
             "required": ["query"],
         },
     },
     {
         "name": "context_pack",
-        "description": "BM25 context와 bounded graph/span/PPR context pack을 반환. v2가 기본이며 legacy는 롤백 호환.",
+        "description": "BM25+graph context. 기본 compact는 context와 refs만 반환; detail=full은 receipt/trace 진단용.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -231,6 +233,7 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                     "default": CONTEXT_PACK_DEFAULT_REPRESENTATION,
                     "description": "legacy|v2|skeleton|refs-only; v2 graph/PPR가 기본 활성화.",
                 },
+                "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"},
             },
             "required": ["query"],
         },
@@ -299,13 +302,14 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "code_read_hashline",
-        "description": "기존 파일을 편집하기 전 대상 줄 범위를 읽어 stale-edit를 막는 기본 읽기 도구. 줄+해시 앵커 반환; 자격증명류 경로는 거부한다.",
+        "description": "편집하기 전 줄+sha12 앵커 읽기. 기본 compact는 path/range/content만 반환; detail=full은 진단용.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "start": {"type": "integer", "minimum": 1, "maximum": 10000000},
                 "end": {"type": "integer", "minimum": 1, "maximum": 10000000},
+                "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"},
             },
             "required": ["path"],
         },
@@ -1231,6 +1235,160 @@ def _search_tool_catalog(query_text: str, *, limit: int) -> list[dict[str, Any]]
     return [dict(tool) for _, _, _, tool in scored[:bounded_limit]]
 
 
+_COMPACT_RESPONSE_TOOLS = frozenset(
+    {"memory_query", "code_query", "context_pack", "code_read_hashline"}
+)
+
+
+def _compact_response_requested(name: object, arguments: object) -> bool:
+    if name not in _COMPACT_RESPONSE_TOOLS:
+        return False
+    args = arguments if isinstance(arguments, dict) else {}
+    return str(args.get("detail", "compact") or "compact").strip().lower() != "full"
+
+
+def _compact_error_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {"ok": False}
+    reason = payload.get("reason") or payload.get("error")
+    if reason:
+        result["error"] = str(redact_value(reason))[:256]
+    if payload.get("argument_warning") is not None:
+        result["warning"] = payload["argument_warning"]
+    return result
+
+
+def _compact_search_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return payload
+    if payload.get("ok") is False:
+        return _compact_error_payload(payload)
+
+    hits: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        hit: dict[str, Any] = {}
+        path = str(item.get("path") or "")
+        if path:
+            hit["path"] = path
+        start, end = item.get("start_line"), item.get("end_line")
+        if isinstance(start, int) and isinstance(end, int):
+            hit["lines"] = [start, end]
+        symbol = str(item.get("qualname") or "")
+        if symbol:
+            hit["symbol"] = symbol
+        snippet = str(item.get("snippet") or "")
+        if snippet:
+            hit["text"] = snippet
+        provenance = item.get("provenance")
+        if isinstance(provenance, dict):
+            processor = str(provenance.get("processor") or "")
+            if processor and processor != "code-brain-local":
+                hit["source"] = processor
+            confidence = provenance.get("confidence")
+            if (
+                isinstance(confidence, (int, float))
+                and not isinstance(confidence, bool)
+                and confidence != 1.0
+            ):
+                hit["confidence"] = confidence
+        if hit:
+            hits.append(hit)
+
+    compact: dict[str, Any] = {"ok": True, "hits": hits}
+    policy = str(payload.get("retrieval_policy") or "")
+    if policy and policy != "bm25":
+        compact["policy"] = policy
+    refresh = payload.get("auto_refresh")
+    if isinstance(refresh, dict):
+        reason = str(refresh.get("reason") or "")
+        if refresh.get("rebuilt"):
+            compact["refresh"] = "rebuilt"
+        elif reason and reason != "current":
+            compact["refresh"] = reason
+    if payload.get("argument_warning") is not None:
+        compact["warning"] = payload["argument_warning"]
+    return compact
+
+
+def _compact_ref(item: dict[str, Any]) -> str | None:
+    path = str(item.get("path") or "")
+    if not path:
+        return None
+    start, end = item.get("start_line"), item.get("end_line")
+    location = f"{path}:{start}-{end}" if isinstance(start, int) and isinstance(end, int) else path
+    symbol = str(item.get("qualname") or "")
+    return f"{location}#{symbol}" if symbol else location
+
+
+def _compact_context_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if "additionalContext" not in payload:
+        return payload
+    if payload.get("ok") is False:
+        return _compact_error_payload(payload)
+
+    compact: dict[str, Any] = {
+        "ok": True,
+        "context": str(payload.get("additionalContext") or ""),
+    }
+    raw_refs = payload.get("lexical_refs")
+    if not isinstance(raw_refs, list):
+        raw_refs = payload.get("results") if isinstance(payload.get("results"), list) else []
+    refs: list[str] = []
+    seen: set[str] = set()
+    for item in raw_refs:
+        ref = _compact_ref(item) if isinstance(item, dict) else None
+        if ref and ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    if refs:
+        compact["refs"] = refs
+
+    budget = payload.get("context_budget")
+    if isinstance(budget, dict) and budget.get("truncated"):
+        compact["truncated"] = True
+    representation = str(payload.get("representation") or "")
+    if representation and representation != CONTEXT_PACK_DEFAULT_REPRESENTATION:
+        compact["representation"] = representation
+    trace = payload.get("retrieval_trace")
+    if isinstance(trace, dict):
+        graph_status = str(trace.get("graph_status") or "")
+        if graph_status and graph_status not in {"used", "empty"}:
+            compact["graph"] = graph_status
+    if payload.get("argument_warning") is not None:
+        compact["warning"] = payload["argument_warning"]
+    return compact
+
+
+def _compact_hashline_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if "content" not in payload:
+        return payload
+    if payload.get("ok") is False:
+        return _compact_error_payload(payload)
+    compact: dict[str, Any] = {
+        "ok": True,
+        "path": str(payload.get("path") or ""),
+        "content": str(payload.get("content") or ""),
+    }
+    start, end = payload.get("start"), payload.get("end")
+    if isinstance(start, int) and isinstance(end, int):
+        compact["range"] = [start, end]
+    if payload.get("truncated"):
+        compact["truncated"] = True
+    return compact
+
+
+def _compact_tool_payload(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if name in {"memory_query", "code_query"}:
+        return _compact_search_payload(payload)
+    if name == "context_pack":
+        return _compact_context_payload(payload)
+    if name == "code_read_hashline":
+        return _compact_hashline_payload(payload)
+    return payload
+
+
 def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run the underlying handler for a tool by name. Raises KeyError if unknown."""
     args = arguments or {}
@@ -1373,9 +1531,9 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         warning = _int_argument_warning(raw_limit, field="limit", default=5)
         if warning is not None:
             result["argument_warning"] = warning
-        return result
+        return _compact_tool_payload(name, result) if _compact_response_requested(name, args) else result
     if name == "context_pack":
-        return context_pack(
+        result = context_pack(
             root,
             str(args.get("query", "")),
             limit=_coerce_int(args.get("limit"), 5, minimum=1, maximum=100),
@@ -1385,6 +1543,7 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
                 or CONTEXT_PACK_DEFAULT_REPRESENTATION
             ),
         )
+        return _compact_tool_payload(name, result) if _compact_response_requested(name, args) else result
     if name == "code_graph_callers":
         from .codegraph import query_callers
         return query_callers(
@@ -1455,12 +1614,13 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
         target = args.get("path")
         if not isinstance(target, str) or not target:
             raise ValueError("code_read_hashline requires path string")
-        return read_hashline(
+        result = read_hashline(
             root,
             target,
             start=(int(args["start"]) if isinstance(args.get("start"), int) else None),
             end=(int(args["end"]) if isinstance(args.get("end"), int) else None),
         )
+        return _compact_tool_payload(name, result) if _compact_response_requested(name, args) else result
     if name == "stream_guard_scan":
         from .stream_guard import scan_text
         return scan_text(str(args.get("text", "")), scope=str(args.get("scope", "tool") or "tool"))
@@ -2097,18 +2257,29 @@ def handle_request(root: Path, request: Any) -> dict[str, Any] | None:
             else:
                 try:
                     tool_result = _dispatch_tool(root, name, arguments or {})
+                    call_result: dict[str, Any] = {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    tool_result,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                            }
+                        ],
+                        "isError": not bool(tool_result.get("ok", True))
+                        if isinstance(tool_result, dict)
+                        else False,
+                    }
+                    if not _compact_response_requested(name, arguments):
+                        call_result["structuredContent"] = (
+                            tool_result if isinstance(tool_result, dict) else None
+                        )
                     response = _ok(
                         request_id,
-                        {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": json.dumps(tool_result, ensure_ascii=False, sort_keys=True),
-                                }
-                            ],
-                            "isError": not bool(tool_result.get("ok", True)) if isinstance(tool_result, dict) else False,
-                            "structuredContent": tool_result if isinstance(tool_result, dict) else None,
-                        },
+                        call_result,
                     )
                 except Exception as exc:
                     response = _ok(

@@ -1,6 +1,9 @@
 .ai/cache/
 .ai/tmp/
+.ai/eval/
 .ai/runtime/.venv/
+.ai/runtime/.venv.code-brain-rollback/
+.code-brain-install-transaction/
 .ai/runtime/.pytest_cache/
 __pycache__/
 *.pyc
@@ -19,3 +22,21 @@ dist/
 # AGENTS.md mirrors tracked .ai/AGENTS.md for agents that auto-load root files.
 # It is generated/seeded, so keep durable user instructions in .ai/AGENTS.md.
 /AGENTS.md
+# >>> code-brain .ai runtime ignore >>>
+# .ai/ 는 code-brain 런타임이 심는 디렉터리다.
+# src / tests / evals / policies / AGENTS.md / config.yaml 은 소스이므로 계속 추적한다.
+# 아래는 머신별 캐시·세션 상태·생성물이라 추적하지 않는다.
+.ai/cache/
+.ai/tmp/
+.ai/eval/
+.ai/runtime/.venv/
+.ai/runtime/.venv.code-brain-rollback/
+.ai/runtime/.pytest_cache/
+.ai/runtime/state/
+.ai/runtime/**/__pycache__/
+.ai/runtime/**/*.pyc
+.ai/memory/**
+!.ai/memory/**/
+!.ai/memory/**/.gitkeep
+.ai/generated/install-manifest.json
+# <<< code-brain .ai runtime ignore <<<

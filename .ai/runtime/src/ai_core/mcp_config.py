@@ -124,11 +124,10 @@ def merge_into_target(target: Path, dialect: str, server_name: str, server_entry
     if dialect == "antigravity":
         entry = _normalize_remote_url_keys(entry, target_key="serverUrl")
     servers[server_name] = entry
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if not target.exists() or target.read_text(encoding="utf-8") != rendered:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(rendered, encoding="utf-8")
 
 
 def merge_antigravity_mcp_json(target: Path, server_entry: dict[str, Any] | None = None) -> None:

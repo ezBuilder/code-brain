@@ -78,6 +78,24 @@ def _tree_usage(path: Path, *, max_entries: int = STORAGE_SCAN_MAX_ENTRIES) -> d
     }
 
 
+def _pinned_bytes(root: Path, directory: Path) -> int:
+    """Bytes held by entries the enforcer is not allowed to delete.
+
+    Pinning is a deletion veto (tracked in git, referenced by tracked source, or an
+    explicit ``.keep``). Counting those bytes against the cap made the cap unsatisfiable:
+    measured on blurivo, .ai/tmp held 546MB of which 475MB were three user fixtures with
+    explicit .keep markers, so every enforce run deleted what it could and still reported
+    failure — a permanent red doctor that no amount of cleanup could clear. Deliberately
+    kept bytes are the user's choice, so they are excluded from the *limit* while still
+    being reported.
+    """
+    try:
+        rows, _errors = _managed_entries(root, directory)
+    except Exception:
+        return 0
+    return sum(int(row["bytes"]) for row in rows if bool(row["pinned"]))
+
+
 def workspace_storage_status(root: Path) -> dict[str, int | bool]:
     root = Path(root)
     ai = _tree_usage(root / ".ai")
@@ -100,24 +118,35 @@ def workspace_storage_status(root: Path) -> dict[str, int | bool]:
     ai_bytes = int(ai["bytes"])
     tmp_bytes = int(tmp["bytes"])
     output_bytes = int(outputs["bytes"])
+    tmp_pinned = _pinned_bytes(root, root / ".ai" / "tmp")
+    output_pinned = _pinned_bytes(root, root / ".ai" / "outputs")
+    # Reclaimable = what the enforcer could actually delete. The caps apply to this.
+    tmp_reclaimable = max(0, tmp_bytes - tmp_pinned)
+    output_reclaimable = max(0, output_bytes - output_pinned)
+    ai_reclaimable = max(0, ai_bytes - tmp_pinned - output_pinned)
     return {
         "ok": complete
         and errors == 0
-        and ai_bytes <= AI_MAX_TOTAL_BYTES
-        and tmp_bytes <= TMP_MAX_TOTAL_BYTES
+        and ai_reclaimable <= AI_MAX_TOTAL_BYTES
+        and tmp_reclaimable <= TMP_MAX_TOTAL_BYTES
         and tmp_top_entries <= TMP_MAX_ENTRIES
-        and output_bytes <= OUTPUT_MAX_TOTAL_BYTES
+        and output_reclaimable <= OUTPUT_MAX_TOTAL_BYTES
         and output_top_entries <= OUTPUT_MAX_ENTRIES,
         "complete": complete,
         "errors": errors,
         "ai_bytes": ai_bytes,
         "ai_max_bytes": AI_MAX_TOTAL_BYTES,
+        "ai_reclaimable_bytes": ai_reclaimable,
         "tmp_bytes": tmp_bytes,
         "tmp_max_bytes": TMP_MAX_TOTAL_BYTES,
+        "tmp_pinned_bytes": tmp_pinned,
+        "tmp_reclaimable_bytes": tmp_reclaimable,
         "tmp_top_entries": tmp_top_entries,
         "tmp_max_entries": TMP_MAX_ENTRIES,
         "output_bytes": output_bytes,
         "output_max_bytes": OUTPUT_MAX_TOTAL_BYTES,
+        "output_pinned_bytes": output_pinned,
+        "output_reclaimable_bytes": output_reclaimable,
         "output_top_entries": output_top_entries,
         "output_max_entries": OUTPUT_MAX_ENTRIES,
         "entries_scanned": int(ai["entries"]),
@@ -173,6 +202,75 @@ def _has_keep_marker(path: Path) -> bool:
     return path.name == ".keep"
 
 
+# Cap the referenced-name scan so a huge repository cannot slow enforcement.
+_REFERENCE_SCAN_MAX_BYTES = 8 * 1024 * 1024
+_REFERENCE_SCAN_MAX_FILES = 4_000
+
+
+def _referenced_entry_names(root: Path, directory: Path, names: list[str]) -> set[str]:
+    """Names under ``directory`` that tracked source text mentions by name.
+
+    Motivation: enforcement deleted `.ai/tmp/<fixture>.mp4`, a 201MB SHA-256-pinned
+    test fixture that tracked scripts and an integration test referenced by name.
+    Nothing about size or age distinguished it from disposable scratch, and the
+    only protection was a hand-placed `.keep` marker nobody had added, so a
+    routine cap enforcement silently broke a live verification gate.
+
+    Conservative by construction: substring match on tracked text only, so a false
+    positive merely retains a file. Any failure returns an empty set, leaving the
+    pre-existing keep-marker and git-tracked rules as the sole protection.
+    """
+    candidates = {name for name in names if len(name) >= 8 and "." in name}
+    if not candidates:
+        return set()
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if listing.returncode != 0:
+        return set()
+
+    try:
+        skip_prefix = directory.relative_to(root).as_posix()
+    except ValueError:
+        skip_prefix = None
+
+    referenced: set[str] = set()
+    scanned = 0
+    for raw in listing.stdout.split(b"\0"):
+        if not raw or scanned >= _REFERENCE_SCAN_MAX_FILES:
+            break
+        try:
+            rel = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        # Never let the managed directory vouch for its own contents.
+        if skip_prefix and (rel == skip_prefix or rel.startswith(skip_prefix + "/")):
+            continue
+        target = root / rel
+        try:
+            if target.is_symlink() or not target.is_file():
+                continue
+            if target.stat().st_size > _REFERENCE_SCAN_MAX_BYTES:
+                continue
+            text = target.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        scanned += 1
+        for name in candidates - referenced:
+            if name in text:
+                referenced.add(name)
+        if referenced == candidates:
+            break
+    return referenced
+
+
 def _managed_entries(root: Path, directory: Path) -> tuple[list[dict[str, object]], int]:
     try:
         names = list_root_confined_directory(directory, root=root, max_entries=_DIRECTORY_SCAN_MAX_ENTRIES)
@@ -181,6 +279,7 @@ def _managed_entries(root: Path, directory: Path) -> tuple[list[dict[str, object
     except OSError:
         return [], 1
     tracked, tracked_known = _tracked_top_entries(root, directory)
+    referenced = _referenced_entry_names(root, directory, names)
     rows: list[dict[str, object]] = []
     errors = 0
     for name in names:
@@ -194,10 +293,29 @@ def _managed_entries(root: Path, directory: Path) -> tuple[list[dict[str, object
                 "name": name,
                 "bytes": int(usage["bytes"]),
                 "mtime_ns": int(usage["newest_mtime_ns"]),
-                "pinned": not tracked_known or name in tracked or _has_keep_marker(path),
+                # Two distinct reasons an entry survives, deliberately kept apart:
+                #  * `pinned` — an explicit user/repo decision (tracked in git, referenced
+                #    by tracked source, or a `.keep` marker). These bytes are excluded from
+                #    the cap, because the user chose to keep them.
+                #  * `undetermined` — git could not be consulted (no repo, git missing,
+                #    oversized listing), so deletion is withheld out of caution. These bytes
+                #    MUST still count against the cap; treating a failed lookup as a user
+                #    decision would silently disable quota enforcement for every
+                #    non-git workspace.
+                "pinned": (
+                    name in tracked
+                    or name in referenced
+                    or _has_keep_marker(path)
+                ),
+                "undetermined": not tracked_known,
             }
         )
     return rows, errors
+
+
+def _protected(row: dict[str, object]) -> bool:
+    """Entries the enforcer must not delete: an explicit pin, or an undetermined state."""
+    return bool(row.get("pinned")) or bool(row.get("undetermined"))
 
 
 def _remove_managed_entry(path: Path, *, root: Path) -> bool:
@@ -230,7 +348,7 @@ def _prune_managed_directory(
     survivors: list[dict[str, object]] = []
     for row in sorted(rows, key=lambda value: (int(value["mtime_ns"]), str(value["name"]))):
         expired = keep_days is not None and int(row["mtime_ns"]) < cutoff_ns
-        if expired and not bool(row["pinned"]):
+        if expired and not _protected(row):
             if _remove_managed_entry(Path(row["path"]), root=root):
                 removed += 1
                 removed_bytes += int(row["bytes"])
@@ -243,7 +361,7 @@ def _prune_managed_directory(
     kept: list[dict[str, object]] = []
     for row in survivors:
         over = count > max(0, int(max_entries)) or total > max(0, int(max_total_bytes))
-        if over and not bool(row["pinned"]):
+        if over and not _protected(row):
             if _remove_managed_entry(Path(row["path"]), root=root):
                 removed += 1
                 removed_bytes += int(row["bytes"])
@@ -253,12 +371,20 @@ def _prune_managed_directory(
             errors += 1
         kept.append(row)
 
+    # Judge the enforcer on what it could delete, not on what it is forbidden to touch.
+    # Pinned entries are a user decision (tracked / referenced by source / explicit .keep);
+    # counting them made `ok` unreachable and left doctor permanently red even after a
+    # successful sweep (blurivo: 475MB of pinned fixtures in a 512MB cap).
+    pinned_bytes = sum(int(row["bytes"]) for row in kept if row["pinned"])
+    reclaimable = max(0, total - pinned_bytes)
     return {
-        "ok": errors == 0 and total <= max_total_bytes and count <= max_entries,
+        "ok": errors == 0 and reclaimable <= max_total_bytes and count <= max_entries,
         "removed": removed,
         "removed_bytes": removed_bytes,
         "bytes_before": bytes_before,
         "bytes_kept": total,
+        "bytes_pinned": pinned_bytes,
+        "bytes_reclaimable": reclaimable,
         "kept": count,
         "pinned": sum(1 for row in kept if row["pinned"]),
         "errors": errors,
@@ -272,7 +398,7 @@ def _reclaim_from_directory(root: Path, directory: Path, *, needed_bytes: int) -
     for row in sorted(rows, key=lambda value: (int(value["mtime_ns"]), str(value["name"]))):
         if reclaimed >= needed_bytes:
             break
-        if bool(row["pinned"]):
+        if _protected(row):
             continue
         if _remove_managed_entry(Path(row["path"]), root=root):
             reclaimed += int(row["bytes"])

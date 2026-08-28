@@ -116,7 +116,7 @@ def test_valid_payload_reaches_handler(
     payload = mcp_server._dispatch_tool(
         tmp_path,
         "memory_query",
-        {"query": "needle", "limit": 5},
+        {"query": "needle", "limit": 5, "detail": "full"},
     )
 
     assert payload == {"ok": True, "results": []}

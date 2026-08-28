@@ -10,9 +10,11 @@ Hard safety rails (CB philosophy, not OmO's token-burner default):
   * OFF by default — only runs when AI_LOOP_CONTINUATION is set.
   * NEVER overrides a security block (the caller only consults this when decision != block).
   * No active plan / no remaining steps  → no continuation.
-  * stop_hook_active / explicit context-pressure → no continuation (avoid compaction & self-loops).
-  * Antigravity → no continuation (it kills its Stop hook before work runs; structurally impossible).
-  * Bounded: per-session continuation counter + wall-clock cap; exceeding either stops the loop.
+  * Explicit context-pressure → no continuation. `stop_hook_active` is diagnostic rather than
+    a bypass: unchanged evidence is bounded by the shared stall fingerprint and host cap.
+  * Antigravity system/error/max-step/non-idle stops → no continuation; a normal model_stop
+    is supported through that host's inverted `decision:"continue"` wire contract.
+  * Bounded: no-progress fingerprint + per-request counter + wall-clock cap.
 
 stdlib only; no LLM, no network. Pure decision + a tiny per-session counter sidecar in .ai/cache/.
 """
@@ -25,13 +27,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-MAX_CONTINUATIONS = 20      # per session; a hard backstop against runaway re-prompting
+from .private_write import atomic_write_private_text, private_file_lock
+
+MAX_CONTINUATIONS = 8       # Claude's documented consecutive Stop-block cap (2026-08-28)
 MAX_WALL_SECONDS = 1800     # 30 min since the first continuation in a session
 _SID_RE = re.compile(r"[^A-Za-z0-9_-]")
+LIMIT_NOTICE = (
+    "Code Brain continuation safety cap reached (8 attempts or 30 minutes; "
+    "scope=repository/worktree + host session). The turn was released for user review."
+)
 
 
 def _enabled() -> bool:
-    return str(os.environ.get("AI_LOOP_CONTINUATION", "")).strip() not in ("", "0", "false", "no")
+    return str(os.environ.get("AI_LOOP_CONTINUATION", "")).strip().lower() not in ("", "0", "false", "no")
 
 
 def _counter_path(root: Path, sid: str) -> Path:
@@ -42,25 +50,80 @@ def _counter_path(root: Path, sid: str) -> Path:
 def _bump_counter(root: Path, sid: str, *, now: float) -> bool:
     """Increment the per-session counter; return True if still within both caps, else False."""
     path = _counter_path(root, sid)
-    state: dict[str, Any] = {}
     try:
-        if path.exists():
-            state = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        state = {}
-    count = int(state.get("count", 0) or 0)
-    first_ts = float(state.get("first_ts", now) or now)
-    if count >= MAX_CONTINUATIONS or (now - first_ts) > MAX_WALL_SECONDS:
+        with private_file_lock(path.with_suffix(".lock"), root=Path(root)):
+            state: dict[str, Any] = {}
+            try:
+                if path.exists():
+                    state = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+                state = {}
+            count = int(state.get("count", 0) or 0)
+            first_ts = float(state.get("first_ts", now) or now)
+            if count >= MAX_CONTINUATIONS or (now - first_ts) > MAX_WALL_SECONDS:
+                state.update(
+                    {
+                        "count": count,
+                        "first_ts": first_ts,
+                        "last_ts": now,
+                        "yield_notice": LIMIT_NOTICE,
+                        "notice_emitted": False,
+                    }
+                )
+                atomic_write_private_text(
+                    path,
+                    json.dumps(state, ensure_ascii=False, sort_keys=True),
+                    root=Path(root),
+                )
+                return False
+            new_state = {
+                "count": count + 1,
+                "first_ts": first_ts if count else now,
+                "last_ts": now,
+            }
+            atomic_write_private_text(
+                path,
+                json.dumps(new_state, ensure_ascii=False, sort_keys=True),
+                root=Path(root),
+            )
+            return True
+    except (OSError, ValueError, TypeError):
         return False
-    new_state = {"count": count + 1, "first_ts": first_ts if count else now, "last_ts": now}
+
+
+def consume_limit_notice(root: Path, sid: str) -> str:
+    """Return a cap-release notice once for this repository/worktree + host session key."""
+    path = _counter_path(root, str(sid or "default"))
+    if path.is_symlink() or not path.is_file():
+        return ""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(new_state), encoding="utf-8")
-        tmp.replace(path)
+        with private_file_lock(path.with_suffix(".lock"), root=Path(root)):
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict) or state.get("notice_emitted") is not False:
+                return ""
+            notice = str(state.get("yield_notice") or "")[:500]
+            if not notice:
+                return ""
+            state["notice_emitted"] = True
+            atomic_write_private_text(
+                path,
+                json.dumps(state, ensure_ascii=False, sort_keys=True),
+                root=Path(root),
+            )
+            return notice
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+        return ""
+
+
+def reset_counter(root: Path, sid: str) -> bool:
+    """Reset the bounded continuation budget when a new user request starts."""
+    path = _counter_path(root, str(sid or "default"))
+    try:
+        with private_file_lock(path.with_suffix(".lock"), root=Path(root)):
+            path.unlink(missing_ok=True)
+        return True
     except OSError:
         return False
-    return True
 
 
 def _has_context_pressure(payload: dict[str, Any]) -> bool:
@@ -81,18 +144,34 @@ def continuation_directive(payload: dict[str, Any], root: Path, *, now: float | 
             return None
         if not isinstance(payload, dict):
             return None
-        if payload.get("stop_hook_active"):
-            return None  # already inside a continuation cycle → never self-loop
         if _has_context_pressure(payload):
             return None
-        agent = str(payload.get("agent") or payload.get("agent_type") or "").lower()
-        if "antigravity" in agent or agent == "agy":
-            return None  # Stop hook is killed before work runs on Antigravity
-        from . import plan_state
-        active = plan_state.active_summary(root)
-        if not active or active.get("remaining", 0) <= 0:
+        from .completion_guard import (
+            _fingerprint,
+            _requires_user_input,
+            request_plan_signal,
+            _stalled,
+            _termination_allows_continuation,
+        )
+        if not _termination_allows_continuation(payload) or _requires_user_input(payload):
             return None
-        sid = str(payload.get("session_id") or payload.get("sid") or "default")
+        sid = str(
+            payload.get("session_id")
+            or payload.get("sid")
+            or payload.get("conversationId")
+            or "default"
+        )
+        active = request_plan_signal(root, sid)
+        if not active:
+            return None
+        signal = {
+            "kind": "plan",
+            "path": "",
+            "plan_id": active.get("plan_id"),
+            "detail": f"{active.get('completed')}/{active.get('total')}",
+        }
+        if _stalled(root, sid, _fingerprint(root, signal)):
+            return None
         if not _bump_counter(root, sid, now=now if now is not None else time.time()):
             return None
         nxt = active.get("next_label") or "the next unchecked step"

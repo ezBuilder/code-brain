@@ -266,16 +266,18 @@ def test_internal_extractors_delegate_to_bounded_scan(
 
     def fake_scan(path: Path, _rule: str, *, timeout_seconds: float):
         calls.append(Path(path))
+        # Mirrors the real `ast-grep scan --json=stream` shape: one object per
+        # match with the span under `range`. The previous fixture used a
+        # `matches` list, which ast-grep never emits, so it masked the fact that
+        # every extractor returned [] against real output.
         return [
             {
-                "message": "function",
-                "matches": [
-                    {
-                        "start": {"line": 0},
-                        "end": {"line": 0},
-                        "text": "function hello() {}",
-                    }
-                ],
+                "message": "node",
+                "text": "function hello() {}",
+                "range": {
+                    "start": {"line": 0, "column": 0},
+                    "end": {"line": 0, "column": 19},
+                },
             }
         ]
 

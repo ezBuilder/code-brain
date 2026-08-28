@@ -114,6 +114,8 @@ cd /path/to/project
 
 Recall spans decisions, failures, lessons, and procedures in one ranked, cited answer; `memory conflicts` flags contradicting decisions offline. A durable plan (`ai plan`) keeps multi-step work honest — with `AI_LOOP_CONTINUATION` the Stop hook re-prompts until every step is checked. `code_find_references` / `code_goto_definition` add LSP-grade navigation when a language server is installed. Opt-in extras: decisions can carry `contradicts`/`derives_from`/`expires_at` relations (expired ones drop from recall); `AI_MCP_RESOURCES` exposes plans/reports/handoff as read-only `codebrain://` MCP resources; `AI_AST_CHUNK` switches Python indexing to AST-aware (cAST) chunking. As of v0.6.0 the safe pilots (MCP resources, directory context, conflict detection) are ON by default — manage them with `ai config pilots`; cAST self-validates via `ai cast eval`, a recall ratchet that enables it only when it beats the default chunker on your repo (nothing changes unmeasured).
 
+The completion guard is default-on and refuses Stop/SubagentStop only when request-scoped machine evidence remains: a changed active plan, new conflict/syntax/unfinished marker, a mutation without a later successful relevant check, or a new failed acceptance run. Verification is bound to the host tool-call identity, successful exit, edit order, and current edit-target content hash; stale/corrupt/partial evidence yields. It never treats a dirty tree or old backlog as current work, never overrides security/user-input/context-pressure stops, and yields after repeated identical evidence or the shared eight-continuation/30-minute cap. Set `AI_COMPLETION_GUARD=0` only as an emergency kill switch.
+
 v0.7.0 adds provable forgetting and measured recall: `ai memory forget` hard-deletes a decision or failure (tombstone + compaction + deletion receipt) so no read path — SessionStart injection included — can resurface it, and `ai memory forget-note` does the same for session notes. A `memory_retrieval` eval axis gates recall quality in `make eval` (expired, refuted, and tombstoned records must never rank), and model downloads happen only via explicit `ai embedding install` / `ai reranker install` — query paths never touch the network. v0.7.1 hardens the index contract: read paths never migrate a structural legacy index — the query fails deterministically with the explicit `ai index rebuild` remediation, mtime-independent and with zero storage growth from repeated failures.
 
 Default MCP tools:
@@ -195,6 +197,14 @@ bash scripts/install-into.sh install /path/to/project
 bash scripts/install-into.sh upgrade /path/to/project
 bash scripts/install-into.sh uninstall /path/to/project
 ```
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-into.ps1 install C:\path\to\project
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-into.ps1 upgrade C:\path\to\project
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-into.ps1 uninstall C:\path\to\project
+```
+
+Both entry points use the same manifest ownership, symlink confinement, byte-no-op, and non-destructive uninstall contract. A persistent write-ahead journal restores managed/config files, prior `core.hooksPath`, and the known-good venv after command failure, interrupt, SIGKILL, or power-loss retry; backup hashes are verified before restoration and COMMITTED is durable before cleanup. Git for Windows supplies the Bash runtime used by the PowerShell entry point; generated MCP and hook commands remain native PowerShell commands.
 
 Antigravity global MCP is opt-in only:
 

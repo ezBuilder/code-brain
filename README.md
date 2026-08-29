@@ -219,7 +219,7 @@ Do not trust synthetic benchmark claims. Run these in your own repo:
 
 ```bash
 make lint
-make test
+make test        # 2,622 tests as parallel shards (~3m); make test-serial for one process
 make eval
 make doctor
 scripts/lockfile-check.sh

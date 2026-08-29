@@ -195,7 +195,7 @@ full-all: 워커 풀 포함 전체
 
 ```bash
 make lint
-make test
+make test        # 2,622개 테스트 병렬 샤드 실행(약 3분). 단일 프로세스는 make test-serial
 make eval
 make doctor
 .ai/bin/ai doctor --strict --json

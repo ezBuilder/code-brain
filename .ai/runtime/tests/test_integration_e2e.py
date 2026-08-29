@@ -1,7 +1,7 @@
 """End-to-end integration tests for Code Brain T1–T4 new features.
 
 Tests verify that multi-step feature chains work correctly:
-1. page_out → audit_fold: Old audit entries are folded and replaced with summaries
+1. page_out → audit_fold: Old audit entries remain raw while sidecar summaries refresh
 2. sleep-time hook spawn: Background jobs register child processes and create lock files
 3. reranker integration: Model mock + rerank() scoring
 4. lessons → procedural consolidate: eval failures trigger lessons, which consolidate to procedural memory
@@ -39,10 +39,10 @@ def tmp_root(tmp_path: Path) -> Path:
 # ============================================================================
 # Test 1: page_out → audit_fold integration
 # ============================================================================
-def test_e2e_page_out_audit_fold_removes_and_replaces_old_entries(tmp_root: Path) -> None:
+def test_e2e_page_out_audit_fold_writes_private_rollup(tmp_root: Path) -> None:
     """
     Scenario: page_out calls audit_fold to compress entries > 30 days old.
-    Verify: Old entries are replaced by _folded summary records.
+    Verify: Raw entries remain and a private rollup is written.
     """
     from ai_core.memory_tier import page_out
     from datetime import datetime, timezone, timedelta
@@ -71,25 +71,26 @@ def test_e2e_page_out_audit_fold_removes_and_replaces_old_entries(tmp_root: Path
     assert result["ok"] is True
     assert result["audit_fold"]["ok"] is True
     assert result["audit_fold"]["folded_days"] >= 1, "Should have folded at least 1 day"
-    assert result["audit_fold"]["removed_entries"] >= 2, "Should have removed old entries"
+    assert result["audit_fold"]["removed_entries"] == 0
+    assert result["audit_fold"]["source_entries"] >= 2
     assert result["audit_fold"]["added_fold_records"] >= 1, "Should have added _folded record"
 
-    # Verify file contents changed
+    # Verify raw file is unchanged and the sidecar contains the summary.
     new_content = audit_file.read_text(encoding="utf-8")
     new_lines = [l.strip() for l in new_content.split("\n") if l.strip()]
     new_entries = [json.loads(l) for l in new_lines]
 
-    # Check: old entries gone, recent entry kept, _folded added
+    # Check: old and recent raw entries are retained.
     old_actions = [e.get("action") for e in new_entries if e.get("action", "").startswith("test.old")]
-    assert len(old_actions) == 0, f"Old entries should be removed, found: {old_actions}"
+    assert len(old_actions) == 2
 
     recent_actions = [e.get("action") for e in new_entries if e.get("action") == "test.recent"]
     assert len(recent_actions) == 1, "Recent entry should be kept"
 
-    fold_records = [e for e in new_entries if e.get("action") == "_folded"]
-    assert len(fold_records) >= 1, "Should have at least 1 _folded record"
-    assert "counts" in fold_records[0]["payload"], "_folded record should have action counts"
-    assert fold_records[0]["payload"]["counts"].get("test.old1", 0) >= 1, "Old actions should be counted"
+    sidecar = tmp_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+    fold_records = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+    assert len(fold_records) >= 1
+    assert fold_records[0]["payload"]["counts"].get("test.old1", 0) >= 1
 
 
 def test_e2e_page_out_dry_run_does_not_modify_audit(tmp_root: Path) -> None:
@@ -460,12 +461,12 @@ def test_e2e_full_chain_page_out_triggers_fold_preserves_lessons(tmp_root: Path,
     assert consol_result["ok"] is True
     assert consol_result["merged"] >= 1
 
-    # Verify audit was actually folded but lessons preserved
+    # Verify the audit rollup exists while raw audit remains available.
     audit_content = audit_file.read_text(encoding="utf-8")
     lines = [l.strip() for l in audit_content.split("\n") if l.strip()]
     entries = [json.loads(l) for l in lines]
-    fold_entries = [e for e in entries if e.get("action") == "_folded"]
-    assert len(fold_entries) >= 1, "Audit should have been folded"
+    assert any(e.get("action") == "test.old" for e in entries)
+    assert (tmp_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl").exists()
 
 
 # ============================================================================

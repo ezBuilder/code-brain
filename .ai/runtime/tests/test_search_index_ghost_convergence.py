@@ -116,6 +116,77 @@ def test_untracked_new_file_is_still_indexed(tmp_path: Path) -> None:
     assert search_mod.index_hash_status(root)["ok"] is True
 
 
+def test_code_brain_tmp_scratch_never_enters_index_or_freshness(tmp_path: Path) -> None:
+    root, _tracked = _make_repo(tmp_path)
+    scratch = root / ".ai" / "tmp" / "live-worker-note.md"
+    scratch.parent.mkdir(parents=True)
+    scratch.write_text("TransientNeedle = 1\n", encoding="utf-8")
+
+    assert scratch not in search_mod.candidate_files(root, use_cache=False, update_cache=False)
+    assert search_mod.rebuild(root)["ok"] is True
+    assert ".ai/tmp/live-worker-note.md" not in _indexed_paths(root)
+
+    scratch.write_text("TransientNeedle = 2\n", encoding="utf-8")
+    status = search_mod.index_hash_status(root)
+    assert status["ok"] is True
+    assert ".ai/tmp/live-worker-note.md" not in (status.get("changed_paths") or [])
+
+
+def test_install_transaction_never_enters_index_or_freshness(tmp_path: Path) -> None:
+    """Installer snapshots are operational state, not project source."""
+    root, _tracked = _make_repo(tmp_path)
+    transaction = root / ".code-brain-install-transaction"
+    (transaction / "files" / "src").mkdir(parents=True)
+    owner = transaction / "owner.json"
+    snapshot = transaction / "files" / "src" / "snapshot.py"
+    owner.write_text('{"schema": 1}\n', encoding="utf-8")
+    snapshot.write_text("TransactionNeedle = True\n", encoding="utf-8")
+
+    candidates = set(search_mod.candidate_files(root, use_cache=False, update_cache=False))
+    assert owner not in candidates
+    assert snapshot not in candidates
+    assert search_mod.rebuild(root)["ok"] is True
+    assert not any(path.startswith(".code-brain-install-transaction/") for path in _indexed_paths(root))
+
+    for path in sorted(transaction.rglob("*"), reverse=True):
+        path.rmdir() if path.is_dir() else path.unlink()
+    transaction.rmdir()
+
+    status = search_mod.index_hash_status(root, use_candidate_cache=False)
+    assert status["ok"] is True, status
+    assert not (status.get("changed_paths") or [])
+
+
+def test_dirty_refresh_purges_legacy_install_transaction_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrelated dirty refresh must retire transaction rows indexed by an older runtime."""
+    root, tracked = _make_repo(tmp_path)
+    transaction = root / ".code-brain-install-transaction"
+    snapshot = transaction / "files" / "src" / "snapshot.py"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text("LegacyTransactionNeedle = True\n", encoding="utf-8")
+
+    current_skip_dirs = set(search_mod.SKIP_DIRS)
+    monkeypatch.setattr(
+        search_mod,
+        "SKIP_DIRS",
+        current_skip_dirs - {".code-brain-install-transaction"},
+    )
+    assert search_mod.rebuild(root)["ok"] is True
+    legacy_path = ".code-brain-install-transaction/files/src/snapshot.py"
+    assert legacy_path in _indexed_paths(root)
+
+    monkeypatch.setattr(search_mod, "SKIP_DIRS", current_skip_dirs)
+    tracked.write_text("TrackedNeedle = False\n", encoding="utf-8")
+    result = search_mod._auto_refresh_if_stale(root)
+    assert result["rebuilt"] is True
+    assert result["reason"] == "dirty_hash_mismatch"
+    assert legacy_path not in _indexed_paths(root)
+    status = search_mod.index_hash_status(root, use_candidate_cache=False)
+    assert status["ok"] is True, status
+
+
 def test_auto_refresh_does_not_reindex_ignored_copy_of_staged_deletion(tmp_path: Path) -> None:
     """A managed file staged for deletion must not oscillate in and out forever."""
 

@@ -100,6 +100,28 @@ def test_atomic_private_write_cleans_temporary_file_on_replace_failure(
     assert list(tmp_path.glob(".state.json.*.tmp")) == []
 
 
+def test_confined_private_rename_is_atomic_and_never_replaces(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    source = root / ".ai" / "memory" / "old.jsonl"
+    target = source.with_name("new.jsonl")
+    source.parent.mkdir(parents=True)
+    source.write_text("source\n", encoding="utf-8")
+    source.chmod(0o600)
+
+    private_write.rename_root_confined_regular_file(source, target, root=root)
+
+    assert not source.exists()
+    assert target.read_text(encoding="utf-8") == "source\n"
+
+    replacement = target.with_name("replacement.jsonl")
+    replacement.write_text("keep\n", encoding="utf-8")
+    replacement.chmod(0o600)
+    with pytest.raises(FileExistsError, match="already exists"):
+        private_write.rename_root_confined_regular_file(target, replacement, root=root)
+    assert target.read_text(encoding="utf-8") == "source\n"
+    assert replacement.read_text(encoding="utf-8") == "keep\n"
+
+
 def test_private_append_creates_private_file_and_preserves_records(tmp_path: Path) -> None:
     path = tmp_path / "registry.jsonl"
 

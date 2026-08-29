@@ -1,4 +1,5 @@
 *.jsonl merge=union text eol=lf
+memory/audit/*.jsonl -merge text eol=lf
 memory/daily/*.md merge=union text eol=lf
 *.enc.yaml -merge
 *.enc.yml -merge
@@ -6,4 +7,3 @@ memory/daily/*.md merge=union text eol=lf
 *.db binary
 *.bin binary
 * text=auto eol=lf
-

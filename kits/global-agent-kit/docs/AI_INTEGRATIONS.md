@@ -26,12 +26,12 @@ Code Brain은 프로젝트별 `.ai/`를 source of truth로 쓰는 선택 통합�
 - 오프라인 충돌 스캔(**기본 ON**, `AI_MEMORY_CONFLICT_SCAN=0`으로 끔): page_out 시 모순 결정쌍 advisory 기록
 - cAST 구조 청킹(`AI_AST_CHUNK`, Python): stdlib ast 재귀분할+형제병합. **자가검증 게이팅** — `ai cast eval`이 자기 repo에서 default 청커 대비 recall 측정 후 이길 때만 ratchet이 자동 ON(무측정 변경 없음)
 - pilot 발견성/일괄: `ai config pilots`(상태·enable/disable), doctor가 on/off 요약 노출
-- 원격 메모리는 opt-in, project-scoped, hook hot path network-free 원칙
+- cross-machine Git memory sync는 명시 실행 전용이며 hook/MCP는 network-free 원칙
 
 전역 규칙에 강제하지 않을 부분:
 
 - `.ai/` 런타임 전체 설치
-- Cloudflare remote memory
+- hook-triggered 또는 Cloudflare remote memory
 - Code Brain MCP server
 - 프로젝트별 branch 정책
 

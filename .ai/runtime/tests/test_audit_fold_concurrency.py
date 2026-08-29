@@ -68,8 +68,10 @@ def test_fold_holds_append_lock_across_read_modify_write(
     ]
     actions = [record.get("action") for record in records]
     assert fold_result["ok"] is True
-    assert actions.count("_folded") == 1
+    assert actions.count("old.action") == 1
     assert actions.count("concurrent.action") == 1
+    sidecar = root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+    assert len(sidecar.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_dry_run_holds_lock_until_snapshot_is_complete(
@@ -131,4 +133,5 @@ def test_non_mapping_json_is_preserved_during_fold(tmp_path: Path) -> None:
     assert result["ok"] is True
     content = audit_file.read_text(encoding="utf-8")
     assert '["unexpected", "shape"]' in content
-    assert '"action":"_folded"' in content
+    assert '"action":"old.action"' in content
+    assert (root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl").exists()

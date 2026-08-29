@@ -94,10 +94,16 @@ def start_session(
         "before": before,
     }
     if should_rebuild and not dry_run:
-        rebuilt = rebuild(root)
+        # Session start can overlap an MCP/hook query that is already healing
+        # the same SQLite index.  Joining the rebuild single-flight avoids two
+        # writers dropping/vacuuming the WAL database concurrently (which can
+        # terminate a process with SIGBUS on mmap-backed SQLite platforms).
+        rebuilt = rebuild(root, single_flight=True)
+        rebuild_deferred = bool(rebuilt.get("skipped"))
         index_payload.update(
             {
-                "rebuilt": True,
+                "rebuilt": not rebuild_deferred and bool(rebuilt.get("ok", True)),
+                "deferred": rebuild_deferred,
                 "result": rebuilt,
                 "after": index_status(
                     root,

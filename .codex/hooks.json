@@ -1,5 +1,18 @@
 {
   "hooks": {
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" Interrupt",
+            "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" Interrupt\"",
+            "statusMessage": "Recording Code Brain interrupt",
+            "timeout": 2,
+            "type": "command"
+          }
+        ]
+      }
+    ],
     "PermissionRequest": [
       {
         "hooks": [
@@ -7,6 +20,7 @@
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PermissionRequest",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" PermissionRequest\"",
             "statusMessage": "Checking Code Brain approval policy",
+            "timeout": 5,
             "type": "command"
           }
         ],
@@ -20,6 +34,7 @@
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PostCompact",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" PostCompact\"",
             "statusMessage": "Recording Code Brain compact completion",
+            "timeout": 2,
             "type": "command"
           }
         ]
@@ -32,6 +47,7 @@
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PostToolUse",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" PostToolUse\"",
             "statusMessage": "Recording Code Brain tool result",
+            "timeout": 2,
             "type": "command"
           }
         ],
@@ -45,6 +61,7 @@
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PreCompact",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" PreCompact\"",
             "statusMessage": "Saving Code Brain compact snapshot",
+            "timeout": 2,
             "type": "command"
           }
         ]
@@ -57,19 +74,36 @@
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" PreToolUse",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" PreToolUse\"",
             "statusMessage": "Checking Code Brain command routing",
+            "timeout": 5,
             "type": "command"
           }
         ],
-        "matcher": "Bash|Shell|exec_command|functions.exec_command|run_command"
+        "matcher": "Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|run_command"
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" SessionEnd",
+            "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" SessionEnd\"",
+            "statusMessage": "Recording Code Brain session end",
+            "timeout": 2,
+            "type": "command"
+          }
+        ],
+        "matcher": "other"
       }
     ],
     "SessionStart": [
       {
         "hooks": [
           {
+            "additionalContextLimit": 5000,
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" SessionStart",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" SessionStart\"",
             "statusMessage": "Loading Code Brain session context",
+            "timeout": 2,
             "type": "command"
           }
         ],
@@ -83,6 +117,7 @@
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" Stop",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" Stop\"",
             "statusMessage": "Recording Code Brain stop event",
+            "timeout": 5,
             "type": "command"
           }
         ]
@@ -92,9 +127,11 @@
       {
         "hooks": [
           {
+            "additionalContextLimit": 5000,
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" SubagentStart",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" SubagentStart\"",
             "statusMessage": "Loading Code Brain subagent context",
+            "timeout": 2,
             "type": "command"
           }
         ]
@@ -107,6 +144,7 @@
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" SubagentStop",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" SubagentStop\"",
             "statusMessage": "Recording Code Brain subagent stop",
+            "timeout": 2,
             "type": "command"
           }
         ]
@@ -116,9 +154,11 @@
       {
         "hooks": [
           {
+            "additionalContextLimit": 2500,
             "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; \"$ROOT/.ai/bin/ai-hook\" UserPromptSubmit",
             "commandWindows": "powershell -NoProfile -Command \"$ROOT = (git rev-parse --show-toplevel 2>$null); if (-not $ROOT) { $ROOT = (Get-Location).Path }; & \\\"$ROOT/.ai/bin/ai-hook.ps1\\\" UserPromptSubmit\"",
             "statusMessage": "Loading Code Brain prompt context",
+            "timeout": 5,
             "type": "command"
           }
         ]

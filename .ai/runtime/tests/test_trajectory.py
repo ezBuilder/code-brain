@@ -241,3 +241,151 @@ def test_summarize_orders_recent_first(tmp_path: Path) -> None:
     out = summarize(tmp_path, limit=10)
     sids = [s["session_id"] for s in out["summary"]]
     assert sids == ["newest", "newer", "old"]
+
+
+# ---------------------------------------------------------------------------
+# Read diagnostics: malformed/unreadable audit rows must never be a silent
+# loss — every dropped row is counted and sampled with its exact source
+# path and physical line number.
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostics_present_and_zero_on_clean_input(tmp_path: Path) -> None:
+    events = [
+        _event("2026-05-01T10:00:00Z", tool_name="Read", session_id="s1"),
+    ]
+    _write_audit(tmp_path, events)
+    out = extract_trajectories(tmp_path)
+    diag = out["diagnostics"]
+    assert diag["malformed_json_rows"] == 0
+    assert diag["non_dict_rows"] == 0
+    assert diag["unparseable_ts_rows"] == 0
+    assert diag["unreadable_files"] == 0
+    assert diag["total_dropped_rows"] == 0
+    assert diag["samples"]["malformed_json_rows"] == []
+
+
+def test_diagnostics_empty_root_still_reports_shape(tmp_path: Path) -> None:
+    out = extract_trajectories(tmp_path)
+    assert out["diagnostics"]["total_dropped_rows"] == 0
+    assert out["diagnostics"]["unreadable_files"] == 0
+
+
+def test_diagnostics_counts_malformed_json_with_path_and_line(tmp_path: Path) -> None:
+    audit_dir = tmp_path / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True)
+    path = audit_dir / "2026.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps(_event("2026-05-01T10:00:00Z", tool_name="Read", session_id="s1")),
+                "{not valid json at all",
+                json.dumps(_event("2026-05-01T10:00:05Z", tool_name="Edit", session_id="s1")),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out = extract_trajectories(tmp_path)
+    diag = out["diagnostics"]
+    # The malformed row must be counted, not silently absorbed into
+    # scanned_events or into any trajectory's event list.
+    assert diag["malformed_json_rows"] == 1
+    assert diag["total_dropped_rows"] == 1
+    assert out["scanned_events"] == 2  # only the two valid rows were yielded
+    sample = diag["samples"]["malformed_json_rows"][0]
+    assert sample["path"] == "2026.jsonl"
+    assert sample["line"] == 2  # 1-based physical line number
+    assert sample["reason"]  # exception type name, e.g. "JSONDecodeError"
+
+
+def test_diagnostics_counts_non_dict_rows(tmp_path: Path) -> None:
+    audit_dir = tmp_path / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True)
+    path = audit_dir / "2026.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps([1, 2, 3]),  # valid JSON, not a dict
+                json.dumps(_event("2026-05-01T10:00:00Z", tool_name="Read", session_id="s1")),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out = extract_trajectories(tmp_path)
+    diag = out["diagnostics"]
+    assert diag["non_dict_rows"] == 1
+    assert diag["total_dropped_rows"] == 1
+    sample = diag["samples"]["non_dict_rows"][0]
+    assert sample["path"] == "2026.jsonl"
+    assert sample["line"] == 1
+
+
+def test_diagnostics_counts_unparseable_timestamps_with_provenance(tmp_path: Path) -> None:
+    audit_dir = tmp_path / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True)
+    path = audit_dir / "2026.jsonl"
+    bad_ts_event = _event("not-a-timestamp", tool_name="Read", session_id="s1")
+    good_event = _event("2026-05-01T10:00:00Z", tool_name="Edit", session_id="s1")
+    path.write_text(
+        "\n".join([json.dumps(bad_ts_event), json.dumps(good_event)]) + "\n",
+        encoding="utf-8",
+    )
+    out = extract_trajectories(tmp_path)
+    diag = out["diagnostics"]
+    # The row was successfully read/parsed as JSON (counted in
+    # scanned_events) but excluded from every trajectory because its
+    # timestamp could not be parsed — this must be visible in diagnostics,
+    # not merely absent from the trajectory output.
+    assert out["scanned_events"] == 2
+    assert diag["unparseable_ts_rows"] == 1
+    sample = diag["samples"]["unparseable_ts_rows"][0]
+    assert sample["path"] == "2026.jsonl"
+    assert sample["line"] == 1
+    assert sample["reason"] == "not-a-timestamp"
+    # Only the one trajectory with a valid timestamp should be extracted.
+    assert len(out["trajectories"]) == 1
+    assert out["trajectories"][0]["total_events"] == 1
+
+
+def test_diagnostics_counts_unreadable_file_by_permission(tmp_path: Path) -> None:
+    audit_dir = tmp_path / ".ai" / "memory" / "audit"
+    audit_dir.mkdir(parents=True)
+    good_path = audit_dir / "2025.jsonl"
+    good_path.write_text(
+        json.dumps(_event("2025-05-01T10:00:00Z", tool_name="Read", session_id="s1")) + "\n",
+        encoding="utf-8",
+    )
+    bad_path = audit_dir / "2026.jsonl"
+    bad_path.write_text(
+        json.dumps(_event("2026-05-01T10:00:00Z", tool_name="Edit", session_id="s1")) + "\n",
+        encoding="utf-8",
+    )
+    # Group/other-writable audit files are rejected by the confined reader
+    # (matching the same convention used for audit reads elsewhere in this
+    # package) rather than being silently read as if trustworthy.
+    bad_path.chmod(0o666)
+    try:
+        out = extract_trajectories(tmp_path)
+        diag = out["diagnostics"]
+        assert diag["unreadable_files"] == 1
+        sample = diag["samples"]["unreadable_files"][0]
+        assert sample["path"] == "2026.jsonl"
+        assert sample["reason"]
+        # The readable file's event must still be extracted — one
+        # unreadable file must not silently blank out the whole corpus.
+        assert out["scanned_events"] == 1
+        assert len(out["trajectories"]) == 1
+    finally:
+        bad_path.chmod(0o644)
+
+
+def test_summarize_still_works_with_diagnostics_present(tmp_path: Path) -> None:
+    events = [
+        _event("2026-05-01T10:00:00Z", tool_name="Read", session_id="s1"),
+    ]
+    _write_audit(tmp_path, events)
+    out = summarize(tmp_path, limit=5)
+    assert out["ok"] is True
+    assert out["total_sessions"] == 1

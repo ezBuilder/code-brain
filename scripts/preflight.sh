@@ -121,38 +121,17 @@ def uv_check() -> dict[str, object]:
 
 
 def python_check() -> dict[str, object]:
-    uv = shutil.which("uv")
-    python_path = installed_venv_python()
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    ok = sys.version_info[:2] >= (3, 11)
     result: dict[str, object] = {
-        "command": "uv python",
+        "command": "preflight python",
         "required": True,
-        "path": "uv run --project .ai/runtime python" if uv else (str(python_path.relative_to(root).as_posix()) if python_path else None),
-        "ok": False,
-        "version": None,
+        "path": sys.executable,
+        "ok": ok,
+        "version": version,
         "minimum": "3.11",
     }
-    command = [uv, "run", "--project", ".ai/runtime", "python", "-c", "import sys; print(sys.version.split()[0])"] if uv else None
-    if not command and python_path:
-        command = [str(python_path), "-c", "import sys; print(sys.version.split()[0])"]
-        result["command"] = "installed runtime python"
-    if not command:
-        result["error"] = "uv or installed runtime Python is required before Python runtime can be resolved"
-        return result
-    try:
-        output = subprocess.check_output(
-            command,
-            cwd=root,
-            env=command_env(),
-            text=True,
-            stderr=subprocess.STDOUT,
-        ).strip()
-    except Exception as exc:
-        result["error"] = str(exc)
-        return result
-    version = output.splitlines()[-1] if output else ""
-    major, minor, *_ = (int(part) for part in version.split("."))
-    result.update({"version": version, "ok": (major, minor) >= (3, 11)})
-    if not result["ok"]:
+    if not ok:
         result["error"] = "Python 3.11 or newer is required"
     return result
 

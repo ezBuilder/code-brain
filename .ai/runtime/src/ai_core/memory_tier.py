@@ -267,9 +267,7 @@ def archive_old_sessions(root: Path, *, age_days: float = 30.0, dry_run: bool = 
 
 
 def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
-    """High-level page-out: rotate session-current if pressured + archive
-    sessions older than AI_MEMORY_ARCHIVE_DAYS (default 30) + fold audit
-    entries older than AI_AUDIT_FOLD_DAYS (default 30)."""
+    """Offline maintenance plus deterministic episodic-index refresh."""
     from .memory import (
         _SESSION_NOTE_MAX_BYTES, _SESSION_NOTE_KEEP_BYTES, EVENTS_KEEP, EVENTS_MAX_BYTES,
         events_path, rotate_jsonl_tail, session_current_path,
@@ -341,6 +339,16 @@ def page_out(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                 "ok": False,
                 "error": str(e),
             }
+
+    # Build only in the detached/offline page-out path. SessionStart reads the
+    # tiny precomputed cache and never scans raw audit files or performs I/O
+    # proportional to lifetime history.
+    try:
+        from .episodic_runtime import build_audit_index
+
+        result["episodic_memory"] = build_audit_index(root, dry_run=dry_run)
+    except Exception as exc:
+        result["episodic_memory"] = {"ok": False, "error": type(exc).__name__}
 
     # Advisory conflict scan (default ON; never blocks page_out). Deterministic,
     # stdlib-only, writes only conflicts.jsonl (never decisions). Disable with

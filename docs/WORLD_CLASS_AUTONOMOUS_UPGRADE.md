@@ -25,14 +25,14 @@
 
 ### 2.1 검증된 강점
 
-<!-- code-brain-contract: doctor-check-count=34 -->
+<!-- code-brain-contract: doctor-check-count=37 -->
 <!-- code-brain-contract: eval-axes=precall_routing,context_budget,tool_discovery,autoresearch_retrieval,code_retrieval,line_span_retrieval,memory_retrieval -->
 
 | 품질 표면 | 현재 근거 | 유지할 계약 |
 | --- | --- | --- |
 | Repo-local 탐색 | `code query`, `context pack`, call graph, hashline read/verify | 편집 전 좁은 탐색과 정확한 읽기 |
 | 안전한 기본값 | 원격 LLM, 외부 알림, 원격 메모리, AutoResearch web ingest 및 코드 실행 루프가 기본 OFF | 네트워크·원격 mutation은 opt-in |
-| Strict doctor | 현재 체크아웃에서 source-derived 34개 check를 강제 | 배포 상태와 `secret_scan`·`index_freshness` 같은 건강 상태를 분리 보고 |
+| Strict doctor | 현재 체크아웃에서 source-derived 37개 check를 강제 | 배포 상태와 `secret_scan`·`index_freshness` 같은 건강 상태를 분리 보고 |
 | 결정론 평가 | `make eval`이 source-derived 7개 축을 `--require-complete`로 강제 | 검색·라우팅·라인/span 변경은 자체 코퍼스 회귀로 판정 |
 | 완료 게이트 | `loop submit --require-acceptance`, sandbox 재실행, typed verdict evidence | 모델의 “완료” 텍스트보다 exit code와 증거 우선 |
 | 증거·진행 상태 | evidence ledger, memory todo, durable plan, loop request/lease | 모든 라운드를 ID로 연결 |
@@ -158,7 +158,7 @@ canonical machine record는 `.ai/outputs/autonomous-round-<round_id>.json`이며
 
 ### P1. Doctor를 계층형 readiness 판정기로 확장
 
-현재 source-derived 29개 strict check를 유지하면서 다음 readiness check를 순차 확장한다.
+현재 source-derived 37개 strict check를 유지하며 readiness check를 source-derived 계약으로 관리한다.
 
 1. ✅ `autonomous_round_completeness`: bounded typed round report의 round/task/acceptance/evidence 연결을 read-only로 검증
 2. `injected_context_budget`: SessionStart + UserPromptSubmit의 합계와 규칙 수 상한

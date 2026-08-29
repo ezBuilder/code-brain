@@ -376,6 +376,108 @@ def test_mutation_requires_a_relevant_successful_check(repo: Path) -> None:
     assert _stop(repo) is None
 
 
+def test_codex_apply_patch_command_tracks_header_path_not_kotlin_arrow(repo: Path) -> None:
+    patch = (
+        f"*** Begin Patch\n*** Update File: {repo / 'app.py'}\n@@\n"
+        "-def f():\n+override fun f() -> {\n*** End Patch"
+    )
+    assert cg.observe_tool_event(
+        repo,
+        {
+            "session_id": "s1",
+            "tool_use_id": "codex-patch-command",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+        },
+    )
+    state = json.loads(cg.state_path(repo).read_text(encoding="utf-8"))
+    row = state["activities"]["s1"]
+    assert row["mutation_paths"] == ["app.py"]
+    assert row["ledger_complete"] is True
+
+
+def test_shell_mutation_path_parser_ignores_language_arrows_and_heredoc_body(repo: Path) -> None:
+    command = """python3 - <<'PY'
+fromAsset = lambda value: value
+callback = value => Function(String value)
+override fun f() -> Unit
+print(1 > 0)
+PY
+printf '%s\n' ok > generated/output.txt
+"""
+    assert cg._candidate_paths(
+        {"tool_input": {"command": command}},
+        command,
+    ) == ["generated/output.txt"]
+
+
+def test_shell_output_path_parser_supports_fd_append_and_tee(repo: Path) -> None:
+    command = "printf x 2>>logs/build.log; printf y | tee -a reports/result.txt"
+    assert cg._candidate_paths(
+        {"tool_input": {"command": command}},
+        command,
+    ) == ["logs/build.log", "reports/result.txt"]
+
+
+def test_gradle_variant_tasks_are_strong_verification(repo: Path) -> None:
+    assert cg.observe_tool_event(
+        repo,
+        {
+            "session_id": "s1",
+            "tool_use_id": "gradle-edit",
+            "tool_name": "Write",
+            "tool_input": {"file_path": "app.py"},
+        },
+    )
+    assert "cb-guard[verification]" in str(_stop(repo))
+
+    assert cg.observe_tool_event(
+        repo,
+        {
+            "session_id": "s1",
+            "tool_use_id": "gradle-check",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": (
+                    "./gradlew --no-daemon :app:compileDebugKotlin "
+                    ":app:testDebugUnitTest :app:assembleDebug"
+                )
+            },
+            "tool_response": "> Task :app:testDebugUnitTest\nBUILD SUCCESSFUL",
+        },
+    )
+    state = json.loads(cg.state_path(repo).read_text(encoding="utf-8"))
+    assert state["activities"]["s1"]["verification_level"] == 3
+    assert _stop(repo) is None
+
+
+def test_argv_and_shell_wrapped_commands_are_recognized_as_proof(repo: Path) -> None:
+    cases = [
+        ({"command": ["flutter", "test"]}, 3),
+        ({"command": ["bash", "-lc", "pytest -q"]}, 3),
+        ({"command": 'zsh -lc "make lint"'}, 2),
+    ]
+    for tool_input, expected in cases:
+        assert cg._verification_level(
+            {"tool_name": "functions.exec_command", "tool_input": tool_input}
+        ) == expected
+
+
+def test_native_builds_count_as_static_proof_but_flutter_run_does_not(repo: Path) -> None:
+    commands = [
+        "xcodebuild -scheme App build",
+        "./gradlew :app:assembleDebug",
+        "flutter build apk --debug",
+    ]
+    for command in commands:
+        assert cg._verification_level(
+            {"tool_name": "functions.exec_command", "tool_input": {"command": command}}
+        ) == 2
+    assert cg._verification_level(
+        {"tool_name": "functions.exec_command", "tool_input": {"command": "flutter run -d device"}}
+    ) == 0
+
+
 def test_failed_or_weak_check_does_not_clear_code_mutation(repo: Path) -> None:
     assert cg.begin_request(repo, "s1") is True
     cg.observe_tool_event(
@@ -684,8 +786,11 @@ def test_stall_escalation_gives_up_after_max_repeats(repo: Path) -> None:
     """Same signal + unchanged tree must stop being re-prompted, or a stuck model burns
     the entire budget on no progress."""
     (repo / "app.py").write_text("def f(:\n", encoding="utf-8")
-    assert _stop(repo) is not None  # 1st block
-    assert _stop(repo) is not None  # 2nd block
+    first = _stop(repo)
+    second = _stop(repo)
+    assert first is not None and "attempt 1/2" in first
+    assert second is not None and "attempt 2/2" in second
+    assert first != second
     assert _stop(repo) is None      # gave up: no progress across repeats
 
 
@@ -743,7 +848,8 @@ def test_user_prompt_rearms_guard_in_same_session(repo: Path) -> None:
 def test_stall_limit_is_configurable(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AI_COMPLETION_GUARD_MAX_STALL", "1")
     (repo / "app.py").write_text("def f(:\n", encoding="utf-8")
-    assert _stop(repo) is not None
+    first = _stop(repo)
+    assert first is not None and "attempt 1/1" in first
     assert _stop(repo) is None
 
 

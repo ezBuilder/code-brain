@@ -34,6 +34,10 @@ tar \
   --exclude './._*' \
   --exclude './*/._*' \
   --exclude './.ai/cache' \
+  --exclude './.ai/memory' \
+  --exclude './.ai/outputs' \
+  --exclude './.ai/runtime/state' \
+  --exclude './.ai/tmp' \
   --exclude './.ai/runtime/.venv' \
   --exclude './.ai/runtime/.pytest_cache' \
   --exclude './.ai/runtime/src/ai_core/__pycache__' \
@@ -41,13 +45,28 @@ tar \
   --exclude './.ai/runtime/tests/__pycache__' \
   -C "$ROOT" -cf - . | tar -C "$WORK" -xf -
 
+# Private memory never enters the drill copy, but the tracked empty-directory
+# skeleton is part of the install/layout contract.
+while IFS= read -r -d '' rel; do
+  mkdir -p "$WORK/$(dirname "$rel")"
+  cp -p "$ROOT/$rel" "$WORK/$rel"
+done < <(git -C "$ROOT" ls-files -z -- '.ai/memory/**/.gitkeep')
+
 cd "$WORK"
 unset CI GITHUB_ACTIONS GITLAB_CI AI_CI
+
+run_ai() {
+  if [[ -x ".ai/runtime/.venv/bin/python" ]]; then
+    .ai/runtime/.venv/bin/python -m ai_core.cli "$@"
+  else
+    uv run --project .ai/runtime ai "$@"
+  fi
+}
 
 manifest=".ai/generated/manifest.json"
 before="$(shasum -a 256 "$manifest" | awk '{print $1}')"
 
-dry_run_json="$(uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --dry-run --json)"
+dry_run_json="$(run_ai upgrade apply --target-version 0.1.1 --dry-run --json)"
 py - "$dry_run_json" "$WORK" <<'PY'
 import json
 import pathlib
@@ -70,7 +89,7 @@ if [[ "$before" != "$after_dry" ]]; then
   exit 1
 fi
 
-apply_json="$(uv run --project .ai/runtime ai upgrade apply --target-version 0.1.1 --json)"
+apply_json="$(run_ai upgrade apply --target-version 0.1.1 --json)"
 backup_path="$(py - "$apply_json" <<'PY'
 import json
 import sys
@@ -101,7 +120,7 @@ if [[ "$before" == "$drifted" ]]; then
   exit 1
 fi
 
-uv run --project .ai/runtime ai upgrade rollback --backup-path "$backup_path" --json >/dev/null
+run_ai upgrade rollback --backup-path "$backup_path" --json >/dev/null
 
 after_rollback="$(shasum -a 256 "$manifest" | awk '{print $1}')"
 if [[ "$before" != "$after_rollback" ]]; then
@@ -109,6 +128,12 @@ if [[ "$before" != "$after_rollback" ]]; then
   exit 1
 fi
 
-uv run --project .ai/runtime ai doctor --strict --json >/dev/null
+py - <<'PY'
+from pathlib import Path
+
+for name in ("code.sqlite", "code.sqlite-shm", "code.sqlite-wal"):
+    (Path(".ai/cache") / name).unlink(missing_ok=True)
+PY
+run_ai doctor --strict --json >/dev/null
 
 echo "rollback drill ok"

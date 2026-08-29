@@ -3,28 +3,30 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import uuid
 from collections import deque
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .private_write import (
     append_private_text,
     atomic_write_private_text,
     iter_root_confined_text_lines,
     list_root_confined_directory,
-    unlink_root_confined_regular_file,
     private_file_lock,
     read_root_confined_tail_bytes,
     read_root_confined_text,
+    unlink_root_confined_regular_file,
     validate_root_confined_regular_file,
 )
 from .redact import redact_value
 
 _AUDIT_THREAD_LOCK = threading.RLock()
-_AUDIT_FILE_MAX_COUNT = 256
+_AUDIT_FILE_MAX_COUNT = 4_096
 _AUDIT_LINE_MAX_BYTES = 1_000_000
+_AUDIT_SEGMENT_MARKER_MAX_BYTES = 4_096
 _AUDIT_ACTION_MAX_CHARS = 256
 _AUDIT_CATEGORY_MAX_CHARS = 128
 _JSONL_TAIL_MAX_LIMIT = 1_000
@@ -38,8 +40,6 @@ _JSONL_AUTO_MAX_BYTES = 32 * 1024 * 1024
 _JSONL_AUTO_KEEP_BYTES = 16 * 1024 * 1024
 _JSONL_AUTO_KEEP_LINES = 50_000
 _AUDIT_MAX_BYTES = 64 * 1024 * 1024
-_AUDIT_KEEP_BYTES = 32 * 1024 * 1024
-_AUDIT_KEEP_LINES = 50_000
 _AUDIT_RETENTION_YEARS = 3
 _AUDIT_INDEX_MAX_ROWS = 50_000
 _TEXT_TAIL_MAX_LINES = 1_000
@@ -49,6 +49,7 @@ _TEXT_TAIL_BYTES_PER_LINE = 64 * 1024
 _JSONL_ALL_MAX_BYTES = 100_000_000
 _JSONL_ALL_MAX_RECORDS = 100_000
 _OPEN_TODO_MAX_LIMIT = 1_000
+_ROTATION_NOTICE_SUFFIX = ".rotation.json"
 
 
 def now_iso() -> str:
@@ -59,12 +60,18 @@ def line_sha(line: str) -> str:
     return hashlib.sha256(line.encode("utf-8")).hexdigest()
 
 
+def _new_audit_event_id() -> str:
+    """Return an opaque ID that remains stable after serialization and rotation."""
+    return f"evt-{uuid.uuid4().hex}"
+
+
 def _previous_audit_sha(path: Path, *, root: Path) -> str | None:
+    line_limit = max(_AUDIT_LINE_MAX_BYTES, _AUDIT_SEGMENT_MARKER_MAX_BYTES)
     try:
         data, _state, complete = read_root_confined_tail_bytes(
             path,
             root=root,
-            max_bytes=_AUDIT_LINE_MAX_BYTES + 1,
+            max_bytes=line_limit + 1,
             require_private=False,
             require_owner=True,
             reject_group_other_writable=True,
@@ -88,8 +95,16 @@ def _previous_audit_sha(path: Path, *, root: Path) -> str | None:
             return None
         raise OSError("previous audit record exceeds line limit")
     last = lines[-1]
-    if len(last.encode("utf-8")) > _AUDIT_LINE_MAX_BYTES:
+    last_bytes = len(last.encode("utf-8"))
+    if last_bytes > line_limit:
         raise OSError("previous audit record exceeds line limit")
+    if last_bytes > _AUDIT_LINE_MAX_BYTES:
+        try:
+            marker = json.loads(last)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise OSError("previous audit record exceeds line limit") from exc
+        if not isinstance(marker, dict) or marker.get("action") != "audit.segment_started":
+            raise OSError("previous audit record exceeds line limit")
     return line_sha(last)
 
 
@@ -100,7 +115,10 @@ def _bounded_audit_line(
     category: object,
     payload: object,
     prev_sha: str | None,
+    event_id: str | None = None,
+    max_bytes: int | None = None,
 ) -> tuple[dict[str, Any], str]:
+    line_limit = _AUDIT_LINE_MAX_BYTES if max_bytes is None else max(1, int(max_bytes))
     action_clean = str(redact_value(action))[:_AUDIT_ACTION_MAX_CHARS]
     category_clean = str(redact_value(category))[:_AUDIT_CATEGORY_MAX_CHARS]
     payload_clean = redact_value(payload)
@@ -112,9 +130,11 @@ def _bounded_audit_line(
         "payload": payload_clean,
         "prev_sha": prev_sha,
     }
+    if event_id is not None:
+        record["event_id"] = event_id
     line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     encoded = line.encode("utf-8")
-    if len(encoded) <= _AUDIT_LINE_MAX_BYTES:
+    if len(encoded) <= line_limit:
         return record, line
     payload_bytes = json.dumps(
         payload_clean,
@@ -128,7 +148,7 @@ def _bounded_audit_line(
         "sha256": hashlib.sha256(payload_bytes).hexdigest(),
     }
     line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    if len(line.encode("utf-8")) > _AUDIT_LINE_MAX_BYTES:
+    if len(line.encode("utf-8")) > line_limit:
         raise OSError("audit record exceeds line limit")
     return record, line
 
@@ -160,6 +180,47 @@ def jsonl_lock_path(path: Path) -> Path:
 
 def audit_transaction_lock_path(root: Path) -> Path:
     return Path(root) / ".ai" / "memory" / ".audit-transaction.lock"
+
+
+def rotation_notice_path(path: Path) -> Path:
+    """Return the private sidecar that records lossy JSONL rotation."""
+    path = Path(path)
+    return path.with_name(f".{path.name}{_ROTATION_NOTICE_SUFFIX}")
+
+
+def _write_rotation_notice(
+    path: Path,
+    *,
+    root: Path,
+    bytes_before: int,
+    bytes_after: int,
+    lines_after: int,
+    dry_run: bool = False,
+) -> None:
+    if dry_run:
+        return
+    try:
+        source = path.relative_to(root).as_posix()
+    except ValueError:
+        source = path.as_posix()
+    notice = {
+        "schema_version": 1,
+        "source": source,
+        "ts": now_iso(),
+        "lossy": True,
+        "reason": "bounded_tail_rotation",
+        "bytes_before": max(0, int(bytes_before)),
+        "bytes_after": max(0, int(bytes_after)),
+        "bytes_discarded": max(0, int(bytes_before) - int(bytes_after)),
+        "lines_after": max(0, int(lines_after)),
+    }
+    notice_path = rotation_notice_path(path)
+    with private_file_lock(jsonl_lock_path(notice_path), root=root):
+        atomic_write_private_text(
+            notice_path,
+            json.dumps(notice, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+            root=root,
+        )
 
 
 def _trim_jsonl_locked(path: Path, *, root: Path) -> bool:
@@ -205,6 +266,13 @@ def _trim_jsonl_locked(path: Path, *, root: Path) -> bool:
         total += len(encoded)
     replacement = "".join(line + "\n" for line in reversed(kept_reversed))
     atomic_write_private_text(path, replacement, root=root)
+    _write_rotation_notice(
+        path,
+        root=root,
+        bytes_before=int(state.st_size),
+        bytes_after=len(replacement.encode("utf-8")),
+        lines_after=len(kept_reversed),
+    )
     return True
 
 
@@ -919,8 +987,27 @@ def audit_path(root: Path, *, at: datetime | None = None) -> Path:
     return root / ".ai" / "memory" / "audit" / f"{effective.year}.jsonl"
 
 
+def _audit_file_sort_key(name: str) -> tuple[int, int, int] | None:
+    """Return physical audit order for canonical year and segment names."""
+    if len(name) == 10 and name[:4].isdigit() and name[4:] == ".jsonl":
+        return int(name[:4]), 1, 0  # current file follows immutable segments
+    parts = name.split(".")
+    if (
+        len(parts) == 4
+        and len(parts[0]) == 4
+        and parts[0].isdigit()
+        and len(parts[1]) == 6
+        and parts[1].isdigit()
+        and len(parts[2]) == 12
+        and all(char in "0123456789abcdef" for char in parts[2])
+        and parts[3] == "jsonl"
+    ):
+        return int(parts[0]), 0, int(parts[1])
+    return None
+
+
 def all_audit_files(root: Path) -> list[Path]:
-    """Return all per-year audit jsonl files sorted ascending.
+    """Return immutable segments then the current file in physical order.
 
     Used by lifetime-totals call sites (e.g. surfacing summary, adaptive
     min_signal) that must aggregate across year boundaries. Returns an empty
@@ -936,9 +1023,10 @@ def all_audit_files(root: Path) -> list[Path]:
         )
     except (FileNotFoundError, OSError):
         return []
-    files: list[Path] = []
+    files: list[tuple[tuple[int, int, int], Path]] = []
     for name in names:
-        if len(name) != 10 or not name[:4].isdigit() or name[4:] != ".jsonl":
+        sort_key = _audit_file_sort_key(name)
+        if sort_key is None:
             continue
         path = d / name
         try:
@@ -950,11 +1038,75 @@ def all_audit_files(root: Path) -> list[Path]:
             )
         except (FileNotFoundError, OSError):
             continue
-        files.append(path)
-    return files
+        files.append((sort_key, path))
+    # A divergent sync can leave two digest-named segments with the same
+    # (year, sequence).  Keep discovery deterministic so every reader sees the
+    # same evidence; strict doctor/repair reject the duplicate sequence rather
+    # than silently choosing one branch.
+    return [path for _key, path in sorted(files, key=lambda item: (item[0], item[1].name))]
 
 
-def _rotate_audit_chain_locked(root: Path, path: Path) -> bool:
+def audit_segment_sequence_issues(paths: Iterable[Path]) -> list[dict[str, Any]]:
+    """Report duplicate, missing-head, and interior-gap segment sequences.
+
+    Raw segments are never pruned, so every segmented year must start at one
+    and remain contiguous. A gap is evidence loss and must never be repaired by
+    relinking the remaining physical neighbors.
+    """
+
+    by_year: dict[int, dict[int, list[str]]] = {}
+    for path in paths:
+        key = _audit_file_sort_key(Path(path).name)
+        if key is None or key[1] != 0:
+            continue
+        by_year.setdefault(key[0], {}).setdefault(key[2], []).append(str(path))
+    issues: list[dict[str, Any]] = []
+    for year, sequence_paths in sorted(by_year.items()):
+        for sequence, matches in sorted(sequence_paths.items()):
+            if len(matches) > 1:
+                issues.append(
+                    {
+                        "kind": "duplicate",
+                        "year": year,
+                        "sequence": sequence,
+                        "paths": sorted(matches),
+                    }
+                )
+        sequences = sorted(sequence_paths)
+        if not sequences:
+            continue
+        if sequences[0] != 1:
+            issues.append(
+                {
+                    "kind": "start",
+                    "year": year,
+                    "expected": 1,
+                    "actual": sequences[0],
+                }
+            )
+        for previous, current in zip(sequences, sequences[1:]):
+            if current != previous + 1:
+                issues.append(
+                    {
+                        "kind": "gap",
+                        "year": year,
+                        "after": previous,
+                        "before": current,
+                        "missing_start": previous + 1,
+                        "missing_end": current - 1,
+                    }
+                )
+    return issues
+
+
+def _rotate_audit_chain_locked(root: Path, path: Path, *, incoming_bytes: int = 0) -> bool:
+    """Seal the current audit file as an immutable, byte-identical segment.
+
+    Unlike the legacy tail rotation, this operation discards and rewrites no
+    raw event. A small marker starts the new current file and cryptographically
+    links it to the previous segment. The digest-bearing filename makes a
+    crash between segment creation and current-file replacement idempotent.
+    """
     try:
         state = validate_root_confined_regular_file(
             path,
@@ -965,85 +1117,79 @@ def _rotate_audit_chain_locked(root: Path, path: Path) -> bool:
     except FileNotFoundError:
         return False
     before = int(state.st_size)
-    if before <= _AUDIT_MAX_BYTES:
+    if before <= 0 or before + max(0, int(incoming_bytes)) <= _AUDIT_MAX_BYTES:
         return False
-    budget = max(0, min(_AUDIT_KEEP_BYTES, _AUDIT_MAX_BYTES - (2 * _AUDIT_LINE_MAX_BYTES)))
-    data, _state, complete = read_root_confined_tail_bytes(
+    if before > max(_AUDIT_MAX_BYTES + _AUDIT_LINE_MAX_BYTES, 128 * 1024 * 1024):
+        raise OSError("audit current file exceeds safe segmentation bound")
+    text, _state = read_root_confined_text(
         path,
         root=root,
-        max_bytes=budget + _AUDIT_LINE_MAX_BYTES + 1,
+        max_bytes=before,
         require_private=False,
         require_owner=True,
         reject_group_other_writable=True,
     )
-    if not complete:
-        boundary = data.find(b"\n")
-        data = data[boundary + 1:] if boundary >= 0 else b""
-    candidates: list[dict[str, Any]] = []
-    total = 0
-    for raw in reversed(data.decode("utf-8").splitlines()[-_AUDIT_KEEP_LINES:]):
-        try:
-            record = json.loads(raw)
-        except json.JSONDecodeError:
+    encoded = text.encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    year = int(path.name[:4])
+    existing = all_audit_files(root)
+    segments = [
+        candidate
+        for candidate in existing
+        if (key := _audit_file_sort_key(candidate.name)) is not None
+        and key[0] == year
+        and key[1] == 0
+    ]
+    segment: Path | None = None
+    for candidate in segments:
+        if candidate.name.split(".")[2] != digest[:12]:
             continue
-        if not isinstance(record, dict):
-            continue
-        encoded_size = len((raw + "\n").encode("utf-8"))
-        if total + encoded_size > budget:
-            break
-        candidates.append(record)
-        total += encoded_size
-    candidates.reverse()
-    marker = {
-        "ts": now_iso(),
-        "monotonic_ns": time.monotonic_ns(),
-        "action": "audit.storage_rotated",
-        "category": "storage",
-        "payload": {"bytes_before": before, "bytes_retained": total},
-        "prev_sha": None,
-    }
-    rebuilt: list[str] = []
-    prev_sha: str | None = None
-    for record in [marker, *candidates]:
-        # Retained records survived only json.loads, so "ts" can be null, "", or garbage —
-        # .get("ts", default) does NOT cover null, and an unparseable value used to abort
-        # the whole rotation with ValueError. Fall back to now; offset-less reads as UTC.
-        ts_raw = str(record.get("ts") or now_iso())
-        try:
-            ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-        except ValueError:
-            ts_dt = datetime.fromisoformat(now_iso().replace("Z", "+00:00"))
-        if ts_dt.tzinfo is None:
-            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
-        bounded, line = _bounded_audit_line(
-            timestamp=ts_dt,
-            action=record.get("action", "unknown"),
-            category=record.get("category", "unknown"),
-            payload=record.get("payload", {}),
-            prev_sha=prev_sha,
+        candidate_text, _candidate_state = read_root_confined_text(
+            candidate, root=root, max_bytes=before, require_private=False
         )
-        if "monotonic_ns" in record:
-            bounded["monotonic_ns"] = record["monotonic_ns"]
-            line = json.dumps(bounded, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        rebuilt.append(line)
-        prev_sha = line_sha(line)
-    atomic_write_private_text(path, "".join(line + "\n" for line in rebuilt), root=root)
+        if candidate_text == text:
+            segment = candidate
+            break
+    if segment is None:
+        segment_keys = [key for candidate in segments if (key := _audit_file_sort_key(candidate.name))]
+        next_sequence = max((key[2] for key in segment_keys), default=0) + 1
+        if next_sequence > 999_999:
+            raise OSError("audit segment sequence exhausted")
+        segment = path.with_name(f"{year}.{next_sequence:06d}.{digest[:12]}.jsonl")
+        atomic_write_private_text(segment, text, root=root)
+        persisted, _persisted_state = read_root_confined_text(
+            segment, root=root, max_bytes=before, require_private=False
+        )
+        if persisted != text:
+            raise OSError("audit segment verification failed")
+
+    nonempty_lines = [line for line in text.splitlines() if line.strip()]
+    previous_last_sha = line_sha(nonempty_lines[-1]) if nonempty_lines else None
+    _marker, marker_line = _bounded_audit_line(
+        timestamp=datetime.now(timezone.utc),
+        action="audit.segment_started",
+        category="storage",
+        payload={
+            "previous_segment": segment.relative_to(root).as_posix(),
+            "previous_file_sha256": digest,
+            "previous_last_sha": previous_last_sha,
+            "bytes_segmented": before,
+            "lossy": False,
+        },
+        prev_sha=None,
+        event_id=_new_audit_event_id(),
+        max_bytes=_AUDIT_SEGMENT_MARKER_MAX_BYTES,
+    )
+    atomic_write_private_text(path, marker_line + "\n", root=root)
     return True
 
 
 def _prune_old_audit_files_locked(root: Path, *, current_year: int) -> int:
-    removed = 0
-    minimum_year = current_year - max(0, _AUDIT_RETENTION_YEARS - 1)
-    for candidate in all_audit_files(root):
-        year = int(candidate.name[:4])
-        if year >= minimum_year or year == current_year:
-            continue
-        try:
-            if unlink_root_confined_regular_file(candidate, root=root):
-                removed += 1
-        except OSError:
-            continue
-    return removed
+    """Keep raw audit years indefinitely; retention applies only to derived data."""
+    # Raw audit is the integrity/provenance source of truth.  Deleting a year
+    # here would make a later rollup unverifiable and turn retention into loss.
+    del root, current_year
+    return 0
 
 
 def append_audit(root: Path, *, action: str, category: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1053,6 +1199,7 @@ def append_audit(root: Path, *, action: str, category: str, payload: dict[str, A
     with _AUDIT_THREAD_LOCK:
         with private_file_lock(audit_transaction_lock_path(root), root=root):
             with private_file_lock(jsonl_lock_path(path), root=root):
+                event_id = _new_audit_event_id()
                 prev_sha = _previous_audit_sha(path, root=root)
                 record, line = _bounded_audit_line(
                     timestamp=timestamp,
@@ -1060,9 +1207,22 @@ def append_audit(root: Path, *, action: str, category: str, payload: dict[str, A
                     category=category,
                     payload=payload,
                     prev_sha=prev_sha,
+                    event_id=event_id,
                 )
+                rotated = _rotate_audit_chain_locked(
+                    root, path, incoming_bytes=len((line + "\n").encode("utf-8"))
+                )
+                if rotated:
+                    prev_sha = _previous_audit_sha(path, root=root)
+                    record, line = _bounded_audit_line(
+                        timestamp=timestamp,
+                        action=action,
+                        category=category,
+                        payload=payload,
+                        prev_sha=prev_sha,
+                        event_id=event_id,
+                    )
                 append_private_text(path, line + "\n", root=root)
-                rotated = _rotate_audit_chain_locked(root, path)
             pruned = _prune_old_audit_files_locked(root, current_year=timestamp.year)
             if rotated or pruned:
                 _rebuild_audit_index_locked(root)
@@ -1074,6 +1234,7 @@ def append_audit(root: Path, *, action: str, category: str, payload: dict[str, A
                         "category": record["category"],
                         "action": record["action"],
                         "path": path.relative_to(root).as_posix(),
+                        "event_id": record.get("event_id"),
                     },
                 )
     return record
@@ -1114,6 +1275,7 @@ def _rebuild_audit_index_locked(root: Path) -> dict[str, Any]:
                     "category": record.get("category"),
                     "action": record.get("action"),
                     "path": rel,
+                    "event_id": record.get("event_id"),
                 }
             )
     text = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for row in rows)
@@ -1384,6 +1546,13 @@ def rotate_jsonl_tail(
             after = len(replacement.encode("utf-8"))
             if not dry_run:
                 atomic_write_private_text(path, replacement, root=root)
+                _write_rotation_notice(
+                    path,
+                    root=root,
+                    bytes_before=before,
+                    bytes_after=after,
+                    lines_after=len(kept),
+                )
             return {
                 "ok": True,
                 "path": rel,
@@ -1395,6 +1564,8 @@ def rotate_jsonl_tail(
                 "lines_before": len(lines),
                 "lines_after": len(kept),
                 "tail_complete": complete,
+                "lossy": True,
+                "rotation_notice": rotation_notice_path(path).relative_to(root).as_posix(),
             }
     except (OSError, UnicodeDecodeError) as exc:
         return {"ok": False, "path": rel, "exists": True, "rotated": False, "error": type(exc).__name__}

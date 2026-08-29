@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .memory import all_audit_files, append_jsonl, read_state_text
+
 __all__ = [
     "mine_patterns",
     "predict_next",
@@ -93,15 +95,18 @@ def _extract_session_id(rec: dict[str, Any]) -> str | None:
     return None
 
 
-def _iter_audit_records(root: Path) -> Iterator[dict[str, Any]]:
-    """Stream audit JSONL files line-by-line. Skip malformed lines silently."""
-    audit_dir = _audit_dir(root)
-    if not audit_dir.is_dir():
-        return
-    for path in sorted(audit_dir.glob("*.jsonl")):
+def _iter_audit_records(
+    root: Path, diagnostics: dict[str, int] | None = None
+) -> Iterator[dict[str, Any]]:
+    """Stream audit JSONL and account for every unreadable/malformed row."""
+    stats = diagnostics if diagnostics is not None else {}
+    stats.setdefault("read_errors", 0)
+    stats.setdefault("malformed_rows", 0)
+    for path in all_audit_files(root):
         try:
             handle = path.open("r", encoding="utf-8")
         except OSError:
+            stats["read_errors"] += 1
             continue
         with handle:
             for raw in handle:
@@ -111,9 +116,12 @@ def _iter_audit_records(root: Path) -> Iterator[dict[str, Any]]:
                 try:
                     rec = json.loads(raw)
                 except (ValueError, TypeError):
+                    stats["malformed_rows"] += 1
                     continue
                 if isinstance(rec, dict):
                     yield rec
+                else:
+                    stats["malformed_rows"] += 1
 
 
 # ---------- mining ----------
@@ -169,7 +177,8 @@ def _mine_patterns_inner(
     scanned = 0
     seen_pretool = 0
 
-    for rec in _iter_audit_records(root):
+    diagnostics: dict[str, int] = {}
+    for rec in _iter_audit_records(root, diagnostics):
         scanned += 1
         if not _is_pretooluse(rec):
             continue
@@ -220,6 +229,8 @@ def _mine_patterns_inner(
         "patterns": patterns,
         "scanned_events": scanned,
         "pretooluse_events": seen_pretool,
+        "malformed_rows": diagnostics.get("malformed_rows", 0),
+        "read_errors": diagnostics.get("read_errors", 0),
     }
 
 
@@ -266,16 +277,13 @@ def predict_next(
 
 # ---------- outcome logging ----------
 
-def _append_speculation_line(root: Path, record: dict[str, Any]) -> None:
+def _append_speculation_line(root: Path, record: dict[str, Any]) -> bool:
     path = _cache_log_path(root)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-    except OSError:
-        # public API contract: never raise. Drop record on disk failure.
-        return
+        append_jsonl(path, record)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def record_speculation(
@@ -284,10 +292,10 @@ def record_speculation(
     exec_id: str,
     pattern: dict,
     predicted_tool: str,
-) -> None:
-    """Append a speculation start to the log. Never raises."""
+) -> bool:
+    """Append a speculation start atomically; return whether it persisted."""
     if not isinstance(exec_id, str) or not exec_id:
-        return
+        return False
     record = {
         "ts": _now_iso(),
         "monotonic_ns": time.monotonic_ns(),
@@ -296,7 +304,7 @@ def record_speculation(
         "pattern": pattern if isinstance(pattern, dict) else {},
         "predicted_tool": predicted_tool if isinstance(predicted_tool, str) else "",
     }
-    _append_speculation_line(root, record)
+    return _append_speculation_line(root, record)
 
 
 def record_outcome(
@@ -305,10 +313,10 @@ def record_outcome(
     exec_id: str,
     hit: bool,
     actual_tool: str,
-) -> None:
-    """Append a speculation outcome to the log. Never raises."""
+) -> bool:
+    """Append an outcome atomically; return whether it persisted."""
     if not isinstance(exec_id, str) or not exec_id:
-        return
+        return False
     record = {
         "ts": _now_iso(),
         "monotonic_ns": time.monotonic_ns(),
@@ -317,7 +325,7 @@ def record_outcome(
         "outcome": "hit" if hit else "miss",
         "actual_tool": actual_tool if isinstance(actual_tool, str) else "",
     }
-    _append_speculation_line(root, record)
+    return _append_speculation_line(root, record)
 
 
 # ---------- aggregation ----------
@@ -333,33 +341,31 @@ def hit_rate(root: Path) -> dict:
     if not path.exists():
         return {"ok": True, "total": 0, "hits": 0, "hit_rate": 0.0}
 
-    total = 0
-    hits = 0
+    outcomes: dict[str, str] = {}
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for raw in handle:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    rec = json.loads(raw)
-                except (ValueError, TypeError):
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                if rec.get("kind") != "outcome":
-                    continue
-                total += 1
-                if rec.get("outcome") == "hit":
-                    hits += 1
-    except OSError as exc:
+        text = read_state_text(path, max_bytes=40_000_000)
+        for line_number, raw in enumerate(text.splitlines(), 1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(rec, dict) or rec.get("kind") != "outcome":
+                continue
+            exec_id = str(rec.get("exec_id") or "").strip() or f"legacy-line-{line_number}"
+            outcomes[exec_id] = "hit" if rec.get("outcome") == "hit" else "miss"
+    except (OSError, UnicodeDecodeError) as exc:
         return {
             "ok": False,
-            "reason": f"OSError: {exc}",
+            "reason": f"{type(exc).__name__}: {exc}",
             "total": 0,
             "hits": 0,
             "hit_rate": 0.0,
         }
 
+    total = len(outcomes)
+    hits = sum(1 for outcome in outcomes.values() if outcome == "hit")
     rate = (hits / total) if total else 0.0
     return {"ok": True, "total": total, "hits": hits, "hit_rate": round(rate, 6)}

@@ -56,6 +56,39 @@ def test_pinned_bytes_excluded_from_cap(repo: Path, monkeypatch: pytest.MonkeyPa
     assert status["tmp_bytes"] >= 5000
 
 
+def test_pinned_entries_are_excluded_from_entry_cap(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(SL, "TMP_MAX_ENTRIES", 1)
+    target = repo / ".ai" / "tmp" / "fixture.bin"
+    _write(target, 10)
+    target.with_name(target.name + ".keep").write_text("", encoding="utf-8")
+
+    status = SL.workspace_storage_status(repo)
+
+    assert status["tmp_top_entries"] == 2
+    assert status["tmp_reclaimable_entries"] == 0
+    assert status["ok"] is True
+
+
+def test_under_cap_unpinned_entry_survives_beside_oversized_pin(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(SL, "TMP_MAX_TOTAL_BYTES", 1_000)
+    pinned = repo / ".ai" / "tmp" / "fixture.bin"
+    _write(pinned, 5_000)
+    pinned.with_name(pinned.name + ".keep").write_text("", encoding="utf-8")
+    unpinned = repo / ".ai" / "tmp" / "small-scratch.bin"
+    _write(unpinned, 500)
+
+    result = SL.enforce_workspace_storage(repo)
+
+    assert result["ok"] is True
+    assert pinned.exists()
+    assert unpinned.exists()
+    assert result["tmp"]["bytes_reclaimable"] <= 1_000
+
+
 def test_unpinned_overflow_still_fails(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(SL, "TMP_MAX_TOTAL_BYTES", 1000)
     _write(repo / ".ai" / "tmp" / "junk.bin", 5000)

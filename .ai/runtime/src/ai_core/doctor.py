@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -64,6 +66,7 @@ def run_checks(
         check_gitattributes(root),
         check_sqlite_features(),
         index_check,
+        check_index_coverage(root),
         check_manifest(root),
         check_trust(root),
         check_jsonl(root),
@@ -75,6 +78,7 @@ def run_checks(
         check_storage_limits(root),
         check_audit_index(root),
         check_audit_chain(root),
+        check_episodic_memory(root, lightweight=lightweight),
         hot_path_check,
         check_secret_scan(
             root,
@@ -90,6 +94,7 @@ def run_checks(
         check_queue_age(root),
         diagnostics_check,
         check_skills_catalog(root),
+        check_hook_capabilities(root),
         check_completion_guard(root),
         check_precall_rules(root),
         check_antigravity_artifacts(root),
@@ -260,6 +265,37 @@ def check_lsp_available(root: Path) -> Check:
     return Check("lsp_available", True, f"optional, inactive: {info.get('reason', 'unknown')}")
 
 
+def check_index_coverage(root: Path) -> Check:
+    """INFO-only inventory of paths omitted or stubbed by the source policy."""
+    try:
+        from .search import index_diagnostics
+
+        report = index_diagnostics(root)
+    except Exception as exc:
+        return Check("index_coverage", True, f"probe skipped: {type(exc).__name__}")
+    skipped = report.get("skipped") if isinstance(report.get("skipped"), list) else []
+    not_indexed = report.get("not_indexed_count", 0)
+    stubs = report.get("classification_stubs")
+    stub_count = len(stubs) if isinstance(stubs, list) else 0
+    symbol_budget_count = int(report.get("symbol_budget_count", 0) or 0)
+    details = [
+        f"candidates={int(report.get('candidate_count', 0) or 0)}",
+        f"skipped={int(report.get('skipped_count', 0) or 0)}",
+        f"not_indexed={int(not_indexed or 0)}",
+        f"generated_stubs={stub_count}",
+        f"symbol_budget_skipped={symbol_budget_count}",
+    ]
+    if skipped:
+        compact = ", ".join(
+            f"{item.get('path')}:{item.get('class')}:{item.get('reason')}"
+            for item in skipped[:8]
+            if isinstance(item, dict)
+        )
+        if compact:
+            details.append(f"reasons={compact}")
+    return Check("index_coverage", True, str(redact_value("; ".join(details))))
+
+
 def check_codegraph_coverage(root: Path) -> Check:
     """INFO-only probe for graph-layer (code_symbols/code_calls) language coverage.
 
@@ -366,6 +402,243 @@ def check_codegraph_coverage(root: Path) -> Check:
     return Check("codegraph_coverage", True, str(redact_value(detail)))
 
 
+def _command_semver(binary: str) -> tuple[int, int, int] | None:
+    """Best-effort local CLI version probe; no network and never a doctor failure itself."""
+    executable = shutil.which(binary)
+    if not executable:
+        return None
+    try:
+        proc = subprocess.run(
+            [executable, "--version"],
+            cwd=str(Path.home()),
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", f"{proc.stdout}\n{proc.stderr}")
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _contains_code_brain_hook(value: object) -> bool:
+    if isinstance(value, dict):
+        command = value.get("command")
+        if isinstance(command, str) and ".ai/bin/ai-hook" in command:
+            return True
+        return any(_contains_code_brain_hook(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_code_brain_hook(child) for child in value)
+    return False
+
+
+def _check_code_brain_command_hooks(
+    host: str,
+    hooks: dict[str, object],
+) -> list[str]:
+    """Validate timeout/matcher policy for managed command hooks only."""
+    hot_path = {
+        "PreToolUse", "UserPromptSubmit", "PermissionRequest", "Stop",
+        "SubagentStop", "TaskCompleted", "TeammateIdle",
+    }
+    context_limits = {"SessionStart": 5000, "SubagentStart": 5000, "UserPromptSubmit": 2500}
+    issues: list[str] = []
+
+    def walk(event: str, value: object, matcher: str | None = None) -> None:
+        if isinstance(value, dict):
+            next_matcher = value.get("matcher") if isinstance(value.get("matcher"), str) else matcher
+            if value.get("type") == "command" and isinstance(value.get("command"), str):
+                command = value["command"]
+                if ".ai/bin/ai-hook" not in command:
+                    return
+                timeout = value.get("timeout")
+                limit = 3 if host == "codex" and event == "SessionEnd" else (5 if event in hot_path else 2)
+                if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+                    issues.append(f"{host} {event} Code Brain command hook timeout missing")
+                elif timeout > limit:
+                    issues.append(f"{host} {event} Code Brain command hook timeout {timeout}>{limit}s")
+                if event == "PreToolUse" and host in {"claude", "codex"}:
+                    matcher_text = next_matcher or ""
+                    required_matchers = ("apply_patch", "Edit", "Write") if host == "codex" else ("Edit", "Write")
+                    if not all(token in matcher_text for token in required_matchers):
+                        issues.append(
+                            f"{host} PreToolUse Code Brain matcher must include {','.join(required_matchers)}"
+                        )
+                elif host == "kiro" and event in {"PreToolUse", "PostToolUse"}:
+                    # Kiro v1 standalone hooks define an omitted matcher as
+                    # always-match.  A bare "*" is not a wildcard here: the
+                    # host compiles it as JavaScript RegExp and rejects it as
+                    # "Nothing to repeat".  Managed guard/observer hooks must
+                    # see every tool, so any narrower matcher is also unsafe.
+                    if next_matcher not in {None, ""}:
+                        issues.append(
+                            f"kiro {event} Code Brain matcher must be omitted for always-match"
+                        )
+                if host == "codex" and event in context_limits:
+                    expected_context_limit = context_limits[event]
+                    context_limit = value.get("additionalContextLimit")
+                    if not isinstance(context_limit, (int, float)) or isinstance(context_limit, bool) or context_limit <= 0:
+                        issues.append(f"{host} {event} Code Brain command hook additionalContextLimit missing/zero")
+                    elif context_limit != expected_context_limit:
+                        issues.append(
+                            f"{host} {event} Code Brain command hook additionalContextLimit "
+                            f"{context_limit}!={expected_context_limit}"
+                        )
+                return
+            for child in value.values():
+                walk(event, child, next_matcher)
+        elif isinstance(value, list):
+            for child in value:
+                walk(event, child, matcher)
+
+    for event, entries in hooks.items():
+        walk(str(event), entries)
+    return issues
+
+
+def check_hook_capabilities(root: Path) -> Check:
+    """Report configured *and active* host hooks instead of equating keys with support.
+
+    This catches two production failure classes: a new event written into a strict older
+    Codex schema, and a manifest that names events but carries no Code Brain handler.
+    Optional/unsupported host events remain explicit in the detail rather than inflating
+    the active count.
+    """
+    root = Path(root)
+    details: list[str] = []
+    issues: list[str] = []
+
+    def load(path: Path) -> dict[str, object] | None:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            issues.append(f"{path.relative_to(root)} unreadable: {exc}")
+            return None
+        if not isinstance(value, dict):
+            issues.append(f"{path.relative_to(root)} is not a JSON object")
+            return None
+        return value
+
+    claude_path = root / ".claude" / "settings.json"
+    if claude_path.exists():
+        payload = load(claude_path)
+        hooks = payload.get("hooks") if isinstance(payload, dict) else None
+        if not isinstance(hooks, dict):
+            issues.append(".claude/settings.json hooks is not an object")
+        else:
+            issues.extend(_check_code_brain_command_hooks("claude", hooks))
+            active = {name for name, entries in hooks.items() if _contains_code_brain_hook(entries)}
+            version = _command_semver("claude")
+            expected = {"PreToolUse", "PostToolUse", "SessionStart", "Stop", "SubagentStop"}
+            if version is not None and version >= (2, 1, 33):
+                expected.update({"TaskCompleted", "TeammateIdle"})
+            if version is not None and version >= (2, 1, 78):
+                expected.add("StopFailure")
+            if version is not None and version >= (2, 1, 83):
+                expected.update({"CwdChanged", "FileChanged"})
+            if version is not None and version >= (2, 1, 84):
+                expected.add("TaskCreated")
+            missing = sorted(expected - active)
+            if missing:
+                issues.append(f"Claude missing active hooks {','.join(missing)}")
+            details.append(
+                f"claude={len(active)} active"
+                + (f" v{'.'.join(map(str, version))}" if version else " version=unknown")
+            )
+
+    codex_path = root / ".codex" / "hooks.json"
+    if codex_path.exists():
+        payload = load(codex_path)
+        hooks = payload.get("hooks") if isinstance(payload, dict) else None
+        if not isinstance(hooks, dict):
+            issues.append(".codex/hooks.json hooks is not an object")
+        else:
+            issues.extend(_check_code_brain_command_hooks("codex", hooks))
+            active = {name for name, entries in hooks.items() if _contains_code_brain_hook(entries)}
+            version = _command_semver("codex")
+            expected = {"PreToolUse", "PostToolUse", "SessionStart", "Stop", "SubagentStop"}
+            if version is not None and version >= (0, 117, 0):
+                expected.add("SessionEnd")
+            if version is not None and version >= (0, 150, 0):
+                expected.add("Interrupt")
+            if version is not None and version < (0, 150, 0) and "Interrupt" in active:
+                issues.append(
+                    f"Codex v{'.'.join(map(str, version))} cannot parse Interrupt; rerun upgrade"
+                )
+            missing = sorted(expected - active)
+            if missing:
+                issues.append(f"Codex missing active hooks {','.join(missing)}")
+            details.append(
+                f"codex={len(active)} active"
+                + (f" v{'.'.join(map(str, version))}" if version else " version=unknown")
+            )
+
+    antigravity_path = root / ".agents" / "hooks.json"
+    if antigravity_path.exists():
+        payload = load(antigravity_path)
+        spec = payload.get("code-brain") if isinstance(payload, dict) else None
+        if not isinstance(spec, dict):
+            issues.append(".agents/hooks.json missing code-brain spec")
+        else:
+            issues.extend(_check_code_brain_command_hooks("antigravity", spec))
+            active = {name for name, entries in spec.items() if _contains_code_brain_hook(entries)}
+            required = {"PostToolUse", "PreInvocation", "Stop"}
+            missing = sorted(required - active)
+            if missing:
+                issues.append(f"Antigravity missing active hooks {','.join(missing)}")
+            disabled = sorted(name for name in ("PreToolUse", "PostInvocation") if name not in active)
+            details.append(
+                f"antigravity={len(active)}/5 active"
+                + (f" disabled={','.join(disabled)}" if disabled else "")
+            )
+
+    kiro_path = root / ".kiro" / "hooks" / "code-brain.json"
+    if kiro_path.exists():
+        payload = load(kiro_path)
+        rows = payload.get("hooks") if isinstance(payload, dict) else None
+        if payload is not None and payload.get("version") != "v1":
+            issues.append(".kiro/hooks/code-brain.json version must be v1")
+        if not isinstance(rows, list):
+            issues.append(".kiro/hooks/code-brain.json hooks is not an array")
+        else:
+            kiro_hooks = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                # Kiro keeps timeout (seconds) and matcher on the hook row,
+                # while command/type live under action. Preserve both fields
+                # for the generic managed-command validator.
+                action = row.get("action")
+                merged = dict(action) if isinstance(action, dict) else {}
+                merged.update(row)
+                kiro_hooks[str(row.get("trigger"))] = merged
+            issues.extend(_check_code_brain_command_hooks("kiro", kiro_hooks))
+            active: set[str] = set()
+            for row in rows:
+                if not isinstance(row, dict) or row.get("enabled", True) is False:
+                    continue
+                if _contains_code_brain_hook(row.get("action")):
+                    active.add(str(row.get("trigger") or ""))
+            expected = {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
+            missing = sorted(expected - active)
+            if missing:
+                issues.append(f"Kiro missing active hooks {','.join(missing)}")
+            version = _command_semver("kiro-cli")
+            surface = "IDE/v3" if version is not None and version < (3, 0, 0) else "CLI/IDE"
+            details.append(
+                f"kiro={len(active)} active surface={surface}"
+                + (f" v{'.'.join(map(str, version))}" if version else " version=unknown")
+                + " stop=advisory"
+            )
+    elif (root / ".kiro").exists():
+        details.append("kiro=unmanaged (existing user hooks preserved)")
+
+    if issues:
+        return Check("hook_capabilities", False, "; ".join(issues[:6]))
+    return Check("hook_capabilities", True, "; ".join(details) if details else "no host hook manifests")
+
+
 def check_antigravity_artifacts(root: Path) -> Check:
     """Verify the workspace's Antigravity wiring is internally consistent.
 
@@ -440,7 +713,21 @@ def check_antigravity_artifacts(root: Path) -> Check:
             issues.append(f"hooks.json unreadable: {exc}")
     if issues:
         return Check("antigravity_artifacts", False, "; ".join(issues[:5]))
-    return Check("antigravity_artifacts", True, "ok")
+    active = 0
+    disabled: list[str] = []
+    if hooks.exists():
+        try:
+            payload = json.loads(hooks.read_text(encoding="utf-8"))
+            spec = payload.get("code-brain") if isinstance(payload, dict) else None
+            if isinstance(spec, dict):
+                active = sum(1 for event in ("PreToolUse", "PostToolUse", "PreInvocation", "PostInvocation", "Stop") if spec.get(event))
+                disabled = [event for event in ("PreToolUse", "PostInvocation") if not spec.get(event)]
+        except (OSError, json.JSONDecodeError):
+            pass
+    detail = f"ok active={active}/5"
+    if disabled:
+        detail += f" disabled={','.join(disabled)}"
+    return Check("antigravity_artifacts", True, detail)
 
 
 def check_completion_guard(root: Path) -> Check:
@@ -678,7 +965,6 @@ def check_config(root: Path) -> Check:
     bad = [key for key in ("embeddings", "remote_llm", "external_notifications") if features.get(key) is not False]
     if bad:
         return Check("config", False, "default-off features enabled: " + ", ".join(bad))
-    # remote_memory feature removed (T37) — .ai/ git sync replaces it.
     search = config.get("search", {})
     if not isinstance(search, dict):
         return Check("config", False, "search config must be a mapping")
@@ -687,6 +973,17 @@ def check_config(root: Path) -> Check:
         return Check("config", False, f"unknown search retriever: {retriever}")
     if retriever != "bm25":
         return Check("config", False, f"search retriever not implemented by default install: {retriever}")
+    # Hook-triggered git sync was retired because hook/MCP hot paths must never
+    # cause network I/O. Keep the old key as a one-release, informational no-op
+    # so upgrades remain compatible; explicit `ai memory sync` still works.
+    sync_block = config.get("memory_sync")
+    if isinstance(sync_block, dict) and sync_block.get("enabled"):
+        return Check(
+            "config",
+            True,
+            "ok (memory_sync.enabled is deprecated: no longer auto-spawned from a hook; "
+            "run `ai memory sync` explicitly instead)",
+        )
     return Check("config", True, "ok")
 
 
@@ -735,8 +1032,59 @@ def check_gitattributes(root: Path) -> Check:
         text = ""
     except (OSError, UnicodeDecodeError):
         return Check("gitattributes", False, "unavailable or untrusted")
-    required = ["*.jsonl merge=union", "memory/daily/*.md merge=union", "*.enc.yaml -merge", "* text=auto eol=lf"]
-    missing = [item for item in required if item not in text]
+    active_rules: list[tuple[str, set[str]]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) >= 2:
+            active_rules.append((fields[0], set(fields[1:])))
+    required = {
+        "*.jsonl": {"merge=union"},
+        "memory/audit/*.jsonl": {"-merge"},
+        "memory/daily/*.md": {"merge=union"},
+        "*.enc.yaml": {"-merge"},
+        "*": {"text=auto", "eol=lf"},
+    }
+    missing = [
+        f"{pattern} {' '.join(sorted(attributes))}"
+        for pattern, attributes in required.items()
+        if not any(rule_pattern == pattern and attributes <= tokens for rule_pattern, tokens in active_rules)
+    ]
+    try:
+        inside = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        inside = None
+    if inside is not None and inside.returncode == 0:
+        try:
+            effective = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "check-attr",
+                    "merge",
+                    "--",
+                    ".ai/memory/audit/__code_brain_probe__.jsonl",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            effective = None
+        if (
+            effective is None
+            or effective.returncode != 0
+            or not effective.stdout.rstrip().endswith(": merge: unset")
+        ):
+            missing.append("effective memory/audit/*.jsonl -merge")
     return Check("gitattributes", not missing, "ok" if not missing else "missing: " + ", ".join(missing))
 
 
@@ -976,11 +1324,11 @@ def check_storage_limits(root: Path) -> Check:
     # produced a failure the user could never clear except by deleting their own fixtures.
     if int(workspace.get("tmp_reclaimable_bytes", workspace["tmp_bytes"])) > TMP_MAX_TOTAL_BYTES:
         bad.append(".ai/tmp:total-bytes")
-    if int(workspace["tmp_top_entries"]) > TMP_MAX_ENTRIES:
+    if int(workspace.get("tmp_reclaimable_entries", workspace["tmp_top_entries"])) > TMP_MAX_ENTRIES:
         bad.append(".ai/tmp:file-count")
     if int(workspace.get("output_reclaimable_bytes", workspace["output_bytes"])) > OUTPUT_MAX_TOTAL_BYTES:
         bad.append(".ai/outputs:total-bytes")
-    if int(workspace["output_top_entries"]) > OUTPUT_MAX_ENTRIES:
+    if int(workspace.get("output_reclaimable_entries", workspace["output_top_entries"])) > OUTPUT_MAX_ENTRIES:
         bad.append(".ai/outputs:file-count")
     if int(workspace.get("ai_reclaimable_bytes", workspace["ai_bytes"])) > AI_MAX_TOTAL_BYTES:
         bad.append(".ai:total-bytes")
@@ -1046,14 +1394,20 @@ def audit_key(record: dict[str, object], path: str | None = None) -> tuple[objec
 def _unsafe_audit_entries(root: Path) -> list[str]:
     audit_root = root / ".ai" / "memory" / "audit"
     try:
-        names = list_root_confined_directory(audit_root, root=root, max_entries=256)
+        from .memory import _AUDIT_FILE_MAX_COUNT
+
+        names = list_root_confined_directory(
+            audit_root, root=root, max_entries=_AUDIT_FILE_MAX_COUNT
+        )
     except FileNotFoundError:
         return []
     except OSError:
         return ["audit-directory-untrusted"]
     bad: list[str] = []
+    from .memory import _audit_file_sort_key
+
     for name in names:
-        if len(name) != 10 or not name[:4].isdigit() or name[4:] != ".jsonl":
+        if _audit_file_sort_key(name) is None:
             continue
         path = audit_root / name
         try:
@@ -1068,7 +1422,7 @@ def _unsafe_audit_entries(root: Path) -> list[str]:
     return bad
 
 
-def check_audit_index(root: Path) -> Check:
+def _check_audit_index_snapshot(root: Path) -> Check:
     audit_root = root / ".ai" / "memory" / "audit"
     index_path = root / ".ai" / "memory" / "audit-index.jsonl"
     bad: list[str] = []
@@ -1136,7 +1490,20 @@ def check_audit_index(root: Path) -> Check:
     return Check("audit_index", not bad, "ok" if not bad else "invalid: " + ", ".join(bad[:10]))
 
 
-def check_audit_chain(root: Path) -> Check:
+def check_audit_index(root: Path) -> Check:
+    """Validate one transaction-consistent audit/index snapshot."""
+
+    from .memory import audit_transaction_lock_path
+    from .private_write import private_file_lock
+
+    try:
+        with private_file_lock(audit_transaction_lock_path(root), root=root):
+            return _check_audit_index_snapshot(root)
+    except OSError as exc:
+        return Check("audit_index", False, f"unavailable or untrusted: {exc}")
+
+
+def _check_audit_chain_snapshot(root: Path) -> Check:
     audit_root = root / ".ai" / "memory" / "audit"
     bad: list[str] = []
     chained = 0
@@ -1149,11 +1516,36 @@ def check_audit_chain(root: Path) -> Check:
         return Check("audit_chain", False, f"invalid: audit-directory-untrusted:{exc}")
     bad.extend(_unsafe_audit_entries(root))
 
-    from .memory import all_audit_files
+    from .memory import _audit_file_sort_key, all_audit_files, audit_segment_sequence_issues
 
-    for path in all_audit_files(root):
+    audit_files = all_audit_files(root)
+    for issue in audit_segment_sequence_issues(audit_files):
+        kind = str(issue["kind"])
+        year = int(issue["year"])
+        if kind == "duplicate":
+            duplicate_path = Path(str(issue["paths"][-1])).relative_to(root).as_posix()
+            bad.append(
+                f"{duplicate_path}:segment_sequence_duplicate:{year}.{int(issue['sequence']):06d}"
+            )
+        elif kind == "start":
+            bad.append(
+                f"audit/{year}:segment_sequence_start:expected=000001 actual={int(issue['actual']):06d}"
+            )
+        elif kind == "gap":
+            bad.append(
+                f"audit/{year}:segment_sequence_gap:missing="
+                f"{int(issue['missing_start']):06d}-{int(issue['missing_end']):06d}"
+            )
+
+    event_ids: set[str] = set()
+    previous_year: int | None = None
+    previous_rel: str | None = None
+    previous_last_sha: str | None = None
+    previous_file_sha256: str | None = None
+    previous_file_bytes: int | None = None
+    for path in audit_files:
         previous_line: str | None = None
-        previous_was_chained = False
+        legacy_records = 0
         rel_path = path.relative_to(root).as_posix()
         try:
             text, _state = read_root_confined_text(
@@ -1165,6 +1557,40 @@ def check_audit_chain(root: Path) -> Check:
         except (OSError, UnicodeDecodeError) as exc:
             bad.append(f"{rel_path}:untrusted:{exc}")
             continue
+        nonempty_lines = [line for line in text.splitlines() if line.strip()]
+        sort_key = _audit_file_sort_key(path.name)
+        file_year = sort_key[0] if sort_key is not None else None
+        file_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if sort_key is not None and sort_key[1] == 0:
+            filename_digest = path.name.split(".")[2]
+            if filename_digest != file_sha256[:12]:
+                bad.append(f"{rel_path}:segment_filename_digest_mismatch")
+        try:
+            first_record = json.loads(nonempty_lines[0]) if nonempty_lines else None
+        except json.JSONDecodeError:
+            first_record = None
+        payload = (
+            first_record.get("payload")
+            if isinstance(first_record, dict) and isinstance(first_record.get("payload"), dict)
+            else {}
+        )
+        if previous_year is None or file_year != previous_year:
+            if isinstance(first_record, dict) and first_record.get("action") == "audit.segment_started":
+                bad.append(f"{rel_path}:segment_link_orphan")
+        else:
+            if not isinstance(first_record, dict) or first_record.get("action") != "audit.segment_started":
+                bad.append(f"{rel_path}:segment_link_marker_missing")
+            else:
+                if payload.get("previous_segment") != previous_rel:
+                    bad.append(f"{rel_path}:segment_link_path_mismatch")
+                if payload.get("previous_last_sha") != previous_last_sha:
+                    bad.append(f"{rel_path}:segment_link_line_mismatch")
+                if payload.get("previous_file_sha256") != previous_file_sha256:
+                    bad.append(f"{rel_path}:segment_link_file_mismatch")
+                if payload.get("bytes_segmented") != previous_file_bytes:
+                    bad.append(f"{rel_path}:segment_link_bytes_mismatch")
+                if payload.get("lossy") is not False:
+                    bad.append(f"{rel_path}:segment_link_lossy")
         for line_no, line in enumerate(text.splitlines(), 1):
             if not line.strip():
                 continue
@@ -1173,13 +1599,22 @@ def check_audit_chain(root: Path) -> Check:
             except json.JSONDecodeError as exc:
                 bad.append(f"{rel_path}:line {line_no}:invalid_json:{exc.msg}")
                 previous_line = line
-                previous_was_chained = False
                 continue
             if not isinstance(record, dict):
                 bad.append(f"{rel_path}:line {line_no}:not_object")
                 previous_line = line
-                previous_was_chained = False
                 continue
+
+            event_id = record.get("event_id")
+            if "event_id" in record:
+                if not isinstance(event_id, str) or not event_id.startswith("evt-") or len(event_id) != 36:
+                    bad.append(f"{rel_path}:line {line_no}:event_id_invalid")
+                elif event_id in event_ids:
+                    bad.append(f"{rel_path}:line {line_no}:event_id_duplicate")
+                else:
+                    event_ids.add(event_id)
+            else:
+                legacy_records += 1
 
             is_chained = "prev_sha" in record
             if is_chained:
@@ -1188,23 +1623,92 @@ def check_audit_chain(root: Path) -> Check:
                 if prev_sha is not None and not (isinstance(prev_sha, str) and len(prev_sha) == 64):
                     bad.append(f"{rel_path}:line {line_no}:prev_sha_invalid")
                 expected = hashlib.sha256(previous_line.encode("utf-8")).hexdigest() if previous_line is not None else None
-                if (previous_was_chained or previous_line is None) and prev_sha != expected:
+                if prev_sha != expected:
                     bad.append(f"{rel_path}:line {line_no}:prev_sha_mismatch")
 
             previous_line = line
-            previous_was_chained = is_chained
 
-    if bad:
-        # Add actionable remediation hint — chain damage usually comes from stash
-        # union merges or partial restore, both of which `ai audit repair-chain`
-        # can fix deterministically without dropping content.
+        if legacy_records:
+            bad.append(f"{rel_path}:legacy_unverifiable={legacy_records}")
+        previous_year = file_year
+        previous_rel = rel_path
+        previous_last_sha = hashlib.sha256(nonempty_lines[-1].encode("utf-8")).hexdigest() if nonempty_lines else None
+        previous_file_sha256 = file_sha256
+        previous_file_bytes = len(text.encode("utf-8"))
+
+    hard_bad = [item for item in bad if "legacy_unverifiable=" not in item]
+    if not hard_bad and bad:
+        # Existing legacy rows are reported honestly but do not make a normal
+        # upgrade red. Any malformed row, unsafe path, bad event ID, or chain
+        # mismatch remains a hard failure.
+        return Check("audit_chain", True, "unverifiable: " + ", ".join(bad[:10]))
+    if hard_bad:
+        # Chain damage usually comes from stash union merges or partial restore;
+        # `ai audit repair-chain` can fix it deterministically without dropping content.
+        if any(
+            marker in item
+            for item in bad
+            for marker in ("segment_sequence_", "segment_link_orphan")
+        ):
+            hint = "restore the missing raw segment; repair refuses evidence gaps"
+        elif any("legacy_unverifiable=" in item for item in bad):
+            hint = "legacy boundary requires explicit migration"
+        else:
+            hint = "run `ai audit repair-chain` to fix"
         return Check(
             "audit_chain",
             False,
-            "invalid: " + ", ".join(bad[:10]) + " — run `ai audit repair-chain` to fix",
+            "invalid: " + ", ".join(hard_bad[:10]) + " — " + hint,
         )
     detail = f"ok chained_lines={chained}" if chained else "ok no chained lines yet"
     return Check("audit_chain", True, detail)
+
+
+def check_audit_chain(root: Path) -> Check:
+    """Validate one transaction-consistent raw-audit snapshot."""
+
+    from .memory import audit_transaction_lock_path
+    from .private_write import private_file_lock
+
+    try:
+        with private_file_lock(audit_transaction_lock_path(root), root=root):
+            return _check_audit_chain_snapshot(root)
+    except OSError as exc:
+        return Check("audit_chain", False, f"unavailable or untrusted: {exc}")
+
+
+def check_episodic_memory(root: Path, *, lightweight: bool = False) -> Check:
+    """Validate the disposable episodic index without penalizing hook checks."""
+    if lightweight:
+        return Check("episodic_memory", True, "deferred: run doctor --strict for full integrity")
+    try:
+        from .episodic_runtime import status
+
+        report = status(root)
+    except Exception as exc:
+        return Check("episodic_memory", False, f"invalid: {type(exc).__name__}; rebuild index")
+    if not report.get("ok") or not report.get("integrity_ok", False):
+        return Check("episodic_memory", False, "invalid derived index; run `ai memory episodic build`")
+    if not report.get("built"):
+        return Check("episodic_memory", True, "inactive: built by detached memory page-out")
+    detail = (
+        f"ok indexed={int(report.get('indexed_events', 0) or 0)} "
+        f"raw={int(report.get('raw_events', 0) or 0)} rows={int(report.get('tier_rows', 0) or 0)}"
+    )
+    if report.get("stale"):
+        detail = "stale append lag; next page-out refreshes — " + detail
+    if not report.get("source_truth_complete", True):
+        gap = report.get("source_history_gap")
+        if isinstance(gap, dict):
+            detail += (
+                "; history_gap="
+                f"{int(gap.get('previous_indexed_events', 0) or 0)}"
+                f"->{int(gap.get('current_raw_events', 0) or 0)}"
+            )
+        legacy_rows = int(report.get("legacy_fold_rows", 0) or 0)
+        if legacy_rows:
+            detail += f"; legacy_lossy={legacy_rows}"
+    return Check("episodic_memory", True, detail)
 
 
 # Wall-clock hot-path timings vary widely across machines (cold caches, slow or
@@ -1471,6 +1975,9 @@ def check_bootstrap_preflight(root: Path) -> Check:
         return proof
     command = [str(script), "--check-only", "--json"]
     env = os.environ.copy()
+    # Reuse the already-running, verified runtime instead of letting a copied
+    # repository trigger an implicit `uv run` sync during a read-only doctor.
+    env["PYTHON"] = sys.executable
     if os.name == "nt":
         bash = shutil.which("bash") or shutil.which("bash.exe")
         if not bash:

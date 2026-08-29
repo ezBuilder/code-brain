@@ -75,17 +75,20 @@ def test_audit_discovery_omits_hardlinked_file(tmp_path: Path) -> None:
     assert external.read_text(encoding="utf-8") == line
 
 
-def test_audit_discovery_accepts_only_canonical_year_files(tmp_path: Path) -> None:
+def test_audit_discovery_accepts_only_canonical_year_and_segment_files(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     audit_dir = root / ".ai" / "memory" / "audit"
     audit_dir.mkdir(parents=True)
     valid = audit_dir / "2025.jsonl"
     valid.write_text(_audit_line("skill.accept"), encoding="utf-8")
+    segment = audit_dir / "2025.000001.0123456789ab.jsonl"
+    segment.write_text(_audit_line("other"), encoding="utf-8")
     (audit_dir / "25.jsonl").write_text(_audit_line("bad"), encoding="utf-8")
     (audit_dir / "2025.jsonl.bak").write_text(_audit_line("bad"), encoding="utf-8")
     (audit_dir / "abcd.jsonl").write_text(_audit_line("bad"), encoding="utf-8")
+    (audit_dir / "2025.1.0123456789ab.jsonl").write_text(_audit_line("bad"), encoding="utf-8")
 
-    assert memory.all_audit_files(root) == [valid]
+    assert memory.all_audit_files(root) == [segment, valid]
     assert obs._surfacing_summary(root)["accepted"] == 1
 
 
@@ -100,18 +103,11 @@ def test_audit_fold_output_is_private(tmp_path: Path) -> None:
 
     assert result["ok"] is True
     assert result["folded_days"] == 1
+    sidecar = root / ".ai" / "memory" / "audit-rollups" / "2025.jsonl"
     if os.name != "nt":
-        assert path.stat().st_mode & 0o077 == 0
+        assert sidecar.stat().st_mode & 0o077 == 0
     records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    assert records == [
-        {
-            "action": "_folded",
-            "payload": {
-                "counts": {"old.action": 1},
-                "date": records[0]["payload"]["date"],
-                "source_files": [".ai/memory/audit/2025.jsonl"],
-                "total": 1,
-            },
-            "ts": records[0]["ts"],
-        }
-    ]
+    assert records[0]["action"] == "old.action"
+    rollups = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+    assert rollups[0]["kind"] == "audit_rollup"
+    assert rollups[0]["payload"]["counts"] == {"old.action": 1}

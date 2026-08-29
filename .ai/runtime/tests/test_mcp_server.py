@@ -79,6 +79,36 @@ def test_sandbox_execute_rejects_invalid_extra_env_name(tmp_path: Path) -> None:
         raise AssertionError("invalid environment name must fail closed")
 
 
+def test_tools_list_polling_does_not_grow_raw_audit(tmp_path: Path, monkeypatch) -> None:
+    captured: list[dict] = []
+    monkeypatch.setattr(mcp_server, "is_ci", lambda: False)
+    monkeypatch.setattr(mcp_server, "append_event", lambda _root, event: captured.append(event))
+
+    for request_id in range(20):
+        response = mcp_server.handle_request(
+            tmp_path,
+            {"jsonrpc": "2.0", "id": request_id, "method": "tools/list"},
+        )
+        assert response is not None
+
+    assert captured == []
+
+
+def test_non_catalog_protocol_request_remains_audited(tmp_path: Path, monkeypatch) -> None:
+    captured: list[dict] = []
+    monkeypatch.setattr(mcp_server, "is_ci", lambda: False)
+    monkeypatch.setattr(mcp_server, "append_event", lambda _root, event: captured.append(event))
+
+    response = mcp_server.handle_request(
+        tmp_path,
+        {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+    )
+
+    assert response == {"jsonrpc": "2.0", "id": 1, "result": {}}
+    assert len(captured) == 1
+    assert captured[0]["method"] == "ping"
+
+
 def test_tools_list_response_cached(tmp_path: Path, monkeypatch) -> None:
     """tools/list payload is built once per process and reused across calls."""
     mcp_server._invalidate_tools_list_cache()

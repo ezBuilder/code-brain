@@ -66,6 +66,7 @@
 - No auth, billing, destructive DB, deployment, package, or prod-secret changes without explicit approval.
 - CI is read-only; write commands must be rejected before worker contact.
 - Hooks/MCP hot paths must not call the network.
+- After changing Codex hook definitions, use the installer or `scripts/trust-codex-hooks.py` when an explicit private policy exists; never auto-approve foreign hooks.
 - Tracked source must not contain plaintext secrets.
 - Redact MCP, diagnostics, and external-channel output.
 

@@ -164,3 +164,23 @@ def test_refresh_is_wired_detached_from_the_hook(tmp_path: Path) -> None:
     pg_src = Path(pg.__file__).read_text(encoding="utf-8")
     inline = pg_src.split("def _output_tokens(")[1]
     assert "usage_report" not in inline
+
+
+def test_detached_refresh_is_gated_by_prompt_growth_opt_in() -> None:
+    from ai_core import hooks
+
+    src = Path(hooks.__file__).read_text(encoding="utf-8")
+    gate = 'if not _env_disabled("AI_PROMPT_GROWTH", default="0"):'
+    gated = src.split(gate, 1)[1].split("if effective_hook in AUTO_REBUILD_HOOKS", 1)[0]
+    assert "_spawn_tokens_cache_refresh(root)" in gated
+
+
+def test_sleep_time_hook_jobs_never_spawn_network_commands() -> None:
+    import inspect
+
+    from ai_core import hooks
+
+    src = inspect.getsource(hooks._spawn_sleep_time_jobs)
+    assert "AI_REMOTE_FETCH" not in src
+    assert '"fetch"' not in src
+    assert '"push"' not in src

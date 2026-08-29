@@ -9,7 +9,13 @@ from pathlib import Path
 from . import __version__
 from .config import load_config
 from .doctor import as_payload, run_checks
-from .hooks import handle_hook, hook_wire_output, read_payload
+from .hooks import (
+    handle_hook,
+    hook_exit_code,
+    hook_stderr,
+    hook_wire_output,
+    read_payload,
+)
 from .inbox import decide, list_approvals, request_approval
 from .memory import append_audit, append_event, rebuild_audit_index
 from .obs import diagnostics, health_summary, metrics, prune_diagnostics, search_report, slo_bench, usage_report, write_log
@@ -55,7 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser.add_argument("--dry-run", action="store_true")
     render_parser.add_argument("--no-overwrite", action="store_true")
     render_parser.add_argument("--manifest-only", action="store_true")
-    doctor_parser = sub.add_parser("doctor")
+    doctor_parser = sub.add_parser(
+        "doctor",
+        help="run health checks, including explicit index skip/stub class+reason diagnostics",
+    )
     doctor_parser.add_argument("--json", action="store_true", dest="command_json")
     doctor_parser.add_argument("--strict", action="store_true")
     worker = sub.add_parser("worker")  # no help= → hidden from --help (still functional)
@@ -474,6 +483,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     memory_sync.add_argument("--agent", default="operator")
     memory_sync.add_argument("--no-push", action="store_true", help="commit/pull only; do not push")
+    memory_sync.add_argument(
+        "--private-remote-confirmed",
+        action="store_true",
+        help="confirm the configured remote is private and allow force-staging complete ignored memory, including every raw audit segment",
+    )
     memory_sync.add_argument("--loop", type=int, default=0, help="daemon mode: sync every N seconds (>=30); run under systemd/launchd")
     memory_sync.add_argument("--json", action="store_true", dest="command_json")
     memory_tier = memory_sub.add_parser("tier", help="MemGPT-style hot/warm/cold classification (T30)")
@@ -487,6 +501,29 @@ def build_parser() -> argparse.ArgumentParser:
     memory_pagein.add_argument("--dry-run", action="store_true")
     memory_pagein.add_argument("--limit", type=int, default=None)
     memory_pagein.add_argument("--json", action="store_true", dest="command_json")
+    memory_episodic = memory_sub.add_parser(
+        "episodic", help="deterministic logarithmic audit-memory index"
+    )
+    memory_episodic_sub = memory_episodic.add_subparsers(
+        dest="memory_episodic_command", required=True
+    )
+    memory_episodic_build = memory_episodic_sub.add_parser("build")
+    memory_episodic_build.add_argument("--fanout", type=int, default=10)
+    memory_episodic_build.add_argument("--dry-run", action="store_true")
+    memory_episodic_build.add_argument("--json", action="store_true", dest="command_json")
+    memory_episodic_status = memory_episodic_sub.add_parser("status")
+    memory_episodic_status.add_argument("--json", action="store_true", dest="command_json")
+    memory_episodic_context = memory_episodic_sub.add_parser("context")
+    memory_episodic_context.add_argument("--byte-budget", type=int, default=8_000)
+    memory_episodic_context.add_argument("--raw-tail", type=int, default=20)
+    memory_episodic_context.add_argument("--fanout", type=int, default=10)
+    memory_episodic_context.add_argument("--json", action="store_true", dest="command_json")
+    memory_episodic_drill = memory_episodic_sub.add_parser("drill-down")
+    memory_episodic_drill.add_argument("--event-id")
+    memory_episodic_drill.add_argument("--start", type=int)
+    memory_episodic_drill.add_argument("--end", type=int)
+    memory_episodic_drill.add_argument("--limit", type=int, default=50)
+    memory_episodic_drill.add_argument("--json", action="store_true", dest="command_json")
     memory_retention = memory_sub.add_parser("retention", help="retention scoring (decay+reinforcement) of durable memory")
     memory_retention.add_argument("--evict-limit", type=int, default=50)
     memory_retention.add_argument("--json", action="store_true", dest="command_json")
@@ -564,7 +601,10 @@ def build_parser() -> argparse.ArgumentParser:
     exec_prune.add_argument("--json", action="store_true", dest="command_json")
     index = sub.add_parser("index")
     index_sub = index.add_subparsers(dest="index_command", required=True)
-    index_rebuild = index_sub.add_parser("rebuild")
+    index_rebuild = index_sub.add_parser(
+        "rebuild",
+        help="rebuild the bounded-window code index and report skipped/stubbed paths",
+    )
     index_rebuild.add_argument("--json", action="store_true", dest="command_json")
     index_rebuild.add_argument(
         "--single-flight",
@@ -1383,8 +1423,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "hook":
             request_payload = read_payload()
             payload = handle_hook(root, args.hook_name, request_payload)
-            emit(payload if args.command_json else hook_wire_output(payload, request_payload), as_json=True)
-            return OK
+            if args.command_json:
+                emit(payload, as_json=True)
+                return OK
+            wire = hook_wire_output(payload, request_payload)
+            exit_code = hook_exit_code(payload, request_payload)
+            stderr = hook_stderr(payload, request_payload)
+            if stderr:
+                print(stderr, file=sys.stderr)
+            if isinstance(wire, dict):
+                emit(wire, as_json=True)
+            elif isinstance(wire, str) and wire:
+                print(wire)
+            return exit_code
         if args.command == "memory" and args.memory_command == "append-event":
             reject_ci_write("memory")
             payload = append_event(root, read_payload())
@@ -1513,9 +1564,19 @@ def main(argv: list[str] | None = None) -> int:
             reject_ci_write("memory")
             from .memory_sync import sync_loop, sync_once
             if args.loop and args.loop > 0:
-                sync_loop(root, agent=args.agent, interval=args.loop)  # blocks until killed
+                sync_loop(
+                    root,
+                    agent=args.agent,
+                    interval=args.loop,
+                    private_remote_confirmed=args.private_remote_confirmed,
+                )  # blocks until killed
                 return OK
-            payload = sync_once(root, agent=args.agent, push=not args.no_push)
+            payload = sync_once(
+                root,
+                agent=args.agent,
+                push=not args.no_push,
+                private_remote_confirmed=args.private_remote_confirmed,
+            )
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "memory" and args.memory_command == "tier":
@@ -1533,6 +1594,33 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "memory" and args.memory_command == "page-in":
             from . import memory_tier as _mt
             payload = _mt.page_in(root, dry_run=bool(args.dry_run), limit=args.limit)
+            emit(payload, as_json=as_json)
+            return OK if payload.get("ok") else GENERIC_ERROR
+        if args.command == "memory" and args.memory_command == "episodic":
+            from . import episodic_runtime as _episodic
+
+            if args.memory_episodic_command == "build":
+                reject_ci_write("memory", dry_run=bool(args.dry_run))
+                payload = _episodic.build_audit_index(
+                    root, fanout=int(args.fanout), dry_run=bool(args.dry_run)
+                )
+            elif args.memory_episodic_command == "status":
+                payload = _episodic.status(root)
+            elif args.memory_episodic_command == "context":
+                payload = _episodic.context_payload(
+                    root,
+                    byte_budget=int(args.byte_budget),
+                    raw_tail=int(args.raw_tail),
+                    fanout=int(args.fanout),
+                )
+            else:
+                payload = _episodic.drilldown_payload(
+                    root,
+                    event_id=args.event_id,
+                    start=args.start,
+                    end=args.end,
+                    limit=int(args.limit),
+                )
             emit(payload, as_json=as_json)
             return OK if payload.get("ok") else GENERIC_ERROR
         if args.command == "memory" and args.memory_command == "retention":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -194,3 +195,58 @@ def test_doctor_rejects_linked_manifest_and_gitattributes(tmp_path: Path) -> Non
     assert attributes_check.ok is False
     assert attributes_check.detail == "unavailable or untrusted"
     assert external_manifest.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_doctor_requires_raw_audit_to_disable_union_merge(tmp_path: Path) -> None:
+    attributes = tmp_path / ".ai" / ".gitattributes"
+    attributes.parent.mkdir(parents=True)
+    baseline = "\n".join(
+        (
+            "*.jsonl merge=union text eol=lf",
+            "memory/daily/*.md merge=union text eol=lf",
+            "*.enc.yaml -merge",
+            "* text=auto eol=lf",
+        )
+    ) + "\n"
+    attributes.write_text(baseline, encoding="utf-8")
+
+    missing = check_gitattributes(tmp_path)
+    attributes.write_text(
+        baseline + "# memory/audit/*.jsonl -merge text eol=lf\n",
+        encoding="utf-8",
+    )
+    commented = check_gitattributes(tmp_path)
+    attributes.write_text(
+        baseline + "memory/audit/*.jsonl -merge text eol=lf\n",
+        encoding="utf-8",
+    )
+
+    assert missing.ok is False
+    assert "memory/audit/*.jsonl -merge" in missing.detail
+    assert commented.ok is False
+    assert check_gitattributes(tmp_path).ok is True
+
+
+def test_doctor_checks_effective_audit_merge_attribute(tmp_path: Path) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    attributes = tmp_path / ".ai" / ".gitattributes"
+    attributes.parent.mkdir(parents=True)
+    attributes.write_text(
+        "\n".join(
+            (
+                "*.jsonl merge=union text eol=lf",
+                "memory/audit/*.jsonl -merge text eol=lf",
+                "memory/daily/*.md merge=union text eol=lf",
+                "*.enc.yaml -merge",
+                "* text=auto eol=lf",
+                "memory/audit/*.jsonl merge=union",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = check_gitattributes(tmp_path)
+
+    assert result.ok is False
+    assert "effective memory/audit/*.jsonl -merge" in result.detail

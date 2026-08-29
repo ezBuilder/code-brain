@@ -111,6 +111,17 @@ def test_codebase_map_fast_mode_ignores_untracked_files(tmp_path: Path) -> None:
     assert any(entry["path"] == "scratch" for entry in full["entries"])
 
 
+def test_codebase_map_excludes_install_transaction(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    transaction = repo / ".code-brain-install-transaction"
+    transaction.mkdir()
+    (transaction / "owner.json").write_text('{"schema": 1}\n', encoding="utf-8")
+
+    payload = build_codebase_map(repo, include_untracked=True)
+
+    assert not any(entry["path"] == ".code-brain-install-transaction" for entry in payload["entries"])
+
+
 def test_session_start_context_includes_codebase_map(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
 

@@ -30,8 +30,7 @@ WRITE_COMMANDS = {
     "worker_stop",
     "session",
     "exec",
-    "remote_memory",
-    "loop",
+    "loop",  # remote_memory removed (T37) — .ai/ git sync replaces it.
     "loopd",
     "worker",
     "selfimprove",

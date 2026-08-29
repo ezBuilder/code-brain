@@ -112,8 +112,11 @@ def test_empty_and_blank_sections_are_dropped() -> None:
     assert hooks._fit_sections(["", "Response: r", ""], 2048) == "Response: r"
 
 
-def test_real_build_context_keeps_learned_rules(tmp_path: Path) -> None:
-    """End-to-end through build_context with a deliberately oversized session tail."""
+def test_real_build_context_keeps_learned_rules(tmp_path: Path, monkeypatch) -> None:
+    """End-to-end through build_context with a deliberately oversized session tail.
+
+    Learned-rule injection is explicit opt-in (AI_PROMPT_GROWTH=1, default off)."""
+    monkeypatch.setenv("AI_PROMPT_GROWTH", "1")
     mem = tmp_path / ".ai" / "memory"
     mem.mkdir(parents=True)
     (mem / "session-current.md").write_text(

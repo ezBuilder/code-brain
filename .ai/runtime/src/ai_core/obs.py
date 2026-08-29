@@ -627,17 +627,27 @@ def _surfacing_summary(root: Path) -> dict[str, Any]:
 
 
 def index_summary(root: Path) -> dict[str, Any]:
+    from .search import index_diagnostics
+
     db = root / ".ai" / "cache" / "code.sqlite"
     if not db.exists():
-        return {"present": False, "indexed_files": 0, "indexed_bytes": 0, "db_bytes": 0}
+        return {
+            "present": False,
+            "indexed_files": 0,
+            "indexed_bytes": 0,
+            "db_bytes": 0,
+            "coverage": index_diagnostics(root),
+        }
     indexed_files = 0
     indexed_bytes = 0
     try:
         import sqlite3
         with sqlite3.connect(db) as conn:
             row = conn.execute(
-                "select count(*) as n, coalesce(sum(m.bytes), 0) as b "
-                "from chunks c left join chunk_meta m on m.chunk_id = c.id"
+                "select count(*) as n, coalesce(sum(coalesce(s.size, m.bytes)), 0) as b "
+                "from chunks c join chunk_meta m on m.chunk_id = c.id "
+                "left join file_state s on s.path = c.path "
+                "where m.kind = 'file'"
             ).fetchone()
             indexed_files = int(row[0] or 0)
             indexed_bytes = int(row[1] or 0)
@@ -648,6 +658,7 @@ def index_summary(root: Path) -> dict[str, Any]:
         "indexed_files": indexed_files,
         "indexed_bytes": indexed_bytes,
         "db_bytes": db.stat().st_size,
+        "coverage": index_diagnostics(root),
     }
 
 

@@ -1,0 +1,60 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "code-brain-session-start",
+      "description": "Load Code Brain session context at the start of a Kiro session.",
+      "trigger": "SessionStart",
+      "action": {
+        "type": "command",
+        "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; AI_HOOK_AGENT=kiro \"$ROOT/.ai/bin/ai-hook\" SessionStart"
+      },
+      "timeout": 2,
+      "enabled": true
+    },
+    {
+      "name": "code-brain-user-prompt-submit",
+      "description": "Load Code Brain prompt context before the model sees the submitted prompt.",
+      "trigger": "UserPromptSubmit",
+      "action": {
+        "type": "command",
+        "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; AI_HOOK_AGENT=kiro \"$ROOT/.ai/bin/ai-hook\" UserPromptSubmit"
+      },
+      "timeout": 2,
+      "enabled": true
+    },
+    {
+      "name": "code-brain-pre-tool-use",
+      "description": "Check Code Brain command routing before a tool runs; a block decision denies the tool call (non-zero exit).",
+      "trigger": "PreToolUse",
+      "action": {
+        "type": "command",
+        "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; AI_HOOK_AGENT=kiro \"$ROOT/.ai/bin/ai-hook\" PreToolUse"
+      },
+      "timeout": 5,
+      "enabled": true
+    },
+    {
+      "name": "code-brain-post-tool-use",
+      "description": "Record Code Brain tool-result context after a tool runs.",
+      "trigger": "PostToolUse",
+      "action": {
+        "type": "command",
+        "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; AI_HOOK_AGENT=kiro \"$ROOT/.ai/bin/ai-hook\" PostToolUse"
+      },
+      "timeout": 2,
+      "enabled": true
+    },
+    {
+      "name": "code-brain-stop",
+      "description": "Advisory continuation feedback at end of turn (Kiro's Stop trigger cannot hard-block).",
+      "trigger": "Stop",
+      "action": {
+        "type": "command",
+        "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; AI_HOOK_AGENT=kiro \"$ROOT/.ai/bin/ai-hook\" Stop"
+      },
+      "timeout": 5,
+      "enabled": true
+    }
+  ]
+}

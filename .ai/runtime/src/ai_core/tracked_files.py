@@ -25,6 +25,7 @@ class TrackedPathList(list[Path]):
 
 FILESYSTEM_BASELINE_SKIP_DIRS = {
     ".git",
+    ".code-brain-install-transaction",
     ".chatgpt2codex",
     ".venv",
     "node_modules",

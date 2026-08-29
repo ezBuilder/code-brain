@@ -114,6 +114,8 @@ def _copy_repo_ignore(src: str, names: list[str]) -> set[str]:
     linked = {name for name in names if (Path(src) / name).is_symlink()}
     if rel.name == ".claude":
         return {name for name in names if name != "commands"} | linked
+    if rel.name == ".ai":
+        return {name for name in names if name in blocked or name in {"outputs", "tmp"}} | linked
     return {name for name in names if name in blocked} | linked
 
 
@@ -123,6 +125,8 @@ def test_copy_repo_ignores_dependencies_and_external_symlinks(tmp_path: Path) ->
     source.mkdir()
     (source / "src").mkdir()
     (source / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (source / ".ai" / "tmp").mkdir(parents=True)
+    (source / ".ai" / "tmp" / "local-scratch.txt").write_text("scratch\n", encoding="utf-8")
     (source / "node_modules" / "pkg").mkdir(parents=True)
     (source / "node_modules" / "pkg" / "index.js").write_text("dependency\n", encoding="utf-8")
     external = tmp_path / "external-dependencies"
@@ -134,6 +138,7 @@ def test_copy_repo_ignores_dependencies_and_external_symlinks(tmp_path: Path) ->
     shutil.copytree(source, target, ignore=_copy_repo_ignore)
 
     assert (target / "src" / "app.py").exists()
+    assert not (target / ".ai" / "tmp").exists()
     assert not (target / "node_modules").exists()
     assert not (target / "linked-dependencies").exists()
 
@@ -187,6 +192,7 @@ def copy_repo(tmp_path: Path) -> Path:
     ):
         for path in target.glob(pattern):
             path.unlink()
+    shutil.rmtree(target / ".ai" / "memory" / "episodic", ignore_errors=True)
     (target / ".ai" / "memory" / "audit-index.jsonl").write_text("\n", encoding="utf-8")
     return target
 
@@ -2571,6 +2577,7 @@ def test_audit_append_updates_index_consistently(tmp_path: Path) -> None:
     assert index_records[-1]["action"] == "test.audit"
     assert index_records[-1]["category"] == "test"
     assert index_records[-1]["path"].startswith(".ai/memory/audit/")
+    assert index_records[-1]["event_id"] == record["event_id"]
     doctor_result = run_ai("doctor", "--strict", "--json", cwd=repo)
     assert doctor_result.returncode == 0, doctor_result.stdout + doctor_result.stderr
 
@@ -2590,7 +2597,9 @@ def test_append_audit_chains_prev_sha(tmp_path: Path) -> None:
     assert records[0]["prev_sha"] is None
     assert records[1]["prev_sha"] == hashlib.sha256(lines[0].encode("utf-8")).hexdigest()
     assert records[2]["prev_sha"] == hashlib.sha256(lines[1].encode("utf-8")).hexdigest()
-    assert set(records[0]) == {"ts", "monotonic_ns", "action", "category", "payload", "prev_sha"}
+    assert set(records[0]) == {"ts", "monotonic_ns", "action", "category", "payload", "prev_sha", "event_id"}
+    assert records[0]["event_id"].startswith("evt-")
+    assert len(records[0]["event_id"]) == 36
 
 
 def test_check_audit_chain_detects_middle_tampering(tmp_path: Path) -> None:
@@ -2612,7 +2621,7 @@ def test_check_audit_chain_detects_middle_tampering(tmp_path: Path) -> None:
     assert "prev_sha_mismatch" in result.detail
 
 
-def test_check_audit_chain_passes_with_legacy_prefix(tmp_path: Path) -> None:
+def test_check_audit_chain_marks_legacy_prefix_unverifiable(tmp_path: Path) -> None:
     from ai_core.doctor import check_audit_chain
     from ai_core.memory import append_audit
 
@@ -2628,16 +2637,20 @@ def test_check_audit_chain_passes_with_legacy_prefix(tmp_path: Path) -> None:
 
     first = append_audit(repo, action="test.first", category="test", payload={"value": "one"})
     assert first["prev_sha"] == hashlib.sha256(legacy_lines[-1].encode("utf-8")).hexdigest()
-    assert check_audit_chain(repo).ok is True
+    legacy_check = check_audit_chain(repo)
+    assert legacy_check.ok is True
+    assert "legacy_unverifiable" in legacy_check.detail
 
     append_audit(repo, action="test.second", category="test", payload={"value": "two"})
     lines = audit_path.read_text(encoding="utf-8").splitlines()
     lines[0] = lines[0].replace("legacy.one", "legacy.changed", 1)
     audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    assert check_audit_chain(repo).ok is True
+    tampered_legacy = check_audit_chain(repo)
+    assert tampered_legacy.ok is True
+    assert "legacy_unverifiable" in tampered_legacy.detail
 
     lines = audit_path.read_text(encoding="utf-8").splitlines()
-    lines[2] = lines[2].replace('"one"', '"tampered"', 1)
+    lines[1] = lines[1].replace("legacy.two", "legacy.changed-two", 1)
     audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     result = check_audit_chain(repo)
     assert result.ok is False
@@ -2883,6 +2896,9 @@ def test_rollback_overwrites_manifest_drift(tmp_path: Path) -> None:
 
 def test_rollback_drill_script_does_not_mutate_worktree() -> None:
     bash = usable_bash_or_skip()
+    rollback_script = (ROOT / "scripts" / "rollback-drill.sh").read_text(encoding="utf-8")
+    for local_state in (".ai/memory", ".ai/outputs", ".ai/runtime/state", ".ai/tmp"):
+        assert f"--exclude './{local_state}'" in rollback_script
     manifest = ROOT / ".ai" / "generated" / "manifest.json"
     before = hashlib.sha256(manifest.read_bytes()).hexdigest()
     before_mtime = manifest.stat().st_mtime_ns
@@ -2898,8 +2914,8 @@ def test_rollback_drill_script_does_not_mutate_worktree() -> None:
     assert "rollback drill ok" in result.stdout
     assert hashlib.sha256(manifest.read_bytes()).hexdigest() == before
     assert manifest.stat().st_mtime_ns == before_mtime
-    rollback_script = (ROOT / "scripts" / "rollback-drill.sh").read_text(encoding="utf-8")
     assert "unset CI GITHUB_ACTIONS GITLAB_CI AI_CI" in rollback_script
+    assert rollback_script.index('for name in ("code.sqlite"') < rollback_script.index("ai doctor --strict")
     assert "rollback-drill.sh" in (ROOT / "scripts" / "release-gate.sh").read_text(encoding="utf-8")
 
 
@@ -4088,17 +4104,37 @@ def test_post_tool_use_hook_skips_injection(tmp_path: Path) -> None:
     assert "hookSpecificOutput" not in response
 
 
-def test_user_prompt_submit_hook_includes_routing_when_memory_empty(tmp_path: Path) -> None:
+def test_user_prompt_submit_hook_omits_static_rules_when_memory_empty(tmp_path: Path) -> None:
+    """Static Response/Search/Read rules live in the host-native static authority
+    file (.ai/AGENTS.md -> CLAUDE.md / root AGENTS.md) that Claude/Codex auto-load.
+    UserPromptSubmit must not repeat them every turn — only SessionStart does, as
+    the one-time safety net for hosts without a loaded static file. With no dynamic
+    memory present, UserPromptSubmit should have nothing left to say."""
     repo = copy_repo(tmp_path)
     init_package_repo(repo)
     payload = json.dumps({"agent": "claude", "dry": True})
     result = run_ai_input("hook", "UserPromptSubmit", "--json", stdin=payload, cwd=repo)
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout)
+    ctx = response.get("additionalContext", "")
+    assert "Search:" not in ctx
+    assert "Response:" not in ctx
+    assert "code_read_hashline" not in ctx
+    assert "Recent decisions" not in ctx
+
+
+def test_session_start_hook_still_includes_static_rules_once(tmp_path: Path) -> None:
+    """SessionStart keeps the safety-net static rules (Response/Search/Read) since
+    it is the single high-value, non-repeating injection point."""
+    repo = copy_repo(tmp_path)
+    init_package_repo(repo)
+    payload = json.dumps({"agent": "claude", "dry": True})
+    result = run_ai_input("hook", "SessionStart", "--json", stdin=payload, cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    response = json.loads(result.stdout)
     ctx = response["additionalContext"]
     assert "Search:" in ctx
     assert "code_read_hashline" in ctx
-    assert "Recent decisions" not in ctx
 
 
 def test_user_prompt_submit_harness_request_injects_directive(tmp_path: Path) -> None:

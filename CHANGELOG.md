@@ -2,6 +2,47 @@
 
 All notable Code Brain changes are recorded here.
 
+## Unreleased
+
+## 0.9.0 - 2026-08-29
+
+### Added
+
+- Oversized source indexing now streams bounded overlapping windows plus capped symbol spans for Python, Rust, TypeScript, JavaScript, Dart, and Kotlin; generated bundles use path-only classification stubs and every omitted source is reported with a class and reason.
+- Host-aware context delivery separates static rules, fingerprinted durable memory, live volatile state, and runtime-only recommendations so Codex does not receive duplicate `AGENTS.md` context while Claude and Antigravity retain their required delivery paths.
+- Normal non-CI installs and upgrades now persist trust for the exact Code Brain-managed Codex project hooks after the target transaction commits, with no policy file required; foreign/custom hooks and global user hooks remain review-gated, CI defaults off, and an explicit private policy can extend the exact allowlist.
+- Headlong-inspired deterministic episodic memory adds a fanout logarithmic pyramid, hard-budget coverage receipts, stable raw provenance, CLI/MCP context and drill-down surfaces, strict integrity status, and a prebuilt 200-byte `cb-life:` hook cache.
+- Lossless digest-named audit segments preserve every raw event while cross-file markers bind path, whole-file hash, last-line hash, and byte count.
+- Kiro IDE/CLI v3 receives a standalone five-event hook seed with native plain-stdout/non-zero-exit behavior; CLI v2 is detected and reported as an inert compatibility surface.
+
+### Changed
+
+- Prompt growth, transcript-token refresh, memory page-in, inline auto page-out, memory-tier context, and codegraph hotspot context are explicit opt-ins. Detached sleep-time page-out now refreshes non-destructive audit rollups and the episodic index; raw audit history is authoritative and never auto-deleted. Hook-triggered Git fetch/push and memory sync were removed; cross-machine sync is an explicit `ai memory sync` command or separately managed loop.
+- Search results are deduplicated by real source in SQLite before hydration, preventing windows from crowding out other files and avoiding repeated large-file reads per query.
+- Managed hook installers now version-gate new Claude/Codex events, set bounded per-event timeouts and Codex context-spill thresholds, cover file-write tools, and preserve foreign hooks across repeated upgrades and downgrades.
+- The full current Claude event catalog is documented with explicit non-adoption reasons for duplicate batch/expansion hooks, default-replacing worktree creation, permission auto-approval, and user/MCP elicitation interception; hook count is not treated as a quality metric.
+
+### Fixed
+
+- The completion guard's shell mutation parser now strips heredoc bodies and tokenizes redirections, so Dart `=>`, Kotlin `->`, and comparison operators inside commands no longer register as write targets and produce false `cb-guard[verification]` stop refusals.
+- Large source files no longer disappear silently from code search or symbol/call graphs, and source byte metrics no longer double-count derived windows or symbol chunks.
+- Managed `AGENTS.md` currentness now tracks all mirrored feature toggles and bounded nested resume/plan state, preserves opted-in runtime recommendations, fails closed on symlinks, and writes atomically.
+- Long-session scope nudges are byte-stable after their threshold, so they no longer defeat UserPromptSubmit delta suppression on every subsequent hook event.
+- Hook shims now launch the managed virtualenv Python directly instead of probing it through a second interpreter, cutting duplicate startup work while retaining uv fallback when the environment is absent.
+- Codex hook auto-trust now validates Code Brain-owned groups against the installer's shared semantic contract, so preserved foreign groups and version-gated `SessionEnd`/`Interrupt` entries no longer trigger repeated manual review while foreign hashes remain untrusted.
+- Managed uninstall now removes only Code Brain's exact Codex project-hook hash entries, retaining pre-existing project trust plus foreign/global hook hashes instead of leaking stale managed state indefinitely.
+- Install and upgrade no longer copy source-side `.ai/outputs` reports into every target; one upgrade transaction removes only untracked output paths owned by the previous install manifest while preserving target-created and Git-tracked artifacts.
+- Pre-manifest partial Code Brain runtimes can now be upgraded only after three independent managed markers agree, replacing stale managed files while preserving private memory and still rejecting unrelated `.ai` directories.
+- Uninstall now removes the Code Brain-owned standalone Kiro hook file while preserving sibling user hooks, preventing dangling commands after the runtime shim is removed.
+- Audit folding no longer replaces raw rows, audit rotation no longer discards a tail, old raw years are no longer pruned, and derived storage caps no longer make authoritative memory an impossible reclaim target.
+- Audit-chain verification now rejects duplicate IDs/sequences, digest/link/byte-count tampering, and nondeterministic sync branches; explicit repair renames changed segments to their canonical digest and cascades downstream links without dropping content.
+- Legacy ID-less event anchors remain stable when a current audit file becomes a segment, and episodic reads refuse mixed concurrent snapshots, duplicate source content, or ambiguous lineage.
+- Episodic tiers/meta/cache now fail closed on malformed rows, hash-chain or source-set changes, unsafe files, and any summary/provenance block that cannot be reproduced from raw truth; normal offline builds self-repair disposable corruption without touching raw history.
+- Episodic forget tombstones now live outside the reclaimable tier root, preventing storage cleanup from resurrecting forgotten summaries.
+- Audit segment sequences now fail closed on missing heads/interior gaps/orphan current markers across doctor, repair, episodic reads, and explicit sync; repair cannot legitimize evidence loss by relinking physical neighbors.
+- Raw audit files no longer inherit JSONL union merge. Private-remote sync requires explicit confirmation, transaction-locks and force-stages the complete ignored segment/current set, excludes derived/transient state, and refuses tracked-segment deletion.
+- Strict doctor audit/index reads use a transaction-consistent snapshot, failed unbuilt episodic status no longer appears inactive, and known disposable episodic/rollup roots can be reclaimed safely in non-git workspaces while explicit pins remain authoritative.
+
 ## 0.8.0 - 2026-08-22
 
 ### Added

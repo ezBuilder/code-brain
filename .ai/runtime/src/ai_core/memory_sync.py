@@ -16,15 +16,24 @@ It is deliberately conservative and NEVER touches the user's code:
   * Holds a per-machine lock per cycle so the SessionEnd daemon and a manual ``ai memory
     sync`` can't race (double commit/push); a stale lock is stolen after a TTL.
   * Writes a per-machine heartbeat so other machines can show "VPS synced 3m ago".
+  * Raw audit is local-private by default. Syncing it requires an explicit private-remote
+    confirmation, stages the complete physical audit set (including ignored immutable
+    segments), and fails closed on a missing segment or invalid lineage. Rebase conflicts
+    are aborted; audit history is never union-merged or silently re-chained.
 
 Hard rule: this does NETWORK I/O (fetch/push) and MUST NOT run on the hooks/MCP hot
-path. It is invoked explicitly by ``ai memory sync`` (one-shot or ``--loop`` daemon) and,
-when ``memory_sync.enabled`` is set, spawned detached at SessionEnd.
+path. It is invoked ONLY explicitly by ``ai memory sync`` (one-shot or ``--loop``
+daemon) — never spawned from a hook, even detached, because a background process
+launched FROM a hook is still the hook causing network I/O. ``memory_sync.enabled``
+in ``.ai/config.yaml`` is a deprecated no-op kept for one release for backward
+compatibility; ``ai doctor`` reports it once per invocation rather than silently
+reactivating an automatic spawn.
 """
 from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -39,6 +48,19 @@ _GIT_TIMEOUT = 30
 # regenerated from .ai/memory). Listing it made `git add` abort on the ignored path,
 # which left .ai/memory unstaged so the sync silently committed nothing.
 MEMORY_PATHS = (".ai/memory",)
+_MEMORY_STAGE_PATHS = (
+    *MEMORY_PATHS,
+    ":(exclude,glob).ai/memory/*.lock",
+    ":(exclude,glob).ai/memory/**/*.lock",
+    ":(exclude).ai/memory/audit-index.jsonl",
+    ":(exclude).ai/memory/audit-rollups",
+    ":(exclude).ai/memory/episodic",
+    ":(exclude).ai/memory/events",
+    ":(exclude).ai/memory/inbox",
+    ":(exclude).ai/memory/outbox",
+    ":(exclude).ai/memory/queue",
+    ":(exclude).ai/memory/loop",
+)
 _HEARTBEAT_DIR = (".ai", "memory", "sync")
 # Per-machine, git-ignored lock so the detached SessionEnd daemon and a manual
 # `ai memory sync` never run a cycle concurrently (double commit/push races). A lock
@@ -65,9 +87,12 @@ def _git(root: Path, *args: str, timeout: int = _GIT_TIMEOUT) -> tuple[bool, str
 
 
 def sync_enabled(root: Path) -> bool:
-    """memory_sync.enabled in .ai/config.yaml (default False). Off by default so the
-    automatic SessionEnd spawn and the daemon stay opt-in; the explicit `ai memory sync`
-    command runs regardless."""
+    """memory_sync.enabled in .ai/config.yaml (default False).
+
+    No hook spawns from this flag anymore (network I/O is banned on the hot path even
+    when detached); the explicit `ai memory sync` command and `--loop` daemon run
+    regardless of this setting. The flag is read only for the `ai doctor` deprecation
+    diagnostic and by any external tooling that wants to know the configured intent."""
     try:
         from .config import load_config
 
@@ -117,19 +142,52 @@ def _other_paths_dirty(root: Path) -> bool:
     return False
 
 
-def _maybe_repair_audit_chain(root: Path) -> None:
-    """After a memory merge/rebase the union-merged audit jsonl can have a broken
-    prev_sha chain. Re-chain it deterministically via the existing ai command."""
-    ai_bin = Path(root) / ".ai" / "bin" / "ai"
-    if not ai_bin.exists():
-        return
-    try:
-        subprocess.run(
-            [str(ai_bin), "audit", "repair-chain", "--json"],
-            cwd=str(root), capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError):
-        pass
+def _audit_sync_preflight(
+    root: Path,
+    *,
+    private_remote_confirmed: bool,
+    transaction_locked: bool = False,
+) -> tuple[bool, str]:
+    """Prove that raw audit can be committed as one complete private snapshot."""
+
+    from .doctor import _check_audit_chain_snapshot, check_audit_chain, check_gitattributes
+    from .memory import all_audit_files
+
+    physical = {path.relative_to(root).as_posix() for path in all_audit_files(root)}
+    tracked_ok, tracked_out, _ = _git(
+        root, "ls-files", "-z", "--", ".ai/memory/audit"
+    )
+    if not tracked_ok:
+        return False, "audit-tracked-set-unavailable"
+    tracked = {path for path in tracked_out.split("\0") if path}
+    missing = sorted(tracked - physical)
+    if missing:
+        return False, "audit-segment-missing:" + ",".join(missing[:4])
+    if not physical:
+        return True, ""
+    if not private_remote_confirmed:
+        return False, "private-remote-confirmation-required"
+    attributes = check_gitattributes(root)
+    if not attributes.ok:
+        return False, "audit-no-merge-policy-missing"
+    chain = (
+        _check_audit_chain_snapshot(root)
+        if transaction_locked
+        else check_audit_chain(root)
+    )
+    if not chain.ok:
+        return False, "audit-integrity-invalid:" + chain.detail[:160]
+    return True, ""
+
+
+def _stage_memory_snapshot(root: Path, *, private_remote_confirmed: bool) -> tuple[bool, str]:
+    """Stage memory, force-including private data only after explicit confirmation."""
+
+    if private_remote_confirmed:
+        ok, _out, err = _git(root, "add", "-f", "--", *_MEMORY_STAGE_PATHS)
+    else:
+        ok, _out, err = _git(root, "add", "--", *_MEMORY_STAGE_PATHS)
+    return ok, err.strip()[:160]
 
 
 def _ahead_has_non_memory_commit(root: Path, upstream: str) -> bool:
@@ -151,60 +209,135 @@ def _ahead_has_non_memory_commit(root: Path, upstream: str) -> bool:
     return False
 
 
-def _acquire_sync_lock(root: Path) -> bool:
-    """Best-effort, portable, non-blocking lock: True if acquired. A lock older than
-    _LOCK_TTL is stolen so a crashed cycle never wedges sync forever. Lock-infra failures
-    fail OPEN (return True) — the lock is a courtesy, never a reason to disable sync."""
-    p = Path(root).joinpath(*_LOCK_PATH)
+def _lock_owner_alive(text: str) -> bool:
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return True
-    try:
-        if p.exists() and (time.time() - p.stat().st_mtime) > _LOCK_TTL:
-            p.unlink()
-    except OSError:
-        pass
-    try:
-        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
+        pid = int(text.split(maxsplit=1)[0])
+    except (IndexError, TypeError, ValueError):
         return False
-    except OSError:
-        return True
+    if pid <= 0:
+        return False
     try:
-        os.write(fd, f"{os.getpid()} {_utc()}".encode())
-    finally:
-        os.close(fd)
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
     return True
 
 
-def _release_sync_lock(root: Path) -> None:
+def _acquire_sync_lock(root: Path) -> tuple[str, str | None]:
+    """Acquire a fail-closed non-blocking lock and return ``(state, token)``.
+
+    ``state`` is ``acquired``, ``busy``, or ``error``. A stale lock is stolen only
+    when its recorded process is no longer alive; infrastructure failures never
+    permit an unlocked network/commit cycle.
+    """
+    p = Path(root).joinpath(*_LOCK_PATH)
     try:
-        Path(root).joinpath(*_LOCK_PATH).unlink()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.parent.resolve(strict=True).relative_to(Path(root).resolve(strict=True))
+    except (OSError, ValueError):
+        return "error", None
+    try:
+        state = p.lstat()
+        if not stat.S_ISREG(state.st_mode) or stat.S_ISLNK(state.st_mode) or state.st_nlink != 1:
+            return "error", None
+        if (time.time() - state.st_mtime) <= _LOCK_TTL:
+            return "busy", None
+        try:
+            owner = p.read_text(encoding="utf-8")[:256]
+        except (OSError, UnicodeDecodeError):
+            return "error", None
+        if _lock_owner_alive(owner):
+            return "busy", None
+        if p.lstat().st_ino != state.st_ino:
+            return "busy", None
+        p.unlink()
+    except FileNotFoundError:
+        pass
     except OSError:
+        return "error", None
+    token = f"{os.getpid()} {time.monotonic_ns()}-{_utc()}"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(p), flags, 0o600)
+    except FileExistsError:
+        return "busy", None
+    except OSError:
+        return "error", None
+    try:
+        os.write(fd, token.encode("utf-8"))
+        os.fsync(fd)
+    except OSError:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return "error", None
+    finally:
+        os.close(fd)
+    return "acquired", token
+
+
+def _release_sync_lock(root: Path, token: str) -> None:
+    p = Path(root).joinpath(*_LOCK_PATH)
+    try:
+        state = p.lstat()
+        if not stat.S_ISREG(state.st_mode) or stat.S_ISLNK(state.st_mode) or state.st_nlink != 1:
+            return
+        if p.read_text(encoding="utf-8") != token:
+            return
+        p.unlink()
+    except (OSError, UnicodeDecodeError):
         pass
 
 
-def sync_once(root: Path, *, agent: str = "agent", push: bool = True) -> dict[str, Any]:
+def sync_once(
+    root: Path,
+    *,
+    agent: str = "agent",
+    push: bool = True,
+    private_remote_confirmed: bool = False,
+) -> dict[str, Any]:
     """One sync cycle. Safe to call repeatedly; no-op when nothing changed and in sync.
 
     Holds a per-machine lock for the cycle so the detached SessionEnd daemon and a manual
     ``ai memory sync`` cannot race (double commit/push). If a live cycle holds the lock this
     returns immediately with ``skipped_lock=True``."""
     root = Path(root)
-    if not _acquire_sync_lock(root):
+    lock_state, lock_token = _acquire_sync_lock(root)
+    if lock_state != "acquired" or lock_token is None:
+        lock_error = None if lock_state == "busy" else "sync-lock-unavailable"
         return {
-            "ok": True, "machine_id": machine_id(root), "committed": False, "pushed": False,
+            "ok": lock_error is None, "machine_id": machine_id(root), "committed": False, "pushed": False,
             "rebased": False, "behind_before": 0, "ahead_before": 0, "skipped_rebase": False,
-            "conflict": False, "skipped_push": False, "skipped_lock": True, "errors": [],
+            "conflict": False, "skipped_push": False, "skipped_lock": True,
+            "errors": [] if lock_error is None else [lock_error],
         }
     try:
-        return _sync_once_locked(root, agent=agent, push=push)
+        return _sync_once_locked(
+            root,
+            agent=agent,
+            push=push,
+            private_remote_confirmed=private_remote_confirmed,
+        )
     finally:
-        _release_sync_lock(root)
+        _release_sync_lock(root, lock_token)
 
 
-def _sync_once_locked(root: Path, *, agent: str = "agent", push: bool = True) -> dict[str, Any]:
+def _sync_once_locked(
+    root: Path,
+    *,
+    agent: str = "agent",
+    push: bool = True,
+    private_remote_confirmed: bool = False,
+) -> dict[str, Any]:
     """One sync cycle (run while holding the per-machine lock). Safe to call repeatedly;
     no-op when nothing changed and in sync."""
     root = Path(root)
@@ -220,6 +353,14 @@ def _sync_once_locked(root: Path, *, agent: str = "agent", push: bool = True) ->
         res["errors"].append("not-a-git-repo")
         return res
 
+    audit_ok, audit_error = _audit_sync_preflight(
+        root, private_remote_confirmed=private_remote_confirmed
+    )
+    if not audit_ok:
+        res["ok"] = False
+        res["errors"].append(audit_error)
+        return res
+
     _write_heartbeat(root, mid, agent)
 
     # Commit ONLY the memory paths that actually exist. Stage them first so NEW files
@@ -227,14 +368,51 @@ def _sync_once_locked(root: Path, *, agent: str = "agent", push: bool = True) ->
     # those paths — which leaves any code the user has staged untouched (never committed).
     paths = [p for p in MEMORY_PATHS if (root / p).exists()]
     if paths:
-        _git(root, "add", "--", *paths)
-        _staged_ok, staged_out, _ = _git(root, "diff", "--cached", "--name-only", "--", *paths)
-        if staged_out.strip():
-            msg = f"chore(memory): sync {mid} via {agent} {_utc()}"
-            ok_c, _, err = _git(root, "-c", "commit.gpgsign=false", "commit", "-m", msg, "--", *paths)
-            res["committed"] = ok_c
-            if not ok_c:
-                res["errors"].append("commit-failed: " + err.strip()[:160])
+        from .memory import audit_transaction_lock_path
+        from .private_write import private_file_lock
+
+        try:
+            with private_file_lock(audit_transaction_lock_path(root), root=root):
+                audit_ok, audit_error = _audit_sync_preflight(
+                    root,
+                    private_remote_confirmed=private_remote_confirmed,
+                    transaction_locked=True,
+                )
+                if not audit_ok:
+                    res["ok"] = False
+                    res["errors"].append(audit_error)
+                    return res
+                staged_ok, stage_error = _stage_memory_snapshot(
+                    root, private_remote_confirmed=private_remote_confirmed
+                )
+                if not staged_ok:
+                    res["ok"] = False
+                    res["errors"].append("stage-failed: " + stage_error)
+                    return res
+                _staged_ok, staged_out, _ = _git(
+                    root, "diff", "--cached", "--name-only", "--", *_MEMORY_STAGE_PATHS
+                )
+                if staged_out.strip():
+                    msg = f"chore(memory): sync {mid} via {agent} {_utc()}"
+                    ok_c, _, err = _git(
+                        root,
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "-m",
+                        msg,
+                        "--",
+                        *_MEMORY_STAGE_PATHS,
+                    )
+                    res["committed"] = ok_c
+                    if not ok_c:
+                        res["ok"] = False
+                        res["errors"].append("commit-failed: " + err.strip()[:160])
+                        return res
+        except OSError as exc:
+            res["ok"] = False
+            res["errors"].append(f"audit-lock-failed: {type(exc).__name__}")
+            return res
 
     up_ok, up_out, _ = _git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
     upstream = up_out.strip() if up_ok else ""
@@ -259,7 +437,13 @@ def _sync_once_locked(root: Path, *, agent: str = "agent", push: bool = True) ->
         rok, _, rerr = _git(root, "-c", "commit.gpgsign=false", "rebase", upstream)
         if rok:
             res["rebased"] = True
-            _maybe_repair_audit_chain(root)
+            audit_ok, audit_error = _audit_sync_preflight(
+                root, private_remote_confirmed=private_remote_confirmed
+            )
+            if not audit_ok:
+                res["ok"] = False
+                res["errors"].append("post-rebase-" + audit_error)
+                return res
         else:
             _git(root, "rebase", "--abort")
             res["conflict"] = True
@@ -283,13 +467,23 @@ def _sync_once_locked(root: Path, *, agent: str = "agent", push: bool = True) ->
     return res
 
 
-def sync_loop(root: Path, *, agent: str = "agent", interval: int = 180) -> None:
+def sync_loop(
+    root: Path,
+    *,
+    agent: str = "agent",
+    interval: int = 180,
+    private_remote_confirmed: bool = False,
+) -> None:
     """Daemon mode: sync every `interval` seconds. Run under systemd/launchd on the VPS.
     Errors per cycle are swallowed so the loop survives transient offline/auth issues."""
     interval = max(30, int(interval))
     while True:
         try:
-            sync_once(root, agent=agent)
+            sync_once(
+                root,
+                agent=agent,
+                private_remote_confirmed=private_remote_confirmed,
+            )
         except Exception:
             pass
         time.sleep(interval)

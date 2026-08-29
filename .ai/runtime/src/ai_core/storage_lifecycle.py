@@ -28,6 +28,10 @@ TMP_MAX_ENTRIES = 256
 TMP_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 OUTPUT_MAX_ENTRIES = 512
 OUTPUT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024
+EPISODIC_MAX_ENTRIES = 8
+EPISODIC_MAX_TOTAL_BYTES = 128 * 1024 * 1024
+AUDIT_ROLLUP_MAX_ENTRIES = 16
+AUDIT_ROLLUP_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 AI_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 STORAGE_SCAN_MAX_ENTRIES = 200_000
 _DIRECTORY_SCAN_MAX_ENTRIES = 4096
@@ -78,6 +82,18 @@ def _tree_usage(path: Path, *, max_entries: int = STORAGE_SCAN_MAX_ENTRIES) -> d
     }
 
 
+def _pinned_accounting(root: Path, directory: Path) -> tuple[int, int]:
+    """Return pinned bytes and top-level entry count with one managed scan."""
+    try:
+        rows, _errors = _managed_entries(root, directory)
+    except Exception:
+        return 0, 0
+    return (
+        sum(int(row["bytes"]) for row in rows if bool(row["pinned"])),
+        sum(1 for row in rows if bool(row["pinned"])),
+    )
+
+
 def _pinned_bytes(root: Path, directory: Path) -> int:
     """Bytes held by entries the enforcer is not allowed to delete.
 
@@ -89,11 +105,13 @@ def _pinned_bytes(root: Path, directory: Path) -> int:
     kept bytes are the user's choice, so they are excluded from the *limit* while still
     being reported.
     """
-    try:
-        rows, _errors = _managed_entries(root, directory)
-    except Exception:
-        return 0
-    return sum(int(row["bytes"]) for row in rows if bool(row["pinned"]))
+    return _pinned_accounting(root, directory)[0]
+
+
+def _pinned_entries(root: Path, directory: Path) -> int:
+    """Top-level entries explicitly outside automatic count quotas."""
+
+    return _pinned_accounting(root, directory)[1]
 
 
 def workspace_storage_status(root: Path) -> dict[str, int | bool]:
@@ -101,6 +119,9 @@ def workspace_storage_status(root: Path) -> dict[str, int | bool]:
     ai = _tree_usage(root / ".ai")
     tmp = _tree_usage(root / ".ai" / "tmp")
     outputs = _tree_usage(root / ".ai" / "outputs")
+    memory = _tree_usage(root / ".ai" / "memory")
+    episodic = _tree_usage(root / ".ai" / "memory" / "episodic")
+    audit_rollups = _tree_usage(root / ".ai" / "memory" / "audit-rollups")
     try:
         tmp_top_entries = len(list_root_confined_directory(root / ".ai" / "tmp", root=root, max_entries=_DIRECTORY_SCAN_MAX_ENTRIES))
     except FileNotFoundError:
@@ -113,41 +134,132 @@ def workspace_storage_status(root: Path) -> dict[str, int | bool]:
         output_top_entries = 0
     except OSError:
         output_top_entries = OUTPUT_MAX_ENTRIES + 1
-    complete = bool(ai["complete"] and tmp["complete"] and outputs["complete"])
-    errors = int(ai["errors"]) + int(tmp["errors"]) + int(outputs["errors"])
+    try:
+        episodic_top_entries = len(
+            list_root_confined_directory(
+                root / ".ai" / "memory" / "episodic",
+                root=root,
+                max_entries=_DIRECTORY_SCAN_MAX_ENTRIES,
+            )
+        )
+    except FileNotFoundError:
+        episodic_top_entries = 0
+    except OSError:
+        episodic_top_entries = EPISODIC_MAX_ENTRIES + 1
+    try:
+        audit_rollup_top_entries = len(
+            list_root_confined_directory(
+                root / ".ai" / "memory" / "audit-rollups",
+                root=root,
+                max_entries=_DIRECTORY_SCAN_MAX_ENTRIES,
+            )
+        )
+    except FileNotFoundError:
+        audit_rollup_top_entries = 0
+    except OSError:
+        audit_rollup_top_entries = AUDIT_ROLLUP_MAX_ENTRIES + 1
+    complete = bool(
+        ai["complete"]
+        and tmp["complete"]
+        and outputs["complete"]
+        and memory["complete"]
+        and episodic["complete"]
+        and audit_rollups["complete"]
+    )
+    errors = (
+        int(ai["errors"])
+        + int(tmp["errors"])
+        + int(outputs["errors"])
+        + int(memory["errors"])
+        + int(episodic["errors"])
+        + int(audit_rollups["errors"])
+    )
     ai_bytes = int(ai["bytes"])
     tmp_bytes = int(tmp["bytes"])
     output_bytes = int(outputs["bytes"])
-    tmp_pinned = _pinned_bytes(root, root / ".ai" / "tmp")
-    output_pinned = _pinned_bytes(root, root / ".ai" / "outputs")
+    memory_bytes = int(memory["bytes"])
+    episodic_bytes = int(episodic["bytes"])
+    audit_rollup_bytes = int(audit_rollups["bytes"])
+    authoritative_memory_bytes = max(
+        0, memory_bytes - episodic_bytes - audit_rollup_bytes
+    )
+    tmp_pinned, tmp_pinned_entries = _pinned_accounting(root, root / ".ai" / "tmp")
+    output_pinned, output_pinned_entries = _pinned_accounting(root, root / ".ai" / "outputs")
+    episodic_pinned, episodic_pinned_entries = _pinned_accounting(
+        root, root / ".ai" / "memory" / "episodic"
+    )
+    audit_rollup_pinned, audit_rollup_pinned_entries = _pinned_accounting(
+        root, root / ".ai" / "memory" / "audit-rollups"
+    )
     # Reclaimable = what the enforcer could actually delete. The caps apply to this.
     tmp_reclaimable = max(0, tmp_bytes - tmp_pinned)
     output_reclaimable = max(0, output_bytes - output_pinned)
-    ai_reclaimable = max(0, ai_bytes - tmp_pinned - output_pinned)
+    episodic_reclaimable = max(0, episodic_bytes - episodic_pinned)
+    audit_rollup_reclaimable = max(0, audit_rollup_bytes - audit_rollup_pinned)
+    tmp_reclaimable_entries = max(0, tmp_top_entries - tmp_pinned_entries)
+    output_reclaimable_entries = max(0, output_top_entries - output_pinned_entries)
+    episodic_reclaimable_entries = max(0, episodic_top_entries - episodic_pinned_entries)
+    audit_rollup_reclaimable_entries = max(
+        0, audit_rollup_top_entries - audit_rollup_pinned_entries
+    )
+    # Raw audit/decision/session memory is authoritative and has no safe automatic
+    # deletion path. Counting it against an automatically enforced cap makes that
+    # cap permanently unsatisfiable once a long-lived project crosses the limit.
+    # The episodic pyramid is derived and disposable, so it remains bounded below.
+    ai_reclaimable = max(
+        0,
+        ai_bytes
+        - authoritative_memory_bytes
+        - tmp_pinned
+        - output_pinned
+        - episodic_pinned
+        - audit_rollup_pinned,
+    )
     return {
         "ok": complete
         and errors == 0
         and ai_reclaimable <= AI_MAX_TOTAL_BYTES
         and tmp_reclaimable <= TMP_MAX_TOTAL_BYTES
-        and tmp_top_entries <= TMP_MAX_ENTRIES
+        and tmp_reclaimable_entries <= TMP_MAX_ENTRIES
         and output_reclaimable <= OUTPUT_MAX_TOTAL_BYTES
-        and output_top_entries <= OUTPUT_MAX_ENTRIES,
+        and output_reclaimable_entries <= OUTPUT_MAX_ENTRIES
+        and episodic_reclaimable <= EPISODIC_MAX_TOTAL_BYTES
+        and episodic_reclaimable_entries <= EPISODIC_MAX_ENTRIES
+        and audit_rollup_reclaimable <= AUDIT_ROLLUP_MAX_TOTAL_BYTES
+        and audit_rollup_reclaimable_entries <= AUDIT_ROLLUP_MAX_ENTRIES,
         "complete": complete,
         "errors": errors,
         "ai_bytes": ai_bytes,
         "ai_max_bytes": AI_MAX_TOTAL_BYTES,
         "ai_reclaimable_bytes": ai_reclaimable,
+        "authoritative_memory_bytes": authoritative_memory_bytes,
+        "episodic_bytes": episodic_bytes,
+        "episodic_max_bytes": EPISODIC_MAX_TOTAL_BYTES,
+        "episodic_pinned_bytes": episodic_pinned,
+        "episodic_reclaimable_bytes": episodic_reclaimable,
+        "episodic_top_entries": episodic_top_entries,
+        "episodic_reclaimable_entries": episodic_reclaimable_entries,
+        "episodic_max_entries": EPISODIC_MAX_ENTRIES,
+        "audit_rollup_bytes": audit_rollup_bytes,
+        "audit_rollup_max_bytes": AUDIT_ROLLUP_MAX_TOTAL_BYTES,
+        "audit_rollup_pinned_bytes": audit_rollup_pinned,
+        "audit_rollup_reclaimable_entries": audit_rollup_reclaimable_entries,
+        "audit_rollup_reclaimable_bytes": audit_rollup_reclaimable,
+        "audit_rollup_top_entries": audit_rollup_top_entries,
+        "audit_rollup_max_entries": AUDIT_ROLLUP_MAX_ENTRIES,
         "tmp_bytes": tmp_bytes,
         "tmp_max_bytes": TMP_MAX_TOTAL_BYTES,
         "tmp_pinned_bytes": tmp_pinned,
         "tmp_reclaimable_bytes": tmp_reclaimable,
         "tmp_top_entries": tmp_top_entries,
+        "tmp_reclaimable_entries": tmp_reclaimable_entries,
         "tmp_max_entries": TMP_MAX_ENTRIES,
         "output_bytes": output_bytes,
         "output_max_bytes": OUTPUT_MAX_TOTAL_BYTES,
         "output_pinned_bytes": output_pinned,
         "output_reclaimable_bytes": output_reclaimable,
         "output_top_entries": output_top_entries,
+        "output_reclaimable_entries": output_reclaimable_entries,
         "output_max_entries": OUTPUT_MAX_ENTRIES,
         "entries_scanned": int(ai["entries"]),
     }
@@ -313,9 +425,18 @@ def _managed_entries(root: Path, directory: Path) -> tuple[list[dict[str, object
     return rows, errors
 
 
-def _protected(row: dict[str, object]) -> bool:
-    """Entries the enforcer must not delete: an explicit pin, or an undetermined state."""
-    return bool(row.get("pinned")) or bool(row.get("undetermined"))
+def _protected(row: dict[str, object], *, allow_undetermined: bool = False) -> bool:
+    """Return whether an entry is outside the caller's deletion authority.
+
+    Unknown git state remains protected for general scratch/output data. The two
+    explicitly derived roots may opt in to reclaiming it: every top-level entry
+    there is disposable by contract and can be rebuilt from authoritative audit.
+    Explicit pins (tracked, referenced, or ``.keep``) always win.
+    """
+
+    return bool(row.get("pinned")) or (
+        bool(row.get("undetermined")) and not allow_undetermined
+    )
 
 
 def _remove_managed_entry(path: Path, *, root: Path) -> bool:
@@ -339,6 +460,7 @@ def _prune_managed_directory(
     keep_days: int | None,
     max_entries: int,
     max_total_bytes: int,
+    allow_undetermined: bool = False,
 ) -> dict[str, int | bool]:
     rows, errors = _managed_entries(root, directory)
     bytes_before = sum(int(row["bytes"]) for row in rows)
@@ -348,7 +470,7 @@ def _prune_managed_directory(
     survivors: list[dict[str, object]] = []
     for row in sorted(rows, key=lambda value: (int(value["mtime_ns"]), str(value["name"]))):
         expired = keep_days is not None and int(row["mtime_ns"]) < cutoff_ns
-        if expired and not _protected(row):
+        if expired and not _protected(row, allow_undetermined=allow_undetermined):
             if _remove_managed_entry(Path(row["path"]), root=root):
                 removed += 1
                 removed_bytes += int(row["bytes"])
@@ -358,15 +480,23 @@ def _prune_managed_directory(
 
     total = sum(int(row["bytes"]) for row in survivors)
     count = len(survivors)
+    reclaimable_total = sum(int(row["bytes"]) for row in survivors if not row["pinned"])
+    reclaimable_count = sum(1 for row in survivors if not row["pinned"])
     kept: list[dict[str, object]] = []
     for row in survivors:
-        over = count > max(0, int(max_entries)) or total > max(0, int(max_total_bytes))
-        if over and not _protected(row):
+        over = (
+            reclaimable_count > max(0, int(max_entries))
+            or reclaimable_total > max(0, int(max_total_bytes))
+        )
+        if over and not _protected(row, allow_undetermined=allow_undetermined):
             if _remove_managed_entry(Path(row["path"]), root=root):
                 removed += 1
                 removed_bytes += int(row["bytes"])
                 total -= int(row["bytes"])
                 count -= 1
+                if not row["pinned"]:
+                    reclaimable_total -= int(row["bytes"])
+                    reclaimable_count -= 1
                 continue
             errors += 1
         kept.append(row)
@@ -376,9 +506,13 @@ def _prune_managed_directory(
     # counting them made `ok` unreachable and left doctor permanently red even after a
     # successful sweep (blurivo: 475MB of pinned fixtures in a 512MB cap).
     pinned_bytes = sum(int(row["bytes"]) for row in kept if row["pinned"])
-    reclaimable = max(0, total - pinned_bytes)
+    reclaimable = max(0, reclaimable_total)
     return {
-        "ok": errors == 0 and reclaimable <= max_total_bytes and count <= max_entries,
+        "ok": (
+            errors == 0
+            and reclaimable <= max_total_bytes
+            and reclaimable_count <= max_entries
+        ),
         "removed": removed,
         "removed_bytes": removed_bytes,
         "bytes_before": bytes_before,
@@ -386,6 +520,7 @@ def _prune_managed_directory(
         "bytes_pinned": pinned_bytes,
         "bytes_reclaimable": reclaimable,
         "kept": count,
+        "reclaimable_entries": reclaimable_count,
         "pinned": sum(1 for row in kept if row["pinned"]),
         "errors": errors,
     }
@@ -424,9 +559,25 @@ def enforce_workspace_storage(root: Path) -> dict[str, object]:
         max_entries=OUTPUT_MAX_ENTRIES,
         max_total_bytes=OUTPUT_MAX_TOTAL_BYTES,
     )
+    episodic = _prune_managed_directory(
+        root,
+        root / ".ai" / "memory" / "episodic",
+        keep_days=None,
+        max_entries=EPISODIC_MAX_ENTRIES,
+        max_total_bytes=EPISODIC_MAX_TOTAL_BYTES,
+        allow_undetermined=True,
+    )
+    audit_rollups = _prune_managed_directory(
+        root,
+        root / ".ai" / "memory" / "audit-rollups",
+        keep_days=None,
+        max_entries=AUDIT_ROLLUP_MAX_ENTRIES,
+        max_total_bytes=AUDIT_ROLLUP_MAX_TOTAL_BYTES,
+        allow_undetermined=True,
+    )
     status = workspace_storage_status(root)
     reclaim: list[dict[str, object]] = []
-    excess = max(0, int(status["ai_bytes"]) - AI_MAX_TOTAL_BYTES)
+    excess = max(0, int(status["ai_reclaimable_bytes"]) - AI_MAX_TOTAL_BYTES)
     for directory in (root / ".ai" / "tmp", root / ".ai" / "outputs"):
         if excess <= 0:
             break
@@ -436,9 +587,17 @@ def enforce_workspace_storage(root: Path) -> dict[str, object]:
     if reclaim:
         status = workspace_storage_status(root)
     return {
-        "ok": bool(tmp["ok"] and outputs["ok"] and status["ok"]),
+        "ok": bool(
+            tmp["ok"]
+            and outputs["ok"]
+            and episodic["ok"]
+            and audit_rollups["ok"]
+            and status["ok"]
+        ),
         "tmp": tmp,
         "outputs": outputs,
+        "episodic": episodic,
+        "audit_rollups": audit_rollups,
         "reclaim": reclaim,
         "status": status,
     }

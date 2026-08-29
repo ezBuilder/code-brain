@@ -119,7 +119,26 @@ def _is_visible_project_file(root: Path, path: Path) -> bool:
         rel = path.relative_to(root)
     except ValueError:
         return False
-    if any(part in {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".dart_tool", ".gradle", "build", "dist", "coverage", "Pods", "DerivedData"} for part in rel.parts):
+    if any(
+        part
+        in {
+            ".git",
+            ".code-brain-install-transaction",
+            ".venv",
+            "venv",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            ".dart_tool",
+            ".gradle",
+            "build",
+            "dist",
+            "coverage",
+            "Pods",
+            "DerivedData",
+        }
+        for part in rel.parts
+    ):
         return False
     if rel.parts[:2] in {(".ai", "cache"), (".ai", "memory"), (".ai", "skills"), (".ai", "precall_rules"), (".ai", "agents_catalog")}:
         return False

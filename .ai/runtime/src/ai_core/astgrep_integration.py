@@ -288,7 +288,14 @@ def ast_grep_search(
     rule_yaml = "id: cb-search\nlanguage: {lang}\nrule:\n  pattern: |\n    {pat}\n".format(
         lang=lang_norm, pat=pat.replace("\n", "\n    "))
     from .redact import redact_value
-    from .search import MAX_TEXT_BYTES, _is_indexable_text_file, iter_text_files
+    from .search import (
+        MAX_TEXT_BYTES,
+        _is_generated_path,
+        _is_indexable_text_file,
+        _iter_redacted_text_pieces,
+        _indexable_text_stat,
+        iter_text_files,
+    )
 
     exact_scope: Path | None = None
     if scope_rel is not None:
@@ -324,18 +331,10 @@ def ast_grep_search(
                 continue
             if suffixes and source.suffix.casefold() not in suffixes:
                 continue
-            try:
-                content, state = read_root_confined_text(
-                    source,
-                    root=root,
-                    max_bytes=MAX_TEXT_BYTES,
-                    require_private=False,
-                    require_owner=True,
-                    reject_group_other_writable=True,
-                )
-            except (OSError, UnicodeDecodeError):
+            state = _indexable_text_stat(root, source)
+            if state is None or _is_generated_path(root, source):
                 continue
-            encoded_size = len(content.encode("utf-8"))
+            encoded_size = int(state.st_size)
             if (
                 copied_files >= AST_MATERIALIZE_MAX_FILES
                 or copied_bytes + encoded_size > AST_MATERIALIZE_MAX_BYTES
@@ -344,7 +343,32 @@ def ast_grep_search(
                 break
             destination = mirror_root / rel
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            destination.write_text(content, encoding="utf-8")
+            try:
+                with destination.open("wb") as handle:
+                    if state.st_size <= MAX_TEXT_BYTES:
+                        content, _ = read_root_confined_text(
+                            source,
+                            root=root,
+                            max_bytes=MAX_TEXT_BYTES,
+                            require_private=False,
+                            require_owner=True,
+                            reject_group_other_writable=True,
+                        )
+                        handle.write(content.encode("utf-8"))
+                    else:
+                        for piece in _iter_redacted_text_pieces(
+                            root,
+                            source,
+                            require_owner=True,
+                            reject_group_other_writable=True,
+                        ):
+                            handle.write(piece.encode("utf-8"))
+            except (OSError, UnicodeDecodeError):
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+                continue
             if os.name != "nt":
                 destination.chmod(0o600)
             copied_files += 1

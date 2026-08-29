@@ -239,6 +239,31 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "episodic_context",
+        "description": "비권위적 로그 피라미드 문맥. coverage receipt를 확인하고 중요한 판단 전 raw drill-down 필수.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "byte_budget": {"type": "integer", "default": 8000, "minimum": 256, "maximum": 64000},
+                "raw_tail": {"type": "integer", "default": 20, "minimum": 0, "maximum": 200},
+                "fanout": {"type": "integer", "default": 10, "minimum": 2, "maximum": 100},
+            },
+        },
+    },
+    {
+        "name": "episodic_drilldown",
+        "description": "episodic event ID 또는 반개구간을 권위적 raw audit 행과 파일/라인으로 해석.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "maxLength": 128},
+                "start": {"type": "integer", "minimum": 0},
+                "end": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
         "name": "code_graph_callers",
         "description": "호출 그래프 역방향 조회: 이 qualname을 누가 호출하나? 읽기전용.",
         "inputSchema": {
@@ -328,7 +353,7 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "ai_request_rebuild",
-        "description": "SQLite FTS5 코드 인덱스를 강제 재빌드. 쓰기성.",
+        "description": "SQLite FTS5 코드 인덱스를 강제 재빌드. 대형 소스는 bounded windows로 처리하고 skip/stub class+reason을 반환한다. 쓰기성.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -341,12 +366,12 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "obs_health_summary",
-        "description": "doctor + 큐 + 워커 + 인덱스 종합 요약. 읽기전용.",
+        "description": "doctor + 큐 + 워커 + 인덱스 종합 요약. index_coverage에 skip/stub class+reason 포함. 읽기전용.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "obs_search",
-        "description": "stale 감지 리포트가 붙은 BM25 검색.",
+        "description": "stale 감지와 large-source coverage 리포트가 붙은 BM25 검색.",
         "inputSchema": {
             "type": "object",
             "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 5}},
@@ -355,7 +380,7 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "doctor_strict",
-        "description": "모든 doctor 체크를 실행하고 전체 페이로드를 반환. 읽기전용.",
+        "description": "모든 doctor 체크를 실행하고 index_coverage를 포함한 전체 페이로드를 반환. 읽기전용.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -907,6 +932,7 @@ def _tool_profile() -> str:
 # (absent = unknown), so a wrong "read-only" claim can never weaken client approval UX.
 _READ_ONLY_TOOLS = frozenset({
     "memory_query", "code_query", "context_pack",
+    "episodic_context", "episodic_drilldown",
     "code_graph_callers", "code_graph_callees", "code_graph_symbol",
     "code_graph_trace", "code_graph_impact", "code_graph_architecture",
     "code_find_references", "code_goto_definition", "code_read_hashline",
@@ -1544,6 +1570,25 @@ def _dispatch_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str
             ),
         )
         return _compact_tool_payload(name, result) if _compact_response_requested(name, args) else result
+    if name == "episodic_context":
+        from .episodic_runtime import context_payload
+
+        return context_payload(
+            root,
+            byte_budget=_coerce_int(args.get("byte_budget"), 8_000, minimum=256, maximum=64_000),
+            raw_tail=_coerce_int(args.get("raw_tail"), 20, minimum=0, maximum=200),
+            fanout=_coerce_int(args.get("fanout"), 10, minimum=2, maximum=100),
+        )
+    if name == "episodic_drilldown":
+        from .episodic_runtime import drilldown_payload
+
+        return drilldown_payload(
+            root,
+            event_id=(str(args["event_id"]) if args.get("event_id") is not None else None),
+            start=(int(args["start"]) if args.get("start") is not None else None),
+            end=(int(args["end"]) if args.get("end") is not None else None),
+            limit=_coerce_int(args.get("limit"), 50, minimum=1, maximum=200),
+        )
     if name == "code_graph_callers":
         from .codegraph import query_callers
         return query_callers(
@@ -2344,6 +2389,13 @@ def record_mcp_request(
     tool_name: str | None = None,
 ) -> None:
     if is_ci():
+        return
+    # The catalog is immutable for the life of the process and may be polled
+    # hundreds of times by a client.  Auditing every poll duplicated the full
+    # schema serialization and grew the immutable raw audit by ~690 bytes per
+    # request without recording an agent action.  Real tool calls remain fully
+    # audited; static discovery traffic is deliberately not trajectory memory.
+    if method == "tools/list":
         return
     try:
         known_method = method if method in {

@@ -56,6 +56,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-into.ps1 u
 ```
 
 The installer records managed files in `.ai/generated/install-manifest.json`, preflights ownership and path confinement, refuses unrelated existing files and symlink escapes, and skips byte-identical protected files. Install, upgrade, and uninstall use a write-ahead journal at `.code-brain-install-transaction`: every managed/config path, prior `core.hooksPath`, and runtime-venv intent is durable before mutation; file backups carry SHA-256/size receipts. ERR/INT/TERM rolls back immediately, while a later invocation recovers an interrupted READY journal after SIGKILL/power loss before parsing or changing target config. COMMITTED is fsynced before old backups are removed. A corrupt/untrusted journal or backup fails closed and remains for forensics. Uninstall removes managed wires but preserves `.ai/memory/`, `.ai/runtime/state/`, `.ai/eval/`, and the user-owned secret allowlist. Windows delegates file/config mutation to this same transaction, then activates the native PowerShell shims before commit. It rebuilds the audit index, installs git pull/checkout hooks, and runs one forced session rebuild. Local `.ai/cache/` and `.ai/runtime/.venv/` artifacts are regenerated per machine.
+For pre-manifest partial installations, use `upgrade`: adoption is enabled only when the runtime package name, Codex Code Brain hook command, and Code Brain MCP table are all present. A lone `.ai` or similarly named runtime remains collision-gated, while authoritative `.ai/memory/` data is preserved during a verified migration. Source-side `.ai/outputs/` artifacts are never part of the managed payload (except its scaffold `.gitkeep`); upgrading an older install transactionally removes only untracked output paths that its previous manifest marked as Code Brain-managed and leaves all target-created or Git-tracked outputs intact.
 
 The default install keeps the runtime dependency-light and uses BM25 search. Provision the optional ONNX dense-search dependencies only when required:
 
@@ -95,7 +96,7 @@ Normal `session start` is the low-latency attachment path. It may reuse root-con
 
 ## Search Cache Profile
 
-`.ai/cache/code.sqlite` uses SQLite FTS5 for lexical code search. The cache stores file paths, hashes, summaries, provenance, and a contentless FTS index; it does not store duplicate full source bodies in the `chunks` table. Query snippets are read lazily from the current source file and redacted before output.
+`.ai/cache/code.sqlite` uses SQLite FTS5 for lexical code search. The cache stores file paths, hashes, summaries, provenance, and a contentless FTS index; it does not store duplicate full source bodies in the `chunks` table. Query snippets are read lazily from the current source file and redacted before output. Sources above 100KB are streamed into overlapping bounded windows plus capped function/class spans; Python, Rust, TypeScript, JavaScript, Dart, and Kotlin use the same path. Results are grouped by real source before snippet hydration so windows cannot crowd other files out or trigger repeated reads. Files above the 32MB defense cap and every generated/binary/data/lock/encoding/unsupported/trust omission appear in index diagnostics with a class and reason; generated bundles receive searchable path-only classification stubs.
 If a source file changes after indexing, local query paths auto-refresh before searching: current tracked dirty paths from `git status` reuse per-file size/mtime_ns/ctime_ns state and hash only on metadata drift, while deletions, rename sources, newly untracked files, and clean-tree checkout/pull drift are reconciled by the authoritative Git-candidate comparison. A staged deletion with an ignored working-tree copy is never re-indexed, preventing an add/remove generation loop. The interactive path can reuse a private candidate-list cache. Strict freshness checks and full rebuilds bypass that cache and query Git directly. Internal runtime state under `.ai/memory/`, `.ai/cache/`, and `.chatgpt2codex/` is excluded from the code index. CI remains read-only; set `AI_SEARCH_AUTO_REFRESH=0` to force stale-report-only behavior.
 
 ### Stale Index Handling
@@ -119,7 +120,15 @@ If a source file changes after indexing, local query paths auto-refresh before s
 
 `ai session start --rebuild auto` (default during `make session-start`) performs the same refresh implicitly when the index is stale at session boundary.
 
-The same session boundary enforces workspace storage retention: `.ai/tmp` is limited to 512MB/256 top-level entries with seven-day retention, `.ai/outputs` is limited to 1GB/512 top-level entries, and total `.ai` usage is limited to 2GB. Oldest untracked scratch entries are reclaimed before untracked outputs. Git-tracked entries and `.keep`-pinned entries are never removed; an unreclaimable overage is surfaced by `doctor --strict`.
+The same session boundary enforces workspace storage retention: `.ai/tmp` is limited to 512MB/256 top-level entries with seven-day retention, `.ai/outputs` to 1GB/512 entries, derived `.ai/memory/episodic` to 128MB/eight entries, derived `.ai/memory/audit-rollups` to 64MB/16 entries, and other reclaimable `.ai` data to 2GB. Oldest untracked scratch entries are reclaimed before outputs. Git-tracked, `.keep`-pinned, authoritative audit/decision/session memory, and `.ai/memory/episodic-tombstones` bytes are reported but excluded from automatic reclaim limits; Code Brain never deletes source-of-truth or forget state to make a cap pass.
+
+Raw memory remains ignored and local-private during install and upgrade. Do not track only the current audit file. If cross-machine memory is required, first verify that the configured Git remote is private, then run:
+
+```bash
+.ai/bin/ai memory sync --private-remote-confirmed --json
+```
+
+That explicit mode stages the complete authoritative memory snapshot, including every ignored raw audit segment and current file, under the audit transaction lock. Locks, queues, events, audit indexes, rollups, and episodic tiers are excluded. Audit files have union merge disabled; a rebase conflict or missing segment aborts sync instead of concatenating or re-chaining evidence. `--no-push` keeps the resulting memory commit local. Never use the confirmation flag with a public remote.
 
 Large project cache checks:
 
@@ -209,7 +218,7 @@ uv run --project .ai/runtime ai report status --json
 Treat a strict doctor failure as a release blocker. Metrics, usage, search, health summary, and SLO output are read-only and allowed in CI.
 `obs usage` reports actual token fields only when they come from agent session transcripts. Claude Desktop/Claude Code usage is read from `CLAUDE_HOME` or `~/.claude/projects/*/*.jsonl` and aggregated from `message.usage`. Codex usage is explicitly reported as `codex_not_implemented` until its local session log format is treated as stable. Code Brain does not convert bytes to tokens or claim token savings.
 `obs search --query ...` shows cache size, indexed file bytes, returned context bytes, stale results, and retriever mode so operators can visually verify whether Code Brain is returning small, fresh context packs instead of broad source dumps.
-The `audit_chain` doctor check verifies chained audit entries with `prev_sha`; legacy audit prefixes remain readable, while tampering after the chain starts is reported as `prev_sha_mismatch`.
+The `audit_chain` doctor check verifies each file's `prev_sha` chain plus immutable-segment filename digests and cross-file marker path/whole-file hash/last-line hash/byte-count links. Duplicate `(year, sequence)` branches, duplicate event IDs, malformed modern rows, and any mismatch are hard failures. Legacy ID-less prefixes remain readable but are explicitly reported as unverifiable; `_folded` rows remain visible as irreversible historical loss.
 `queue status` and `obs metrics` include `oldest_pending_age_seconds`, `oldest_processing_age_seconds`, and matching job ids so operators can spot backlog drift before leases expire.
 `obs health-summary` rolls up doctor failures, singleton worker lock state, queue age, and the latest `dist/release-gate.summary.json` artifact booleans; it exits `0` for status reporting even when `"ok": false`.
 
@@ -323,7 +332,7 @@ Storage: `.ai/cache/sandbox/<exec_id>.{txt,meta.json}` (mode `0o600`, gitignored
 
 ### Cross-Session Memory (proactive logging)
 
-Code Brain's central feature is *cross-session context sharing*. The SessionStart hook injects last-N decisions/todos/session notes/resume snapshot into the next session's `additionalContext` — but only if those records exist. Encourage agents to log proactively, and operators can log directly:
+Code Brain's central feature is *cross-session context sharing*. Claude receives last-N decisions/todos/session notes/resume state through `SessionStart`; Antigravity auto-loads the managed root `AGENTS.md`; Codex uses that same file when its bounded durable-state fingerprint is current and receives only live deltas through the hook. If the file is stale or untrusted, Codex safely falls back to full hook context. Operators can log directly:
 
 | Operation | CLI | MCP tool |
 |---|---|---|
@@ -334,7 +343,26 @@ Code Brain's central feature is *cross-session context sharing*. The SessionStar
 
 All four are write-class (rejected in CI per `WRITE_COMMANDS`). Records auto-redact via `redact_value` before persisting. Decisions are append-only; closing a todo writes a new line with `status="done"` and preserves the original open line for audit.
 
-The leading indicator that the memory layer is being used: `obs usage` shows `hook_breakdown.SessionStart.bytes_total` rising over time. When low, log more aggressively.
+Judge memory by useful, current decisions/todos/resume state being recalled with bounded context bytes—not by SessionStart bytes increasing. Stable or falling bytes are expected when Codex deduplicates an already current `AGENTS.md`; growth without better recall is a regression signal.
+
+Prompt growth and memory-ranking extras are not required for normal memory correctness. Enable them only after measuring value with `AI_PROMPT_GROWTH=1`, `AI_MEMORY_PAGE_IN=1`, `AI_MEMORY_TIER_SUMMARY=1`, `AI_AUTO_PAGE_OUT=1`, or `AI_CODEGRAPH_SUMMARY=1`; the transcript-token refresher is completely dormant while prompt growth is off. Detached sleep-time page-out always performs offline, non-destructive audit-rollup and episodic-index maintenance even when those extras are off.
+
+### Episodic audit memory
+
+```bash
+.ai/bin/ai memory episodic build --dry-run --json
+.ai/bin/ai memory episodic build --json
+.ai/bin/ai memory episodic status --json
+.ai/bin/ai memory episodic context --byte-budget 8000 --raw-tail 20 --json
+.ai/bin/ai memory episodic drill-down --event-id <evt-id> --json
+.ai/bin/ai memory episodic drill-down --start 100 --end 120 --limit 50 --json
+```
+
+Treat context summaries as a non-authoritative index. Check `receipt.uncovered` and `source_truth_complete`, then drill down before an important judgment. An unchanged build must report a no-op with no tier/meta/cache growth. `status.integrity_ok=false`, a segment-link error, or a duplicate sequence is a release blocker; restore trusted raw bytes or run the explicit `ai audit repair-chain` workflow for a known merge splice. Repair never chooses between divergent same-sequence branches.
+
+The raw audit grows linearly and is retained deliberately. Derived tier rows and injected context grow logarithmically. Explicit build/status/context/drill-down validate the raw corpus in linear time, while `SessionStart` only checks source metadata and reads the prebuilt 200-byte `cb-life:` cache. Full design and failure semantics: [Episodic Memory and Lossless Audit History](docs/EPISODIC_MEMORY.md).
+
+Cross-machine sync is explicit because hooks and MCP never cause network traffic, even through detached children. Run `.ai/bin/ai memory sync` for one cycle or supervise `.ai/bin/ai memory sync --loop` outside the hook lifecycle. A legacy `memory_sync.enabled: true` setting is a diagnosed no-op and should be removed.
 
 ### Session Resume Snapshots
 
@@ -472,9 +500,9 @@ The doctor check `mcp_methods_registered` enforces that:
 2. All four Claude slash command files exist.
 3. All four Codex prompt files exist.
 
-### PreToolUse Auto-Routing (Claude/Codex)
+### PreToolUse Auto-Routing (Claude/Codex/Kiro)
 
-`.claude/settings.json` (Claude Code) and `.codex/hooks.json` (Codex CLI) register `PreToolUse` hooks that intercept `Bash` tool calls before they execute — this is Code Brain's "auto-routing" of long-output shell commands. `precall.evaluate` decides whether the command would dump large output into the model's context window.
+`.claude/settings.json` (Claude Code), `.codex/hooks.json` (Codex CLI), and `.kiro/hooks/code-brain.json` (Kiro IDE/CLI v3) register `PreToolUse` hooks before tools execute — this is Code Brain's "auto-routing" of long-output shell commands and its file-write stream guard. `precall.evaluate` decides whether a shell command would dump large output into the model's context window. Kiro CLI v2 does not load the standalone v1 hook file; it remains an inert forward-compatible seed until the host migrates to v3.
 
 Intercepted patterns (denied with redirect message):
 - `grep -r` / `grep -R` / `grep -rn` (recursive grep)
@@ -491,7 +519,68 @@ Allowed (passes through to Bash):
 
 When intercepted, the hook returns `decision: "block"` with a reason instructing the agent to retry via `ai exec run -- <original>` or MCP `sandbox_execute`. The agent normally re-issues the call against Code Brain's sandbox, which stores full output to `.ai/cache/sandbox/<exec_id>.txt` and returns only a short summary (first 30 + last 5 lines, ≤4 KB) to the context window.
 
-Disable: remove the `PreToolUse` block from `.claude/settings.json` (Claude Code) or the `PreToolUse` key from `.codex/hooks.json` (Codex CLI). The `precall` heuristic itself stays loaded but never fires without hook registration.
+Disable: remove the `PreToolUse` block from `.claude/settings.json` (Claude Code), the `PreToolUse` key from `.codex/hooks.json` (Codex CLI), or disable the matching row in `.kiro/hooks/code-brain.json` (Kiro). The `precall` heuristic itself stays loaded but never fires without hook registration.
+
+### Codex Hook Trust After Upgrades
+
+[Codex hook trust](https://learn.chatgpt.com/docs/hooks) is tied to the exact hook-definition hash.
+A newly installed or changed hook is therefore skipped until that hash is trusted; the CLI's
+`--dangerously-bypass-hook-trust` switch applies only to that invocation and is not a persistent
+desktop setting.
+
+After a normal non-CI install or upgrade, Code Brain now bootstraps Codex project trust and persists
+the current hashes of the exact managed project hooks by default. This happens only after the target
+transaction commits. The no-policy path does not create or mutate a policy file, does not trust
+global user hooks, and requires all of the following before a first project-trust write:
+
+- `.ai/bin/ai-hook` and `.ai/bin/ai-hook.ps1` are safe regular files and match the installer source
+  byte-for-byte; every Code Brain-owned `.codex/hooks.json` group matches the shared canonical
+  contract, including target-specific `SessionEnd`/`Interrupt` version gates;
+- the target's parsed `.codex/config.toml` equals the managed Code Brain config, so project trust
+  cannot silently activate a custom MCP command;
+- Codex's live app-server accepts and then reports both the project-trust and exact hook-hash writes.
+
+Foreign hook groups are preserved but excluded from the automatic hash-trust write; modified Code
+Brain groups, changed routers, unsafe files, and custom project configs remain review-gated. An
+unavailable/rejecting Codex app-server also leaves the hooks review-gated without failing the managed
+installation. Set `AI_CODEX_HOOK_AUTO_TRUST=0` to opt out. CI,
+`GITHUB_ACTIONS`, `GITLAB_CI`, and `AI_CI` default to opt-out; set
+`AI_CODEX_HOOK_AUTO_TRUST=1` explicitly to enable the same verified path there.
+Before a normal uninstall removes the manifest entries, it deletes only the live app-server keys for
+exact Code Brain project-hook commands. Existing project trust, foreign project-hook hashes, and
+global user-hook hashes are retained; an unavailable app-server cannot block filesystem cleanup.
+
+An explicit private policy remains available for reviewed custom project configs or exact global
+user-hook scripts:
+
+```json
+{
+  "schema": 1,
+  "trust_project_code_brain_hooks": true,
+  "trusted_project_roots": ["/absolute/path/to/project"],
+  "trusted_user_hook_paths": [
+    "/absolute/path/to/.codex/hooks/my-reviewed-hook.sh"
+  ]
+}
+```
+
+Save it as `${XDG_CONFIG_HOME:-$HOME/.config}/code-brain/codex-hook-trust.json` with mode `0600`,
+or point `AI_CODEX_HOOK_TRUST_POLICY` at an absolute policy path. The helper persists only current
+hashes of exact Code Brain project-hook commands and explicitly allowlisted direct user-hook scripts.
+The default-location policy augments the managed default: a newly installed exact target outside its
+project roots still gets managed-project trust while retaining its approved user-hook paths. A policy
+selected explicitly with `AI_CODEX_HOOK_TRUST_POLICY` remains authoritative and has no such fallback.
+Prefer listing each project root explicitly rather than allowlisting an entire workspace. Targets
+outside `trusted_project_roots`, foreign commands, content drift, symlinks, wrong-owner files, and
+group/world-writable policy or hook files remain untrusted. An existing policy is never generated or
+rewritten by the installer.
+Missing entries in the default policy are ignored without rewriting it, so deleting an old workspace
+or user-hook script cannot disable exact managed-target trust for unrelated upgrades. Dangling
+symlinks and all malformed or unsafe existing entries still fail closed. An explicitly selected
+`AI_CODEX_HOOK_TRUST_POLICY` remains strict and does not receive this stale-entry fallback.
+For a linked Git worktree, Codex loads project hooks from the main worktree; the helper resolves that
+root through Git, requires the linked-worktree routers to match, and semantically validates both hook
+manifests before trusting only canonical Code Brain entries surfaced from the main worktree.
 
 ### Completion Guard And Turn Summary
 
@@ -513,6 +602,38 @@ is recorded and Claude receives one user-visible, non-reentrant system warning. 
 evidence classes, golden tests require cross-host decision equivalence; detection remains partial to
 observable PostToolUse and bounded tree evidence. It is not a semantic oracle for requirements that
 were never represented by a plan, edit, marker, conflict, or acceptance record.
+
+Claude also applies the same quality evidence to `TaskCompleted` and `TeammateIdle`; an incomplete
+task is rejected with Claude's documented exit-2/stderr contract. Kiro can block
+`PreToolUse`/`UserPromptSubmit` through a non-zero exit but its `Stop` trigger is advisory, so Code
+Brain records the recommendation without claiming it can force another model turn. Codex
+`SessionEnd` is installed only on CLI 0.117+, and `Interrupt` only on 0.150+; downgrades prune only
+Code Brain's own gated entries while preserving foreign hooks.
+
+Every managed command hook has an explicit timeout: hot-path/blocking events are capped at five
+seconds, observation-only events at two seconds, and Codex `SessionEnd` at two seconds under its
+three-second host cap. Codex context-producing hooks set `additionalContextLimit` only where the
+host accepts it: 5000 tokens for `SessionStart`/`SubagentStart`, 2500 for
+`UserPromptSubmit`. `doctor --strict` validates these values, file-write matcher coverage, version
+gates, and each host's active/disabled surface.
+
+Compatibility stays fail-closed. Claude Code 2.1.251's changelog mentions
+`PreModelSwitch`/`PostModelSwitch`, but Code Brain does not emit them until their payload and
+blocking contracts are part of the stable hook reference. Antigravity keeps `PreToolUse` and
+`PostInvocation` disabled because its native decision schemas have not yet passed Code Brain's live
+allow/continue regression gate; the three proven hooks remain active and `doctor` reports the two
+disabled surfaces instead of pretending full coverage.
+
+The [current Claude hook reference](https://code.claude.com/docs/en/hooks) also exposes `Setup`,
+`UserPromptExpansion`, `PostToolBatch`, `WorktreeCreate`, `WorktreeRemove`, `Elicitation`, and
+`ElicitationResult`. They are intentionally not duplicated in the project hook set: setup is owned
+by the transactional installer; per-tool `PostToolUse` already supplies the evidence ledger that a
+second batch hook would duplicate; direct command expansion has no separate Code Brain deny policy;
+`WorktreeCreate` would replace Claude's default Git worktree implementation; and Code Brain must not
+intercept or rewrite user/MCP elicitation answers. `PermissionRequest` is likewise not used to
+auto-approve Claude operations—`PreToolUse` enforces project safety before the host permission
+dialog. Add one of these surfaces only with a concrete policy, host-version gate, native payload
+fixture, and allow/block regression proof; event count alone is not an optimization target.
 
 Broad-change reporting uses the standing Response rule in the generated agent contract.
 `turn_report` measures Git facts in a detached child at Stop/SessionEnd and injects one terse

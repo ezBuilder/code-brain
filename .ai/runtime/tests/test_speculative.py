@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,6 +58,18 @@ def test_mine_empty(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert result["patterns"] == []
     assert result["scanned_events"] == 0
+    assert result["malformed_rows"] == 0
+    assert result["read_errors"] == 0
+
+
+def test_mine_reports_malformed_rows_instead_of_silent_loss(fresh_root: Path) -> None:
+    audit = _audit_path(fresh_root)
+    audit.write_text("{bad-json}\n", encoding="utf-8")
+
+    result = spec.mine_patterns(fresh_root)
+
+    assert result["ok"] is True
+    assert result["malformed_rows"] == 1
 
 
 def test_mine_basic_bigram(fresh_root: Path) -> None:
@@ -117,8 +130,8 @@ def test_record_speculation_and_outcome_roundtrip(fresh_root: Path) -> None:
     """record_speculation + record_outcome -> hit_rate counts match."""
     pattern = {"preceding": "Read", "following": "Edit", "support": 3, "confidence": 0.8}
 
-    spec.record_speculation(fresh_root, exec_id="x1", pattern=pattern, predicted_tool="Edit")
-    spec.record_outcome(fresh_root, exec_id="x1", hit=True, actual_tool="Edit")
+    assert spec.record_speculation(fresh_root, exec_id="x1", pattern=pattern, predicted_tool="Edit")
+    assert spec.record_outcome(fresh_root, exec_id="x1", hit=True, actual_tool="Edit")
 
     spec.record_speculation(fresh_root, exec_id="x2", pattern=pattern, predicted_tool="Edit")
     spec.record_outcome(fresh_root, exec_id="x2", hit=False, actual_tool="Bash")
@@ -159,6 +172,36 @@ def test_atomic_record_no_partial_lines(fresh_root: Path) -> None:
         rec = json.loads(raw)  # parses cleanly -> no partial writes
         assert "kind" in rec
         assert rec["kind"] in {"speculate", "outcome"}
+
+
+def test_concurrent_records_are_lossless_and_parseable(fresh_root: Path) -> None:
+    pattern = {"preceding": "Read", "following": "Edit"}
+
+    def write(index: int) -> None:
+        assert spec.record_speculation(
+            fresh_root,
+            exec_id=f"concurrent-{index}",
+            pattern=pattern,
+            predicted_tool="Edit",
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(write, range(100)))
+
+    lines = (fresh_root / ".ai" / "cache" / "speculative.jsonl").read_text().splitlines()
+    assert len(lines) == 100
+    assert {json.loads(line)["exec_id"] for line in lines} == {
+        f"concurrent-{index}" for index in range(100)
+    }
+
+
+def test_hit_rate_counts_latest_outcome_once_per_exec_id(fresh_root: Path) -> None:
+    assert spec.record_outcome(fresh_root, exec_id="same", hit=False, actual_tool="Bash")
+    assert spec.record_outcome(fresh_root, exec_id="same", hit=True, actual_tool="Edit")
+
+    rate = spec.hit_rate(fresh_root)
+
+    assert rate == {"ok": True, "total": 1, "hits": 1, "hit_rate": 1.0}
 
 
 def test_within_session_only(fresh_root: Path) -> None:
@@ -213,8 +256,8 @@ def test_hit_rate_empty(tmp_path: Path) -> None:
 
 def test_record_handles_bad_exec_id(fresh_root: Path) -> None:
     """Empty exec_id is dropped silently — no exception, no log entry."""
-    spec.record_speculation(fresh_root, exec_id="", pattern={}, predicted_tool="Edit")
-    spec.record_outcome(fresh_root, exec_id="", hit=True, actual_tool="Edit")
+    assert spec.record_speculation(fresh_root, exec_id="", pattern={}, predicted_tool="Edit") is False
+    assert spec.record_outcome(fresh_root, exec_id="", hit=True, actual_tool="Edit") is False
     log = fresh_root / ".ai" / "cache" / "speculative.jsonl"
     # File may not exist OR may exist empty
     if log.exists():

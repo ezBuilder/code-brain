@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
@@ -13,8 +14,9 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import load_config
 from .policy import is_ci
@@ -23,6 +25,7 @@ from .private_write import (
     atomic_write_private_text,
     ensure_root_confined_directory,
     ensure_root_confined_private_regular_file,
+    iter_root_confined_bytes,
     private_file_try_lock,
     read_root_confined_text,
     validate_root_confined_directory,
@@ -61,6 +64,7 @@ FILESYSTEM_CANDIDATE_TIMEOUT_SECONDS = 10.0
 SKIP_PATH_PREFIXES = (
     ".ai/memory/",
     ".ai/cache/",
+    ".ai/tmp/",
     ".ai/outputs/",
     ".ai/skills/",
     ".ai/precall_rules/",
@@ -81,6 +85,7 @@ VENDORED_RUNTIME_PREFIXES = (
 _VENDORED_OPT_IN_CACHE: dict[str, tuple[int, bool]] = {}
 SKIP_DIRS = {
     ".git",
+    ".code-brain-install-transaction",
     ".chatgpt2codex",
     ".venv",
     ".playwright-cli",
@@ -100,13 +105,29 @@ SKIP_DIRS = {
     ".gradle",
     "Pods",
     "DerivedData",
-    "dist",
-    "build",
-    "coverage",
     "logs",
-    "generated",
 }
+# ``MAX_TEXT_BYTES`` remains the per-chunk/window cap. It is deliberately not
+# used as a whole-file admission gate: source files are streamed into bounded,
+# overlapping windows below. The larger limit is an absolute per-file defense
+# cap, not an invitation to materialize a large source string.
 MAX_TEXT_BYTES = 100_000
+MAX_INDEXABLE_SOURCE_BYTES = 32 * 1024 * 1024
+SOURCE_WINDOW_OVERLAP_BYTES = 8 * 1024
+SOURCE_WINDOW_STEP_BYTES = MAX_TEXT_BYTES - SOURCE_WINDOW_OVERLAP_BYTES
+MAX_INDEX_DIAGNOSTIC_ITEMS = 256
+STREAM_REDACTION_CARRY_CHARS = 8 * 1024
+MAX_LARGE_SYMBOL_CHUNKS = 256
+MAX_LARGE_SYMBOL_BYTES = 2 * 1024 * 1024
+INDEX_DIAGNOSTICS_CACHE_NAME = "code-index-diagnostics.json"
+GENERATED_DIRS = {"dist", "build", "coverage", "generated"}
+GENERATED_SUFFIXES = (".map", ".min.js", ".min.css")
+GENERATED_NAME_MARKERS = (".bundle.", ".chunk.", ".generated.", ".compiled.")
+DATA_SUFFIXES = {
+    ".bin", ".class", ".db", ".dylib", ".gz", ".ico", ".jpeg", ".jpg",
+    ".lockb", ".pdf", ".png", ".pyc", ".so", ".sqlite", ".sqlite3",
+    ".tar", ".wasm", ".webp", ".woff", ".woff2", ".zip",
+}
 INDEX_DB_MAX_BYTES = 512 * 1024 * 1024
 INDEX_SIDECAR_MAX_BYTES = 128 * 1024 * 1024
 MTIME_STALE_GRACE_SECONDS = 2.0
@@ -119,8 +140,6 @@ SKIP_NAMES = {
     "Gemfile.lock",
 }
 SKIP_SUFFIXES = {
-    ".map",
-    ".min.js",
     ".snap",
 }
 TEXT_SUFFIXES = {
@@ -138,6 +157,7 @@ TEXT_SUFFIXES = {
     ".rs",
     ".java",
     ".kt",
+    ".kts",
     ".swift",
     ".c",
     ".h",
@@ -155,6 +175,318 @@ TEXT_SUFFIXES = {
     ".sh",
     ".ps1",
 }
+
+@dataclass(frozen=True)
+class _IndexPathPolicy:
+    classification: str
+    reason: str
+    body_searchable: bool
+
+
+@dataclass(frozen=True)
+class _TextWindow:
+    ordinal: int
+    start_line: int
+    end_line: int
+    text: str
+
+
+@dataclass(frozen=True)
+class _MaterializedSource:
+    path: Path
+    digest: str
+    state: os.stat_result
+    redacted_bytes: int
+    line_count: int
+
+
+class _IndexSourceError(OSError):
+    """A source was discovered but could not be safely indexed."""
+
+    def __init__(self, record: dict[str, str]):
+        super().__init__(record.get("reason", "source unavailable"))
+        self.record = record
+
+
+def _path_policy(root: Path, path: Path) -> _IndexPathPolicy:
+    """Classify a candidate before any body read takes place."""
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return _IndexPathPolicy("trust", "outside_root", False)
+    rel_posix = rel.as_posix()
+    if any(rel_posix.startswith(prefix) for prefix in _skip_path_prefixes(root)):
+        return _IndexPathPolicy("excluded", "policy_path_prefix", False)
+    if any(part in SKIP_DIRS for part in rel.parts):
+        return _IndexPathPolicy("excluded", "policy_directory", False)
+    if path.name in SKIP_NAMES or path.suffix.casefold() in {".lock", ".lockfile"}:
+        return _IndexPathPolicy("lock", "lockfile_policy", False)
+    lowered_name = path.name.casefold()
+    if any(lowered_name.endswith(suffix) for suffix in SKIP_SUFFIXES):
+        return _IndexPathPolicy("binary_data", "snapshot_policy", False)
+    if (
+        any(part.casefold() in GENERATED_DIRS for part in rel.parts[:-1])
+        or any(lowered_name.endswith(suffix) for suffix in GENERATED_SUFFIXES)
+        or any(marker in lowered_name for marker in GENERATED_NAME_MARKERS)
+    ):
+        return _IndexPathPolicy("generated", "generated_artifact_body_omitted", False)
+    if path.suffix not in TEXT_SUFFIXES and path.name not in {"AGENTS.md", "CLAUDE.md"}:
+        if path.suffix.casefold() in DATA_SUFFIXES:
+            return _IndexPathPolicy("binary_data", "unsupported_binary_or_data", False)
+        return _IndexPathPolicy("unsupported", "unsupported_extension", False)
+    return _IndexPathPolicy("source", "source_windowed", True)
+
+
+def _is_generated_path(root: Path, path: Path) -> bool:
+    return _path_policy(root, path).classification == "generated"
+
+
+def _classification_stub(rel: str, policy: _IndexPathPolicy) -> str:
+    """Searchable path-only representation for generated/bundled artifacts."""
+    return str(
+        redact_value(
+            f"{rel}\nCode Brain classification: {policy.classification}\n"
+            f"Body omitted: {policy.reason}\n"
+        )
+    )
+
+
+_PRIVATE_KEY_BEGIN_RE = re.compile(r"-----BEGIN [^-\n]{0,80}PRIVATE KEY-----", re.IGNORECASE)
+_PRIVATE_KEY_END_RE = re.compile(r"-----END [^-\n]{0,80}PRIVATE KEY-----", re.IGNORECASE)
+
+
+class _StreamingRedactor:
+    """Apply the existing redaction policy without retaining a whole source."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._private_block = False
+        self._private_newlines = 0
+
+    def feed(self, text: str) -> list[str]:
+        if text:
+            self._buffer += text
+        return self._drain(final=False)
+
+    def finish(self) -> list[str]:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> list[str]:
+        output: list[str] = []
+        while True:
+            if self._private_block:
+                end = _PRIVATE_KEY_END_RE.search(self._buffer)
+                if end is None:
+                    if final:
+                        self._private_newlines += self._buffer.count("\n")
+                        self._buffer = ""
+                        output.append("[REDACTED]" + ("\n" * self._private_newlines))
+                        self._private_newlines = 0
+                    else:
+                        keep = self._buffer[-128:]
+                        self._private_newlines += self._buffer[:-128].count("\n")
+                        self._buffer = keep
+                    return output
+                self._private_newlines += self._buffer[: end.end()].count("\n")
+                self._buffer = self._buffer[end.end():]
+                self._private_block = False
+                output.append("[REDACTED]" + ("\n" * self._private_newlines))
+                self._private_newlines = 0
+                continue
+
+            begin = _PRIVATE_KEY_BEGIN_RE.search(self._buffer)
+            if begin is not None:
+                prefix = self._buffer[: begin.start()]
+                if prefix:
+                    output.append(str(redact_value(prefix)))
+                # ``prefix`` was already emitted, so only count newlines in
+                # the private-key marker itself. Counting the whole prefix
+                # would shift every later graph span by the lines seen in
+                # the current streaming buffer.
+                self._private_newlines = self._buffer[begin.start(): begin.end()].count("\n")
+                self._buffer = self._buffer[begin.end():]
+                self._private_block = True
+                continue
+
+            if final:
+                if self._buffer:
+                    output.append(str(redact_value(self._buffer)))
+                    self._buffer = ""
+                return output
+
+            safe_cut = len(self._buffer) - STREAM_REDACTION_CARRY_CHARS
+            if safe_cut <= 0:
+                return output
+            # Keep a marker that is split across input chunks intact. Ordinary
+            # secret patterns get the same bounded carry window.
+            marker = self._buffer.find("-----BEGIN", max(0, safe_cut - 128), safe_cut)
+            if marker >= 0:
+                safe_cut = marker
+            if safe_cut <= 0:
+                return output
+            output.append(str(redact_value(self._buffer[:safe_cut])))
+            self._buffer = self._buffer[safe_cut:]
+
+
+def _text_prefix_by_bytes(text: str, limit: int) -> tuple[str, str]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text, ""
+    cut = max(1, int(limit))
+    while cut > 0 and cut < len(encoded) and (encoded[cut] & 0xC0) == 0x80:
+        cut -= 1
+    prefix = encoded[:cut].decode("utf-8")
+    return prefix, encoded[cut:].decode("utf-8")
+
+
+class _SourceWindowBuilder:
+    """Turn a redacted text stream into deterministic overlapping windows."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._buffer_start_line = 1
+        self._ordinal = 0
+        self._emitted = False
+        self._digest = hashlib.sha256()
+        self._redacted_bytes = 0
+        self._newline_count = 0
+
+    @property
+    def digest(self) -> str:
+        return self._digest.hexdigest()
+
+    @property
+    def redacted_bytes(self) -> int:
+        return self._redacted_bytes
+
+    @property
+    def line_count(self) -> int:
+        return self._newline_count + 1
+
+    def feed(self, text: str) -> list[_TextWindow]:
+        if not text:
+            return []
+        encoded = text.encode("utf-8")
+        self._digest.update(encoded)
+        self._redacted_bytes += len(encoded)
+        self._newline_count += text.count("\n")
+        self._buffer += text
+        windows: list[_TextWindow] = []
+        while len(self._buffer.encode("utf-8")) >= MAX_TEXT_BYTES:
+            window_text, _remainder = _text_prefix_by_bytes(self._buffer, MAX_TEXT_BYTES)
+            windows.append(self._make_window(window_text))
+            discarded, self._buffer = _text_prefix_by_bytes(
+                self._buffer,
+                SOURCE_WINDOW_STEP_BYTES,
+            )
+            self._buffer_start_line += discarded.count("\n")
+            self._emitted = True
+        return windows
+
+    def finish(self) -> list[_TextWindow]:
+        if not self._buffer:
+            return []
+        if self._emitted and len(self._buffer.encode("utf-8")) <= SOURCE_WINDOW_OVERLAP_BYTES:
+            return []
+        return [self._make_window(self._buffer)]
+
+    def _make_window(self, text: str) -> _TextWindow:
+        window = _TextWindow(
+            ordinal=self._ordinal,
+            start_line=self._buffer_start_line,
+            end_line=(
+                self._buffer_start_line
+                + text.count("\n")
+                - (1 if text.endswith("\n") else 0)
+            ),
+            text=text,
+        )
+        self._ordinal += 1
+        return window
+
+
+def _iter_redacted_text_pieces(
+    root: Path,
+    path: Path,
+    *,
+    require_owner: bool = False,
+    reject_group_other_writable: bool = False,
+) -> Iterator[str]:
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    redactor = _StreamingRedactor()
+    for raw in iter_root_confined_bytes(
+        path,
+        root=root,
+        max_bytes=MAX_INDEXABLE_SOURCE_BYTES,
+        chunk_bytes=65_536,
+        require_private=False,
+        require_owner=require_owner,
+        reject_group_other_writable=reject_group_other_writable,
+    ):
+        decoded = decoder.decode(raw, final=False)
+        if "\x00" in decoded:
+            raise OSError("binary data contains NUL bytes")
+        yield from redactor.feed(decoded)
+    tail = decoder.decode(b"", final=True)
+    yield from redactor.feed(tail)
+    yield from redactor.finish()
+
+
+def _redacted_source_digest(root: Path, path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        for piece in _iter_redacted_text_pieces(root, path):
+            digest.update(piece.encode("utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _IndexSourceError(_source_skip_record(root, path, exc=exc)) from exc
+    return digest.hexdigest()
+
+
+@contextmanager
+def _materialize_redacted_source(root: Path, path: Path) -> Iterator[_MaterializedSource]:
+    state = _indexable_text_stat(root, path)
+    if state is None:
+        raise _IndexSourceError(_source_skip_record(root, path))
+    with tempfile.TemporaryDirectory(prefix="code-brain-large-source-") as temp_dir:
+        materialized_path = Path(temp_dir) / f"source{path.suffix or '.txt'}"
+        digest = hashlib.sha256()
+        redacted_bytes = 0
+        newline_count = 0
+        try:
+            with materialized_path.open("wb") as handle:
+                for piece in _iter_redacted_text_pieces(root, path):
+                    encoded = piece.encode("utf-8")
+                    handle.write(encoded)
+                    digest.update(encoded)
+                    redacted_bytes += len(encoded)
+                    newline_count += piece.count("\n")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise _IndexSourceError(_source_skip_record(root, path, exc=exc)) from exc
+        yield _MaterializedSource(
+            path=materialized_path,
+            digest=digest.hexdigest(),
+            state=state,
+            redacted_bytes=redacted_bytes,
+            line_count=newline_count + 1,
+        )
+
+
+def _iter_local_text_windows(path: Path) -> Iterator[_TextWindow]:
+    builder = _SourceWindowBuilder()
+    with path.open("rb") as handle:
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        total = 0
+        while True:
+            raw = handle.read(65_536)
+            if not raw:
+                break
+            total += len(raw)
+            if total > MAX_INDEXABLE_SOURCE_BYTES:
+                raise OSError("materialized source exceeds size limit")
+            yield from builder.feed(decoder.decode(raw, final=False))
+        yield from builder.feed(decoder.decode(b"", final=True))
+        yield from builder.finish()
+
 
 # Dual-emission subtoken indexing (BM25 tokenization for code identifiers):
 # unicode61 splits snake_case at "_" but keeps camelCase identifiers as one
@@ -604,10 +936,20 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
         changed = 0
         added = 0
         unchanged = 0
+        skipped_records: list[dict[str, str]] = []
+        symbol_budget_records: list[dict[str, str | int]] = []
+        skipped_count = 0
         # Rows that still parse as indexable text on disk but that git no longer
         # reports as candidates. They are retired below instead of being
         # re-affirmed, which is what lets a polluted index converge.
-        retire: set[str] = set()
+        # A newer runtime can tighten path policy while a consumer still has rows written by
+        # an older version. Purge those legacy rows on *any* incremental refresh, including a
+        # targeted dirty-file refresh that otherwise would never inspect unrelated ghost rows.
+        retire: set[str] = {
+            rel
+            for rel in existing
+            if _path_policy(root, root / rel).classification == "excluded"
+        }
         if paths is not None:
             stale_targets = {
                 rel
@@ -617,7 +959,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             if stale_targets:
                 git_candidates = _git_candidate_rels(root)
                 if git_candidates is not None:
-                    retire = stale_targets - git_candidates
+                    retire.update(stale_targets - git_candidates)
         candidate_paths = (
             _target_text_files(root, paths - retire)
             if paths is not None
@@ -627,14 +969,80 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             )
         )
         for rel, path in candidate_paths:
+            existing_pair = existing.get(rel)
+            policy = _path_policy(root, path)
+            source_state = _indexable_text_stat(root, path)
+            if policy.classification == "generated":
+                if source_state is None:
+                    _append_skip_record(skipped_records, _source_skip_record(root, path))
+                    skipped_count += 1
+                    if existing_pair is not None:
+                        _delete_indexed_file(conn, rel, existing_pair[0])
+                    continue
+                seen.add(rel)
+                stub = _classification_stub(rel, policy)
+                digest = hashlib.sha256(stub.encode("utf-8")).hexdigest()
+                if existing_pair is not None and existing_pair[1] == digest:
+                    _upsert_file_state(conn, rel, path, digest, state=source_state)
+                    unchanged += 1
+                    continue
+                if existing_pair is not None:
+                    _delete_indexed_file(conn, rel, existing_pair[0])
+                _insert_file_anchor(conn, root, rel, stub, digest, source_state, path)
+                if existing_pair is not None:
+                    changed += 1
+                else:
+                    added += 1
+                continue
+            if source_state is not None and source_state.st_size > MAX_TEXT_BYTES:
+                seen.add(rel)
+                try:
+                    digest = _redacted_source_digest(root, path)
+                except _IndexSourceError as exc:
+                    _append_skip_record(skipped_records, exc.record)
+                    skipped_count += 1
+                    if existing_pair is not None:
+                        _delete_indexed_file(conn, rel, existing_pair[0])
+                    continue
+                if existing_pair is not None and existing_pair[1] == digest:
+                    _upsert_file_state(conn, rel, path, digest, state=source_state)
+                    unchanged += 1
+                    continue
+                if existing_pair is not None:
+                    _delete_indexed_file(conn, rel, existing_pair[0])
+                try:
+                    _digest, _state, symbol_stats = _insert_large_file(conn, root, rel, path)
+                except _IndexSourceError as exc:
+                    _append_skip_record(skipped_records, exc.record)
+                    skipped_count += 1
+                    continue
+                if symbol_stats.get("budget_skipped", 0):
+                    symbol_budget_records.append(
+                        {
+                            "path": rel,
+                            "class": "symbol_budget",
+                            "reason": "large_symbol_chunks_capped",
+                            "budget_skipped": int(symbol_stats["budget_skipped"]),
+                            "inserted": int(symbol_stats["inserted"]),
+                            "bytes": int(symbol_stats["bytes"]),
+                        }
+                    )
+                if existing_pair is not None:
+                    changed += 1
+                else:
+                    added += 1
+                continue
             loaded = _read_indexable_text(root, path)
             if loaded is None:
+                _append_skip_record(skipped_records, _source_skip_record(root, path))
+                skipped_count += 1
+                if existing_pair is not None:
+                    _delete_indexed_file(conn, rel, existing_pair[0])
                 continue
             content, source_state = loaded
             seen.add(rel)
             redacted = redact_value(content)
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
-            existing_pair = existing.get(rel)
             if existing_pair is not None and existing_pair[1] == digest:
                 _upsert_file_state(conn, rel, path, digest, state=source_state)
                 unchanged += 1
@@ -642,19 +1050,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
             # Need to (re)write this file: drop dependent rows, including the
             # row-level FTS entries for the file and its function chunks.
             if existing_pair is not None:
-                _delete_chunk_rows(conn, existing_pair[0])
-                # summaries/provenance/codegraph have path-keyed UNIQUE rows; clear them too
-                conn.execute("delete from summaries where path = ?", (rel,))
-                conn.execute("delete from provenance where path = ?", (rel,))
-                conn.execute("delete from code_symbols where path = ?", (rel,))
-                conn.execute("delete from code_calls where path = ?", (rel,))
-                # Also delete function chunks for this file (they have path like "file.ext:qualname")
-                # Applies to any supported language that has function-level chunks
-                chunk_ids = conn.execute(
-                    "select id from chunks where path like ?", (f"{rel}:%",)
-                ).fetchall()
-                for (cid,) in chunk_ids:
-                    _delete_chunk_rows(conn, cid)
+                _delete_indexed_file(conn, rel, existing_pair[0])
             summary = summarize(redacted)
             cursor = conn.execute(
                 "insert into chunks(path, sha256, summary) values (?, ?, ?)",
@@ -689,7 +1085,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
         # Cleanup deleted files. In targeted mode, only target paths are allowed
         # to delete rows; full mode compares against the complete seen set.
         deleted = 0
-        delete_candidates = paths if paths is not None else set(existing)
+        delete_candidates = (set(paths) | retire) if paths is not None else set(existing)
         for rel in sorted(delete_candidates):
             existing_pair = existing.get(rel)
             if existing_pair is None or rel in seen:
@@ -700,20 +1096,14 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
                 if _is_indexable_text_file(root, target):
                     continue
             if rel not in seen:
-                _delete_chunk_rows(conn, cid)
-                conn.execute("delete from summaries where path = ?", (rel,))
-                conn.execute("delete from provenance where path = ?", (rel,))
-                conn.execute("delete from code_symbols where path = ?", (rel,))
-                conn.execute("delete from code_calls where path = ?", (rel,))
-                conn.execute("delete from file_state where path = ?", (rel,))
-                # Also delete function chunks for this file
-                chunk_ids = conn.execute(
-                    "select id from chunks where path like ?", (f"{rel}:%",)
-                ).fetchall()
-                for (func_cid,) in chunk_ids:
-                    _delete_chunk_rows(conn, func_cid)
+                _delete_indexed_file(conn, rel, cid)
                 deleted += 1
         conn.commit()
+    _write_index_diagnostics_cache(
+        root,
+        skipped=skipped_records,
+        symbol_budget=symbol_budget_records,
+    )
     if changed or added or deleted:
         _mark_index_generation(root)
     return {
@@ -724,6 +1114,9 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
         "changed": changed,
         "added": added,
         "deleted": deleted,
+        "skipped": skipped_records,
+        "skipped_count": skipped_count,
+        "symbol_budget": symbol_budget_records,
         "indexed": unchanged + changed + added,
         "targeted": paths is not None,
     }
@@ -737,6 +1130,303 @@ def _delete_chunk_rows(conn: sqlite3.Connection, chunk_id: int) -> None:
     conn.execute("delete from chunks where id = ?", (chunk_id,))
 
 
+def _delete_indexed_file(conn: sqlite3.Connection, rel: str, anchor_id: int) -> None:
+    """Remove a file anchor and every derived window/symbol row for ``rel``."""
+    _delete_chunk_rows(conn, anchor_id)
+    conn.execute("delete from summaries where path = ?", (rel,))
+    conn.execute("delete from provenance where path = ?", (rel,))
+    conn.execute("delete from code_symbols where path = ?", (rel,))
+    conn.execute("delete from code_calls where path = ?", (rel,))
+    escaped = rel.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    derived = conn.execute(
+        "select id from chunks where path like ? escape '\\'",
+        (f"{escaped}:%",),
+    ).fetchall()
+    for (chunk_id,) in derived:
+        _delete_chunk_rows(conn, int(chunk_id))
+    conn.execute("delete from file_state where path = ?", (rel,))
+
+
+def _insert_file_anchor(
+    conn: sqlite3.Connection,
+    root: Path,
+    rel: str,
+    text: str,
+    digest: str,
+    source_state: os.stat_result,
+    source_path: Path,
+    *,
+    kind: str = "file",
+) -> int:
+    summary = summarize(text)
+    cursor = conn.execute(
+        "insert into chunks(path, sha256, summary) values (?, ?, ?)",
+        (rel, digest, summary),
+    )
+    chunk_id = int(cursor.lastrowid)
+    conn.execute(
+        "insert into chunks_fts(rowid, path, content) values (?, ?, ?)",
+        (chunk_id, rel, _fts_document(text)),
+    )
+    conn.execute(
+        "insert into chunk_meta(chunk_id, kind, bytes, line_count) values (?, ?, ?, ?)",
+        (chunk_id, kind, len(text.encode("utf-8")), text.count("\n") + 1),
+    )
+    conn.execute("insert into summaries(path, summary) values (?, ?)", (rel, summary))
+    conn.execute(
+        "insert into provenance(path, processor, model_hash, prompt_version, chunker_version, confidence) "
+        "values (?, ?, ?, ?, ?, ?)",
+        (rel, "code-brain-local", None, "extractive-v1", "1", 1.0),
+    )
+    _insert_chunk_embedding(conn, chunk_id, text, root)
+    _upsert_file_state(conn, rel, source_path, digest, state=source_state)
+    return chunk_id
+
+
+def _insert_file_window(
+    conn: sqlite3.Connection,
+    rel: str,
+    text: str,
+    *,
+    chunk_path: str,
+    kind: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    qualname: str | None = None,
+) -> int:
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    cursor = conn.execute(
+        "insert into chunks(path, sha256, summary) values (?, ?, ?)",
+        (chunk_path, digest, summarize(text)),
+    )
+    chunk_id = int(cursor.lastrowid)
+    conn.execute(
+        "insert into chunks_fts(rowid, path, content) values (?, ?, ?)",
+        (chunk_id, chunk_path, _fts_document(text)),
+    )
+    if start_line is None or end_line is None:
+        conn.execute(
+            "insert into chunk_meta(chunk_id, kind, bytes, line_count) values (?, ?, ?, ?)",
+            (chunk_id, kind, len(text.encode("utf-8")), text.count("\n") + 1),
+        )
+    else:
+        conn.execute(
+            "insert into chunk_meta(chunk_id, kind, bytes, line_count, qualname, start_line, end_line) "
+            "values (?, ?, ?, ?, ?, ?, ?)",
+            (
+                chunk_id,
+                kind,
+                len(text.encode("utf-8")),
+                text.count("\n") + 1,
+                qualname,
+                start_line,
+                end_line,
+            ),
+        )
+    return chunk_id
+
+
+def _iter_local_line_prefixes(path: Path) -> Iterator[tuple[int, bytes]]:
+    """Yield bounded logical-line prefixes without allocating a long line."""
+    line = bytearray()
+    line_no = 1
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(65_536)
+            if not chunk:
+                break
+            cursor = 0
+            while cursor < len(chunk):
+                newline = chunk.find(b"\n", cursor)
+                segment_end = len(chunk) if newline < 0 else newline
+                if len(line) < MAX_TEXT_BYTES:
+                    line.extend(chunk[cursor:segment_end][: MAX_TEXT_BYTES - len(line)])
+                cursor = segment_end
+                if newline < 0:
+                    break
+                if len(line) < MAX_TEXT_BYTES:
+                    line.extend(b"\n")
+                yield line_no, bytes(line)
+                line.clear()
+                line_no += 1
+                cursor += 1
+    if line:
+        yield line_no, bytes(line)
+
+
+def _read_local_span_texts(
+    path: Path,
+    spans: list[tuple[str, int, int]],
+) -> tuple[dict[tuple[str, int, int], str], set[tuple[str, int, int]]]:
+    """Read selected spans in one bounded pass, never one full-file scan per symbol."""
+    if not spans:
+        return {}, set()
+    ordered = sorted(spans, key=lambda item: (item[1], item[2], item[0]))
+    active: list[tuple[str, int, int]] = []
+    buffers: dict[tuple[str, int, int], bytearray] = {}
+    skipped: set[tuple[str, int, int]] = set()
+    collected_bytes = 0
+    next_span = 0
+    for line_no, line in _iter_local_line_prefixes(path):
+        while next_span < len(ordered) and ordered[next_span][1] <= line_no:
+            active.append(ordered[next_span])
+            next_span += 1
+        next_active: list[tuple[str, int, int]] = []
+        for key in active:
+            if key in skipped:
+                continue
+            _qualname, _start_line, end_line = key
+            if line_no > end_line:
+                continue
+            buffer = buffers.setdefault(key, bytearray())
+            if (
+                len(buffer) + len(line) > MAX_TEXT_BYTES
+                or collected_bytes + len(line) > MAX_LARGE_SYMBOL_BYTES
+            ):
+                skipped.add(key)
+                collected_bytes -= len(buffer)
+                buffers.pop(key, None)
+                continue
+            buffer.extend(line)
+            collected_bytes += len(line)
+            if line_no < end_line:
+                next_active.append(key)
+        active = next_active
+        if not active and next_span >= len(ordered):
+            break
+    return (
+        {
+            key: bytes(value).decode("utf-8", errors="replace")
+            for key, value in buffers.items()
+            if key not in skipped
+        },
+        skipped,
+    )
+
+
+def _insert_large_symbol_chunks(
+    conn: sqlite3.Connection,
+    rel: str,
+    materialized_path: Path,
+    symbols: list[dict[str, Any]],
+) -> dict[str, int]:
+    eligible: list[tuple[tuple[str, int, int], dict[str, Any]]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for symbol in symbols:
+        qualname = str(symbol.get("qualname") or "").strip()
+        try:
+            start_line = int(symbol.get("lineno"))
+            end_line = int(symbol.get("end_lineno"))
+        except (TypeError, ValueError):
+            continue
+        if not qualname or start_line < 1 or end_line < start_line:
+            continue
+        key = (qualname, start_line, end_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        eligible.append((key, symbol))
+
+    selected = eligible[:MAX_LARGE_SYMBOL_CHUNKS]
+    span_texts, span_budget_skipped = _read_local_span_texts(
+        materialized_path,
+        [key for key, _symbol in selected],
+    )
+    inserted = 0
+    inserted_bytes = 0
+    budget_skipped = max(0, len(eligible) - len(selected)) + len(span_budget_skipped)
+    for key, symbol in selected:
+        qualname, start_line, end_line = key
+        if key in span_budget_skipped:
+            continue
+        text = span_texts.get(key, "")
+        if not text:
+            text = qualname
+        text_bytes = len(text.encode("utf-8"))
+        if inserted_bytes + text_bytes > MAX_LARGE_SYMBOL_BYTES:
+            budget_skipped += 1
+            continue
+        chunk_path = f"{rel}:{qualname}"
+        try:
+            _insert_file_window(
+                conn,
+                rel,
+                text,
+                chunk_path=chunk_path,
+                kind=str(symbol.get("kind") or "symbol"),
+                start_line=start_line,
+                end_line=end_line,
+                qualname=qualname,
+            )
+            inserted += 1
+            inserted_bytes += text_bytes
+        except sqlite3.IntegrityError:
+            continue
+    return {
+        "inserted": inserted,
+        "bytes": inserted_bytes,
+        "budget_skipped": budget_skipped,
+    }
+
+
+def _insert_large_file(
+    conn: sqlite3.Connection,
+    root: Path,
+    rel: str,
+    path: Path,
+) -> tuple[str, os.stat_result, dict[str, int]]:
+    """Index a large source through redacted bounded windows and graph spans."""
+    with _materialize_redacted_source(root, path) as material:
+        anchor_id: int | None = None
+        for window in _iter_local_text_windows(material.path):
+            if anchor_id is None:
+                anchor_id = _insert_file_window(
+                    conn,
+                    rel,
+                    window.text,
+                    chunk_path=rel,
+                    kind="file",
+                )
+                summary = summarize(window.text)
+                conn.execute("insert into summaries(path, summary) values (?, ?)", (rel, summary))
+                conn.execute(
+                    "insert into provenance(path, processor, model_hash, prompt_version, chunker_version, confidence) "
+                    "values (?, ?, ?, ?, ?, ?)",
+                    (rel, "code-brain-local", None, "extractive-v1", "1", 1.0),
+                )
+                _insert_chunk_embedding(conn, anchor_id, window.text, root)
+            else:
+                _insert_file_window(
+                    conn,
+                    rel,
+                    window.text,
+                    chunk_path=f"{rel}::window:{window.ordinal}:{window.start_line}-{window.end_line}",
+                    kind="file_window",
+                    start_line=window.start_line,
+                    end_line=window.end_line,
+                )
+        if anchor_id is None:
+            anchor_id = _insert_file_window(conn, rel, "", chunk_path=rel, kind="file")
+            conn.execute("insert into summaries(path, summary) values (?, ?)", (rel, ""))
+            conn.execute(
+                "insert into provenance(path, processor, model_hash, prompt_version, chunker_version, confidence) "
+                "values (?, ?, ?, ?, ?, ?)",
+                (rel, "code-brain-local", None, "extractive-v1", "1", 1.0),
+            )
+            _insert_chunk_embedding(conn, anchor_id, "", root)
+        symbols = _insert_codegraph_for_path(
+            conn,
+            rel,
+            "",
+            path,
+            redacted_path=material.path,
+        )
+        symbol_stats = _insert_large_symbol_chunks(conn, rel, material.path, symbols)
+        conn.execute("update chunks set sha256 = ? where id = ?", (material.digest, anchor_id))
+        _upsert_file_state(conn, rel, path, material.digest, state=material.state)
+        return material.digest, material.state, symbol_stats
+
+
 def _rebuild_inner(root: Path) -> dict[str, Any]:
     with _connection_scope(root) as conn:
         init_schema(conn, migrate_legacy=True)
@@ -744,10 +1434,47 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
         drop_schema(conn)
         create_schema(conn)
         indexed = 0
+        skipped_count = 0
+        skipped_records: list[dict[str, str]] = []
+        symbol_budget_records: list[dict[str, str | int]] = []
         for path in iter_text_files(root, use_cache=False, update_cache=True):
             rel = path.relative_to(root).as_posix()
+            policy = _path_policy(root, path)
+            source_state = _indexable_text_stat(root, path)
+            if policy.classification == "generated":
+                if source_state is None:
+                    _append_skip_record(skipped_records, _source_skip_record(root, path))
+                    skipped_count += 1
+                    continue
+                stub = _classification_stub(rel, policy)
+                digest = hashlib.sha256(stub.encode("utf-8")).hexdigest()
+                _insert_file_anchor(conn, root, rel, stub, digest, source_state, path)
+                indexed += 1
+                continue
+            if source_state is not None and source_state.st_size > MAX_TEXT_BYTES:
+                try:
+                    _digest, _state, symbol_stats = _insert_large_file(conn, root, rel, path)
+                except _IndexSourceError as exc:
+                    _append_skip_record(skipped_records, exc.record)
+                    skipped_count += 1
+                    continue
+                if symbol_stats.get("budget_skipped", 0):
+                    symbol_budget_records.append(
+                        {
+                            "path": rel,
+                            "class": "symbol_budget",
+                            "reason": "large_symbol_chunks_capped",
+                            "budget_skipped": int(symbol_stats["budget_skipped"]),
+                            "inserted": int(symbol_stats["inserted"]),
+                            "bytes": int(symbol_stats["bytes"]),
+                        }
+                    )
+                indexed += 1
+                continue
             loaded = _read_indexable_text(root, path)
             if loaded is None:
+                _append_skip_record(skipped_records, _source_skip_record(root, path))
+                skipped_count += 1
                 continue
             content, source_state = loaded
             redacted = redact_value(content)
@@ -776,11 +1503,19 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
             indexed += 1
         conn.commit()
         conn.execute("vacuum")
+    _write_index_diagnostics_cache(
+        root,
+        skipped=skipped_records,
+        symbol_budget=symbol_budget_records,
+    )
     _mark_index_generation(root)
     return {
         "ok": True,
         "db_path": db_path(root).relative_to(root).as_posix(),
         "indexed": indexed,
+        "skipped": skipped_records,
+        "skipped_count": skipped_count,
+        "symbol_budget": symbol_budget_records,
         "max_db_bytes": INDEX_DB_MAX_BYTES,
     }
 
@@ -966,7 +1701,14 @@ def _insert_function_chunks_for_python(
     _insert_function_chunks(conn, path, source_text, file_chunk_id)
 
 
-def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text: str, abs_path: Path) -> None:
+def _insert_codegraph_for_path(
+    conn: sqlite3.Connection,
+    rel: str,
+    redacted_text: str,
+    abs_path: Path,
+    *,
+    redacted_path: Path | None = None,
+) -> list[dict[str, Any]]:
     """Insert function/class symbols + call edges for Python and multi-language source files.
 
     Default ON (AI_SEARCH_CODEGRAPH=1). Python uses the stdlib ast module; JS, TS, Go,
@@ -974,7 +1716,7 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
     Skips unsupported files and any file the AST parser rejects (best-effort indexer behavior).
     """
     if not _codegraph_enabled():
-        return
+        return []
 
     # Detect language from file extension
     lang = None
@@ -988,7 +1730,7 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
             extract_symbols_func = extract_symbols
             extract_calls_func = extract_calls
         except Exception:
-            return
+            return []
     elif rel.endswith((".js", ".jsx")):
         lang = "javascript"
         try:
@@ -996,7 +1738,7 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
             extract_symbols_func = extract_symbols_js
             extract_calls_func = extract_calls_js
         except Exception:
-            return
+            return []
     elif rel.endswith((".ts", ".tsx")):
         lang = "typescript"
         try:
@@ -1004,7 +1746,7 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
             extract_symbols_func = extract_symbols_ts
             extract_calls_func = extract_calls_ts
         except Exception:
-            return
+            return []
     elif rel.endswith(".go"):
         lang = "go"
         try:
@@ -1012,7 +1754,7 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
             extract_symbols_func = extract_symbols_go
             extract_calls_func = extract_calls_go
         except Exception:
-            return
+            return []
     elif rel.endswith(".rs"):
         lang = "rust"
         try:
@@ -1020,7 +1762,7 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
             extract_symbols_func = extract_symbols_rs
             extract_calls_func = extract_calls_rs
         except Exception:
-            return
+            return []
     elif rel.endswith((".kt", ".kts")):
         lang = "kotlin"
         try:
@@ -1028,7 +1770,7 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
             extract_symbols_func = extract_symbols_kt
             extract_calls_func = extract_calls_kt
         except Exception:
-            return
+            return []
     elif rel.endswith(".dart"):
         lang = "dart"
         try:
@@ -1036,13 +1778,15 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
             extract_symbols_func = extract_symbols_dart
             extract_calls_func = extract_calls_dart
         except Exception:
-            return
+            return []
     else:
         # Unsupported language
-        return
+        return []
 
     try:
         if lang == "python":
+            if redacted_path is not None:
+                return _insert_python_bounded_codegraph(conn, rel, redacted_path)
             # Python AST extraction works with source text
             syms = extract_symbols_func(redacted_text, path=rel)
             for s in syms:
@@ -1057,35 +1801,51 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
                     "insert into code_calls(path, caller, callee, lineno, lang) values (?, ?, ?, ?, ?)",
                     (c.path, c.caller, c.callee, c.lineno, lang),
                 )
+            return [
+                {
+                    "qualname": s.qualname,
+                    "kind": s.kind,
+                    "lineno": s.lineno,
+                    "end_lineno": s.end_lineno,
+                    "parent": s.parent,
+                }
+                for s in syms
+            ]
         else:
             # ast-grep requires a file path. Parse a private temporary copy of
             # the already-redacted trusted descriptor content, never the
             # repository path, so path replacement cannot change the input.
-            suffix = abs_path.suffix or ".txt"
-            with tempfile.TemporaryDirectory(prefix="code-brain-codegraph-") as temp_dir:
-                trusted_path = Path(temp_dir) / f"source{suffix}"
-                trusted_path.write_text(redacted_text, encoding="utf-8")
-                syms = extract_symbols_func(str(trusted_path))
+            if redacted_path is not None:
+                trusted_path = redacted_path
+                try:
+                    syms = list(extract_symbols_func(str(trusted_path)) or [])
+                except Exception:
+                    syms = []
+                try:
+                    calls = list(extract_calls_func(str(trusted_path)) or [])
+                except Exception:
+                    calls = []
+                if not syms or not calls:
+                    fallback_syms, fallback_calls = _fallback_multilang_records(
+                        trusted_path,
+                        lang,
+                    )
+                    if not syms:
+                        syms = fallback_syms
+                    if not calls:
+                        calls = fallback_calls
                 for s in syms:
                     conn.execute(
                         "insert into code_symbols(path, qualname, kind, lineno, end_lineno, lang) "
                         "values (?, ?, ?, ?, ?, ?)",
                         (rel, s.get("qualname"), s.get("kind"), s.get("lineno"), s.get("end_lineno"), lang),
                     )
-                calls = extract_calls_func(str(trusted_path))
-                # Attribute each call to the innermost enclosing declaration.
-                # Previously every non-Python caller was hardcoded "<module>",
-                # which made code_graph_callers useless for those languages:
-                # it could say a callee is called but never by which function.
-                # The Python extractor already records real caller names, so
-                # this brings ast-grep languages to the same contract.
                 caller_spans = sorted(
                     (
                         (int(sym["lineno"]), int(sym["end_lineno"]), str(sym["qualname"]))
                         for sym in syms
                         if sym.get("lineno") and sym.get("end_lineno") and sym.get("qualname")
                     ),
-                    # Narrowest span last so the innermost enclosing wins.
                     key=lambda item: (item[1] - item[0]),
                     reverse=True,
                 )
@@ -1099,9 +1859,43 @@ def _insert_codegraph_for_path(conn: sqlite3.Connection, rel: str, redacted_text
                         "insert into code_calls(path, caller, callee, lineno, lang) values (?, ?, ?, ?, ?)",
                         (rel, caller, c.get("callee"), c.get("lineno"), lang),
                     )
+                return [dict(s) for s in syms if isinstance(s, dict)]
+            suffix = abs_path.suffix or ".txt"
+            with tempfile.TemporaryDirectory(prefix="code-brain-codegraph-") as temp_dir:
+                trusted_path = Path(temp_dir) / f"source{suffix}"
+                trusted_path.write_text(redacted_text, encoding="utf-8")
+                syms = extract_symbols_func(str(trusted_path))
+                for s in syms:
+                    conn.execute(
+                        "insert into code_symbols(path, qualname, kind, lineno, end_lineno, lang) "
+                        "values (?, ?, ?, ?, ?, ?)",
+                        (rel, s.get("qualname"), s.get("kind"), s.get("lineno"), s.get("end_lineno"), lang),
+                    )
+                calls = extract_calls_func(str(trusted_path))
+                # Attribute each call to the innermost enclosing declaration.
+                caller_spans = sorted(
+                    (
+                        (int(sym["lineno"]), int(sym["end_lineno"]), str(sym["qualname"]))
+                        for sym in syms
+                        if sym.get("lineno") and sym.get("end_lineno") and sym.get("qualname")
+                    ),
+                    key=lambda item: (item[1] - item[0]),
+                    reverse=True,
+                )
+                for c in calls:
+                    call_line = c.get("lineno") or 0
+                    caller = "<module>"
+                    for start_line, end_line, qualname in caller_spans:
+                        if start_line <= call_line <= end_line:
+                            caller = qualname
+                    conn.execute(
+                        "insert into code_calls(path, caller, callee, lineno, lang) values (?, ?, ?, ?, ?)",
+                        (rel, caller, c.get("callee"), c.get("lineno"), lang),
+                    )
+                return [dict(s) for s in syms if isinstance(s, dict)]
     except Exception:
         # Indexer must continue even if one file misbehaves.
-        return
+        return []
 
 
 def _insert_chunk_embedding(conn: sqlite3.Connection, chunk_id: int, text: str, root: Path) -> None:
@@ -1312,6 +2106,232 @@ def _function_chunks_for_lang(path: str, source_text: str, lang: str) -> list[di
         })
 
     return chunks
+
+
+_PY_DECL_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<async>async\s+)?(?P<kind>def|class)\s+(?P<name>[A-Za-z_]\w*)")
+_MULTILANG_DECL_RE: dict[str, tuple[re.Pattern[str], ...]] = {
+    "javascript": (
+        re.compile(r"\b(?:async\s+)?function\s+([A-Za-z_$][\w$]*)"),
+        re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)"),
+        re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^\n]*\)|[A-Za-z_$][\w$]*)\s*=>"),
+    ),
+    "typescript": (
+        re.compile(r"\b(?:async\s+)?function\s+([A-Za-z_$][\w$]*)"),
+        re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)"),
+        re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^\n]*\)|[A-Za-z_$][\w$]*)\s*=>"),
+    ),
+    "go": (re.compile(r"\bfunc\s+(?:\([^\n]*\)\s*)?([A-Za-z_]\w*)"),),
+    "rust": (re.compile(r"\b(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)"),),
+    "kotlin": (
+        re.compile(r"\b(?:fun|class|object|interface)\s+([A-Za-z_]\w*)"),
+    ),
+    "dart": (
+        re.compile(r"\b(?:class|mixin|extension|enum)\s+([A-Za-z_]\w*)"),
+        re.compile(r"\b(?:Future<[^>]+>|void|bool|int|double|String|dynamic|[A-Z][\w<>?]*)\s+([A-Za-z_]\w*)\s*\("),
+    ),
+}
+_CALL_RE = re.compile(r"\b([A-Za-z_$][\w$]*)\s*\(")
+_CALL_KEYWORDS = {
+    "if", "for", "while", "switch", "catch", "return", "sizeof", "typeof",
+    "def", "fn", "fun", "class", "function",
+}
+
+
+def _fallback_symbol_records(window: _TextWindow, lang: str) -> list[dict[str, Any]]:
+    lines = window.text.splitlines()
+    records: list[dict[str, Any]] = []
+    if lang == "python":
+        for offset, line in enumerate(lines):
+            match = _PY_DECL_RE.match(line)
+            if match is None:
+                continue
+            start = window.start_line + offset
+            indent = len(match.group("indent"))
+            end = window.end_line
+            for next_offset in range(offset + 1, len(lines)):
+                candidate = lines[next_offset]
+                if not candidate.strip():
+                    continue
+                candidate_indent = len(candidate) - len(candidate.lstrip(" \t"))
+                if candidate_indent <= indent:
+                    end = window.start_line + next_offset - 1
+                    break
+            records.append(
+                {
+                    "qualname": match.group("name"),
+                    "kind": (
+                        "class"
+                        if match.group("kind") == "class"
+                        else "async_function"
+                        if match.group("async")
+                        else "function"
+                    ),
+                    "lineno": start,
+                    "end_lineno": max(start, end),
+                    "parent": None,
+                }
+            )
+        return records
+    patterns = _MULTILANG_DECL_RE.get(lang, ())
+    for offset, line in enumerate(lines):
+        for pattern in patterns:
+            for match in pattern.finditer(line):
+                name = match.group(1)
+                start = window.start_line + offset
+                end = window.end_line
+                if "{" in line:
+                    depth = line.count("{") - line.count("}")
+                    for next_offset in range(offset + 1, len(lines)):
+                        depth += lines[next_offset].count("{") - lines[next_offset].count("}")
+                        if depth <= 0:
+                            end = window.start_line + next_offset
+                            break
+                kind = "class" if re.search(r"\b(class|object|interface|mixin|enum)\b", line) else "function"
+                records.append(
+                    {
+                        "qualname": name,
+                        "kind": kind,
+                        "lineno": start,
+                        "end_lineno": max(start, end),
+                    }
+                )
+    return records
+
+
+def _fallback_call_records(window: _TextWindow) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for offset, line in enumerate(window.text.splitlines()):
+        line_no = window.start_line + offset
+        for match in _CALL_RE.finditer(line):
+            callee = match.group(1)
+            if callee in _CALL_KEYWORDS:
+                continue
+            records.append({"callee": callee, "lineno": line_no})
+    return records
+
+
+def _caller_for_line(symbols: list[dict[str, Any]], line_no: int) -> str:
+    enclosing = [
+        symbol
+        for symbol in symbols
+        if int(symbol.get("lineno", 0)) <= line_no <= int(symbol.get("end_lineno", 0))
+    ]
+    if not enclosing:
+        return "<module>"
+    return str(min(enclosing, key=lambda item: int(item["end_lineno"]) - int(item["lineno"]))["qualname"])
+
+
+def _insert_python_bounded_codegraph(
+    conn: sqlite3.Connection,
+    rel: str,
+    materialized_path: Path,
+) -> list[dict[str, Any]]:
+    from .codegraph import extract_calls, extract_symbols
+
+    symbols: list[dict[str, Any]] = []
+    symbol_keys: set[tuple[str, int, int]] = set()
+    for window in _iter_local_text_windows(materialized_path):
+        try:
+            extracted = extract_symbols(window.text, path=rel)
+        except Exception:
+            extracted = []
+        records = [
+            {
+                "qualname": str(item.qualname),
+                "kind": str(item.kind),
+                "lineno": window.start_line + int(item.lineno) - 1,
+                "end_lineno": window.start_line + int(item.end_lineno) - 1,
+                "parent": item.parent,
+            }
+            for item in extracted
+        ]
+        if not records:
+            records = _fallback_symbol_records(window, "python")
+        for record in records:
+            key = (
+                str(record.get("qualname") or ""),
+                int(record.get("lineno") or 0),
+                int(record.get("end_lineno") or 0),
+            )
+            if not key[0] or key in symbol_keys or len(symbols) >= 10_000:
+                continue
+            symbol_keys.add(key)
+            symbols.append(record)
+
+    for symbol in symbols:
+        conn.execute(
+            "insert into code_symbols(path, qualname, kind, lineno, end_lineno, parent, lang) "
+            "values (?, ?, ?, ?, ?, ?, ?)",
+            (
+                rel,
+                symbol["qualname"],
+                symbol["kind"],
+                symbol["lineno"],
+                symbol["end_lineno"],
+                symbol.get("parent"),
+                "python",
+            ),
+        )
+
+    calls: list[dict[str, Any]] = []
+    call_keys: set[tuple[int, str, str]] = set()
+    for window in _iter_local_text_windows(materialized_path):
+        try:
+            extracted_calls = extract_calls(window.text, path=rel)
+        except Exception:
+            extracted_calls = []
+        records = [
+            {
+                "callee": str(item.callee),
+                "lineno": window.start_line + int(item.lineno) - 1,
+            }
+            for item in extracted_calls
+        ]
+        if not records:
+            records = _fallback_call_records(window)
+        for record in records:
+            lineno = int(record.get("lineno") or 0)
+            callee = str(record.get("callee") or "")
+            caller = _caller_for_line(symbols, lineno)
+            key = (lineno, caller, callee)
+            if not callee or key in call_keys or len(calls) >= 20_000:
+                continue
+            call_keys.add(key)
+            calls.append({"lineno": lineno, "caller": caller, "callee": callee})
+    for call in calls:
+        conn.execute(
+            "insert into code_calls(path, caller, callee, lineno, lang) values (?, ?, ?, ?, ?)",
+            (rel, call["caller"], call["callee"], call["lineno"], "python"),
+        )
+    return symbols
+
+
+def _fallback_multilang_records(
+    materialized_path: Path,
+    lang: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    symbols: list[dict[str, Any]] = []
+    symbol_keys: set[tuple[str, int, int]] = set()
+    calls: list[dict[str, Any]] = []
+    call_keys: set[tuple[int, str]] = set()
+    for window in _iter_local_text_windows(materialized_path):
+        for symbol in _fallback_symbol_records(window, lang):
+            key = (
+                str(symbol.get("qualname") or ""),
+                int(symbol.get("lineno") or 0),
+                int(symbol.get("end_lineno") or 0),
+            )
+            if key[0] and key not in symbol_keys and len(symbols) < 10_000:
+                symbol_keys.add(key)
+                symbols.append(symbol)
+        for call in _fallback_call_records(window):
+            key = (int(call.get("lineno") or 0), str(call.get("callee") or ""))
+            if key[1] and key not in call_keys and len(calls) < 20_000:
+                call_keys.add(key)
+                calls.append(call)
+    for call in calls:
+        call["caller"] = _caller_for_line(symbols, int(call["lineno"]))
+    return symbols, calls
 
 
 def _compute_rrf_k(indexed_chunk_count: int) -> int:
@@ -1712,7 +2732,10 @@ def _rg_fallback(root: Path, query_text: str, *, limit: int = 10) -> list[dict[s
         candidate_path, rel_path = normalized
         allowed = path_allowed.get(rel_path)
         if allowed is None:
-            allowed = _is_indexable_text_file(policy_root, candidate_path)
+            allowed = _is_indexable_text_file(policy_root, candidate_path) and not _is_generated_path(
+                policy_root,
+                candidate_path,
+            )
             path_allowed[rel_path] = allowed
         if not allowed:
             continue
@@ -1770,6 +2793,21 @@ def _result_scope(path: str, summary: str | None) -> str:
     return (f"{p} — {head}"[:160]) if head else p[:160]
 
 
+def _dedupe_search_results(results: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    """Collapse overlapping windows back to one deterministic result per file."""
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for result in results:
+        path = str(result.get("path") or "")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        deduped.append(result)
+        if len(deduped) >= max(1, int(limit)):
+            break
+    return deduped
+
+
 def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None = None) -> dict[str, Any]:
     text = str(text or "").strip()
     limit = normalize_result_limit(limit)
@@ -1800,29 +2838,45 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
             state = _index_state_from_conn(conn)
             loaded_rows = conn.execute(
                 """
-                select c.id, c.path, c.sha256, c.summary,
+                with matched as (
+                  select c.id, c.path, c.sha256, c.summary,
+                         m.kind, m.qualname, m.start_line, m.end_line,
+                         case
+                           when m.qualname is not null
+                             and substr(c.path, -(length(m.qualname) + 1)) = ':' || m.qualname
+                             then substr(c.path, 1, length(c.path) - length(m.qualname) - 1)
+                           when instr(c.path, '::window:') > 0
+                             then substr(c.path, 1, instr(c.path, '::window:') - 1)
+                           else c.path
+                         end as source_lookup_path,
+                         bm25(chunks_fts, ?, ?) as lexical_score
+                  from chunks_fts
+                  join chunks c on c.id = chunks_fts.rowid
+                  left join chunk_meta m on m.chunk_id = c.id
+                  where chunks_fts match ?
+                ), ranked as (
+                  select *, row_number() over (
+                    partition by source_lookup_path
+                    order by lexical_score, id
+                  ) as source_rank
+                  from matched
+                )
+                select r.id, r.path, r.sha256, r.summary,
                        coalesce(p.processor, 'code-brain-local') as processor,
                        p.model_hash,
                        coalesce(p.prompt_version, 'extractive-v1') as prompt_version,
                        coalesce(p.chunker_version, '1') as chunker_version,
                        coalesce(p.confidence, 1.0) as confidence,
-                       m.kind, m.qualname, m.start_line, m.end_line,
+                       r.kind, r.qualname, r.start_line, r.end_line,
                        src_chunk.path as source_path, src_chunk.sha256 as source_sha256
-                from chunks_fts
-                join chunks c on c.id = chunks_fts.rowid
-                left join chunk_meta m on m.chunk_id = c.id
-                left join chunks src_chunk on src_chunk.path = case
-                  when m.qualname is not null
-                    and substr(c.path, -(length(m.qualname) + 1)) = ':' || m.qualname
-                    then substr(c.path, 1, length(c.path) - length(m.qualname) - 1)
-                  else c.path
-                end
+                from ranked r
+                left join chunks src_chunk on src_chunk.path = r.source_lookup_path
                 left join provenance p on p.path = src_chunk.path
-                where chunks_fts match ?
-                order by bm25(chunks_fts, ?, ?)
+                where r.source_rank = 1
+                order by r.lexical_score, r.id
                 limit ?
                 """,
-                (escape_fts_query(text), path_weight, content_weight, candidate_limit),
+                (path_weight, content_weight, escape_fts_query(text), candidate_limit),
             ).fetchall()
             loaded_vectors: dict[int, list[float]] = {}
             if dense_active and loaded_rows:
@@ -1893,9 +2947,22 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
             }
     recommended_policy = retrieval_policy_for_query(text, index_state)
     fts_results: list[dict[str, Any]] = []
+    snippet_cache: dict[tuple[str, str], str] = {}
     for row in rows:
         chunk_path = str(row["path"])
         source_path = str(row["source_path"] or chunk_path)
+        expected_sha = str(row["source_sha256"] or row["sha256"] or "")
+        snippet_key = (source_path, expected_sha)
+        snippet = snippet_cache.get(snippet_key)
+        if snippet is None:
+            snippet = snippet_from_file(
+                root,
+                source_path,
+                text,
+                fallback=row["summary"],
+                expected_sha=expected_sha or None,
+            )
+            snippet_cache[snippet_key] = snippet
         result = {
             "id": int(row["id"]),
             "path": source_path,
@@ -1904,13 +2971,7 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
                 if row["qualname"]
                 else _result_scope(source_path, row["summary"])
             ),
-            "snippet": snippet_from_file(
-                root,
-                source_path,
-                text,
-                fallback=row["summary"],
-                expected_sha=row["source_sha256"] or row["sha256"],
-            ),
+            "snippet": snippet,
             "provenance": {
                 "processor": row["processor"],
                 "model_hash": row["model_hash"],
@@ -1977,6 +3038,7 @@ def query(root: Path, text: str, *, limit: int = 5, evidence_source: str | None 
                 fts_results = reranked
     except Exception:
         pass
+    fts_results = _dedupe_search_results(fts_results, limit=candidate_limit)
     # Strip internal fields before returning.
     for r in fts_results:
         r.pop("id", None)
@@ -2608,6 +3670,14 @@ def index_hash_status(
         seen.add(rel)
         indexed_entry = indexed.get(rel)
         if indexed_entry is None:
+            policy = _path_policy(root, path)
+            if policy.classification != "generated":
+                try:
+                    _probe_indexable_source(root, path, stat_result)
+                except (OSError, UnicodeDecodeError):
+                    # Content-policy skips have no anchor by design. Treat them as
+                    # converged until the bytes become valid source again.
+                    continue
             changed.add(rel)
             continue
         expected, indexed_metadata = indexed_entry
@@ -2619,13 +3689,26 @@ def index_hash_status(
                 continue
             if current_metadata == indexed_metadata:
                 continue
-        loaded = _read_indexable_text(root, path)
-        if loaded is None:
-            changed.add(rel)
-            continue
-        content, source_state = loaded
-        redacted = str(redact_value(content))
-        digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+        policy = _path_policy(root, path)
+        if policy.classification == "generated":
+            redacted = _classification_stub(rel, policy)
+            source_state = stat_result
+            digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+        elif stat_result.st_size > MAX_TEXT_BYTES:
+            try:
+                digest = _redacted_source_digest(root, path)
+            except _IndexSourceError:
+                changed.add(rel)
+                continue
+            source_state = stat_result
+        else:
+            loaded = _read_indexable_text(root, path)
+            if loaded is None:
+                changed.add(rel)
+                continue
+            content, source_state = loaded
+            redacted = str(redact_value(content))
+            digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
         if digest != expected:
             changed.add(rel)
         elif use_metadata and refresh_metadata:
@@ -2705,8 +3788,10 @@ def observability(root: Path, *, query_text: str | None = None, limit: int = 5) 
         "sqlite_wal_bytes": 0,
         "indexed_files": 0,
         "indexed_bytes": 0,
+        "indexed_source_bytes": 0,
         "summary_bytes": 0,
         "embeddings": {"enabled": False, "disabled_rows": 0},
+        "coverage": index_diagnostics(root),
     }
     if not path.exists():
         payload["ok"] = False
@@ -2722,15 +3807,21 @@ def observability(root: Path, *, query_text: str | None = None, limit: int = 5) 
             row = conn.execute(
                 """
                 select count(*) as indexed_files,
-                       coalesce(sum(m.bytes), 0) as indexed_bytes,
+                       coalesce(sum(coalesce(s.size, m.bytes)), 0) as indexed_bytes,
                        coalesce(sum(length(c.summary)), 0) as summary_bytes
                 from chunks c
                 left join chunk_meta m on m.chunk_id = c.id
+                left join file_state s on s.path = c.path
+                where m.kind = 'file'
                 """
             ).fetchone()
             payload["indexed_files"] = int(row["indexed_files"])
             payload["indexed_bytes"] = int(row["indexed_bytes"])
             payload["summary_bytes"] = int(row["summary_bytes"])
+            source_bytes = conn.execute(
+                "select coalesce(sum(size), 0) as bytes from file_state"
+            ).fetchone()
+            payload["indexed_source_bytes"] = int(source_bytes["bytes"] if source_bytes else 0)
             disabled = conn.execute("select count(*) as count from embeddings_vec0").fetchone()
             payload["embeddings"] = {"enabled": False, "disabled_rows": int(disabled["count"])}
     except RuntimeError as exc:
@@ -2777,10 +3868,11 @@ def indexed_bytes_for_paths(root: Path, paths: list[str]) -> int:
         init_schema(conn)
         row = conn.execute(
             f"""
-            select coalesce(sum(m.bytes), 0) as bytes
+            select coalesce(sum(coalesce(s.size, m.bytes)), 0) as bytes
             from chunks c
             join chunk_meta m on m.chunk_id = c.id
-            where c.path in ({placeholders})
+            left join file_state s on s.path = c.path
+            where c.path in ({placeholders}) and m.kind = 'file'
             """,
             paths,
         ).fetchone()
@@ -2828,27 +3920,85 @@ def _is_indexable_text_file(root: Path, path: Path) -> bool:
     return _indexable_text_stat(root, path) is not None
 
 
-def _indexable_text_stat(root: Path, path: Path) -> os.stat_result | None:
+def _source_skip_record(
+    root: Path,
+    path: Path,
+    *,
+    exc: BaseException | None = None,
+) -> dict[str, str]:
     try:
-        rel = path.relative_to(root)
+        rel = path.relative_to(root).as_posix()
     except ValueError:
-        return None
-    rel_posix = rel.as_posix()
-    if any(rel_posix.startswith(prefix) for prefix in _skip_path_prefixes(root)):
-        return None
-    if any(part in SKIP_DIRS for part in rel.parts):
-        return None
-    if path.name in SKIP_NAMES:
-        return None
-    if any(path.name.endswith(suffix) for suffix in SKIP_SUFFIXES):
-        return None
-    if path.suffix not in TEXT_SUFFIXES and path.name not in {"AGENTS.md", "CLAUDE.md"}:
+        rel = str(path)
+    policy = _path_policy(root, path)
+    if policy.classification not in {"source", "generated"}:
+        return {"path": rel, "class": policy.classification, "reason": policy.reason}
+    message = str(exc or "").casefold()
+    if "nul" in message or "binary data" in message:
+        reason = "binary_or_data_content"
+        classification = "binary_data"
+    elif isinstance(exc, UnicodeDecodeError) or "utf-8" in message or "decode" in message:
+        reason = "invalid_utf8"
+        classification = "encoding"
+    elif "exceed" in message or "size limit" in message:
+        reason = "source_too_large"
+        classification = "size"
+    elif "symlink" in message or "link" in message or "outside" in message:
+        reason = "untrusted_link_or_root_escape"
+        classification = "trust"
+    elif "permission" in message or "owner" in message:
+        reason = "untrusted_permissions"
+        classification = "trust"
+    else:
+        try:
+            state = path.lstat()
+        except FileNotFoundError:
+            reason = "not_found"
+            classification = "source"
+        except OSError:
+            reason = "unreadable_source"
+            classification = "source"
+        else:
+            if stat_module.S_ISLNK(state.st_mode):
+                reason = "untrusted_link_or_root_escape"
+                classification = "trust"
+            elif getattr(state, "st_nlink", 1) != 1:
+                reason = "untrusted_hardlink"
+                classification = "trust"
+            elif state.st_size > MAX_INDEXABLE_SOURCE_BYTES:
+                reason = "source_too_large"
+                classification = "size"
+            else:
+                if exc is None:
+                    try:
+                        _probe_indexable_source(root, path, state)
+                    except (OSError, UnicodeDecodeError) as probe_exc:
+                        return _source_skip_record(root, path, exc=probe_exc)
+                reason = "unreadable_source"
+                classification = "source"
+    return {"path": rel, "class": classification, "reason": reason}
+
+
+def _append_skip_record(records: list[dict[str, str]], record: dict[str, str]) -> None:
+    if len(records) < MAX_INDEX_DIAGNOSTIC_ITEMS:
+        records.append(
+            {
+                "path": str(record.get("path") or "")[:1024],
+                "class": str(record.get("class") or "unknown")[:64],
+                "reason": str(record.get("reason") or "unknown")[:128],
+            }
+        )
+
+
+def _indexable_text_stat(root: Path, path: Path) -> os.stat_result | None:
+    policy = _path_policy(root, path)
+    if policy.classification not in {"source", "generated"}:
         return None
     try:
         return validate_root_confined_regular_file(
             path,
             root=root,
-            max_bytes=MAX_TEXT_BYTES,
+            max_bytes=MAX_INDEXABLE_SOURCE_BYTES,
         )
     except OSError:
         return None
@@ -2856,15 +4006,27 @@ def _indexable_text_stat(root: Path, path: Path) -> os.stat_result | None:
 
 def _read_indexable_text(root: Path, path: Path) -> tuple[str, os.stat_result] | None:
     """Read one source file from the same confined descriptor used for trust checks."""
-    if _indexable_text_stat(root, path) is None:
+    policy = _path_policy(root, path)
+    source_state = _indexable_text_stat(root, path)
+    if source_state is None:
+        return None
+    if policy.classification == "generated":
+        return _classification_stub(path.relative_to(root).as_posix(), policy), source_state
+    # Large source must go through the streaming/window path. Returning a
+    # partial body here would recreate the original silent omission under a
+    # different name, so callers branch on the descriptor size first.
+    if source_state.st_size > MAX_TEXT_BYTES:
         return None
     try:
-        return read_root_confined_text(
+        content, state = read_root_confined_text(
             path,
             root=root,
             max_bytes=MAX_TEXT_BYTES,
             require_private=False,
         )
+        if "\x00" in content:
+            return None
+        return content, state
     except (OSError, UnicodeDecodeError):
         return None
 
@@ -3190,6 +4352,192 @@ def candidate_files(
     return sorted(root / rel for rel in rels)
 
 
+def _indexed_anchor_paths(root: Path) -> set[str]:
+    db = db_path(root)
+    if not db.exists():
+        return set()
+    try:
+        with sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                "select c.path from chunks c join chunk_meta m on m.chunk_id = c.id where m.kind = 'file'"
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+    except (OSError, sqlite3.Error):
+        return set()
+
+
+def _probe_indexable_source(root: Path, path: Path, state: os.stat_result) -> None:
+    """Validate UTF-8/binary policy without retaining a full large source."""
+    if state.st_size > MAX_TEXT_BYTES:
+        for piece in _iter_redacted_text_pieces(root, path):
+            if "\x00" in piece:
+                raise OSError("binary data contains NUL bytes")
+        return
+    content, _ = read_root_confined_text(
+        path,
+        root=root,
+        max_bytes=MAX_TEXT_BYTES,
+        require_private=False,
+    )
+    if "\x00" in content:
+        raise OSError("binary data contains NUL bytes")
+
+
+def _index_diagnostics_cache_path(root: Path) -> Path:
+    return root / ".ai" / "cache" / INDEX_DIAGNOSTICS_CACHE_NAME
+
+
+def _write_index_diagnostics_cache(
+    root: Path,
+    *,
+    skipped: list[dict[str, str]],
+    symbol_budget: list[dict[str, str | int]],
+) -> None:
+    try:
+        path = _index_diagnostics_cache_path(root)
+        ensure_root_confined_directory(path.parent, root=root, mode=0o700)
+        payload = {
+            "schema": 1,
+            "skipped": skipped[:MAX_INDEX_DIAGNOSTIC_ITEMS],
+            "symbol_budget": symbol_budget[:MAX_INDEX_DIAGNOSTIC_ITEMS],
+        }
+        atomic_write_private_text(
+            path,
+            json.dumps(redact_value(payload), sort_keys=True),
+            root=root,
+        )
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _read_index_diagnostics_cache(root: Path) -> dict[str, Any]:
+    try:
+        text, _ = read_root_confined_text(
+            _index_diagnostics_cache_path(root),
+            root=root,
+            max_bytes=2_000_000,
+            require_private=True,
+        )
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def index_diagnostics(root: Path) -> dict[str, Any]:
+    """Return explicit classifications for every discovered non-indexed path.
+
+    This is intentionally read-only. Generated/bundled files are reported as
+    searchable path-only stubs; binary/data, lockfiles, trust failures, bad
+    encodings, and size-limit failures are reported with a class and reason.
+    """
+    root = Path(root)
+    skipped: list[dict[str, str]] = []
+    not_indexed: list[dict[str, str]] = []
+    stubs: list[dict[str, str]] = []
+    counts: dict[str, int] = {}
+    skipped_total = 0
+    not_indexed_total = 0
+    cached = _read_index_diagnostics_cache(root)
+    symbol_budget = (
+        cached.get("symbol_budget")
+        if isinstance(cached.get("symbol_budget"), list)
+        else []
+    )
+    try:
+        candidates = candidate_files(root, use_cache=False, update_cache=False)
+    except Exception as exc:
+        return {
+            "ok": True,
+            "candidate_count": 0,
+            "indexed_candidates": 0,
+            "skipped": [{"path": str(root), "class": "discovery", "reason": type(exc).__name__}],
+            "unindexed": [{"path": str(root), "class": "discovery", "reason": type(exc).__name__}],
+            "classification_stubs": [],
+            "skipped_count": 1,
+            "not_indexed_count": 0,
+            "silent_skip_count": 0,
+            "symbol_budget": symbol_budget,
+            "symbol_budget_count": sum(
+                int(item.get("budget_skipped", 0) or 0)
+                for item in symbol_budget
+                if isinstance(item, dict)
+            ),
+            "by_class": {"discovery": 1},
+            "limits": {"max_source_bytes": MAX_INDEXABLE_SOURCE_BYTES, "window_bytes": MAX_TEXT_BYTES},
+        }
+    indexed = _indexed_anchor_paths(root)
+    for path in candidates:
+        policy = _path_policy(root, path)
+        if policy.classification in {"excluded"}:
+            continue
+        state = _indexable_text_stat(root, path)
+        if state is None:
+            record = _source_skip_record(root, path)
+            skipped_total += 1
+            counts[record["class"]] = counts.get(record["class"], 0) + 1
+            _append_skip_record(skipped, record)
+            continue
+        if policy.classification == "generated":
+            record = {
+                "path": path.relative_to(root).as_posix(),
+                "class": "generated",
+                "reason": policy.reason,
+                "indexed_as": "path_stub",
+            }
+            if record["path"] not in indexed:
+                not_indexed_total += 1
+                counts["index"] = counts.get("index", 0) + 1
+                _append_skip_record(not_indexed, {k: str(v) for k, v in record.items() if k != "indexed_as"})
+            if len(stubs) < MAX_INDEX_DIAGNOSTIC_ITEMS:
+                stubs.append({k: str(v) for k, v in record.items()})
+            continue
+        try:
+            _probe_indexable_source(root, path, state)
+        except (OSError, UnicodeDecodeError) as exc:
+            record = _source_skip_record(root, path, exc=exc)
+            skipped_total += 1
+            counts[record["class"]] = counts.get(record["class"], 0) + 1
+            _append_skip_record(skipped, record)
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel not in indexed:
+            record = {"path": rel, "class": "index", "reason": "not_indexed"}
+            not_indexed_total += 1
+            counts["index"] = counts.get("index", 0) + 1
+            _append_skip_record(not_indexed, record)
+    unindexed = [*skipped, *not_indexed]
+    return {
+        "ok": True,
+        "candidate_count": len(candidates),
+        "indexed_candidates": max(0, len(candidates) - skipped_total - not_indexed_total),
+        "skipped": skipped,
+        "unindexed": unindexed,
+        "classification_stubs": stubs,
+        "skipped_count": skipped_total,
+        "not_indexed_count": not_indexed_total,
+        # Every reported omission carries an explicit class/reason. This is
+        # the count of omissions that fell outside the bounded diagnostic
+        # lists, not the count of intentional policy skips.
+        "silent_skip_count": max(0, skipped_total - len(skipped)) + max(
+            0, not_indexed_total - len(not_indexed)
+        ),
+        "symbol_budget": symbol_budget,
+        "symbol_budget_count": sum(
+            int(item.get("budget_skipped", 0) or 0)
+            for item in symbol_budget
+            if isinstance(item, dict)
+        ),
+        "by_class": {key: counts[key] for key in sorted(counts)},
+        "truncated": skipped_total > len(skipped) or not_indexed_total > len(not_indexed),
+        "limits": {
+            "max_source_bytes": MAX_INDEXABLE_SOURCE_BYTES,
+            "window_bytes": MAX_TEXT_BYTES,
+            "window_overlap_bytes": SOURCE_WINDOW_OVERLAP_BYTES,
+        },
+    }
+
+
 def summarize(content: str) -> str:
     for line in content.splitlines():
         stripped = line.strip()
@@ -3198,17 +4546,14 @@ def summarize(content: str) -> str:
     return ""
 
 
-def snippet_from_file(root: Path, rel_path: str, query_text: str, *, fallback: str, expected_sha: str | None = None) -> str:
-    path = root / rel_path
-    loaded = _read_indexable_text(root, path)
-    if loaded is None:
-        return f"[stale index: source unavailable; run ai index rebuild] {fallback}"
-    content, _source_state = loaded
-    redacted = str(redact_value(content))
-    if expected_sha:
-        current_sha = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
-        if current_sha != expected_sha:
-            return f"[stale index: source changed; run ai index rebuild] {fallback}"
+def _iter_redacted_windows(root: Path, path: Path) -> Iterator[_TextWindow]:
+    builder = _SourceWindowBuilder()
+    for piece in _iter_redacted_text_pieces(root, path):
+        yield from builder.feed(piece)
+    yield from builder.finish()
+
+
+def _snippet_from_redacted_text(redacted: str, query_text: str) -> str:
     terms = [term.casefold() for term in query_text.split() if term.strip()]
     lowered = redacted.casefold()
     hit_at = -1
@@ -3226,6 +4571,53 @@ def snippet_from_file(root: Path, rel_path: str, query_text: str, *, fallback: s
     if end < len(redacted):
         snippet += "..."
     return snippet[:SNIPPET_MAX_BYTES]
+
+
+def snippet_from_file(root: Path, rel_path: str, query_text: str, *, fallback: str, expected_sha: str | None = None) -> str:
+    path = root / rel_path
+    source_state = _indexable_text_stat(root, path)
+    if source_state is None:
+        return f"[stale index: source unavailable; run ai index rebuild] {fallback}"
+    if source_state.st_size > MAX_TEXT_BYTES and not _is_generated_path(root, path):
+        builder = _SourceWindowBuilder()
+        first_window = ""
+        matched = ""
+        try:
+            for piece in _iter_redacted_text_pieces(root, path):
+                for window in builder.feed(piece):
+                    if not first_window:
+                        first_window = window.text
+                    if not matched and any(
+                        term.casefold() in window.text.casefold()
+                        for term in query_text.split()
+                        if term.strip()
+                    ):
+                        matched = window.text
+            for window in builder.finish():
+                if not first_window:
+                    first_window = window.text
+                if not matched and any(
+                    term.casefold() in window.text.casefold()
+                    for term in query_text.split()
+                    if term.strip()
+                ):
+                    matched = window.text
+        except (OSError, UnicodeDecodeError):
+            return f"[stale index: source unavailable; run ai index rebuild] {fallback}"
+        if expected_sha and builder.digest != expected_sha:
+            return f"[stale index: source changed; run ai index rebuild] {fallback}"
+        return _snippet_from_redacted_text(matched or first_window, query_text) or fallback
+
+    loaded = _read_indexable_text(root, path)
+    if loaded is None:
+        return f"[stale index: source unavailable; run ai index rebuild] {fallback}"
+    content, _source_state = loaded
+    redacted = str(redact_value(content))
+    if expected_sha:
+        current_sha = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+        if current_sha != expected_sha:
+            return f"[stale index: source changed; run ai index rebuild] {fallback}"
+    return _snippet_from_redacted_text(redacted, query_text)
 
 
 def escape_fts_query(text: str) -> str:

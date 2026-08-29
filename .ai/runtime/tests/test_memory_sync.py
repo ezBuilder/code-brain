@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
 from ai_core.memory_sync import peer_sync_summary, sync_enabled, sync_once  # noqa: E402
+from ai_core import memory, memory_sync as memory_sync_module  # noqa: E402
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -78,6 +79,43 @@ def _clone(tmp_path: Path, remote: Path, name: str) -> Path:
     return dst
 
 
+def _private_audit_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "private-audit"
+    repo.mkdir()
+    _gok(repo, "init", "-q")
+    _config(repo)
+    (repo / ".gitignore").write_text(".ai/memory/**\n", encoding="utf-8")
+    attributes = repo / ".ai" / ".gitattributes"
+    attributes.parent.mkdir(parents=True)
+    attributes.write_text(
+        "*.jsonl merge=union text eol=lf\n"
+        "memory/audit/*.jsonl -merge text eol=lf\n"
+        "memory/daily/*.md merge=union text eol=lf\n"
+        "*.enc.yaml -merge\n"
+        "* text=auto eol=lf\n",
+        encoding="utf-8",
+    )
+    (repo / "code.py").write_text("print(1)\n", encoding="utf-8")
+    _gok(repo, "add", ".gitignore", ".ai/.gitattributes", "code.py")
+    _gok(repo, "commit", "-q", "-m", "init")
+    return repo
+
+
+def _seed_segmented_audit(repo: Path, monkeypatch) -> list[Path]:
+    monkeypatch.setattr(memory, "_AUDIT_MAX_BYTES", 2_000)
+    monkeypatch.setattr(memory, "_AUDIT_LINE_MAX_BYTES", 400)
+    for index in range(50):
+        memory.append_audit(
+            repo,
+            action="test.private.sync",
+            category="test",
+            payload={"index": index, "padding": "x" * 80},
+        )
+    files = memory.all_audit_files(repo)
+    assert len(files) >= 3
+    return files
+
+
 def test_sync_commits_only_memory_not_code_and_pushes(tmp_path: Path) -> None:
     remote, mac = _origin_with_mac(tmp_path)
     # change BOTH a memory file and a code file (uncommitted)
@@ -90,6 +128,59 @@ def test_sync_commits_only_memory_not_code_and_pushes(tmp_path: Path) -> None:
     assert "code.py" not in files  # code is never committed by the sync
     # the code edit stays uncommitted in the working tree
     assert "code.py" in _gok(mac, "status", "--porcelain")
+
+
+def test_raw_audit_sync_requires_private_confirmation_and_stages_complete_ignored_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = _private_audit_repo(tmp_path)
+    files = _seed_segmented_audit(repo, monkeypatch)
+    head_before = _gok(repo, "rev-parse", "HEAD").strip()
+
+    refused = sync_once(repo, agent="test", push=False)
+
+    assert refused["ok"] is False
+    assert "private-remote-confirmation-required" in refused["errors"]
+    assert _gok(repo, "rev-parse", "HEAD").strip() == head_before
+
+    synced = sync_once(
+        repo,
+        agent="test",
+        push=False,
+        private_remote_confirmed=True,
+    )
+    tracked = set(_gok(repo, "ls-files", ".ai/memory/audit").splitlines())
+    expected = {path.relative_to(repo).as_posix() for path in files}
+
+    assert synced["committed"] is True
+    assert tracked == expected
+    assert ".ai/memory/audit-index.jsonl" not in _gok(repo, "ls-files").splitlines()
+    assert not any(path.endswith(".lock") for path in _gok(repo, "ls-files").splitlines())
+
+
+def test_raw_audit_sync_refuses_tracked_segment_deletion(tmp_path: Path, monkeypatch) -> None:
+    repo = _private_audit_repo(tmp_path)
+    files = _seed_segmented_audit(repo, monkeypatch)
+    first = sync_once(
+        repo,
+        agent="test",
+        push=False,
+        private_remote_confirmed=True,
+    )
+    assert first["committed"] is True
+    head_before = _gok(repo, "rev-parse", "HEAD").strip()
+    files[0].unlink()
+
+    refused = sync_once(
+        repo,
+        agent="test",
+        push=False,
+        private_remote_confirmed=True,
+    )
+
+    assert refused["ok"] is False
+    assert any(error.startswith("audit-segment-missing:") for error in refused["errors"])
+    assert _gok(repo, "rev-parse", "HEAD").strip() == head_before
 
 
 def test_sync_commits_memory_even_with_gitignored_agents_md(tmp_path: Path) -> None:
@@ -201,11 +292,45 @@ def test_sync_steals_a_stale_lock(tmp_path: Path) -> None:
     (mac / ".ai" / "memory" / "decisions.jsonl").write_text('{"id":"d1"}\n{"id":"d2"}\n', encoding="utf-8")
     lock = mac / ".ai" / "cache" / "memory-sync.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("123 crashed", encoding="utf-8")
+    lock.write_text("999999999 crashed", encoding="utf-8")
     old = time.time() - 9999
     os.utime(lock, (old, old))
     res = sync_once(mac, agent="claude")
     assert res["committed"] and not res["skipped_lock"], res
+
+
+def test_sync_never_steals_stale_lock_from_live_owner(tmp_path: Path) -> None:
+    remote, mac = _origin_with_mac(tmp_path)
+    lock = mac / ".ai" / "cache" / "memory-sync.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(f"{os.getpid()} still-running", encoding="utf-8")
+    old = time.time() - 9999
+    os.utime(lock, (old, old))
+
+    result = sync_once(mac, agent="claude")
+
+    assert result["ok"] is True
+    assert result["skipped_lock"] is True
+    assert lock.exists()
+
+
+def test_sync_lock_infrastructure_error_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        memory_sync_module,
+        "_acquire_sync_lock",
+        lambda _root: ("error", None),
+    )
+    monkeypatch.setattr(
+        memory_sync_module,
+        "_sync_once_locked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sync cycle must not run")),
+    )
+
+    result = sync_once(tmp_path, agent="claude")
+
+    assert result["ok"] is False
+    assert result["skipped_lock"] is True
+    assert result["errors"] == ["sync-lock-unavailable"]
 
 
 def test_sync_enabled_reads_config(tmp_path: Path) -> None:

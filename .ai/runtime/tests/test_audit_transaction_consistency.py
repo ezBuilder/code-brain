@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
 
-from ai_core import audit_fold, memory
+from ai_core import audit_fold, doctor, memory
 
 
 def _record(action: str, *, days_old: int) -> str:
@@ -75,7 +75,42 @@ def test_rebuild_and_append_are_serialized_without_duplicate_index_rows(
     assert actions.count("second.action") == 1
 
 
-def test_fold_rebuilds_derived_index_to_match_rewritten_audit(tmp_path: Path) -> None:
+def test_doctor_audit_index_snapshot_blocks_concurrent_append(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "repo"
+    memory.append_audit(root, action="first.action", category="test", payload={})
+    snapshot_started = Event()
+    allow_snapshot = Event()
+    real_snapshot = doctor._check_audit_index_snapshot
+
+    def paused_snapshot(candidate: Path):
+        snapshot_started.set()
+        assert allow_snapshot.wait(timeout=5)
+        return real_snapshot(candidate)
+
+    monkeypatch.setattr(doctor, "_check_audit_index_snapshot", paused_snapshot)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        check_future = pool.submit(doctor.check_audit_index, root)
+        assert snapshot_started.wait(timeout=5)
+        append_future = pool.submit(
+            memory.append_audit,
+            root,
+            action="second.action",
+            category="test",
+            payload={},
+        )
+        time.sleep(0.05)
+        assert append_future.done() is False
+        allow_snapshot.set()
+        assert check_future.result(timeout=5).ok is True
+        append_future.result(timeout=5)
+
+    assert doctor.check_audit_index(root).ok is True
+
+
+def test_fold_leaves_raw_and_derived_index_unchanged(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     audit = memory.audit_path(root)
     audit.parent.mkdir(parents=True)
@@ -95,9 +130,9 @@ def test_fold_rebuilds_derived_index_to_match_rewritten_audit(tmp_path: Path) ->
     ]
     index_actions = _index_actions(root)
     assert sorted(index_actions) == sorted(audit_actions)
-    assert "old.action" not in index_actions
+    assert "old.action" in index_actions
     assert "recent.action" in index_actions
-    assert "_folded" in index_actions
+    assert (root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl").exists()
 
 
 def test_fold_and_append_leave_index_exactly_consistent(
@@ -144,5 +179,6 @@ def test_fold_and_append_leave_index_exactly_consistent(
         if line.strip()
     ]
     assert sorted(_index_actions(root)) == sorted(audit_actions)
-    assert audit_actions.count("_folded") == 1
+    assert audit_actions.count("old.action") == 1
     assert audit_actions.count("concurrent.action") == 1
+    assert (root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl").exists()

@@ -72,10 +72,11 @@ def test_task_created_records_todo(tmp_root: Path) -> None:
     assert any(p.get("status") == "open" for p in parsed)
 
 
-def test_task_completed_closes_matching_todo(tmp_root: Path) -> None:
+def test_task_completed_lifecycle_does_not_close_before_quality_gate(tmp_root: Path) -> None:
     from ai_core.hooks import _handle_lifecycle_event
 
-    # Seed: create then complete
+    # Lifecycle dispatch records the completion request.  The public handle_hook path
+    # closes the todo only after the TaskCompleted quality gate allows it.
     _handle_lifecycle_event(tmp_root, "TaskCreated", {"title": "Add P1 audit"})
     _handle_lifecycle_event(tmp_root, "TaskCompleted", {"title": "Add P1 audit"})
     todos = (tmp_root / ".ai" / "memory" / "todos.jsonl").read_text(encoding="utf-8")
@@ -84,9 +85,7 @@ def test_task_completed_closes_matching_todo(tmp_root: Path) -> None:
         for line in todos.splitlines()
         if line.strip()
     ]
-    # Both the original "open" record AND the close record must exist
-    assert "open" in statuses
-    assert "done" in statuses
+    assert statuses == ["open"]
 
 
 def test_task_completed_without_match_is_no_op(tmp_root: Path) -> None:

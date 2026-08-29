@@ -27,6 +27,7 @@ from ai_core.recommend import (  # noqa: E402
     upsert_pending_candidate,
     _candidate_id,
     _danger_match,
+    _frontmatter,
     _hyphen_encode_path,
     _read_marker,
     _sha256,
@@ -218,6 +219,72 @@ def test_accept_refuses_user_owned(tmp_root: Path):
     assert res["reason"] == "user_owned_target"
 
 
+def test_frontmatter_description_is_one_escaped_yaml_scalar():
+    description = 'safe\nmanaged-by: attacker\nquoted: "value"\n# not a comment'
+    frontmatter = _frontmatter(description, "sk-safe", "a" * 64)
+
+    description_lines = [line for line in frontmatter.splitlines() if line.startswith("description:")]
+    assert len(description_lines) == 1
+    encoded = description_lines[0].split(":", 1)[1].strip()
+    assert json.loads(encoded) == description
+    assert not any(line.startswith("managed-by: attacker") for line in frontmatter.splitlines())
+    assert not any(line.startswith("quoted:") for line in frontmatter.splitlines())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
+def test_accept_refuses_existing_external_symlink_without_following_or_overwriting(tmp_root: Path):
+    _seed_decisions(tmp_root, "release", 4)
+    candidate = recommend(tmp_root, include_global=False, min_signal=3)["candidates"][0]
+    target = tmp_root / ".claude" / "commands" / f"{candidate['slug']}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    external = tmp_root / "external-skill.md"
+    original = "user-owned\n"
+    external.write_text(original, encoding="utf-8")
+    target.symlink_to(external)
+
+    result = accept(tmp_root, candidate["id"])
+
+    assert result == {
+        "ok": False,
+        "reason": "user_owned_target",
+        "path": f".claude/commands/{candidate['slug']}.md",
+    }
+    assert external.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")
+def test_accept_refuses_existing_external_hardlink_without_replacing_inode(tmp_root: Path):
+    _seed_decisions(tmp_root, "release", 4)
+    candidate = recommend(tmp_root, include_global=False, min_signal=3)["candidates"][0]
+    target = tmp_root / ".claude" / "commands" / f"{candidate['slug']}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    external = tmp_root / "external-skill.md"
+    original = "user-owned\n"
+    external.write_text(original, encoding="utf-8")
+    os.link(external, target)
+
+    result = accept(tmp_root, candidate["id"])
+
+    assert result["ok"] is False
+    assert result["reason"] == "user_owned_target"
+    assert external.read_text(encoding="utf-8") == original
+    assert target.stat().st_ino == external.stat().st_ino
+
+
+def test_accept_writes_all_targets_confined_private_and_replaces_only_managed_files(tmp_root: Path):
+    _seed_decisions(tmp_root, "release", 4)
+    candidate = recommend(tmp_root, include_global=False, min_signal=3)["candidates"][0]
+    result = accept(tmp_root, candidate["id"])
+
+    assert result["ok"] is True
+    for relative in result["installed_paths"]:
+        path = tmp_root / relative
+        assert path.is_file()
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert path.resolve().is_relative_to(tmp_root.resolve())
+
+
 def test_uninstall_drift_protection(tmp_root: Path):
     _seed_decisions(tmp_root, "rollout", 4)
     rec = recommend(tmp_root, include_global=False, min_signal=3)
@@ -232,6 +299,65 @@ def test_uninstall_drift_protection(tmp_root: Path):
     res2 = uninstall(tmp_root, cand["slug"], force=True)
     assert res2["ok"]
     assert not target.exists()
+
+
+def test_uninstall_rejects_catalog_path_escape_without_external_deletion(tmp_root: Path) -> None:
+    outside = tmp_root.parent / "outside-skill.md"
+    outside.write_text("user-owned\n", encoding="utf-8")
+    entry = CatalogEntry(
+        id="sk-tampered",
+        slug="safe-skill",
+        status="installed",
+        draft={"description": "safe", "body": "safe"},
+        evidence={},
+        created_at="2026-05-20T00:00:00Z",
+        installed_paths=["../outside-skill.md"],
+        body_sha256=_sha256("safe"),
+    )
+    append_jsonl(catalog_path(tmp_root), entry.to_record())
+
+    result = uninstall(tmp_root, entry.slug, force=True)
+
+    assert result == {"ok": False, "reason": "unsafe_installed_path"}
+    assert outside.read_text(encoding="utf-8") == "user-owned\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
+def test_uninstall_rejects_symlink_before_removing_any_managed_target(tmp_root: Path) -> None:
+    _seed_decisions(tmp_root, "cleanup", 4)
+    candidate = recommend(tmp_root, include_global=False, min_signal=3)["candidates"][0]
+    installed = accept(tmp_root, candidate["id"])
+    paths = [tmp_root / rel for rel in installed["installed_paths"]]
+    external = tmp_root / "external-user-file.md"
+    external.write_text("user-owned\n", encoding="utf-8")
+    paths[0].unlink()
+    paths[0].symlink_to(external)
+
+    result = uninstall(tmp_root, candidate["slug"], force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "unsafe_installed_path"
+    assert external.read_text(encoding="utf-8") == "user-owned\n"
+    assert all(path.exists() for path in paths[1:])
+
+
+def test_pending_and_installed_descriptions_are_redacted(tmp_root: Path) -> None:
+    secret = "AKIA" + ("A" * 16)
+    candidate = Candidate(
+        id="sk-redacted",
+        slug="redacted-skill",
+        description=f"credential {secret}",
+        body=f"Never persist {secret}",
+        evidence={"sample": secret},
+    )
+
+    pending = upsert_pending_candidate(tmp_root, candidate)
+    assert secret not in json.dumps(pending.to_record())
+    result = accept(tmp_root, pending.id)
+
+    assert result["ok"] is True
+    for rel in result["installed_paths"]:
+        assert secret not in (tmp_root / rel).read_text(encoding="utf-8")
 
 
 def test_accept_rejects_danger_pattern(tmp_root: Path):

@@ -16,7 +16,12 @@ from .memory import (
     read_text_tail as _read_text_tail,
 )
 from .policy import is_ci
-from .private_write import atomic_write_private_text, read_root_confined_text
+from .private_write import (
+    atomic_write_private_text,
+    private_file_lock,
+    read_root_confined_text,
+    validate_root_confined_regular_file,
+)
 from .redact import redact_value
 
 import os as _os
@@ -62,13 +67,21 @@ TODOS_LIMIT = 3
 SESSION_TAIL_LINES = 4
 PRIOR_SESSION_TAIL_LINES = 4
 
-KNOWN_AGENTS = {"claude", "codex", "antigravity"}
+KNOWN_AGENTS = {"claude", "codex", "antigravity", "kiro"}
+
+# Events whose native host contract can prevent a turn or worker from ending. Keep
+# task/teammate quality gates separate from actual turn-end hooks: their wire contract is
+# exit-code based on Claude, and a task may finish while the request-level plan continues.
+_STOP_LIKE_HOOKS = frozenset({"Stop", "SubagentStop"})
+_QUALITY_GATE_HOOKS = frozenset({"TaskCompleted", "TeammateIdle"})
+_COMPLETION_GUARD_HOOKS = _STOP_LIKE_HOOKS | _QUALITY_GATE_HOOKS
 
 
 def normalize_agent(payload: dict[str, Any]) -> str:
     """Map a hook payload's agent identifier to one of the canonical names.
 
-    Returns one of ``claude``, ``codex``, ``antigravity``, or ``unknown``. We
+    Returns a canonical host name such as ``claude``, ``codex``, ``antigravity``,
+    ``kiro``, or ``unknown``. We
     prefer an explicit ``agent`` (or ``agent_name``) field. Antigravity command
     hooks do not provide one, so their documented camelCase payload signature
     (``conversationId``/``workspacePaths``/``terminationReason``/``fullyIdle``)
@@ -81,6 +94,7 @@ def normalize_agent(payload: dict[str, Any]) -> str:
         "claude": "claude", "claude-code": "claude", "claudecode": "claude",
         "codex": "codex", "codex-cli": "codex",
         "antigravity": "antigravity", "agy": "antigravity", "antigravity-cli": "antigravity",
+        "kiro": "kiro", "kiro-cli": "kiro", "kiro-ide": "kiro",
     }
     if norm in aliases:
         return aliases[norm]
@@ -92,12 +106,17 @@ def normalize_agent(payload: dict[str, Any]) -> str:
     ):
         return "antigravity"
     env = _os.environ
+    explicit_env = str(env.get("AI_HOOK_AGENT") or "").strip().lower()
+    if explicit_env in aliases:
+        return aliases[explicit_env]
     if env.get("CLAUDE_PROJECT_DIR"):
         return "claude"
     if env.get("CODEX_HOME") or env.get("CODEX_TURN_ID"):
         return "codex"
     if env.get("ANTIGRAVITY_CLI") or env.get("AGY_HOME"):
         return "antigravity"
+    if env.get("KIRO_CLI") or env.get("KIRO_HOME"):
+        return "kiro"
     return "unknown"
 DELTA_NOTICE_SHORT = "cb-ctx: Δ"
 DELTA_NOTICE_VERBOSE = "Code Brain context unchanged since last injection (delta-skipped)."
@@ -163,6 +182,50 @@ def _maybe_apply_delta(root: Path, hook_name: str, full_context: str) -> tuple[s
     return full_context, False, original_bytes
 
 
+def _claim_background_cooldown(
+    root: Path,
+    marker: Path,
+    cooldown_seconds: float,
+    *,
+    marker_value: str | None = None,
+) -> bool:
+    """Atomically admit at most one detached job per cooldown window.
+
+    Hook events can arrive concurrently from multiple host processes.  A plain
+    ``exists/stat/write`` sequence lets every contender pass before any marker is
+    written, multiplying detached children.  Serialize the marker transaction with
+    a separate private file lock and fail closed on untrusted marker paths.
+    """
+    marker = Path(marker)
+    guard = marker.with_name(f".{marker.name}.claim.lock")
+    try:
+        with private_file_lock(guard, root=Path(root)):
+            try:
+                state = validate_root_confined_regular_file(
+                    marker,
+                    root=Path(root),
+                    require_owner=True,
+                    reject_group_other_writable=True,
+                )
+            except FileNotFoundError:
+                state = None
+            except OSError:
+                return False
+            now = time.time()
+            if (
+                state is not None
+                and float(cooldown_seconds) > 0
+                and now - float(state.st_mtime) < float(cooldown_seconds)
+            ):
+                return False
+            atomic_write_private_text(
+                marker, marker_value if marker_value is not None else str(now), root=Path(root)
+            )
+            return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _spawn_background_rebuild(root: Path) -> None:
     import os
     import subprocess
@@ -198,7 +261,7 @@ def _spawn_background_rebuild(root: Path) -> None:
         pass
 
 
-def _spawn_agents_md_refresh(root: Path) -> None:
+def _spawn_agents_md_refresh(root: Path, agent: str = "") -> None:
     """Refresh the managed AGENTS.md memory block in a DETACHED process.
 
     Older Antigravity builds could end a slow ``Stop`` command before a synchronous
@@ -207,6 +270,15 @@ def _spawn_agents_md_refresh(root: Path) -> None:
     Running the refresh detached (own session, like _spawn_background_rebuild)
     keeps side effects out of that decision budget. The refresh is write-on-change, so
     repeated spawns don't churn AGENTS.md. Never raises into the hook hot path.
+
+    Host-aware single-sourcing: Claude Code auto-loads only ``CLAUDE.md``, never
+    ``AGENTS.md`` — refreshing the root ``AGENTS.md`` mirror for a Claude turn would be
+    pure wasted work (there is no reader on that host). Codex CLI DOES auto-load root
+    ``AGENTS.md``, but the mirrored block is DYNAMIC-ONLY and fingerprint-checked (see
+    ``ai_core.agents_md``), so a Codex refresh is not duplication — it is what keeps the
+    file current for whichever host (Codex again, or Antigravity, which has no hook path
+    at all) reads it next, and lets Codex's own next SessionStart see ``is_current() ==
+    True`` and skip re-injecting the dynamic body via the hook.
     """
     import os
     import subprocess
@@ -216,6 +288,8 @@ def _spawn_agents_md_refresh(root: Path) -> None:
 
     if _env_disabled("AI_AGENTS_MD_MEMORY", default="1"):
         return
+    if agent == "claude":
+        return
     # Cooldown: PostToolUse can fire many times per turn. Spawn at most once per
     # window so we don't launch a build_context process on every tool call.
     try:
@@ -223,13 +297,8 @@ def _spawn_agents_md_refresh(root: Path) -> None:
     except (TypeError, ValueError):
         cooldown = 15.0
     lock = root / ".ai" / "cache" / "agents_md_refresh.lock"
-    try:
-        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
-            return
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text(str(time.time()), encoding="utf-8")
-    except Exception:
-        pass
+    if not _claim_background_cooldown(root, lock, cooldown):
+        return
     src = str(root / ".ai" / "runtime" / "src")
     code = (
         "import sys;from pathlib import Path;"
@@ -276,13 +345,8 @@ def _spawn_turn_report(root: Path, agent: str) -> None:
     except (TypeError, ValueError):
         cooldown = 10.0
     lock = root / ".ai" / "cache" / "turn_report.lock"
-    try:
-        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
-            return
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text(str(time.time()), encoding="utf-8")
-    except Exception:
-        pass
+    if not _claim_background_cooldown(root, lock, cooldown):
+        return
     src = str(root / ".ai" / "runtime" / "src")
     code = (
         "import sys;from pathlib import Path;"
@@ -327,20 +391,18 @@ def _spawn_tokens_cache_refresh(root: Path) -> None:
 
     from .portable import detached_popen_kwargs
 
-    if _env_disabled("AI_PROMPT_GROWTH"):
+    # Explicit opt-in (default off): nothing reads this cache unless prompt_growth
+    # itself is enabled, so spawning the multi-second transcript scan by default would
+    # be a pure-waste background process on every Stop/SessionEnd.
+    if _env_disabled("AI_PROMPT_GROWTH", default="0"):
         return
     try:
         cooldown = float(os.environ.get("AI_PROMPT_GROWTH_TOKENS_COOLDOWN", "3600"))
     except (TypeError, ValueError):
         cooldown = 3600.0
     lock = root / ".ai" / "cache" / "prompt_growth_tokens.lock"
-    try:
-        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
-            return
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text(str(time.time()), encoding="utf-8")
-    except Exception:
-        pass
+    if not _claim_background_cooldown(root, lock, cooldown):
+        return
     src = str(root / ".ai" / "runtime" / "src")
     code = (
         "import sys;from pathlib import Path;"
@@ -360,51 +422,6 @@ def _spawn_tokens_cache_refresh(root: Path) -> None:
                 stdin=subprocess.DEVNULL,
                 cwd=str(root),
                 env=env,
-                **detached_popen_kwargs(),
-            )
-    except Exception:
-        pass
-
-
-def _spawn_memory_sync(root: Path, agent: str) -> None:
-    """Spawn the opt-in cross-machine memory sync DETACHED (off the hook hot path). The
-    sync does git fetch/push; this only launches it. No-op unless memory_sync.enabled, and
-    a cooldown bounds how often it runs so rapid turn-end Stops don't hammer the remote."""
-    import os
-    import subprocess
-
-    from .portable import detached_popen_kwargs
-
-    try:
-        from .memory_sync import sync_enabled
-
-        if not sync_enabled(root):
-            return
-    except Exception:
-        return
-    try:
-        cooldown = float(os.environ.get("AI_MEMORY_SYNC_COOLDOWN", "120"))
-    except (TypeError, ValueError):
-        cooldown = 120.0
-    lock = root / ".ai" / "cache" / "memory_sync.lock"
-    try:
-        if cooldown > 0 and lock.exists() and (time.time() - lock.stat().st_mtime) < cooldown:
-            return
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text(str(time.time()), encoding="utf-8")
-    except OSError:
-        pass
-    ai_bin = root / ".ai" / "bin" / "ai"
-    if not ai_bin.exists():
-        return
-    try:
-        with open(os.devnull, "wb") as devnull:
-            subprocess.Popen(
-                [str(ai_bin), "memory", "sync", "--agent", agent, "--json"],
-                stdout=devnull,
-                stderr=devnull,
-                stdin=subprocess.DEVNULL,
-                cwd=str(root),
                 **detached_popen_kwargs(),
             )
     except Exception:
@@ -453,22 +470,11 @@ def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
     if _env_disabled("AI_SLEEP_TIME", default="1"):
         return {"ok": True, "spawned": [], "skipped": True, "reason": "AI_SLEEP_TIME disabled"}
 
-    # Lock-based dedup (600s cooldown)
+    # Cross-process cooldown admission.  The marker update must be one locked
+    # transaction or concurrent Stop/SessionEnd events multiply every child job.
     lock_path = root / ".ai" / "cache" / "sleep-time.lock"
-    try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        if lock_path.exists():
-            age = time.time() - lock_path.stat().st_mtime
-            if age < 600:
-                return {"ok": True, "spawned": [], "skipped": True, "reason": "lock_recent"}
-    except OSError:
-        pass
-
-    # Update lock
-    try:
-        lock_path.write_text("running", encoding="utf-8")
-    except OSError:
-        pass
+    if not _claim_background_cooldown(root, lock_path, 600, marker_value="running"):
+        return {"ok": True, "spawned": [], "skipped": True, "reason": "lock_recent"}
 
     # Resolve ai binary
     from .portable import IS_WINDOWS, detached_popen_kwargs
@@ -566,35 +572,14 @@ def _spawn_sleep_time_jobs(root: Path) -> dict[str, Any]:
     except Exception:
         pass
 
-    # Job 4 (P3): refresh origin refs so SessionStart's cb-behind banner can detect a
-    # remote machine being ahead. Network — so OPT-IN only (AI_REMOTE_FETCH=1), keeping
-    # Code Brain's offline-by-default ethos. Detached + off the hook hot path; failures
-    # (offline, no remote, auth) are swallowed. SessionStart never fetches; it only reads
-    # the ref this job updated.
-    if _env_enabled("AI_REMOTE_FETCH"):
-        try:
-            from .process_janitor import register_child
-
-            cmd = ["git", "-C", str(root), "fetch", "--quiet", "--no-tags"]
-            with open(os.devnull, "wb") as devnull:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=devnull,
-                    stderr=devnull,
-                    stdin=subprocess.DEVNULL,
-                    cwd=str(root),
-                    **detached_popen_kwargs(),
-                )
-            register_child(root, pid=proc.pid, kind="sleep_time_git_fetch", command=cmd)
-            spawned.append(f"git_fetch(pid={proc.pid})")
-        except Exception:
-            pass
-
-    # Job 5 (T30 step C): memory page-in — consolidate a compact, salience-ranked
+    # Job 4 (T30 step C): memory page-in — consolidate a compact, salience-ranked
     # HOT cache so the next SessionStart injects a tighter, fewer-token context.
     # Deterministic + offline; ordered AFTER page-out so tiers settle first.
-    # Opt-out via AI_MEMORY_PAGE_IN=0/off (default on). Detached, swallows errors.
-    if not _env_disabled("AI_MEMORY_PAGE_IN", default="1"):
+    # Explicit opt-in: the ranked HOT cache is an optional optimization, not required
+    # for bounded retention or correctness. Keeping it off avoids an otherwise unused
+    # detached process on every sleep-time cycle; page-out below remains always-on for
+    # storage rotation/folding.
+    if _env_enabled("AI_MEMORY_PAGE_IN", default="0"):
         try:
             from .process_janitor import register_child
 
@@ -1506,8 +1491,12 @@ def _session_scope_summary(root: Path) -> str:
         count += 1
     if not found_start or count < threshold:
         return ""
+    # Do not include the live count: it changes after every hook event and used to defeat
+    # UserPromptSubmit's whole-context delta cache, re-injecting ~2 KiB every turn once
+    # the threshold was crossed. The threshold is enough actionable information and stays
+    # byte-stable until the next SessionStart.
     return (
-        f"cb-scope: {count} audit events since SessionStart — "
+        f"cb-scope: long session ({threshold}+ audit events) — "
         "if the topic has shifted, `/clear` before continuing."
     )
 
@@ -1604,6 +1593,7 @@ def read_payload(stdin: str | None = None) -> dict[str, Any]:
 def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> dict[str, Any]:
     start = time.perf_counter()
     effective_hook = hook_name or payload.get("hook") or payload.get("event") or "unknown"
+    host_agent = normalize_agent(payload)
     antigravity_first_invocation = (
         effective_hook == "PreInvocation"
         and str(payload.get("invocationNum", "")).strip() == "0"
@@ -1626,7 +1616,7 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             reset_counter(root, sid)
         except Exception:
             pass
-    if effective_hook in {"SessionStart", "Stop", "SubagentStop"} and not (is_ci() or payload.get("dry") is True):
+    if effective_hook in {"SessionStart", "Stop", "SubagentStop", "StopFailure", "Interrupt"} and not (is_ci() or payload.get("dry") is True):
         try:
             from .process_janitor import cleanup_children
             cleanup_children(root)
@@ -1769,16 +1759,18 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
         # older hosts. A cooldown in the helper
         # bounds frequency; the refresh is write-on-change and detached so it finishes
         # even if the host kills the parent hook.
-        if effective_hook in {"Stop", "SessionEnd", "PostToolUse"}:
-            _spawn_agents_md_refresh(root)
+        if effective_hook in {"Stop", "SessionEnd", "StopFailure", "Interrupt", "PostToolUse"}:
+            _spawn_agents_md_refresh(root, agent=host_agent)
         # Turn-change snapshot: same trigger set as the AGENTS.md refresh. Detached;
         # git facts only, never part of the synchronous Stop decision.
-        if effective_hook in {"Stop", "SessionEnd"}:
-            _spawn_turn_report(root, normalize_agent(payload))
+        if effective_hook in {"Stop", "SessionEnd", "StopFailure", "Interrupt"}:
+            _spawn_turn_report(root, host_agent)
             # Same reason, different cost centre: the transcript aggregation that feeds
             # prompt_growth's `baseline_tokens` is a multi-second scan, so it is refreshed
-            # out-of-band and the hook only ever reads its TTL cache.
-            _spawn_tokens_cache_refresh(root)
+            # out-of-band and the hook only ever reads its TTL cache. Prompt growth is
+            # explicit opt-in, so its detached transcript scan must be off too.
+            if not _env_disabled("AI_PROMPT_GROWTH", default="0"):
+                _spawn_tokens_cache_refresh(root)
         if effective_hook in AUTO_REBUILD_HOOKS:
             _spawn_background_rebuild(root)
             try:
@@ -1799,7 +1791,11 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                         pass
             # Prompt growth: record this turn and let the deterministic loop grow the
             # project prompt. Background only (Stop hook), never blocks; fail-soft.
-            if not _env_disabled("AI_PROMPT_GROWTH"):
+            # Explicit opt-in (default off): this writes derived rules and spends a
+            # background transcript scan (_spawn_tokens_cache_refresh) on every turn it
+            # runs, which is unwanted cost/noise unless a project has deliberately
+            # turned the self-growth loop on.
+            if not _env_disabled("AI_PROMPT_GROWTH", default="0"):
                 try:
                     from . import prompt_growth
 
@@ -1819,9 +1815,10 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                                 pass
                 except Exception:
                     pass
-            # T35 autonomous page-out: when MemGPT pressure breaches threshold,
-            # the agent should not wait for a human `ai memory page-out` call.
-            if not _env_disabled("AI_AUTO_PAGE_OUT"):
+            # Optional inline pressure reaction. Bounded retention does not depend on
+            # this path: detached sleep-time page-out always performs rotation/folding.
+            # Default-off prevents an audit scan/fold from landing on the Stop hot path.
+            if _env_enabled("AI_AUTO_PAGE_OUT", default="0"):
                 try:
                     from .memory_tier import hot_pressure, page_out
 
@@ -1863,33 +1860,21 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                 _spawn_sleep_time_jobs(root)
             except Exception:
                 pass
-        if effective_hook in SLEEP_TIME_HOOKS:
-            # P4: opt-in cross-machine memory auto-sync. Detached + off the hot path; the
-            # sync itself does git fetch/push but this hook only spawns it. Gated by
-            # memory_sync.enabled and a cooldown so rapid turn-end Stops don't hammer git.
-            # Deliberately NOT extended to the fallback hooks: pushing at turn start
-            # would surprise the user mid-task.
-            _spawn_memory_sync(root, normalize_agent(payload))
-    elapsed_ms = int((time.perf_counter() - start) * 1000)
+        # Cross-machine memory auto-sync (git fetch/push) is intentionally NOT spawned
+        # from any hook: the project's own contract forbids network I/O on the hooks/MCP
+        # hot path, and a background process launched FROM the hook is still the hook
+        # causing network I/O even when detached. Use the explicit `ai memory sync`
+        # command instead (one-shot or --loop daemon). A lingering
+        # memory_sync.enabled: true in .ai/config.yaml is a deprecated no-op, diagnosed
+        # once per session by `ai doctor` rather than silently reactivating an automatic
+        # spawn.
     target_ms = _target_ms_for(effective_hook)
-    if persisted and elapsed_ms > target_ms:
-        try:
-            from .memory import append_audit
-
-            append_audit(
-                root,
-                action="hook.slow",
-                category="hook",
-                payload={"hook": effective_hook, "elapsed_ms": elapsed_ms, "target_ms": target_ms},
-            )
-        except Exception:
-            pass
     response = {
         "ok": True,
         "hook": effective_hook,
         "mode": mode,
         "persisted": persisted,
-        "elapsed_ms": elapsed_ms,
+        "elapsed_ms": 0,
         "target_ms": target_ms,
         "additional_context_bytes": additional_context_bytes,
     }
@@ -2015,7 +2000,11 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
             response["dir_context"] = True
     # G3: Stop-hook plan continuation (opt-in via AI_LOOP_CONTINUATION, bounded). Only when NOT
     # already blocking for security — a security block must never be downgraded to a continuation.
-    if effective_hook in _STOP_LIKE_HOOKS and response.get("decision") != "block":
+    if (
+        effective_hook in _STOP_LIKE_HOOKS
+        and host_agent != "kiro"
+        and response.get("decision") != "block"
+    ):
         try:
             from .loop_continuation import continuation_directive
             cont = continuation_directive(payload, root)
@@ -2031,10 +2020,18 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
     # — it reads conflict markers, broken syntax, self-introduced TODOs and failed acceptance
     # instead of any self-report. Still second in line: an explicit plan names a better next
     # action than a derived signal ever can.
-    if effective_hook in _STOP_LIKE_HOOKS and response.get("decision") != "block":
+    if (
+        effective_hook in _COMPLETION_GUARD_HOOKS
+        and not (host_agent == "kiro" and effective_hook in _STOP_LIKE_HOOKS)
+        and response.get("decision") != "block"
+    ):
         try:
             from .completion_guard import guard_directive
-            guard = guard_directive(payload, root)
+            guard = guard_directive(
+                payload,
+                root,
+                include_plan=effective_hook in _STOP_LIKE_HOOKS,
+            )
             if guard:
                 response["decision"] = "block"
                 response["reason"] = guard
@@ -2053,13 +2050,39 @@ def handle_hook(root: Path, hook_name: str | None, payload: dict[str, Any]) -> d
                 response["completion_guard_notice"] = " ".join(notices)[:900]
         except Exception:
             pass
+    if effective_hook == "TaskCompleted" and persisted:
+        if response.get("decision") == "block":
+            try:
+                from .memory import append_audit
+
+                append_audit(
+                    root,
+                    action="task.completion_blocked",
+                    category="hook",
+                    payload={"task_id": str(payload.get("task_id") or "")[:64]},
+                )
+            except Exception:
+                pass
+        else:
+            _close_task_todo(root, payload)
+
+    # Measure after every synchronous decision and lifecycle side effect. Measuring before
+    # completion_guard used to under-report actual Stop/TaskCompleted latency.
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    response["elapsed_ms"] = elapsed_ms
+    if persisted and elapsed_ms > target_ms:
+        try:
+            from .memory import append_audit
+
+            append_audit(
+                root,
+                action="hook.slow",
+                category="hook",
+                payload={"hook": effective_hook, "elapsed_ms": elapsed_ms, "target_ms": target_ms},
+            )
+        except Exception:
+            pass
     return redact_value(response)
-
-
-# Turn-end events that can refuse to stop. SubagentStop uses the same decision contract as
-# Stop (Claude Code hooks reference, retrieved 2026-08-28), so a subagent that quits early is
-# caught by the same guard instead of silently handing back half-finished work.
-_STOP_LIKE_HOOKS = frozenset({"Stop", "SubagentStop"})
 
 
 def codex_wire_output(response: dict[str, Any]) -> dict[str, Any]:
@@ -2143,19 +2166,67 @@ def antigravity_wire_output(response: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def hook_wire_output(response: dict[str, Any], request_payload: dict[str, Any]) -> dict[str, Any]:
+def kiro_wire_output(response: dict[str, Any]) -> str | None:
+    """Project to Kiro's command-hook stdout contract.
+
+    Kiro adds successful command stdout to model context verbatim; emitting Codex JSON
+    therefore creates noisy context rather than a decision. Blocking PreToolUse and
+    UserPromptSubmit is expressed by a non-zero process status (``hook_exit_code``), while
+    Stop is observational in the current Kiro contract and cannot force continuation.
+    """
+    hook = str(response.get("hook") or "")
+    specific = response.get("hookSpecificOutput")
+    specific = specific if isinstance(specific, dict) else {}
+    if hook in {"SessionStart", "UserPromptSubmit"}:
+        context = specific.get("additionalContext") or response.get("additionalContext")
+        return str(context) if context else None
+    if hook == "Stop" and response.get("decision") == "block":
+        reason = str(response.get("reason") or "").strip()
+        return reason or None
+    return None
+
+
+def hook_wire_output(
+    response: dict[str, Any],
+    request_payload: dict[str, Any],
+) -> dict[str, Any] | str | None:
     """Select the strict wire schema from the ORIGINAL host hook payload."""
-    if normalize_agent(request_payload) == "antigravity":
+    agent = normalize_agent(request_payload)
+    if agent == "antigravity":
         return antigravity_wire_output(response)
+    if agent == "kiro":
+        return kiro_wire_output(response)
     out = codex_wire_output(response)
     # Claude's official universal `systemMessage` is user-visible without re-entering the model
     # loop. Keep it host-gated: other Claude-compatible runtimes may enforce a narrower schema.
-    if normalize_agent(request_payload) == "claude" and response.get("completion_guard_notice"):
+    if agent == "claude" and response.get("completion_guard_notice"):
         out["systemMessage"] = str(response["completion_guard_notice"])
     return out
 
 
-LIFECYCLE_SNAPSHOT_HOOKS = {"PreCompact", "SessionEnd"}
+def hook_exit_code(response: dict[str, Any], request_payload: dict[str, Any]) -> int:
+    """Return the host-native command status for decisions JSON cannot express."""
+    if response.get("decision") != "block":
+        return 0
+    hook = str(response.get("hook") or "")
+    agent = normalize_agent(request_payload)
+    if agent == "claude" and hook in _QUALITY_GATE_HOOKS:
+        return 2
+    if agent == "kiro" and hook in {"PreToolUse", "UserPromptSubmit", "PreTaskExec"}:
+        # Kiro documents exit 2 as the native blocking status for PreToolUse;
+        # it is also non-zero for Prompt Submit/PreTaskExec's blocking contract.
+        return 2
+    return 0
+
+
+def hook_stderr(response: dict[str, Any], request_payload: dict[str, Any]) -> str:
+    """Feedback text for host contracts that block by non-zero command status."""
+    if hook_exit_code(response, request_payload) == 0:
+        return ""
+    return str(response.get("reason") or "Blocked by Code Brain hook.")[:900]
+
+
+LIFECYCLE_SNAPSHOT_HOOKS = {"PreCompact", "SessionEnd", "StopFailure", "Interrupt"}
 
 
 def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any]) -> None:
@@ -2165,6 +2236,37 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
     Errors are swallowed by the caller — never break the hook hot path.
     """
     from .memory import append_audit
+
+    if hook_name in {"StopFailure", "Interrupt"}:
+        session_id = str(payload.get("session_id") or payload.get("sid") or "")
+        agent = normalize_agent(payload)
+        if hook_name == "StopFailure":
+            reason = str(payload.get("error") or "unknown")[:64]
+            details = str(payload.get("error_details") or "")[:200]
+            action = "session.stop_failure"
+            snapshot_reason = f"stop_failure_{reason}"
+            audit_payload = {"error": reason, "error_details": details, "session_id": session_id}
+        else:
+            reason = str(payload.get("reason") or payload.get("interrupt_reason") or "unknown")[:64]
+            action = "session.interrupt"
+            snapshot_reason = f"interrupt_{reason}"
+            audit_payload = {"reason": reason, "session_id": session_id}
+        if session_id:
+            try:
+                from .session_resume import write_snapshot
+
+                _auto_milestone_on_stale(root)
+                write_snapshot(
+                    root,
+                    session_id=session_id,
+                    agent=agent,
+                    force=True,
+                    reason=snapshot_reason,
+                )
+            except Exception:
+                pass
+        append_audit(root, action=action, category="memory", payload=audit_payload)
+        return
 
     if hook_name in LIFECYCLE_SNAPSHOT_HOOKS:
         session_id = str(payload.get("session_id") or payload.get("sid") or "")
@@ -2264,7 +2366,7 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
         return
 
     if hook_name == "CwdChanged":
-        prev = str(payload.get("previous_cwd") or "")
+        prev = str(payload.get("old_cwd") or payload.get("previous_cwd") or "")
         new = str(payload.get("new_cwd") or "")
         cross_project = False
         if prev and new:
@@ -2328,7 +2430,9 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
         return
 
     if hook_name == "TaskCreated":
-        title = str(payload.get("title") or payload.get("subject") or "").strip()
+        title = str(
+            payload.get("task_subject") or payload.get("title") or payload.get("subject") or ""
+        ).strip()
         if title:
             try:
                 from .memory import append_todo
@@ -2338,22 +2442,25 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
         return
 
     if hook_name == "TaskCompleted":
-        match = str(payload.get("title") or payload.get("subject") or payload.get("task_id") or "").strip()
-        if match:
-            try:
-                from .memory import close_todo
-                close_todo(root, match=match[:200], status="done", reason="task_hook")
-            except Exception:
-                pass
+        append_audit(
+            root,
+            action="task.completion_requested",
+            category="memory",
+            payload={
+                "task_id": str(payload.get("task_id") or "")[:64],
+                "task_subject": str(payload.get("task_subject") or "")[:200],
+            },
+        )
         return
 
     if hook_name == "FileChanged":
-        file_path = str(payload.get("file_path") or payload.get("path") or "")
+        file_path = str(payload.get("file_path") or payload.get("filePath") or payload.get("path") or "")
+        change_event = str(payload.get("event") or payload.get("changeType") or "")[:32]
         append_audit(
             root,
             action="file.changed",
             category="memory",
-            payload={"file_path": file_path[:200]},
+            payload={"file_path": file_path[:200], "event": change_event},
         )
         return
 
@@ -2368,6 +2475,20 @@ def _handle_lifecycle_event(root: Path, hook_name: str, payload: dict[str, Any])
         )
         return
 
+
+def _close_task_todo(root: Path, payload: dict[str, Any]) -> None:
+    """Close a mirrored Claude task only after its completion gate allowed closure."""
+    match = str(
+        payload.get("task_subject") or payload.get("title") or payload.get("subject") or ""
+    ).strip()
+    if not match:
+        return
+    try:
+        from .memory import close_todo
+
+        close_todo(root, match=match[:200], status="done", reason="task_hook_verified")
+    except Exception:
+        pass
 
 _FAILURE_MAX_SURFACE = 3   # bound the AS-OF block so it cannot push other sections off the budget cliff
 
@@ -2452,7 +2573,7 @@ def _lessons_context(root: Path, hook_name: str) -> str:
 
 def _learned_prompt_context(root: Path) -> str:
     """Inject auto-grown project rules (prompt growth). Empty until the loop has grown one."""
-    if _env_disabled("AI_PROMPT_GROWTH"):
+    if _env_disabled("AI_PROMPT_GROWTH", default="0"):
         return ""
     try:
         from . import prompt_growth
@@ -2496,23 +2617,42 @@ def _session_harness_context(root: Path) -> str:
     )
 
 
-def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None = None) -> str:
-    agent = normalize_agent(payload)
-    writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
-    header = f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={writes}."
-    if hook_name not in INJECTION_HOOKS or root is None:
-        return ""
-    sections = [header]
-    sections.append("Response: match the user's language; self-output <=10 words; answers concise by default; broad changes end with a brief key-point summary; expand for explicit detail or severe risk. No next-step outro; keep working.")
-    # Bounded turn-summary nudge: only when the PREVIOUS turn's measured change was large.
-    # Injected from UserPromptSubmit, never Stop. Claude can attach Stop additionalContext
-    # while blocking and Antigravity can continue, but either route re-opens the model turn,
-    # consumes the shared bounded continuation budget, and is not portable across all Codex
-    # hosts. Reserve that scarce channel for correctness/security, not prose formatting.
-    # Placed HERE, next to the standing response rule, because
-    # build_context truncates from the TAIL once the budget is hit (measured: this repo,
-    # navio, blurivo and fluxwright all already fill 2048B exactly), and a directive that
-    # gets silently truncated away is worse than none.
+def static_rule_sections() -> list[str]:
+    """The Response/Search/Read behavioural rules as a list of sections, in the exact
+    text ``build_context`` has always injected at SessionStart. Factored out so
+    ``ai_core.agents_md.render_block`` can embed the identical text inside the managed
+    AGENTS.md block's static sub-section (see agents_md.py): once that block is current,
+    Codex's own SessionStart hook skips re-injecting these lines (see build_context) rather
+    than only skipping the durable memory body — a single source of truth for the text
+    means the two paths can never drift out of sync with each other.
+    """
+    if _env_enabled("AI_ROUTING_HINT_COMPACT"):
+        routing = "Search: MCP `code_query`/`context_pack` before grep."
+    else:
+        routing = (
+            "Search: MCP `code_query`/`context_pack` first; graph tools for call paths; "
+            "`ai exec run -- rg/grep` only for exact fallback."
+        )
+    return [
+        "Response: match the user's language; self-output <=10 words; answers concise by default; broad changes end with a brief key-point summary; expand for explicit detail or severe risk. No next-step outro; keep working.",
+        routing,
+        "Read: before editing existing files, use exact target slices with "
+        "`code_read_hashline` or `.ai/bin/ai code read-hashline PATH --start START --end END`.",
+    ]
+
+
+def _build_volatile_sections(hook_name: str, payload: dict[str, Any], root: Path) -> list[str]:
+    """Sections that must NEVER be mirrored into the AGENTS.md managed block or judged by
+    its durable fingerprint: turn-change nudges, the git/remote-derived staleness banner,
+    and the codebase-map summary. All three depend on state (current branch, dirty tree,
+    remote-ahead, tracked-file layout) that changes far more often than the file-backed
+    memory below, and re-deriving/caching them per turn is exactly the cheap, per-turn
+    "volatile delta" the hook should keep doing — mirroring them into a once-per-refresh
+    file and skipping re-injection when "current" would silently show a stale branch/dirty
+    state whenever nothing else in memory happened to change that turn. Always appended by
+    build_context regardless of AGENTS.md currentness (see build_context).
+    """
+    sections: list[str] = []
     if hook_name == "UserPromptSubmit":
         try:
             from .turn_report import nudge_line
@@ -2522,18 +2662,6 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             turn_line = ""
         if turn_line:
             sections.append(turn_line)
-    if _env_enabled("AI_ROUTING_HINT_COMPACT"):
-        routing = "Search: MCP `code_query`/`context_pack` before grep."
-    else:
-        routing = (
-            "Search: MCP `code_query`/`context_pack` first; graph tools for call paths; "
-            "`ai exec run -- rg/grep` only for exact fallback."
-        )
-    sections.append(routing)
-    sections.append(
-        "Read: before editing existing files, use exact target slices with "
-        "`code_read_hashline` or `.ai/bin/ai code read-hashline PATH --start START --end END`."
-    )
     staleness = _memory_staleness_context(root, hook_name)
     if staleness:
         sections.append(staleness)
@@ -2541,6 +2669,96 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
         map_context = _codebase_map_summary_context(root)
         if map_context:
             sections.append(map_context)
+    return sections
+
+
+def _build_auxiliary_sections(hook_name: str, payload: dict[str, Any], root: Path) -> list[str]:
+    """Runtime-only recommendations and telemetry.
+
+    These sections are intentionally not mirrored into ``AGENTS.md``: their inputs are
+    caches, audit streams, global catalogs, or the live code index rather than the bounded
+    durable-memory files covered by ``agents_md.fingerprint``. Codex still receives them
+    when the mirrored durable block is current; otherwise a current AGENTS.md would
+    accidentally disable explicitly opted-in recommendations and telemetry.
+    """
+    sections: list[str] = []
+    if hook_name == "SessionStart":
+        try:
+            from .episodic_runtime import read_hook_context
+
+            episodic = read_hook_context(root)
+        except Exception:
+            episodic = ""
+        if episodic:
+            sections.append(episodic)
+    skill_recommendations = _skill_recommendation_context(root, hook_name, payload)
+    if skill_recommendations:
+        sections.append(skill_recommendations)
+    agent_recommendations = _agent_recommendation_context(root, hook_name, payload)
+    if agent_recommendations:
+        sections.append(agent_recommendations)
+    precall_recommendations = _precall_recommendation_context(root, hook_name, payload)
+    if precall_recommendations:
+        sections.append(precall_recommendations)
+    if _is_compact_mode():
+        if hook_name in SKILL_RECOMMENDATION_HOOKS:
+            meta = _compact_meta_line(root)
+            if meta:
+                sections.append(meta)
+    else:
+        federated = _federated_summary_context(root, hook_name)
+        if federated:
+            sections.append(federated)
+        satisfaction = _satisfaction_summary_context(root, hook_name)
+        if satisfaction:
+            sections.append(satisfaction)
+    # Explicit opt-in (default off): these are operational TELEMETRY (hot/warm/cold
+    # audit-event counts, top-callee call counts) — not semantic decisions/todos/
+    # evidence the model needs to act correctly.
+    if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_MEMORY_TIER_SUMMARY", default="0"):
+        memory_tier = _memory_tier_summary_context(root)
+        if memory_tier:
+            sections.append(memory_tier)
+    if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_CODEGRAPH_SUMMARY", default="0"):
+        codegraph_summary = _codegraph_hotspot_context(root)
+        if codegraph_summary:
+            sections.append(codegraph_summary)
+    return sections
+
+
+def _build_dynamic_sections(
+    hook_name: str,
+    payload: dict[str, Any],
+    root: Path,
+    *,
+    include_auxiliary: bool = True,
+) -> list[str]:
+    """DURABLE, file-backed dynamic sections: session-harness plan progress (reads
+    ``.ai/memory/plans``), resume snapshot, decisions, failures, todos, session tail,
+    learned rules, and lessons — every mirrored section's input is covered by
+    ``ai_core.agents_md.FINGERPRINT_DEPENDENCIES``.
+
+    Runtime-only recommendations and telemetry are appended by
+    ``_build_auxiliary_sections`` when ``include_auxiliary`` is true. The AGENTS.md mirror
+    passes false so its fingerprint never claims freshness for inputs it does not track.
+
+    Deliberately excludes: the header line and the Response/Search/Read static rules
+    (live ONLY in build_context's top-level static block, never here — same reasoning as
+    below, now folded into the managed block's static sub-section, see agents_md.py); AND
+    the git/remote/codebase-map VOLATILE sections (see ``_build_volatile_sections`` — those
+    must never be judged by the durable fingerprint, since branch/dirty state changes far
+    more often than memory files and silently going stale here would hide real drift).
+
+    This is also exactly the body ai_core.agents_md.render_block() mirrors into the
+    git-ignored root AGENTS.md for Antigravity (which has no hook-injection path at all):
+    keeping volatile/static content out of this function is what keeps that mirrored file
+    from ever duplicating rules or state that (for hosts with a hook) are delivered fresh
+    every turn by build_context's own static+volatile sections, and what makes a
+    fingerprint of its declared durable dependency files (see ai_core.agents_md.fingerprint)
+    meaningful as a currentness signal across hosts/turns.
+    """
+    sections: list[str] = []
+    if hook_name == "SessionStart":
         sections.append(_session_harness_context(root))
     if hook_name == "UserPromptSubmit":
         try:
@@ -2652,35 +2870,8 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
             owner = str(entry.get("owner") or "")
             lines.append(f"  - {text} [{owner}]" if owner else f"  - {text}")
         sections.append("\n".join(lines))
-    skill_recommendations = _skill_recommendation_context(root, hook_name, payload)
-    if skill_recommendations:
-        sections.append(skill_recommendations)
-    agent_recommendations = _agent_recommendation_context(root, hook_name, payload)
-    if agent_recommendations:
-        sections.append(agent_recommendations)
-    precall_recommendations = _precall_recommendation_context(root, hook_name, payload)
-    if precall_recommendations:
-        sections.append(precall_recommendations)
-    if _is_compact_mode():
-        if hook_name in SKILL_RECOMMENDATION_HOOKS:
-            meta = _compact_meta_line(root)
-            if meta:
-                sections.append(meta)
-    else:
-        federated = _federated_summary_context(root, hook_name)
-        if federated:
-            sections.append(federated)
-        satisfaction = _satisfaction_summary_context(root, hook_name)
-        if satisfaction:
-            sections.append(satisfaction)
-    if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_MEMORY_TIER_SUMMARY"):
-        memory_tier = _memory_tier_summary_context(root)
-        if memory_tier:
-            sections.append(memory_tier)
-    if hook_name in SKILL_RECOMMENDATION_HOOKS and not _env_disabled("AI_CODEGRAPH_SUMMARY"):
-        codegraph_summary = _codegraph_hotspot_context(root)
-        if codegraph_summary:
-            sections.append(codegraph_summary)
+    if include_auxiliary:
+        sections.extend(_build_auxiliary_sections(hook_name, payload, root))
     session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
         sections.append("session tail:\n" + session_tail)
@@ -2691,6 +2882,69 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     if lessons:
         sections.append(lessons)
     # T37 — cloudflare remote_memory removed (.ai/ git sync handles cross-device).
+    return sections
+
+
+def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None = None) -> str:
+    agent = normalize_agent(payload)
+    writes = "off" if is_ci() or payload.get("dry") is True else "worker-local"
+    header = f"Code Brain fast_path: hook={hook_name}, agent={agent}, network=off, writes={writes}."
+    if hook_name not in INJECTION_HOOKS or root is None:
+        return ""
+    sections = [header]
+    # Currentness check, Codex + SessionStart only — done ONCE, BEFORE rendering either
+    # the static rules or the durable dynamic sections, so a current file skips that work
+    # rather than rendering it only to discard it. Runtime-only auxiliary sections remain
+    # live and are evaluated below. is_current() is a bounded
+    # stat()-only signature over a declared durable-memory-file list (no git subprocess,
+    # no body re-render — see ai_core.agents_md module docstring for why a hash of the
+    # *regenerated* body, or any git-derived input, was unsafe/slow/worktree-fragile).
+    #
+    # Antigravity has no SessionStart/UserPromptSubmit hook at all (confirmed: its wire
+    # projection never emits additionalContext for those events), so this branch never
+    # actually applies to it in practice — its only path to the static+durable body is the
+    # mirrored root AGENTS.md file it auto-loads, written by ai_core.agents_md.refresh().
+    #
+    # Claude Code auto-loads only CLAUDE.md, never AGENTS.md, so it has zero exposure to
+    # that mirrored file — it must always get the full static+durable body here,
+    # unconditionally, at SessionStart (never repeated at UserPromptSubmit/SubagentStart).
+    #
+    # Codex CLI DOES auto-load root AGENTS.md. If some agent's turn (its own, or
+    # Antigravity's, or a stale one from before this repo existed) already wrote a managed
+    # block there whose embedded fingerprint matches the CURRENT durable-memory state
+    # (decisions/todos/session-current/resume-snapshots/plans/learned-prompt/lessons/
+    # .ai/config.yaml), Codex already has the static rules AND the durable dynamic body via
+    # that auto-loaded file — re-sending either via additionalContext would duplicate it.
+    # Only when the file is missing, unmanaged, or the fingerprint is stale does Codex fall
+    # back to the full static+durable body here. VOLATILE sections (git branch/dirty state,
+    # codebase-map, turn nudges — see _build_volatile_sections) are NEVER part of this gate:
+    # they are appended unconditionally below regardless of currentness, since that state
+    # changes far more often than memory files and going stale here would hide real drift.
+    skip_static_and_durable = False
+    if agent == "codex" and hook_name == "SessionStart":
+        try:
+            from . import agents_md as _agents_md
+
+            skip_static_and_durable = _agents_md.is_current(root)
+        except Exception:
+            skip_static_and_durable = False  # fail-soft: keep the full body on any error
+    if skip_static_and_durable:
+        sections.append(
+            "cb-agents-md: static rules + durable memory (decisions/todos/resume/"
+            "session-tail/learned-prompt/lessons) are current in this repo's "
+            "auto-loaded AGENTS.md — not repeated here."
+        )
+        sections.extend(_build_auxiliary_sections(hook_name, payload, root))
+    else:
+        # Static behavioural rules (Response/Search/Read). Only SessionStart, never
+        # repeated at UserPromptSubmit/SubagentStart (no global repetition).
+        if hook_name == "SessionStart":
+            sections.extend(static_rule_sections())
+        sections.extend(_build_dynamic_sections(hook_name, payload, root))
+    # Volatile sections are appended unconditionally, regardless of AGENTS.md currentness
+    # (see the comment block above): git-derived staleness/codebase-map state and turn
+    # nudges must never be skipped just because durable memory happens to be unchanged.
+    sections.extend(_build_volatile_sections(hook_name, payload, root))
     return _fit_sections(sections, _max_injection_bytes_for(hook_name))
 
 
@@ -2708,6 +2962,7 @@ _PROTECTED_SECTION_PREFIXES = (
     "Read:",
     "cb-turn:",
     "cb-stale:",
+    "cb-life:",
     # prompt_growth.LEARNED_HEADER, inlined to keep this module import-cycle free and
     # usable at import time. Guarded by test_hook_context_budget.
     "# Learned project rules (auto-grown by Code Brain; do not edit by hand)",
@@ -2804,15 +3059,15 @@ def _memory_staleness_context(root: Path, hook_name: str) -> str:
             if local:
                 banners.append(local)
             # P3: remote-ahead (cb-behind) — another machine pushed work we lack. Reads
-            # the already-fetched upstream ref only (no fetch here); the fetch runs in
-            # the detached sleep-time job. Closes the silent cross-machine divergence gap.
+            # an already-fetched upstream ref only (no fetch here). Refresh refs with an
+            # explicit user-run `git fetch` or `ai memory sync`; hooks never cause network.
             behind = remote_sync_banner(root)
             if behind:
                 banners.append(behind)
         except Exception:
             return ""
-        # P4: peer heartbeat summary — "VPS synced 3m ago" — when memory auto-sync runs
-        # on another machine. Local file reads only; absent for single-machine users.
+        # P4: peer heartbeat summary from an explicitly run memory sync process.
+        # Local file reads only; absent for single-machine users.
         try:
             from .memory_sync import peer_sync_summary
 

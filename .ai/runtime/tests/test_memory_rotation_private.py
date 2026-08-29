@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_core.memory import append_jsonl, rotate_jsonl_tail
+from ai_core.memory import append_jsonl, rotation_notice_path, rotate_jsonl_tail
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix symlink semantics")
@@ -73,3 +73,19 @@ def test_rotation_dry_run_leaves_file_unchanged(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert result["rotated"] is True
     assert path.read_bytes() == original
+
+
+def test_rotation_persists_loss_marker_in_private_sidecar(tmp_path: Path) -> None:
+    path = tmp_path / ".ai" / "memory" / "events.jsonl"
+    for index in range(20):
+        append_jsonl(path, {"id": index, "payload": "x" * 20})
+
+    result = rotate_jsonl_tail(path, max_bytes=50, keep_lines=2)
+
+    assert result["ok"] is True
+    assert result["lossy"] is True
+    notice = rotation_notice_path(path)
+    payload = json.loads(notice.read_text(encoding="utf-8"))
+    assert payload["source"] == ".ai/memory/events.jsonl"
+    assert payload["lossy"] is True
+    assert payload["bytes_discarded"] > 0

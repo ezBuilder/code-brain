@@ -189,6 +189,36 @@ def test_start_session_reuses_precomputed_index_status_for_doctor(
     assert captured["lightweight"] is True
 
 
+def test_start_session_joins_index_rebuild_single_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_session_side_effects(monkeypatch)
+    monkeypatch.setattr(
+        session_mod,
+        "index_status",
+        lambda _root, **_kwargs: {"stale": True, "reason": "hash_mismatch"},
+    )
+    captured: dict[str, object] = {}
+
+    def busy_rebuild(_root: Path, **kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "skipped": "another rebuild in progress",
+            "db_path": ".ai/cache/code.sqlite",
+        }
+
+    monkeypatch.setattr(session_mod, "rebuild", busy_rebuild)
+
+    payload = session_mod.start_session(tmp_path, agent="operator", rebuild_mode="auto")
+
+    assert captured == {"single_flight": True}
+    assert payload["index"]["rebuilt"] is False
+    assert payload["index"]["deferred"] is True
+    assert payload["index"]["result"]["skipped"] == "another rebuild in progress"
+
+
 def _make_indexed_repo(tmp_path: Path) -> tuple[Path, Path]:
     repo = tmp_path / "repo"
     source = repo / "src" / "main.py"

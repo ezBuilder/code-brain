@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -101,23 +102,23 @@ class TestMixedAge:
             _make_audit_entry("recent.action", _now_iso()),
         ]
         audit_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        original = audit_file.read_bytes()
 
         result = fold_old_entries(audit_root, days=30)
         assert result["ok"] is True
         assert result["folded_days"] >= 1  # At least one date folded
-        assert result["removed_entries"] == 2
+        assert result["removed_entries"] == 0
+        assert result["source_entries"] == 2
+        assert result["rolled_up_entries"] == 2
         assert result["added_fold_records"] >= 1
 
-        # Verify file contains recent + fold records
-        content = audit_file.read_text(encoding="utf-8")
-        new_lines = content.splitlines()
-        assert len(new_lines) >= 2  # 1 recent + at least 1 fold
-
-        # Last record should be a fold
-        last_line = new_lines[-1]
-        last_entry = json.loads(last_line)
-        assert last_entry.get("action") == "_folded"
-        assert "counts" in last_entry.get("payload", {})
+        # Raw audit remains byte-identical; the derived record is private.
+        assert audit_file.read_bytes() == original
+        sidecar = audit_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+        rollups = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+        assert len(rollups) >= 1
+        assert rollups[0]["kind"] == "audit_rollup"
+        assert rollups[0]["source"]["path"] == ".ai/memory/audit/2026.jsonl"
 
 
 class TestIdempotence:
@@ -174,7 +175,9 @@ class TestDryRun:
         assert result["ok"] is True
         assert result["dry_run"] is True
         assert result["folded_days"] >= 1  # Would fold
-        assert result["removed_entries"] == 1  # Would remove
+        assert result["removed_entries"] == 0
+        assert result["source_entries"] == 1
+        assert not (audit_root / ".ai" / "memory" / "audit-rollups").exists()
 
         # File unchanged
         content = audit_file.read_text(encoding="utf-8")
@@ -226,7 +229,8 @@ class TestMultipleFiles:
 
         result = fold_old_entries(audit_root, days=30)
         assert result["ok"] is True
-        assert result["removed_entries"] >= 2  # At least 2 old entries removed
+        assert result["removed_entries"] == 0
+        assert result["source_entries"] >= 2
         assert len(result["files_touched"]) >= 1
 
 
@@ -250,19 +254,17 @@ class TestFoldStructure:
         result = fold_old_entries(audit_root, days=30)
         assert result["ok"] is True
         assert result["folded_days"] == 2  # Two separate dates
-        assert result["removed_entries"] == 3
+        assert result["removed_entries"] == 0
+        assert result["source_entries"] == 3
 
-        # Parse final file
-        content = audit_file.read_text(encoding="utf-8")
-        fold_lines = [l for l in content.splitlines() if l.strip()]
-        fold_entries = [json.loads(l) for l in fold_lines]
-
-        fold_recs = [e for e in fold_entries if e.get("action") == "_folded"]
+        sidecar = audit_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+        fold_recs = [json.loads(l) for l in sidecar.read_text(encoding="utf-8").splitlines()]
         assert len(fold_recs) == 2
 
         for fold in fold_recs:
-            assert "ts" in fold
-            assert fold["ts"].endswith("T23:59:59Z")
+            assert fold["kind"] == "audit_rollup"
+            assert "rollup_id" in fold
+            assert "source" in fold
             payload = fold.get("payload", {})
             assert "date" in payload
             assert "counts" in payload
@@ -285,16 +287,17 @@ class TestEmptyLines:
             + "\n"
         )
         audit_file.write_text(content, encoding="utf-8")
+        original = audit_file.read_bytes()
 
         result = fold_old_entries(audit_root, days=30)
         assert result["ok"] is True
-        assert result["removed_entries"] == 1
+        assert result["removed_entries"] == 0
+        assert result["source_entries"] == 1
 
-        # Result should still be valid
-        new_lines = audit_file.read_text(encoding="utf-8").splitlines()
-        for line in new_lines:
-            if line.strip():
-                json.loads(line)  # Should parse
+        # Raw audit and its blank line remain untouched.
+        assert audit_file.read_bytes() == original
+        sidecar = audit_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+        assert len(sidecar.read_text(encoding="utf-8").splitlines()) == 1
 
 
 class TestDisabledFolding:
@@ -314,3 +317,121 @@ class TestDisabledFolding:
 
         # File unchanged
         assert audit_file.read_text(encoding="utf-8") == original
+
+
+def test_fold_is_idempotent_and_never_rewrites_raw_audit(audit_root: Path) -> None:
+    audit_file = audit_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    audit_file.write_text(_make_audit_entry("old.action", _past_iso(40)) + "\n", encoding="utf-8")
+
+    first = fold_old_entries(audit_root, days=30)
+    raw_after_first = audit_file.read_bytes()
+    sidecar = audit_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+    sidecar_after_first = sidecar.read_bytes()
+    second = fold_old_entries(audit_root, days=30)
+
+    assert first["added_fold_records"] == 1
+    assert second["added_fold_records"] == 0
+    assert second["folded_days"] == 0
+    assert audit_file.read_bytes() == raw_after_first
+    assert sidecar.read_bytes() == sidecar_after_first
+
+
+def test_rollup_is_deterministic_and_backdated_append_replaces_date_record(audit_root: Path) -> None:
+    audit_file = audit_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    first = {"ts": _past_iso(40), "action": "old.one", "category": "test", "payload": {}, "event_id": "evt-" + "1" * 32}
+    audit_file.write_text(json.dumps(first, sort_keys=True) + "\n", encoding="utf-8")
+
+    fold_old_entries(audit_root, days=30)
+    sidecar = audit_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+    first_bytes = sidecar.read_bytes()
+    sidecar.unlink()
+    fold_old_entries(audit_root, days=30)
+    assert sidecar.read_bytes() == first_bytes
+
+    second = {"ts": _past_iso(40), "action": "old.two", "category": "test", "payload": {}, "event_id": "evt-" + "2" * 32}
+    with audit_file.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(second, sort_keys=True) + "\n")
+    result = fold_old_entries(audit_root, days=30)
+    records = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+
+    assert result["added_fold_records"] == 0
+    assert result["updated_fold_records"] == 1
+    assert len(records) == 1
+    assert records[0]["payload"]["total"] == 2
+    assert records[0]["payload"]["counts"] == {"old.one": 1, "old.two": 1}
+    assert records[0]["ts"] == records[0]["source"]["date"] + "T23:59:59Z"
+
+
+def test_large_day_uses_bounded_event_anchors(audit_root: Path) -> None:
+    audit_file = audit_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "ts": _past_iso(40),
+            "action": "bulk.action",
+            "category": "test",
+            "payload": {},
+            "event_id": f"evt-{index:032x}",
+        }
+        for index in range(1_000)
+    ]
+    audit_file.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n", encoding="utf-8")
+
+    fold_old_entries(audit_root, days=30)
+    sidecar = audit_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+    source = json.loads(sidecar.read_text(encoding="utf-8"))["source"]
+
+    assert "event_ids" not in source
+    assert len(source["event_id_anchors"]) <= 32
+    assert source["event_id_first"] == rows[0]["event_id"]
+    assert source["event_id_last"] == rows[-1]["event_id"]
+    assert source["event_id_count"] == 1_000
+    assert source["line_ranges"] == [[1, 1_000]]
+
+
+def test_legacy_fold_rows_remain_read_compatible_without_raw_rewrite(audit_root: Path) -> None:
+    audit_file = audit_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    legacy_fold = {
+        "ts": "2026-01-01T23:59:59Z",
+        "action": "_folded",
+        "payload": {"date": "2026-01-01", "counts": {"legacy": 2}, "total": 2},
+    }
+    raw = json.dumps(legacy_fold, sort_keys=True) + "\n" + _make_audit_entry("new.old", _past_iso(40)) + "\n"
+    audit_file.write_text(raw, encoding="utf-8")
+
+    result = fold_old_entries(audit_root, days=30)
+
+    assert result["ok"] is True
+    assert audit_file.read_text(encoding="utf-8") == raw
+    rollups = (audit_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl").read_text(encoding="utf-8")
+    assert '"new.old"' in rollups
+    assert '"legacy"' not in rollups
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix link semantics")
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_fold_refuses_linked_rollup_sidecar_without_touching_target(
+    audit_root: Path, link_kind: str
+) -> None:
+    audit_file = audit_root / ".ai" / "memory" / "audit" / "2026.jsonl"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    raw = _make_audit_entry("old.action", _past_iso(40)) + "\n"
+    audit_file.write_text(raw, encoding="utf-8")
+    sidecar = audit_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    external = audit_root / "external-rollup.jsonl"
+    external.write_text('{"rollup_id":"external"}\n', encoding="utf-8")
+    if link_kind == "symlink":
+        sidecar.symlink_to(external)
+    else:
+        os.link(external, sidecar)
+    original_external = external.read_bytes()
+
+    result = fold_old_entries(audit_root, days=30)
+
+    assert result["ok"] is False
+    assert audit_file.read_text(encoding="utf-8") == raw
+    assert external.read_bytes() == original_external

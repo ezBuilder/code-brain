@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import stat
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,13 @@ from .memory import (
     read_jsonl_tail,
     todos_path,
 )
+from .private_write import (
+    atomic_write_private_text,
+    private_file_lock,
+    read_root_confined_text,
+    unlink_root_confined_regular_file,
+    validate_root_confined_regular_file,
+)
 from .portable import hyphen_encode_path
 from .redact import redact_value
 
@@ -38,6 +46,7 @@ DANGER_PATTERNS = (
     re.compile(r"ignore\s+(previous|prior|all)\s+instructions?", re.IGNORECASE),
 )
 SLUG_RE = re.compile(r"[^a-z0-9]+")
+STRICT_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 @dataclass
@@ -441,10 +450,17 @@ def cluster_candidates(
 
 def list_catalog(root: Path) -> list[AgentCatalogEntry]:
     p = catalog_path(root)
-    if not p.exists():
+    try:
+        text, _state = read_root_confined_text(
+            p,
+            root=root,
+            max_bytes=100_000_000,
+            require_private=False,
+        )
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
         return []
     seen: dict[str, AgentCatalogEntry] = {}
-    for line in p.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -488,6 +504,11 @@ def recommend(
     }
     out: list[dict[str, Any]] = []
     for c in cands:
+        description = str(redact_value(c.description))
+        body = str(redact_value(c.body))
+        evidence = redact_value(c.evidence)
+        if not isinstance(evidence, dict):
+            evidence = {}
         if c.id in existing and existing[c.id].status != "pending":
             continue
         if c.slug in terminal_slugs:
@@ -497,8 +518,8 @@ def recommend(
         if c.id not in existing:
             entry = AgentCatalogEntry(
                 id=c.id, slug=c.slug, status="pending",
-                description=c.description, body=c.body,
-                body_sha256=_sha256(c.body),
+                description=description, body=body,
+                body_sha256=_sha256(body),
                 installed_paths=[], created_at=now_iso(),
                 model=c.model, tools=list(c.tools),
             )
@@ -508,8 +529,8 @@ def recommend(
                 payload={"id": c.id, "slug": c.slug},
             )
         out.append({
-            "id": c.id, "slug": c.slug, "description": c.description,
-            "body": c.body, "evidence": c.evidence, "status": "pending",
+            "id": c.id, "slug": c.slug, "description": description,
+            "body": body, "evidence": evidence, "status": "pending",
             "model": c.model, "tools": list(c.tools),
         })
     return {"ok": True, "candidates": out}
@@ -524,27 +545,48 @@ def _frontmatter(
     model: str | None = None,
     tools: list[str] | None = None,
 ) -> str:
+    def yaml_scalar(value: str, *, limit: int = 160) -> str:
+        # JSON strings are YAML scalars and keep newlines, quotes, and mapping
+        # prefixes from becoming frontmatter syntax.
+        return json.dumps(str(value)[:limit], ensure_ascii=False)
+
+    def safe_scalar(value: str) -> str:
+        value = str(value)
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._, -]{0,63}", value):
+            return value
+        return yaml_scalar(value, limit=256)
+
     lines = [
         "---",
-        f"name: {slug}",
-        f"description: {description[:160]}",
+        f"name: {safe_scalar(slug)}",
+        f"description: {yaml_scalar(description)}",
         "managed-by: code-brain",
-        f"catalog-id: {cid}",
-        f"body-sha256: {body_sha}",
+        f"catalog-id: {safe_scalar(cid)}",
+        f"body-sha256: {safe_scalar(body_sha)}",
     ]
     if model is not None:
-        lines.append(f"model: {model}")
+        lines.append(f"model: {safe_scalar(model)}")
     if tools:
-        lines.append(f"tools: {', '.join(tools)}")
+        rendered_tools = ", ".join(str(tool) for tool in tools)
+        lines.append(f"tools: {safe_scalar(rendered_tools)}")
     lines.append("---")
     lines.append("")
     return "\n".join(lines)
 
 
-def _read_marker(path: Path) -> dict[str, str]:
-    if not path.exists():
+def _read_marker(path: Path, *, root: Path | None = None) -> dict[str, str]:
+    try:
+        if root is None:
+            text = path.read_text(encoding="utf-8")
+        else:
+            text, _state = read_root_confined_text(
+                path,
+                root=root,
+                max_bytes=1_000_000,
+                require_private=False,
+            )
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
         return {}
-    text = path.read_text(encoding="utf-8")
     if not text.startswith("---\n"):
         return {}
     end = text.find("\n---\n", 4)
@@ -560,18 +602,68 @@ def _read_marker(path: Path) -> dict[str, str]:
     return out
 
 
+def _agent_install_lock_path(root: Path) -> Path:
+    return catalog_path(root).with_name(".accept.lock")
+
+
+def _valid_slug(slug: str) -> bool:
+    return bool(slug) and len(slug) <= 48 and STRICT_SLUG_RE.fullmatch(slug) is not None
+
+
+def _expected_agent_install_path(slug: str) -> str | None:
+    if not _valid_slug(slug):
+        return None
+    return f".claude/agents/{slug}.md"
+
+
+def _target_preflight(root: Path, target: Path) -> dict[str, Any] | None:
+    """Return a refusal for an existing target unless it is our private file."""
+    try:
+        state = target.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {"ok": False, "reason": "user_owned_target"}
+    if (
+        stat.S_ISLNK(state.st_mode)
+        or not stat.S_ISREG(state.st_mode)
+        or int(getattr(state, "st_nlink", 1)) != 1
+    ):
+        return {"ok": False, "reason": "user_owned_target"}
+    try:
+        validate_root_confined_regular_file(
+            target,
+            root=root,
+            require_owner=True,
+            reject_group_other_writable=True,
+        )
+    except OSError:
+        return {"ok": False, "reason": "user_owned_target"}
+    if _read_marker(target, root=root).get("managed-by") != "code-brain":
+        return {"ok": False, "reason": "user_owned_target"}
+    return None
+
+
 def accept(root: Path, candidate_id: str) -> dict[str, Any]:
+    with private_file_lock(_agent_install_lock_path(root), root=root):
+        return _accept_locked(root, candidate_id)
+
+
+def _accept_locked(root: Path, candidate_id: str) -> dict[str, Any]:
     existing = {e.id: e for e in list_catalog(root)}
     entry = existing.get(candidate_id)
     if entry is None:
         return {"ok": False, "reason": "not_found"}
     if entry.status not in ("pending",):
         return {"ok": False, "reason": f"status_{entry.status}"}
-    body = redact_value(entry.body)
-    if _danger_match(body):
+    if not _valid_slug(entry.slug):
+        return {"ok": False, "reason": "invalid_slug"}
+    description = str(redact_value(entry.description or entry.slug))
+    body = str(redact_value(entry.body))
+    if _danger_match(description) or _danger_match(body):
         rejected = AgentCatalogEntry(
             id=entry.id, slug=entry.slug, status="rejected",
-            description=entry.description, body=body, body_sha256=_sha256(body),
+            description=description, body=body, body_sha256=_sha256(body),
             installed_paths=[], created_at=entry.created_at,
             model=entry.model or "sonnet", tools=list(entry.tools or []),
         )
@@ -581,17 +673,23 @@ def accept(root: Path, candidate_id: str) -> dict[str, Any]:
         body = "\n" + body
     body_sha = _sha256(body)
     fm = _frontmatter(
-        entry.slug, entry.description, entry.id, body_sha,
+        entry.slug, description, entry.id, body_sha,
         model=entry.model or "sonnet",
         tools=list(entry.tools or []),
     )
     target = root / ".claude" / "agents" / f"{entry.slug}.md"
-    if target.exists():
-        m = _read_marker(target)
-        if m.get("managed-by") != "code-brain":
-            return {"ok": False, "reason": "user_owned_target", "path": str(target.relative_to(root))}
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(fm + body, encoding="utf-8")
+    refusal = _target_preflight(root, target)
+    if refusal is not None:
+        refusal["path"] = str(target.relative_to(root))
+        return refusal
+    try:
+        atomic_write_private_text(target, fm + body, root=root)
+    except OSError:
+        return {
+            "ok": False,
+            "reason": "unsafe_target",
+            "path": str(target.relative_to(root)),
+        }
     installed = [target.relative_to(root).as_posix()]
     accepted = AgentCatalogEntry(
         id=entry.id, slug=entry.slug, status="installed",
@@ -626,27 +724,54 @@ def reject(root: Path, candidate_id: str) -> dict[str, Any]:
 
 
 def uninstall(root: Path, slug: str, *, force: bool = False) -> dict[str, Any]:
+    with private_file_lock(_agent_install_lock_path(root), root=root):
+        return _uninstall_locked(root, slug, force=force)
+
+
+def _uninstall_locked(root: Path, slug: str, *, force: bool = False) -> dict[str, Any]:
+    if not _valid_slug(slug):
+        return {"ok": False, "reason": "invalid_slug"}
     last = None
     for e in list_catalog(root):
         if e.slug == slug:
             last = e
     if last is None or last.status != "installed":
         return {"ok": False, "reason": "not_installed"}
+    expected = _expected_agent_install_path(last.slug)
+    if expected is None or last.slug != slug:
+        return {"ok": False, "reason": "unsafe_installed_path"}
+    if last.installed_paths != [expected]:
+        return {"ok": False, "reason": "unsafe_installed_path"}
     drift = []
     for rel in last.installed_paths:
         path = root / rel
-        if path.exists():
-            m = _read_marker(path)
-            disk_sha = _sha256(m.get("__body__", ""))
-            if last.body_sha256 and disk_sha != last.body_sha256:
-                drift.append(rel)
+        try:
+            validate_root_confined_regular_file(
+                path,
+                root=root,
+                require_owner=True,
+                reject_group_other_writable=True,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return {"ok": False, "reason": "unsafe_installed_path", "path": rel}
+        marker = _read_marker(path, root=root)
+        if marker.get("managed-by") != "code-brain":
+            return {"ok": False, "reason": "user_owned_target", "path": rel}
+        disk_sha = _sha256(marker.get("__body__", ""))
+        if last.body_sha256 and disk_sha != last.body_sha256:
+            drift.append(rel)
     if drift and not force:
         return {"ok": False, "reason": "drift_detected", "paths": drift}
     removed = []
     for rel in last.installed_paths:
         path = root / rel
-        if path.exists():
-            path.unlink()
+        try:
+            removed_now = unlink_root_confined_regular_file(path, root=root)
+        except OSError:
+            return {"ok": False, "reason": "unsafe_installed_path", "path": rel}
+        if removed_now:
             removed.append(rel)
     uninstalled = AgentCatalogEntry(
         id=last.id, slug=last.slug, status="uninstalled",

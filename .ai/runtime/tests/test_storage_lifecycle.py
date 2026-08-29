@@ -33,12 +33,13 @@ def test_append_jsonl_enforces_automatic_byte_and_line_caps(tmp_path: Path, monk
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     assert len(rows) <= 3
     assert rows[-1]["idx"] == 19
+    notice = json.loads(memory.rotation_notice_path(path).read_text(encoding="utf-8"))
+    assert notice["lossy"] is True
+    assert notice["bytes_discarded"] > 0
 
 
-def test_audit_rotation_preserves_chain_and_rebuilds_index(tmp_path: Path, monkeypatch) -> None:
+def test_audit_segmentation_preserves_chain_and_rebuilds_index(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(memory, "_AUDIT_MAX_BYTES", 2_000)
-    monkeypatch.setattr(memory, "_AUDIT_KEEP_BYTES", 1_000)
-    monkeypatch.setattr(memory, "_AUDIT_KEEP_LINES", 8)
     monkeypatch.setattr(memory, "_AUDIT_LINE_MAX_BYTES", 400)
 
     for idx in range(40):
@@ -48,19 +49,24 @@ def test_audit_rotation_preserves_chain_and_rebuilds_index(tmp_path: Path, monke
     assert path.stat().st_size <= 2_000
     assert doctor.check_audit_chain(tmp_path).ok is True
     assert doctor.check_audit_index(tmp_path).ok is True
-    rows = [json.loads(line) for line in path.read_text().splitlines()]
-    assert any(row.get("action") == "audit.storage_rotated" for row in rows)
-    assert rows[-1]["payload"]["idx"] == 39
+    files = memory.all_audit_files(tmp_path)
+    assert len(files) > 1
+    assert all(file.stat().st_size <= 2_000 for file in files)
+    rows = [json.loads(line) for file in files for line in file.read_text().splitlines()]
+    events = [row for row in rows if row.get("action") == "test.event"]
+    markers = [row for row in rows if row.get("action") == "audit.segment_started"]
+    assert [row["payload"]["idx"] for row in events] == list(range(40))
+    assert markers and all(marker["payload"]["lossy"] is False for marker in markers)
 
 
-def test_audit_retention_removes_expired_year_files(tmp_path: Path, monkeypatch) -> None:
+def test_audit_retention_never_removes_raw_year_files(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(memory, "_AUDIT_RETENTION_YEARS", 2)
     old = tmp_path / ".ai" / "memory" / "audit" / "2020.jsonl"
     _private_file(old, b'{"ts":"2020-01-01T00:00:00Z"}\n')
 
     memory.append_audit(tmp_path, action="current", category="test", payload={})
 
-    assert not old.exists()
+    assert old.exists()
     assert memory.audit_path(tmp_path).exists()
 
 
@@ -152,7 +158,7 @@ def test_workspace_storage_prunes_tmp_by_age_and_size(tmp_path: Path, monkeypatc
     assert result["status"]["tmp_bytes"] <= 250
 
 
-def test_workspace_storage_prunes_oldest_unpinned_output_and_preserves_tracked(tmp_path: Path, monkeypatch) -> None:
+def test_workspace_storage_keeps_under_cap_unpinned_output_and_preserves_tracked(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         storage_lifecycle,
         "_tracked_top_entries",
@@ -176,10 +182,10 @@ def test_workspace_storage_prunes_oldest_unpinned_output_and_preserves_tracked(t
     result = storage_lifecycle.enforce_workspace_storage(tmp_path)
 
     assert result["ok"] is True
-    assert not old.exists()
+    assert old.exists()
     assert new.exists()
     assert tracked.exists()
-    assert result["status"]["output_bytes"] <= 250
+    assert result["status"]["output_reclaimable_bytes"] <= 250
 
 
 def test_workspace_storage_preserves_companion_keep_marker_across_runs(tmp_path: Path, monkeypatch) -> None:
@@ -206,7 +212,8 @@ def test_workspace_storage_preserves_companion_keep_marker_across_runs(tmp_path:
     assert second["ok"] is True
     assert artifact.exists()
     assert marker.exists()
-    assert not expendable.exists()
+    assert expendable.exists()
+    assert second["status"]["output_reclaimable_bytes"] <= 150
 
 
 def test_workspace_storage_total_quota_reclaims_tmp_before_outputs(tmp_path: Path, monkeypatch) -> None:

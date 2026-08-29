@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .memory import (
+    all_audit_files,
     append_audit,
     append_jsonl,
     audit_path,
@@ -35,7 +37,13 @@ from .memory import (
     session_current_path,
     todos_path,
 )
-from .private_write import atomic_write_private_text, private_file_lock, read_root_confined_text
+from .private_write import (
+    atomic_write_private_text,
+    private_file_lock,
+    read_root_confined_text,
+    unlink_root_confined_regular_file,
+    validate_root_confined_regular_file,
+)
 from .portable import hyphen_encode_path
 from .redact import redact_value
 
@@ -815,13 +823,10 @@ def _adaptive_min_signal_lower(root: Path, base: int) -> int:
         threshold = 5
     if threshold <= 0:
         return base
-    audit_dir = root / ".ai" / "memory" / "audit"
-    if not audit_dir.is_dir():
-        return base
     accepted = 0
     rejected = 0
     try:
-        for audit_file in sorted(audit_dir.glob("*.jsonl")):
+        for audit_file in all_audit_files(root):
             try:
                 text = audit_file.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -1055,7 +1060,12 @@ def upsert_pending_candidate(root: Path, candidate: Candidate) -> CatalogEntry:
     is the explicit "skill enhancement mode" the user mandated to stop the
     infinite-duplicate-skill churn (e.g. ai-runbook 58회 vs 59회 vs 60회 ...).
     """
-    body_sha = _sha256(candidate.body)
+    description = str(redact_value(candidate.description))
+    body = str(redact_value(candidate.body))
+    evidence = redact_value(candidate.evidence)
+    if not isinstance(evidence, dict):
+        evidence = {}
+    body_sha = _sha256(body)
     existing_list = list_catalog(root)
     existing_by_id = {e.id: e for e in existing_list}
     if candidate.id in existing_by_id:
@@ -1075,10 +1085,10 @@ def upsert_pending_candidate(root: Path, candidate: Candidate) -> CatalogEntry:
             slug=candidate.slug,
             status="pending",
             draft={
-                "description": candidate.description,
-                "body": candidate.body,
+                "description": description,
+                "body": body,
             },
-            evidence=candidate.evidence,
+            evidence=evidence,
             created_at=same_slug_pending.created_at,  # preserve original ts
             installed_paths=[],
             body_sha256=body_sha,
@@ -1100,10 +1110,10 @@ def upsert_pending_candidate(root: Path, candidate: Candidate) -> CatalogEntry:
         slug=candidate.slug,
         status="pending",
         draft={
-            "description": candidate.description,
-            "body": candidate.body,
+            "description": description,
+            "body": body,
         },
-        evidence=candidate.evidence,
+        evidence=evidence,
         created_at=now_iso(),
         installed_paths=[],
         body_sha256=body_sha,
@@ -1242,9 +1252,13 @@ def recommend(
 # ---------- accept / reject / uninstall ----------
 
 def _frontmatter(description: str, catalog_id: str, body_sha256: str) -> str:
+    # JSON's double-quoted scalar syntax is also valid YAML.  Escaping the
+    # description prevents newlines, quotes, and mapping-looking text from
+    # escaping the single frontmatter field while preserving the parsed value.
+    safe_description = json.dumps(str(description)[:160], ensure_ascii=False)
     return (
         "---\n"
-        f"description: {description[:160]}\n"
+        f"description: {safe_description}\n"
         "managed-by: code-brain\n"
         f"catalog-id: {catalog_id}\n"
         f"body-sha256: {body_sha256}\n"
@@ -1252,15 +1266,33 @@ def _frontmatter(description: str, catalog_id: str, body_sha256: str) -> str:
     )
 
 
-def _write_skill_file(path: Path, frontmatter: str, body: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(frontmatter + body, encoding="utf-8")
+def _skill_install_lock_path(root: Path) -> Path:
+    return catalog_path(root).with_name(".accept.lock")
 
 
-def _read_marker(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    text = path.read_text(encoding="utf-8")
+def _write_skill_file(path: Path, frontmatter: str, body: str, *, root: Path) -> None:
+    """Write a generated skill only through the confined private writer."""
+    atomic_write_private_text(path, frontmatter + body, root=root)
+
+
+def _read_marker(path: Path, *, root: Path | None = None) -> dict[str, str]:
+    if root is None:
+        if not path.exists():
+            return {}
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return {}
+    else:
+        try:
+            text, _state = read_root_confined_text(
+                path,
+                root=root,
+                max_bytes=1_000_000,
+                require_private=False,
+            )
+        except (FileNotFoundError, OSError, UnicodeDecodeError):
+            return {}
     if not text.startswith("---\n"):
         return {}
     end = text.find("\n---\n", 4)
@@ -1277,8 +1309,8 @@ def _read_marker(path: Path) -> dict[str, str]:
     return out
 
 
-def _disk_body_sha(path: Path) -> str:
-    info = _read_marker(path)
+def _disk_body_sha(path: Path, *, root: Path | None = None) -> str:
+    info = _read_marker(path, root=root)
     if not info:
         return ""
     return _sha256(info.get("__body__", ""))
@@ -1300,64 +1332,87 @@ def _entry_by_slug(root: Path, slug: str) -> CatalogEntry | None:
 
 
 def accept(root: Path, candidate_id: str) -> dict[str, Any]:
-    entry = _entry_by_id(root, candidate_id)
-    if entry is None:
-        return {"ok": False, "reason": "not_found"}
-    if entry.status not in {"pending", "rejected"}:
-        return {"ok": False, "reason": f"status_{entry.status}"}
-    body = str(entry.draft.get("body") or "")
-    desc = str(entry.draft.get("description") or entry.slug)
-    if _danger_match(body):
-        rejected = CatalogEntry(
-            id=entry.id, slug=entry.slug, status="rejected",
-            draft=entry.draft, evidence=entry.evidence,
-            created_at=entry.created_at, installed_paths=[],
-            body_sha256=entry.body_sha256,
-        )
-        _persist_entry(root, rejected)
-        append_audit(root, action="skill.danger_rejected", category="memory", payload={"id": entry.id})
-        return {"ok": False, "reason": "danger_pattern"}
-    body = redact_value(body)
-    if not body.startswith("\n"):
-        body = "\n" + body
-    body_sha = _sha256(body)
-    fm = _frontmatter(desc, entry.id, body_sha)
+    with private_file_lock(_skill_install_lock_path(root), root=root):
+        entry = _entry_by_id(root, candidate_id)
+        if entry is None:
+            return {"ok": False, "reason": "not_found"}
+        if entry.status not in {"pending", "rejected"}:
+            return {"ok": False, "reason": f"status_{entry.status}"}
+        body = str(entry.draft.get("body") or "")
+        desc = str(redact_value(entry.draft.get("description") or entry.slug))
+        if _danger_match(body):
+            rejected = CatalogEntry(
+                id=entry.id, slug=entry.slug, status="rejected",
+                draft=entry.draft, evidence=entry.evidence,
+                created_at=entry.created_at, installed_paths=[],
+                body_sha256=entry.body_sha256,
+            )
+            _persist_entry(root, rejected)
+            append_audit(root, action="skill.danger_rejected", category="memory", payload={"id": entry.id})
+            return {"ok": False, "reason": "danger_pattern"}
+        body = redact_value(body)
+        if not body.startswith("\n"):
+            body = "\n" + body
+        body_sha = _sha256(body)
+        fm = _frontmatter(desc, entry.id, body_sha)
 
-    targets = [
-        root / ".claude" / "commands" / f"{entry.slug}.md",
-        root / ".codex" / "prompts" / f"{entry.slug}.md",
-        root / ".agents" / "skills" / entry.slug / "SKILL.md",
-    ]
-    for tgt in targets:
-        if tgt.exists():
-            existing_marker = _read_marker(tgt)
+        targets = [
+            root / ".claude" / "commands" / f"{entry.slug}.md",
+            root / ".codex" / "prompts" / f"{entry.slug}.md",
+            root / ".agents" / "skills" / entry.slug / "SKILL.md",
+        ]
+        for tgt in targets:
+            try:
+                state = tgt.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return {
+                    "ok": False,
+                    "reason": "user_owned_target",
+                    "path": str(tgt.relative_to(root)),
+                }
+            # Never replace a link, directory, or multiply-linked inode.  In
+            # particular, do not let a managed marker authorize overwriting a
+            # user's external hardlink/symlink target.
+            if (
+                stat.S_ISLNK(state.st_mode)
+                or not stat.S_ISREG(state.st_mode)
+                or int(getattr(state, "st_nlink", 1)) != 1
+            ):
+                return {
+                    "ok": False,
+                    "reason": "user_owned_target",
+                    "path": str(tgt.relative_to(root)),
+                }
+            existing_marker = _read_marker(tgt, root=root)
             if existing_marker.get("managed-by") != "code-brain":
                 return {
                     "ok": False,
                     "reason": "user_owned_target",
                     "path": str(tgt.relative_to(root)),
                 }
-    installed: list[str] = []
-    for tgt in targets:
-        _write_skill_file(tgt, fm, body)
-        installed.append(tgt.relative_to(root).as_posix())
+        installed: list[str] = []
+        for tgt in targets:
+            _write_skill_file(tgt, fm, body, root=root)
+            installed.append(tgt.relative_to(root).as_posix())
 
-    accepted = CatalogEntry(
-        id=entry.id, slug=entry.slug, status="installed",
-        draft={"description": desc, "body": body},
-        evidence=entry.evidence,
-        created_at=entry.created_at, installed_paths=installed,
-        body_sha256=body_sha,
-    )
-    _persist_entry(root, accepted)
-    append_audit(root, action="skill.accept_install", category="memory", payload={"id": entry.id, "slug": entry.slug})
-    return {
-        "ok": True,
-        "id": entry.id,
-        "slug": entry.slug,
-        "installed_paths": installed,
-        "body_sha256": body_sha,
-    }
+        accepted = CatalogEntry(
+            id=entry.id, slug=entry.slug, status="installed",
+            draft={"description": desc, "body": body},
+            evidence=entry.evidence,
+            created_at=entry.created_at, installed_paths=installed,
+            body_sha256=body_sha,
+        )
+        _persist_entry(root, accepted)
+        append_audit(root, action="skill.accept_install", category="memory", payload={"id": entry.id, "slug": entry.slug})
+        return {
+            "ok": True,
+            "id": entry.id,
+            "slug": entry.slug,
+            "installed_paths": installed,
+            "body_sha256": body_sha,
+        }
 
 
 def reject(root: Path, candidate_id: str) -> dict[str, Any]:
@@ -1377,16 +1432,43 @@ def reject(root: Path, candidate_id: str) -> dict[str, Any]:
     return {"ok": True, "id": entry.id}
 
 
+def _expected_skill_install_paths(slug: str) -> set[str] | None:
+    if not slug or len(slug) > 48 or _slugify(slug) != slug:
+        return None
+    return {
+        f".claude/commands/{slug}.md",
+        f".codex/prompts/{slug}.md",
+        f".agents/skills/{slug}/SKILL.md",
+    }
+
+
 def uninstall(root: Path, slug: str, *, force: bool = False) -> dict[str, Any]:
+    with private_file_lock(_skill_install_lock_path(root), root=root):
+        return _uninstall_locked(root, slug, force=force)
+
+
+def _uninstall_locked(root: Path, slug: str, *, force: bool = False) -> dict[str, Any]:
     entry = _entry_by_slug(root, slug)
     if entry is None or entry.status != "installed":
         return {"ok": False, "reason": "not_installed"}
+    expected_paths = _expected_skill_install_paths(entry.slug)
+    if expected_paths is None or any(rel not in expected_paths for rel in entry.installed_paths):
+        return {"ok": False, "reason": "unsafe_installed_path"}
     drift_paths: list[str] = []
     for rel in entry.installed_paths:
         path = root / rel
-        if not path.exists():
+        try:
+            validate_root_confined_regular_file(
+                path,
+                root=root,
+                require_owner=True,
+                reject_group_other_writable=True,
+            )
+        except FileNotFoundError:
             continue
-        marker = _read_marker(path)
+        except OSError:
+            return {"ok": False, "reason": "unsafe_installed_path", "path": rel}
+        marker = _read_marker(path, root=root)
         disk_sha = _sha256(marker.get("__body__", ""))
         recorded = entry.body_sha256
         if recorded and disk_sha != recorded:
@@ -1396,8 +1478,7 @@ def uninstall(root: Path, slug: str, *, force: bool = False) -> dict[str, Any]:
     removed: list[str] = []
     for rel in entry.installed_paths:
         path = root / rel
-        if path.exists():
-            path.unlink()
+        if unlink_root_confined_regular_file(path, root=root):
             removed.append(rel)
     uninstalled = CatalogEntry(
         id=entry.id, slug=entry.slug, status="uninstalled",

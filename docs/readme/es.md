@@ -7,13 +7,16 @@
 [![Release Gate](https://img.shields.io/github/actions/workflow/status/ezBuilder/code-brain/release-gate.yml?branch=main&style=flat-square&label=release-gate)](https://github.com/ezBuilder/code-brain/actions/workflows/release-gate.yml)
 [![Stars](https://img.shields.io/github/stars/ezBuilder/code-brain?style=flat-square&color=FFC107)](https://github.com/ezBuilder/code-brain/stargazers)
 
-![Claude Code](https://img.shields.io/badge/Claude_Code-ready-8A2BE2?style=flat-square)
-![Codex CLI](https://img.shields.io/badge/Codex_CLI-ready-111111?style=flat-square)
-![Antigravity](https://img.shields.io/badge/Antigravity-ready-4285F4?style=flat-square)
+![Claude Code](https://img.shields.io/badge/Claude_Code-21_hooks-8A2BE2?style=flat-square)
+![Codex CLI](https://img.shields.io/badge/Codex_CLI-12_hooks-111111?style=flat-square)
+![Antigravity](https://img.shields.io/badge/Antigravity-3_hooks-4285F4?style=flat-square)
+![Kiro](https://img.shields.io/badge/Kiro_IDE%2FCLI_v3-5_hooks-7B61FF?style=flat-square)
+![MCP](https://img.shields.io/badge/MCP-62_methods-FF6F00?style=flat-square)
+![Doctor](https://img.shields.io/badge/strict_doctor-37_checks-00897B?style=flat-square)
 
 [한국어](ko.md) · [English](../../README.md) · [中文](zh-CN.md) · [日本語](ja.md) · Español · [Français](fr.md) · [Deutsch](de.md)
 
-Code Brain es infraestructura local del repositorio para agentes de codificación con IA serios. Proporciona a Claude Code, Codex CLI y Google Antigravity la misma memoria de proyecto, búsqueda de código BM25, política de hooks, herramientas MCP, registro de auditoría y ruta de actualización dentro de un mismo espacio de trabajo.
+Code Brain es infraestructura local del repositorio para agentes de codificación con IA serios. Proporciona a Claude Code, Codex CLI, Google Antigravity y Kiro la misma memoria de proyecto, búsqueda de código BM25, política de hooks, registro de auditoría y ruta de actualización dentro de un mismo espacio de trabajo; la exposición de MCP es específica de cada host.
 
 Está construido sobre una verdad incómoda: los agentes son potentes, pero olvidan el contexto, leen demasiado código, vuelcan salidas enormes y se desvían entre herramientas. Code Brain convierte un repositorio en una capa operativa lista para agentes.
 
@@ -225,6 +228,10 @@ Límites de artefactos generados:
 .ai/memory/prompt_growth/versions/   keep latest 30
 .ai/memory/evidence.jsonl            4MB cap
 .ai/memory/session-current.md        100KB cap
+.ai/memory/audit/YYYY.jsonl          lossless 64MB segments; raw retained
+.ai/memory/audit-rollups/            64MB cap, 16 top-level entries
+.ai/memory/episodic/                 128MB cap, 8 top-level entries
+.ai/memory/episodic-tombstones/      authoritative forget markers; never tier-reclaimed
 .ai/cache/sandbox/                   pruned after Stop/SessionEnd
 ```
 
@@ -232,6 +239,8 @@ Limpieza manual:
 
 ```bash
 .ai/bin/ai memory page-out --json
+.ai/bin/ai memory episodic build --json
+.ai/bin/ai memory episodic status --json
 .ai/bin/ai exec prune --older-than-seconds 86400 --json
 .ai/bin/ai audit rebuild-index --json
 ```
@@ -258,9 +267,11 @@ Limpieza manual:
 │   ├── hooks.py                 Claude/Codex/Antigravity hook handling
 │   ├── mcp_server.py            MCP JSON-RPC stdio server
 │   ├── mcp_config.py            Claude/Codex/Antigravity config dialects
-│   ├── memory.py                decisions/todos/audit/events rotation
+│   ├── memory.py                decisions/todos + lossless audit segments
 │   ├── memory_tier.py           page-out / page-in / tiering
 │   ├── memory_hot.py            sleep-time salience-ranked HOT memory cache
+│   ├── episodic_memory.py       deterministic logarithmic pyramid core
+│   ├── episodic_runtime.py      receipts + authoritative raw drill-down
 │   ├── evidence.py              bounded evidence ledger
 │   ├── doctor.py                release and safety checks
 │   ├── obs.py                   usage/health/search diagnostics

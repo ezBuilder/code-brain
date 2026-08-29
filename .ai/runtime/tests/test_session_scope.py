@@ -66,8 +66,11 @@ def test_warns_when_threshold_crossed(tmp_path: Path, monkeypatch: pytest.Monkey
     entries.extend(_entry("event.append", kind="mcp.request") for _ in range(15))
     _write_audit(audit, entries)
     out = _session_scope_summary(tmp_path)
-    assert out.startswith("cb-scope: 15 audit events since SessionStart")
+    assert out.startswith("cb-scope: long session (10+ audit events)")
     assert "/clear" in out
+    entries.append(_entry("event.append", kind="mcp.request"))
+    _write_audit(audit, entries)
+    assert _session_scope_summary(tmp_path) == out
 
 
 def test_resets_after_new_session_start(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

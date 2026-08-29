@@ -82,9 +82,11 @@ def test_doctor_rechecks_when_preflight_environment_changes(
     _write_proof(tmp_path)
     monkeypatch.setenv("UV_OFFLINE", "1")
     calls: list[list[str]] = []
+    observed_env: dict[str, str] = {}
 
-    def failed_preflight(command, **_kwargs):
+    def failed_preflight(command, **kwargs):
         calls.append([str(item) for item in command])
+        observed_env.update(kwargs["env"])
         return doctor.subprocess.CompletedProcess(command, 1, stdout="", stderr="environment changed")
 
     monkeypatch.setattr(doctor.subprocess, "run", failed_preflight)
@@ -92,6 +94,7 @@ def test_doctor_rechecks_when_preflight_environment_changes(
     check = doctor.check_bootstrap_preflight(tmp_path)
 
     assert calls
+    assert observed_env["PYTHON"] == sys.executable
     assert check.ok is False
     assert check.detail == "environment changed"
 

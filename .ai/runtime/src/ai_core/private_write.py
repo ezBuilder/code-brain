@@ -337,6 +337,51 @@ def unlink_root_confined_regular_file(path: Path, *, root: Path) -> bool:
     return True
 
 
+def rename_root_confined_regular_file(source: Path, target: Path, *, root: Path) -> None:
+    """Atomically rename one private file within the same confined directory.
+
+    The destination must not already exist.  Refusing replacement is important
+    for immutable digest-named audit segments: a sync divergence must be
+    surfaced, never resolved by silently overwriting either branch.
+    """
+    source = Path(source)
+    target = Path(target)
+    root = Path(root)
+    if os.path.abspath(source.parent) != os.path.abspath(target.parent):
+        raise OSError("private rename requires the same parent directory")
+    if os.name != "nt":
+        with _open_confined_parent_fd(source, root=root, create=False) as parent_fd:
+            try:
+                source_state = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                _raise_confined_path_error(exc)
+            _require_private_mutation_target(source_state)
+            try:
+                os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError("private rename destination already exists")
+            os.rename(
+                source.name,
+                target.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            try:
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+        return
+    _require_root_confined_parent(source, root)
+    _require_root_confined_parent(target, root)
+    source_state = source.lstat()
+    _require_private_mutation_target(source_state)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError("private rename destination already exists")
+    source.rename(target)
+
+
 def remove_root_confined_tree(path: Path, *, root: Path) -> bool:
     """Remove one confined directory tree without following directory links.
 
@@ -725,6 +770,64 @@ def read_root_confined_text(
     return data.decode("utf-8"), state
 
 
+def iter_root_confined_bytes(
+    path: Path,
+    *,
+    root: Path | None = None,
+    max_bytes: int = 1_000_000,
+    chunk_bytes: int = 65_536,
+    require_private: bool = True,
+    require_owner: bool = False,
+    reject_group_other_writable: bool = False,
+) -> Iterator[bytes]:
+    """Stream bounded bytes from a confined regular file without following links.
+
+    Unlike :func:`read_root_confined_bytes`, this keeps only one bounded read
+    chunk in memory. The descriptor is validated before the first yield and
+    remains the object being read for the lifetime of the iterator.
+    """
+    path = Path(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_context = (
+        _open_confined_parent_fd(path, root=Path(root), create=False)
+        if root is not None and os.name != "nt"
+        else None
+    )
+    if parent_context is not None:
+        with parent_context as parent_fd:
+            try:
+                fd = os.open(path.name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                _raise_confined_path_error(exc)
+            yield from _iter_open_bytes_fd(
+                fd,
+                max_bytes=max_bytes,
+                chunk_bytes=chunk_bytes,
+                require_private=require_private,
+                require_owner=require_owner,
+                reject_group_other_writable=reject_group_other_writable,
+            )
+        return
+    _require_root_confined_parent(path, root)
+    if path.is_symlink():
+        raise OSError("refusing to read through symlink")
+    fd = os.open(path, flags)
+    yield from _iter_open_bytes_fd(
+        fd,
+        max_bytes=max_bytes,
+        chunk_bytes=chunk_bytes,
+        require_private=require_private,
+        require_owner=require_owner,
+        reject_group_other_writable=reject_group_other_writable,
+    )
+
+
 def read_root_confined_tail_bytes(
     path: Path,
     *,
@@ -924,6 +1027,41 @@ def _read_open_bytes_fd(
             if total > limit:
                 raise OSError(f"private read exceeds {limit} bytes")
         return b"".join(chunks), state
+    finally:
+        os.close(fd)
+
+
+def _iter_open_bytes_fd(
+    fd: int,
+    *,
+    max_bytes: int,
+    chunk_bytes: int,
+    require_private: bool,
+    require_owner: bool,
+    reject_group_other_writable: bool,
+) -> Iterator[bytes]:
+    try:
+        state = os.fstat(fd)
+        _validate_open_read_state(
+            state,
+            require_private=require_private,
+            require_owner=require_owner,
+            reject_group_other_writable=reject_group_other_writable,
+        )
+        limit = max(0, int(max_bytes))
+        if state.st_size > limit:
+            raise OSError(f"private read exceeds {limit} bytes")
+        size = max(1, min(1_048_576, int(chunk_bytes)))
+        total = 0
+        while True:
+            remaining = limit - total
+            chunk = os.read(fd, min(size, remaining + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise OSError(f"private read exceeds {limit} bytes")
+            yield chunk
     finally:
         os.close(fd)
 

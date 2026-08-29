@@ -17,11 +17,13 @@ Public API:
 from __future__ import annotations
 
 import json
-import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+
+from .memory import all_audit_files
+from .private_write import iter_root_confined_text_lines, list_root_confined_directory
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -42,6 +44,18 @@ SHALLOW_MAX_DISTINCT_TOOLS = 3
 OVER_EXPLORATION_UNIQUE_FILES = 22  # From the TRAJEVAL "22x review" finding.
 OVER_EXPLORATION_MAX_EDITS = 3
 
+# Streaming read cap: matches the confined-read convention already used for
+# audit files elsewhere in this package (e.g. ai_core.episodic_runtime),
+# large enough for realistic multi-year audit logs while still bounding
+# memory/DoS exposure for a single file.
+MAX_AUDIT_FILE_BYTES = 100_000_000
+MAX_AUDIT_LINE_BYTES = 1_000_000
+
+# Diagnostics provenance is capped per category so a badly corrupted file
+# cannot make a single trajectory call hold unbounded memory — the *count*
+# is always exact, only the list of example locations is capped.
+MAX_DIAGNOSTIC_SAMPLES = 20
+
 
 # ---------------------------------------------------------------------------
 # Audit log discovery & parsing
@@ -53,31 +67,157 @@ def _audit_dir(root: Path) -> Path:
 
 
 def _audit_files(root: Path) -> list[Path]:
-    """Return all ``<year>.jsonl`` audit files, oldest first."""
-    audit_dir = _audit_dir(root)
-    if not audit_dir.exists():
-        return []
-    files = sorted(
-        p for p in audit_dir.iterdir() if p.is_file() and re.fullmatch(r"\d{4}\.jsonl", p.name)
+    """Return trusted immutable segments and current files in physical order."""
+    return all_audit_files(root)
+
+
+class ReadDiagnostics:
+    """Accumulates counts and bounded example locations for every audit
+    row/file this module could not use, so callers can tell "no events"
+    apart from "events were silently discarded" (never a silent loss).
+
+    Counts (``*_rows``/``*_files``) are always exact. ``samples`` holds at
+    most ``MAX_DIAGNOSTIC_SAMPLES`` example locations *per category*
+    (oldest-seen first) — capped so a badly corrupted file cannot make a
+    single call hold unbounded memory, while the count itself never loses
+    precision.
+    """
+
+    __slots__ = (
+        "malformed_json_rows",
+        "non_dict_rows",
+        "unparseable_ts_rows",
+        "unreadable_files",
+        "samples",
     )
-    return files
+
+    def __init__(self) -> None:
+        self.malformed_json_rows = 0
+        self.non_dict_rows = 0
+        self.unparseable_ts_rows = 0
+        self.unreadable_files = 0
+        self.samples: dict[str, list[dict[str, Any]]] = {
+            "malformed_json_rows": [],
+            "non_dict_rows": [],
+            "unparseable_ts_rows": [],
+            "unreadable_files": [],
+        }
+
+    def _record(self, category: str, *, path: str, line: int | None = None, reason: str = "") -> None:
+        setattr(self, category, getattr(self, category) + 1)
+        bucket = self.samples[category]
+        if len(bucket) < MAX_DIAGNOSTIC_SAMPLES:
+            entry: dict[str, Any] = {"path": path}
+            if line is not None:
+                entry["line"] = line
+            if reason:
+                entry["reason"] = reason
+            bucket.append(entry)
+
+    def malformed_json(self, *, path: str, line: int, reason: str) -> None:
+        self._record("malformed_json_rows", path=path, line=line, reason=reason)
+
+    def non_dict(self, *, path: str, line: int) -> None:
+        self._record("non_dict_rows", path=path, line=line)
+
+    def unparseable_ts(self, *, path: str, line: int, raw_ts: Any) -> None:
+        self._record("unparseable_ts_rows", path=path, line=line, reason=str(raw_ts)[:80])
+
+    def unreadable_file(self, *, path: str, reason: str) -> None:
+        self._record("unreadable_files", path=path, reason=reason)
+
+    @property
+    def total_dropped_rows(self) -> int:
+        return self.malformed_json_rows + self.non_dict_rows
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "malformed_json_rows": self.malformed_json_rows,
+            "non_dict_rows": self.non_dict_rows,
+            "unparseable_ts_rows": self.unparseable_ts_rows,
+            "unreadable_files": self.unreadable_files,
+            "total_dropped_rows": self.total_dropped_rows,
+            "samples": {k: list(v) for k, v in self.samples.items()},
+        }
 
 
-def _iter_audit_events(root: Path) -> Iterator[dict[str, Any]]:
-    """Yield parsed audit events line-by-line from all year files (chronological)."""
-    for path in _audit_files(root):
+def _iter_audit_events(
+    root: Path, diagnostics: "ReadDiagnostics | None" = None
+) -> Iterator[dict[str, Any]]:
+    """Yield parsed audit events line-by-line from all year files (chronological).
+
+    Reads use the same root-confined, owner-validated streaming primitive
+    (`iter_root_confined_text_lines`) already used elsewhere in this
+    package for audit files (see ``ai_core.episodic_runtime``), instead of
+    a bare ``path.open()`` — so a symlink, a file owned by another user, or
+    a group/other-writable file is rejected the same way it would be
+    anywhere else audit logs are read, rather than being silently
+    followed/trusted here. Every row this function cannot use (malformed
+    JSON, a non-dict row, or a file that cannot be opened/validated) is
+    counted and sampled into ``diagnostics`` with its exact source path and
+    physical line number — never dropped without a trace. Pass ``None`` to
+    intentionally discard diagnostics; every real call site inside this
+    module passes a live accumulator.
+
+    ``_audit_files`` (``ai_core.memory.all_audit_files``) already silently
+    excludes entries that fail its own confinement/ownership validation at
+    discovery time (before this function ever sees them) — a whole
+    unreadable/tampered audit file would otherwise vanish with no trace at
+    all. To keep that failure visible too, this function independently
+    lists the raw audit directory (read-only, via
+    ``list_root_confined_directory``) and reports any candidate audit
+    filename present there but absent from ``_audit_files``'s result as an
+    additional ``unreadable_file`` diagnostic.
+    """
+    included = {path.name for path in _audit_files(root)}
+    if diagnostics is not None:
         try:
-            with path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError:
-                        # Skip malformed lines silently — audit may be partial.
-                        continue
-        except OSError:
+            all_names = list_root_confined_directory(_audit_dir(root), root=root)
+        except (FileNotFoundError, OSError):
+            all_names = []
+        for name in all_names:
+            if name in included or name.startswith("."):
+                continue
+            if not name.endswith(".jsonl"):
+                continue
+            diagnostics.unreadable_file(
+                path=name, reason="excluded_at_discovery"
+            )
+
+    for path in _audit_files(root):
+        rel = path.name
+        try:
+            lines = iter_root_confined_text_lines(
+                path,
+                root=root,
+                max_bytes=MAX_AUDIT_FILE_BYTES,
+                max_line_bytes=MAX_AUDIT_LINE_BYTES,
+                require_private=False,
+                require_owner=True,
+                reject_group_other_writable=True,
+            )
+            for line_number, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    parsed = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    if diagnostics is not None:
+                        diagnostics.malformed_json(
+                            path=rel, line=line_number, reason=type(exc).__name__
+                        )
+                    continue
+                if not isinstance(parsed, dict):
+                    if diagnostics is not None:
+                        diagnostics.non_dict(path=rel, line=line_number)
+                    continue
+                parsed["_cb_source_path"] = rel
+                parsed["_cb_source_line"] = line_number
+                yield parsed
+        except (OSError, UnicodeDecodeError) as exc:
+            if diagnostics is not None:
+                diagnostics.unreadable_file(path=rel, reason=type(exc).__name__)
             continue
 
 
@@ -195,27 +335,43 @@ def extract_trajectories(
         gaps — a gap larger than ``IDLE_GAP_SECONDS`` starts a new anonymous
         trajectory named ``anon-<bucket>``.
 
-    Returns a dict ``{ok, trajectories, scanned_events}`` where
-    ``trajectories`` is sorted by ``start_ts`` descending and truncated to
-    ``limit`` entries. When ``session_id`` is given, only that trajectory is
-    returned (still inside a list).
+    Returns a dict ``{ok, trajectories, scanned_events, diagnostics}``
+    where ``trajectories`` is sorted by ``start_ts`` descending and
+    truncated to ``limit`` entries, and ``diagnostics`` reports exact
+    counts (plus bounded example locations) for every row or file this
+    call could not use — audit read/parse errors are never silently
+    dropped; ``diagnostics["total_dropped_rows"]`` plus
+    ``diagnostics["unparseable_ts_rows"]`` account for every row that was
+    read but excluded from every trajectory. When ``session_id`` is
+    given, only that trajectory is returned (still inside a list).
     """
     if limit <= 0:
         limit = 1
     if not _audit_dir(root).exists():
-        return {"ok": True, "trajectories": [], "scanned_events": 0}
+        return {
+            "ok": True,
+            "trajectories": [],
+            "scanned_events": 0,
+            "diagnostics": ReadDiagnostics().to_dict(),
+        }
 
     open_trajs: dict[str, dict[str, Any]] = {}
     finished: list[dict[str, Any]] = []
     last_anon_ts: datetime | None = None
     current_anon_sid: str | None = None
     scanned = 0
+    diagnostics = ReadDiagnostics()
 
-    for event in _iter_audit_events(root):
+    for event in _iter_audit_events(root, diagnostics):
         scanned += 1
         ts_str = event.get("ts")
         ts = _parse_ts(ts_str)
         if ts is None:
+            diagnostics.unparseable_ts(
+                path=str(event.get("_cb_source_path") or ""),
+                line=int(event.get("_cb_source_line") or 0),
+                raw_ts=ts_str,
+            )
             continue
 
         sid = _session_id_of(event)
@@ -273,7 +429,12 @@ def extract_trajectories(
         finished = [t for t in finished if t["session_id"] == session_id]
     finished = finished[:limit]
 
-    return {"ok": True, "trajectories": finished, "scanned_events": scanned}
+    return {
+        "ok": True,
+        "trajectories": finished,
+        "scanned_events": scanned,
+        "diagnostics": diagnostics.to_dict(),
+    }
 
 
 # ---------------------------------------------------------------------------

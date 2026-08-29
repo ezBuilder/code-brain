@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from ai_core import doctor
+from ai_core.mcp_catalog_meta import MCP_METHOD_COUNT
 
 
 def test_doctor_mcp_registration_does_not_import_full_server(tmp_path: Path) -> None:
@@ -29,7 +30,7 @@ def test_doctor_mcp_registration_does_not_import_full_server(tmp_path: Path) -> 
     try:
         check = doctor.check_mcp_methods_registered(tmp_path)
         assert check.ok is True
-        assert "mcp_methods=60" in check.detail
+        assert f"mcp_methods={MCP_METHOD_COUNT}" in check.detail
         assert "ai_core.mcp_server" not in sys.modules
     finally:
         if previous is not None:

@@ -69,16 +69,15 @@ def test_unreadable_lock_is_not_due(tmp_path: Path) -> None:
     assert _sleep_time_fallback_due(tmp_path) in {True, False}
 
 
-def test_memory_sync_stays_on_turn_end_only() -> None:
-    """Auto-sync does git fetch/push; it must not fire at turn start."""
+def test_memory_sync_is_never_spawned_from_a_hook() -> None:
+    """Auto-sync does git fetch/push. The project's own contract forbids network I/O on
+    the hooks/MCP hot path even when the call is detached — a background process
+    launched FROM a hook is still the hook causing network I/O. So no hook, turn-start
+    fallback or turn-end, may spawn it; only the explicit `ai memory sync` command may."""
     # Resolve from the imported module, not the CWD: a relative path here only works when
     # pytest happens to run from the repo root, and fails from .ai/runtime.
     import ai_core.hooks as _hooks_mod
 
     source = Path(_hooks_mod.__file__).read_text(encoding="utf-8")
-    marker = "_spawn_memory_sync(root, normalize_agent(payload))"
-    assert marker in source
-    before = source.split(marker)[0]
-    guard = before.rsplit("if effective_hook", 1)[-1]
-    assert "SLEEP_TIME_HOOKS" in guard
-    assert "FALLBACK" not in guard
+    assert "_spawn_memory_sync" not in source
+    assert not hasattr(_hooks_mod, "_spawn_memory_sync")

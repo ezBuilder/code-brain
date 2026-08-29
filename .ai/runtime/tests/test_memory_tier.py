@@ -185,12 +185,11 @@ def test_page_out_actually_folds_old_audit_entries(tmp_root: Path, monkeypatch):
     assert payload["ok"] is True
     assert payload["audit_fold"]["ok"] is True
     assert payload["audit_fold"]["folded_days"] >= 1
-    assert payload["audit_fold"]["removed_entries"] >= 1
+    assert payload["audit_fold"]["removed_entries"] == 0
 
-    # Check that file now contains _folded record
-    content = audit_file.read_text(encoding="utf-8")
-    lines = [l.strip() for l in content.split("\n") if l.strip()]
-    fold_records = [json.loads(l) for l in lines if json.loads(l).get("action") == "_folded"]
+    # Check that the private sidecar contains the rollup.
+    sidecar = tmp_root / ".ai" / "memory" / "audit-rollups" / "2026.jsonl"
+    fold_records = [json.loads(l) for l in sidecar.read_text(encoding="utf-8").splitlines()]
     assert len(fold_records) >= 1
 
 

@@ -8,14 +8,11 @@ features:
   embeddings: false
   remote_llm: false
   external_notifications: false
-  remote_memory: false
-remote_memory:
-  provider: cloudflare
-  inject_on_session_start: false
-  default_scope: project
-  cache_path: .ai/cache/remote-memory/summary.json
+# remote_memory (Cloudflare-backed cross-device context) removed — .ai/ git sync
+# replaces it. memory_sync below covers the same cross-machine need without a
+# third-party provider or a hook-spawned network call.
 memory_sync:
-  enabled: false
+  enabled: false  # deprecated no-op; run `ai memory sync` explicitly
 cache:
   sqlite_path: .ai/cache/code.sqlite
 search:

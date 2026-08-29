@@ -76,12 +76,25 @@ def test_old_kept_brevity_rule_upgrades_text(tmp_path: Path) -> None:
     assert "Answers to user questions concise by default" in pg.learned_prompt_text(root)
 
 
-def test_injection_reflects_learned_file(tmp_path: Path) -> None:
+def test_injection_reflects_learned_file(tmp_path: Path, monkeypatch) -> None:
+    """The injection surface (hooks._learned_prompt_context) is explicit opt-in
+    (AI_PROMPT_GROWTH=1); growth itself (pg.tick) is unaffected by that flag."""
+    monkeypatch.setenv("AI_PROMPT_GROWTH", "1")
     root = _seed(tmp_path)
     assert hooks._learned_prompt_context(root) == ""
     for _ in range(20):
         pg.tick(root, output_chars=1200, cooldown=5)
     assert "Learned project rules" in hooks._learned_prompt_context(root)
+
+
+def test_injection_stays_empty_when_prompt_growth_not_opted_in(tmp_path: Path, monkeypatch) -> None:
+    """Default-off: even a grown rule must not surface unless explicitly enabled."""
+    monkeypatch.delenv("AI_PROMPT_GROWTH", raising=False)
+    root = _seed(tmp_path)
+    for _ in range(20):
+        pg.tick(root, output_chars=1200, cooldown=5)
+    assert pg.learned_path(root).exists()  # growth happened
+    assert hooks._learned_prompt_context(root) == ""  # but injection stays off
 
 
 def test_record_turn_never_raises(tmp_path: Path) -> None:

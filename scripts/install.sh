@@ -29,6 +29,7 @@ Options:
 Defaults:
   target: current directory
   global: prompt with default yes in an interactive shell; skip in CI/non-interactive shells
+  Codex: trust exact Code Brain-managed project hooks; set AI_CODEX_HOOK_AUTO_TRUST=0 to opt out
 EOF
 }
 
@@ -175,4 +176,4 @@ if [[ "$RUNTIME_DEFERRED" -eq 1 ]]; then
 else
   echo "[code-brain] installed. New AI sessions in $TARGET now load Code Brain memory, search, hooks, and MCP automatically." >&2
 fi
-echo "[code-brain] (optional) cross-machine sync: set memory_sync.enabled: true in .ai/config.yaml + AI_REMOTE_FETCH=1." >&2
+echo "[code-brain] (optional) cross-machine sync is explicit: run '.ai/bin/ai memory sync' once or manage '.ai/bin/ai memory sync --loop' outside hooks." >&2

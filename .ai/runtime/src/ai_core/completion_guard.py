@@ -51,6 +51,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -143,7 +144,8 @@ _VERIFY_PATTERNS: tuple[tuple[int, re.Pattern[str]], ...] = (
     (2, re.compile(r"^(?:make|gmake)\b.*\b(?:lint|check|doctor|eval|build)\b", re.I)),
     (2, re.compile(r"^(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:lint|check|typecheck|build)\b|cargo\s+(?:check|clippy)\b)", re.I)),
     (3, re.compile(r"^(?:dart|flutter)\s+test\b", re.I)),
-    (2, re.compile(r"^(?:dart|flutter)\s+analyze\b|^(?:dotnet|swift)\s+build\b", re.I)),
+    (2, re.compile(r"^(?:dart|flutter)\s+(?:analyze|build)\b|^(?:dotnet|swift)\s+build\b", re.I)),
+    (2, re.compile(r"^xcodebuild\b(?=.*\b(?:build|archive)\b)", re.I)),
     (2, re.compile(r"^(?:\S*/)?(?:ruff|mypy|pyright|eslint|tsc|shellcheck)\b", re.I)),
     (2, re.compile(r"^(?:\S*/)?(?:python(?:3(?:\.\d+)?)?)\s+-m\s+(?:compileall|mypy|ruff)\b", re.I)),
     (2, re.compile(r"^(?:bash|zsh|sh)\s+-n\b|^(?:bash\s+)?(?:\./)?scripts/docs-check\.sh\b", re.I)),
@@ -461,12 +463,17 @@ def _tool_input(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _tool_command(payload: dict[str, Any]) -> str:
     inputs = _tool_input(payload)
-    return str(
+    raw = (
         inputs.get("command")
         or inputs.get("CommandLine")
         or inputs.get("commandLine")
         or ""
     )
+    if isinstance(raw, (list, tuple)):
+        if not raw or not all(isinstance(token, str) for token in raw):
+            return ""
+        return shlex.join(raw)
+    return raw if isinstance(raw, str) else ""
 
 
 def _candidate_paths(payload: dict[str, Any], command: str = "") -> list[str]:
@@ -476,16 +483,76 @@ def _candidate_paths(payload: dict[str, Any], command: str = "") -> list[str]:
         value = inputs.get(key)
         if isinstance(value, str) and value.strip():
             values.append(value.strip())
-    for key in ("patch", "diff", "content"):
+    for key in ("patch", "diff", "content", "command"):
         value = inputs.get(key)
         if isinstance(value, str) and ("*** " in value or "+++ b/" in value):
             values.extend(match.group(1).strip() for match in _PATCH_PATH_RE.finditer(value))
     if command:
-        for match in re.finditer(r"(?:>>?|\btee(?:\s+-a)?)\s+([^\s;&|]+)", command):
-            target = match.group(1).strip("'\"")
-            if target and target not in {"/dev/null", "NUL"}:
-                values.append(target)
+        values.extend(_shell_output_paths(command))
     return values[:32]
+
+
+def _without_heredoc_bodies(command: str) -> str:
+    """Keep shell command lines while removing opaque heredoc payloads.
+
+    Source text inside Python/Dart/Kotlin heredocs can contain ``>``, ``=>`` and ``->``.
+    Treating those language operators as shell redirections corrupts the verification ledger
+    with bogus paths. Delimiters are shell words by contract; ambiguous forms fail closed by
+    leaving the text for the token parser, which itself accepts only real redirection tokens.
+    """
+    kept: list[str] = []
+    delimiter: str | None = None
+    strip_tabs = False
+    heredoc_re = re.compile(r"<<(?P<dash>-)?\s*(?P<quote>['\"]?)(?P<word>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)")
+    for line in command.splitlines():
+        if delimiter is not None:
+            candidate = line.lstrip("\t") if strip_tabs else line
+            if candidate.strip() == delimiter:
+                delimiter = None
+                strip_tabs = False
+            continue
+        kept.append(line)
+        match = heredoc_re.search(line)
+        if match:
+            delimiter = match.group("word")
+            strip_tabs = bool(match.group("dash"))
+    return "\n".join(kept)
+
+
+def _shell_output_paths(command: str) -> list[str]:
+    """Extract explicit shell output targets without interpreting source-language arrows."""
+    try:
+        tokens = shlex.split(_without_heredoc_bodies(command), posix=True)
+    except ValueError:
+        return []
+    paths: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        match = re.fullmatch(r"(?:[0-9]+|&)?>{1,2}(.*)", token)
+        if match:
+            target = match.group(1)
+            if not target and i + 1 < len(tokens):
+                i += 1
+                target = tokens[i]
+            target = target.rstrip(";").strip("'\"")
+            if target and target not in {"/dev/null", "NUL", "&1", "&2"}:
+                paths.append(target)
+            i += 1
+            continue
+        if Path(token).name == "tee":
+            i += 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                i += 1
+            while i < len(tokens):
+                target = tokens[i].strip("'\"")
+                if not target or target.startswith("-") or target in {"/dev/null", "NUL"}:
+                    break
+                paths.append(target)
+                i += 1
+            continue
+        i += 1
+    return paths[:32]
 
 
 def _tool_call_id(payload: dict[str, Any]) -> str:
@@ -609,7 +676,9 @@ def _mutation_scope(payload: dict[str, Any]) -> str:
     short = name.rsplit(".", 1)[-1]
     command = _tool_command(payload)
     if short in _MUTATION_TOOLS:
-        return _scope_for_paths(_candidate_paths(payload, command))
+        # Codex supplies apply_patch text in tool_input.command. Parse its patch header, but never
+        # interpret Kotlin `-> {` or diff body text as shell redirection targets.
+        return _scope_for_paths(_candidate_paths(payload))
     if name in _SHELL_TOOLS or short in _SHELL_TOOLS:
         if _SHELL_MUTATION_RE.search(command):
             return _scope_for_paths(_candidate_paths(payload, command))
@@ -620,9 +689,50 @@ def _strip_shell_prefix(segment: str) -> str:
     text = segment.strip().lstrip("(").strip()
     # Common harmless wrappers and environment assignments. Keep this intentionally narrow:
     # proof recognition must fail closed rather than accepting prose that mentions a test.
-    text = re.sub(r"^(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S+)\s+)+", "", text)
-    text = re.sub(r"^(?:time\s+|command\s+|timeout\s+\S+\s+)", "", text)
+    for _ in range(3):
+        before = text
+        text = re.sub(
+            r"^(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S+)\s+)+",
+            "",
+            text,
+        )
+        text = re.sub(r"^(?:time\s+|command\s+|timeout\s+\S+\s+)", "", text).strip()
+        try:
+            tokens = shlex.split(text)
+        except ValueError:
+            break
+        if (
+            len(tokens) >= 3
+            and Path(tokens[0].replace("\\", "/")).name.lower() in {"bash", "zsh", "sh"}
+            and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", tokens[1])
+        ):
+            text = tokens[2].strip()
+        if text == before:
+            break
     return text.strip()
+
+
+def _gradle_verification_level(segment: str) -> int:
+    """Classify concrete Gradle verification tasks without trusting arbitrary task prose."""
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return 0
+    if not tokens:
+        return 0
+    executable = Path(tokens[0].replace("\\", "/")).name.lower()
+    if executable not in {"gradle", "gradle.bat", "gradlew", "gradlew.bat"}:
+        return 0
+    level = 0
+    for token in tokens[1:]:
+        if not token or token.startswith("-"):
+            continue
+        task = token.rsplit(":", 1)[-1]
+        if re.fullmatch(r"(?:test(?:[A-Z0-9].*)?|.*Test(?:[A-Z0-9].*)?)", task):
+            return 3
+        if re.fullmatch(r"(?:compile|assemble|build|check|lint)(?:[A-Z0-9].*)?", task):
+            level = max(level, 2)
+    return level
 
 
 def _verification_level(payload: dict[str, Any]) -> int:
@@ -635,6 +745,7 @@ def _verification_level(payload: dict[str, Any]) -> int:
     level = 0
     for raw_segment in re.split(r"&&|\|\||;|\n", command):
         segment = _strip_shell_prefix(raw_segment)
+        level = max(level, _gradle_verification_level(segment))
         for strength, pattern in _VERIFY_PATTERNS:
             if pattern.search(segment):
                 level = max(level, strength)
@@ -712,8 +823,9 @@ def observe_tool_event(
             call_id = _tool_call_id(payload)
             input_digest = _tool_input_digest(payload)
             if scope:
+                path_command = "" if name.rsplit(".", 1)[-1] in _MUTATION_TOOLS else command
                 event_paths, paths_complete = _normalized_paths(
-                    Path(root), _candidate_paths(payload, command)
+                    Path(root), _candidate_paths(payload, path_command)
                 )
                 prior_paths = [
                     str(value) for value in row.get("mutation_paths", []) if isinstance(value, str)
@@ -927,12 +1039,14 @@ def detect(
     *,
     sid: str = "",
     diagnostics: list[str] | None = None,
+    include_plan: bool = True,
 ) -> dict[str, Any] | None:
     """First unfinished-work signal in precedence order, or None when the tree looks done."""
     root = Path(root)
-    signal = _signal_plan(root, baseline)
-    if signal:
-        return signal
+    if include_plan:
+        signal = _signal_plan(root, baseline)
+        if signal:
+            return signal
     ok_status, files, unmerged, untracked, overflow = _worktree_status(root)
     if not ok_status:
         if diagnostics is not None:
@@ -1168,11 +1282,11 @@ def request_plan_signal(root: Path, sid: str) -> dict[str, Any] | None:
     return active
 
 
-def _stalled(root: Path, sid: str, fingerprint: str) -> bool:
-    """True when this exact signal+tree has already been blocked MAX_STALL_REPEATS times.
+def _stall_attempt(root: Path, sid: str, fingerprint: str) -> tuple[int, int]:
+    """Return ``(attempt, limit)``; attempt 0 means the anti-nag rail must yield.
 
-    This is the anti-nag rail. Without it a model that cannot fix the signal (or refuses to)
-    would be re-prompted until the hard cap, burning the whole budget on no progress.
+    Exposing the bounded attempt keeps repeated safety nudges distinguishable to the user while
+    preserving the same no-progress cap. State write failure still fails open for turn completion.
     """
     limit = _int_env("AI_COMPLETION_GUARD_MAX_STALL", MAX_STALL_REPEATS, minimum=1)
     try:
@@ -1195,10 +1309,16 @@ def _stalled(root: Path, sid: str, fingerprint: str) -> bool:
                     sessions.pop(key, None)
             state["sessions"] = sessions
             if not _write_state(root, state):
-                return True
-            return count > limit
+                return 0, limit
+            return (count if count <= limit else 0), limit
     except OSError:
-        return True  # state cannot be made durable → never risk an unbounded loop
+        return 0, limit  # state cannot be made durable → never risk an unbounded loop
+
+
+def _stalled(root: Path, sid: str, fingerprint: str) -> bool:
+    """Compatibility predicate for callers that only need the yield decision."""
+    attempt, _limit = _stall_attempt(root, sid, fingerprint)
+    return attempt == 0
 
 
 def reset_session(root: Path, sid: str) -> bool:
@@ -1319,7 +1439,13 @@ def consume_degraded_notice(root: Path, sid: str) -> str:
         return ""
 
 
-def guard_directive(payload: dict[str, Any], root: Path, *, now: float | None = None) -> str | None:
+def guard_directive(
+    payload: dict[str, Any],
+    root: Path,
+    *,
+    now: float | None = None,
+    include_plan: bool = True,
+) -> str | None:
     """Reason to refuse this turn end, or None to let it end. Never raises.
 
     The caller sets decision=block + reason=<this> on Stop ONLY when not already blocking for
@@ -1341,13 +1467,20 @@ def guard_directive(payload: dict[str, Any], root: Path, *, now: float | None = 
             _record_degraded_notice(root, sid, "request baseline missing, corrupt, or expired")
             return None  # missing/corrupt/stale request attribution can never justify a loop
         diagnostics: list[str] = []
-        signal = detect(root, baseline, sid=sid, diagnostics=diagnostics)
+        signal = detect(
+            root,
+            baseline,
+            sid=sid,
+            diagnostics=diagnostics,
+            include_plan=include_plan,
+        )
         if not signal:
             if diagnostics:
                 _record_degraded_notice(root, sid, "; ".join(dict.fromkeys(diagnostics)))
             return None
         fingerprint = _fingerprint(root, signal)
-        if _stalled(root, sid, fingerprint):
+        attempt, attempt_limit = _stall_attempt(root, sid, fingerprint)
+        if attempt == 0:
             return None  # no progress across repeats → stop nagging, hand back to the user
         # Share loop_continuation's bounded per-session budget: one "keep going" ledger.
         from .loop_continuation import _bump_counter
@@ -1356,7 +1489,8 @@ def guard_directive(payload: dict[str, Any], root: Path, *, now: float | None = 
         kind = str(signal.get("kind"))
         where = str(signal.get("detail") or "")
         return (
-            f"cb-guard[{kind}]: unfinished work detected{f' at {where}' if where else ''}. "
+            f"cb-guard[{kind}] attempt {attempt}/{attempt_limit}: "
+            f"unfinished work detected{f' at {where}' if where else ''}. "
             f"Do NOT stop — {signal.get('action')}. "
             "If it is genuinely blocked, say so explicitly and record the blocker; "
             "if this signal is wrong, state why in one line and stop."

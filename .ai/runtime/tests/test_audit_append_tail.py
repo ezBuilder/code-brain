@@ -88,6 +88,23 @@ def test_oversized_existing_last_record_fails_without_modification(
     assert path.read_text(encoding="utf-8") == original
 
 
+def test_oversized_non_marker_json_record_cannot_bypass_line_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    monkeypatch.setattr(memory, "_AUDIT_LINE_MAX_BYTES", 1024)
+    path = memory.audit_path(root)
+    path.parent.mkdir(parents=True)
+    original = json.dumps({"action": "not-a-marker", "payload": "x" * 2500}) + "\n"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(OSError, match="exceeds line limit"):
+        memory.append_audit(root, action="new", category="test", payload={})
+
+    assert path.read_text(encoding="utf-8") == original
+
+
 def test_audit_action_and_category_are_capped_consistently(tmp_path: Path) -> None:
     root = tmp_path / "repo"
 

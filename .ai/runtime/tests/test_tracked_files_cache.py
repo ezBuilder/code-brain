@@ -132,6 +132,7 @@ def test_non_git_filesystem_baseline_excludes_internal_runtime_state(
         repo / ".chatgpt2codex" / "session.json",
         repo / ".ai" / "memory" / "events.jsonl",
         repo / ".ai" / "cache" / "state.json",
+        repo / ".code-brain-install-transaction" / "owner.json",
         repo / ".venv" / "secret.py",
         repo / "node_modules" / "pkg" / "index.js",
     ]

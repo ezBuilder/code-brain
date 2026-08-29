@@ -38,6 +38,8 @@ usage:
 Installs, upgrades, or removes Code Brain in an existing project.
 Managed files are recorded in .ai/generated/install-manifest.json.
 Existing unrelated target files are never overwritten.
+Exact Code Brain-managed Codex hooks are trusted after install/upgrade by default.
+Set AI_CODEX_HOOK_AUTO_TRUST=0 to leave them review-gated.
 EOF
 }
 
@@ -94,12 +96,17 @@ managed_files() {
         done
       fi
     } | grep -vxE "\.ai/secret_scan_allowlist\.txt|\.ai/generated/install-manifest\.json|\.ai/eval(/.*)?" \
-      | awk '!(($0 ~ /^\.ai\/memory\// || $0 ~ /^\.ai\/runtime\/state\//) && $0 !~ /\.gitkeep$/)' \
+      | awk '
+          $0 ~ /^\.ai\/outputs\// && $0 != ".ai/outputs/.gitkeep" { next }
+          ($0 ~ /^\.ai\/memory\// || $0 ~ /^\.ai\/runtime\/state\//) && $0 !~ /\.gitkeep$/ { next }
+          { print }
+        ' \
       | while IFS= read -r rel; do
         [[ -f "$rel" ]] && printf '%s\n' "$rel"
       done
   ) || true
-  # ^ never propagate the SOURCE repo's private runtime memory/state DATA or user-owned .ai/eval scratch
+  # ^ never propagate the SOURCE repo's private runtime memory/state DATA, durable output
+  #   artifacts, or user-owned .ai/eval scratch
   #   (audit chain, decisions,
   #   sessions, evidence, prompt-growth, worker heartbeats). Seeding it pollutes the target project
   #   and corrupts its audit chain. Directory structure still propagates via the .gitkeep files,
@@ -186,7 +193,19 @@ manifest_path() {
 }
 
 legacy_code_brain_install() {
-  [[ -x "$TARGET_ROOT/.ai/bin/ai" || -f "$TARGET_ROOT/.ai/AGENTS.md" ]]
+  if [[ -x "$TARGET_ROOT/.ai/bin/ai" || -f "$TARGET_ROOT/.ai/AGENTS.md" ]]; then
+    return 0
+  fi
+  # Early pre-manifest builds could leave the runtime and host wiring without
+  # either modern marker. Require three independent Code Brain signatures
+  # before allowing `upgrade` to adopt that partial namespace; a normal
+  # unrelated .ai directory must still use the collision-safe fresh install.
+  [[ -f "$TARGET_ROOT/.ai/runtime/pyproject.toml" ]] \
+    && grep -qxF 'name = "code-brain-runtime"' "$TARGET_ROOT/.ai/runtime/pyproject.toml" \
+    && [[ -f "$TARGET_ROOT/.codex/hooks.json" ]] \
+    && grep -Fq '.ai/bin/ai-hook' "$TARGET_ROOT/.codex/hooks.json" \
+    && [[ -f "$TARGET_ROOT/.codex/config.toml" ]] \
+    && grep -Fq '[mcp_servers.code-brain]' "$TARGET_ROOT/.codex/config.toml"
 }
 
 copy_managed_files() {
@@ -216,9 +235,26 @@ if manifest.is_file():
     except Exception:
         manifest_files = set()
 
-legacy_install = os.access(target_root / ".ai" / "bin" / "ai", os.X_OK) or (
-    target_root / ".ai" / "AGENTS.md"
-).is_file()
+runtime_marker = target_root / ".ai" / "runtime" / "pyproject.toml"
+hooks_marker = target_root / ".codex" / "hooks.json"
+config_marker = target_root / ".codex" / "config.toml"
+partial_legacy_install = False
+try:
+    partial_legacy_install = (
+        runtime_marker.is_file()
+        and b"name = \"code-brain-runtime\"" in runtime_marker.read_bytes().splitlines()
+        and hooks_marker.is_file()
+        and b".ai/bin/ai-hook" in hooks_marker.read_bytes()
+        and config_marker.is_file()
+        and b"[mcp_servers.code-brain]" in config_marker.read_bytes()
+    )
+except OSError:
+    partial_legacy_install = False
+legacy_install = (
+    os.access(target_root / ".ai" / "bin" / "ai", os.X_OK)
+    or (target_root / ".ai" / "AGENTS.md").is_file()
+    or partial_legacy_install
+)
 managed_prefixes = (
     ".ai/",
     ".githooks/",
@@ -366,7 +402,7 @@ payload = {
     "installed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "project": root.name,
     "files": sorted(set(files)),
-    "merged_config_files": [".mcp.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json", ".agents/mcp_config.json", ".agents/hooks.json"],
+    "merged_config_files": [".mcp.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json", ".agents/mcp_config.json", ".agents/hooks.json", ".kiro/hooks/code-brain.json"],
     "source_git_sha": source,
     "source_ref": source_ref,
     "source_repo_url": source_repo_url,
@@ -475,6 +511,7 @@ restore_managed_owner_if_root() {
     "$TARGET_ROOT/.agents/mcp_config.json" \
     "$TARGET_ROOT/.agents/hooks.json" \
     "$TARGET_ROOT/.agents/skills" \
+    "$TARGET_ROOT/.kiro/hooks/code-brain.json" \
     "$TARGET_ROOT/AGENTS.md" \
     "$TARGET_ROOT/CLAUDE.md" \
     "$TARGET_ROOT/bootstrap-code-brain.sh"
@@ -674,81 +711,191 @@ if not dst.exists() or dst.read_text(encoding="utf-8") != new_text:
 PY
 }
 
+# Detects the local Claude Code CLI version as "MAJOR.MINOR.PATCH" (best-effort).
+# Used only to gate Claude hooks.json event keys that a too-old Claude Code
+# install may not recognize (see merge_claude_settings). Fails closed: prints
+# nothing and returns non-zero when the version cannot be determined, and
+# callers must treat that as "unknown" and NOT enable the gated event — Claude
+# Code drops malformed/unknown hook entries rather than tolerating them the
+# way Codex's hooks.json parser does, so guessing support is the wrong default.
+detect_claude_cli_version() {
+  local override="${AI_CLAUDE_CLI_VERSION_OVERRIDE:-}"
+  if [[ -n "$override" ]]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+  command -v claude >/dev/null 2>&1 || return 1
+  local raw
+  raw="$(claude --version 2>/dev/null | head -1)" || return 1
+  # Observed format: "2.1.220 (Claude Code)".
+  [[ "$raw" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# True (rc 0) when the locally detected Claude Code version is >= $1. Reuses
+# compare_versions (defined above for the Codex CLI gate); fails closed when
+# the version cannot be detected.
+claude_cli_version_at_least() {
+  local required="$1" detected
+  detected="$(detect_claude_cli_version)" || return 1
+  [[ "$(compare_versions "$detected" "$required")" != "-1" ]]
+}
+
 merge_claude_settings() {
   local dst="$TARGET_ROOT/.claude/settings.json"
-  py - "$dst" <<'PY'
+  # StopFailure, TeammateIdle, TaskCreated, FileChanged and CwdChanged are real,
+  # officially documented Claude Code hook events, but they are newer additions
+  # to the event vocabulary than the rest of this file's managed events
+  # (StopFailure: v2.1.78, 2026-03-17; TeammateIdle: v2.1.33, 2026-02-06;
+  # CwdChanged/FileChanged: v2.1.83, 2026-03-24; TaskCreated: v2.1.84,
+  # 2026-03-26 — verified 2026-08-29 against the official changelog and hooks
+  # reference). An unknown/unsupported hooks.json key can be dropped or
+  # rejected outright by an older Claude Code, unlike Codex's tolerant
+  # hooks.json parser, so all five are version-gated rather than shipped
+  # unconditionally like the rest of this file's existing (older,
+  # already-supported) managed events.
+  local stopfailure_enabled="0" teammateidle_enabled="0" taskcreated_enabled="0" filechanged_enabled="0" cwdchanged_enabled="0"
+  if claude_cli_version_at_least "2.1.78"; then
+    stopfailure_enabled="1"
+  fi
+  if claude_cli_version_at_least "2.1.33"; then
+    teammateidle_enabled="1"
+  fi
+  if claude_cli_version_at_least "2.1.83"; then
+    filechanged_enabled="1"
+    cwdchanged_enabled="1"
+  fi
+  if claude_cli_version_at_least "2.1.84"; then
+    taskcreated_enabled="1"
+  fi
+  py - "$dst" "$stopfailure_enabled" "$teammateidle_enabled" "$taskcreated_enabled" "$filechanged_enabled" "$cwdchanged_enabled" <<'PY'
 import json
 import os
 import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
+stopfailure_enabled = sys.argv[2] == "1"
+teammateidle_enabled = sys.argv[3] == "1"
+taskcreated_enabled = sys.argv[4] == "1"
+filechanged_enabled = sys.argv[5] == "1"
+cwdchanged_enabled = sys.argv[6] == "1"
 managed = {
     "PreToolUse": [
-        {"matcher": "Bash",
-         "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PreToolUse"}]}
+        # Widened from "Bash"-only to also cover Claude's file-write tools (Edit/Write/
+        # MultiEdit/NotebookEdit — official matcher tool-name list, verified 2026-08-29).
+        # Code Brain's PreToolUse handler routes command-shaped input (tool_input.command/
+        # CommandLine) through precall/commit-secret rules, AND separately runs
+        # stream_guard.evaluate_hook_payload() against the full tool_input text for EVERY
+        # PreToolUse call regardless of tool shape (.ai/runtime/src/ai_core/{hooks,
+        # stream_guard}.py, verified 2026-08-29) — a secret/dangerous-pattern match there sets
+        # decision=block independent of the command-only checks. So this widening does add a
+        # real, new block surface: a file-write tool call (Edit/Write/MultiEdit/NotebookEdit)
+        # whose file_path/content trips stream_guard can now be denied, the same way a
+        # matching Bash command already could be. That is the intended protection, not a side
+        # effect to explain away — do not describe this matcher as "observation only" or claim
+        # it "cannot introduce a new way to block".
+        {"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+         "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PreToolUse", "timeout": 5}]}
     ],
     "PostToolUse": [
-        {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep",
-         "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUse"}]}
+        # Bash is required here (not just Edit/Write/...): completion_guard observes
+        # test/lint/build command results via PostToolUse, and those run through the Bash
+        # tool, not a file-write tool. Omitting Bash silently blinds that observation path.
+        {"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep",
+         "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUse", "timeout": 2}]}
     ],
     "SessionStart": [
-        {"matcher": "startup|resume|clear|compact",
-         "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SessionStart"}]}
+        # "fork" was added as a SessionStart source alongside startup/resume/clear/compact
+        # (Claude Code hook events reference, verified 2026-08-29). Listing it here is a
+        # config-only, fail-safe addition: a Claude Code build that doesn't emit "fork" simply
+        # never matches this extra alternative, so nothing regresses on older installs.
+        {"matcher": "startup|resume|clear|compact|fork",
+         "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SessionStart", "timeout": 2}]}
     ],
     "UserPromptSubmit": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook UserPromptSubmit"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook UserPromptSubmit", "timeout": 5}]}
     ],
     "Stop": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook Stop"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook Stop", "timeout": 5}]}
     ],
     "SubagentStop": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SubagentStop"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SubagentStop", "timeout": 2}]}
     ],
     "PreCompact": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PreCompact"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PreCompact", "timeout": 2}]}
     ],
     "SessionEnd": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SessionEnd"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SessionEnd", "timeout": 2}]}
     ],
     "Notification": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook Notification"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook Notification", "timeout": 2}]}
     ],
     "PostCompact": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostCompact"}]}
-    ],
-    "CwdChanged": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook CwdChanged"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostCompact", "timeout": 2}]}
     ],
     "ConfigChange": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook ConfigChange"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook ConfigChange", "timeout": 2}]}
     ],
     "PermissionDenied": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PermissionDenied"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PermissionDenied", "timeout": 2}]}
     ],
     "InstructionsLoaded": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook InstructionsLoaded"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook InstructionsLoaded", "timeout": 2}]}
     ],
     "SubagentStart": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SubagentStart"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook SubagentStart", "timeout": 2}]}
     ],
-    "TaskCreated": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook TaskCreated"}]}
-    ],
+    # TaskCompleted does NOT support matchers (official hooks reference: "TaskCompleted hooks
+    # do not support matchers and fire on every occurrence") — a matcher key here would be
+    # silently ignored at best; deliberately omitted rather than added speculatively.
     "TaskCompleted": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook TaskCompleted"}]}
-    ],
-    "FileChanged": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook FileChanged"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook TaskCompleted", "timeout": 5}]}
     ],
     "PostToolUseFailure": [
-        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUseFailure"}]}
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook PostToolUseFailure", "timeout": 2}]}
     ],
 }
+# StopFailure/TeammateIdle: neither supports matchers (official hooks reference), and both
+# are added only when the locally detected Claude Code version supports them (see the version
+# gate above this heredoc).
+if stopfailure_enabled:
+    managed["StopFailure"] = [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook StopFailure", "timeout": 2}]}
+    ]
+if teammateidle_enabled:
+    managed["TeammateIdle"] = [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook TeammateIdle", "timeout": 5}]}
+    ]
+# TaskCreated does NOT support matchers (official hooks reference), and — unlike
+# TaskCompleted — a hook on it CAN block: exit code 2 rolls back the task's creation
+# (verified 2026-08-29). Code Brain's handler only records/observes; it never returns
+# a block decision for TaskCreated, so this addition is side-effect free either way.
+if taskcreated_enabled:
+    managed["TaskCreated"] = [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook TaskCreated", "timeout": 2}]}
+    ]
+# FileChanged's matcher is NOT a regex/glob: Claude Code splits it on "|" into literal
+# filenames to watch (basename match), and only starts the watcher when some FileChanged
+# group names at least one file (official hooks reference + hooks guide, verified
+# 2026-08-29). Watch exactly the repo-root files whose edits should be recorded/should
+# refresh injected context. `watchPaths` (SessionStart/CwdChanged hook output) could
+# extend this list dynamically, but this installer does not assume that output shape is
+# populated by the current runtime — the static matcher alone is enough to make this
+# hook fire instead of a no-matcher entry, which would never watch anything.
+if filechanged_enabled:
+    managed["FileChanged"] = [
+        {"matcher": "AGENTS.md|CLAUDE.md|.ai/config.yaml",
+         "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook FileChanged", "timeout": 2}]}
+    ]
+if cwdchanged_enabled:
+    managed["CwdChanged"] = [
+        {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.ai/bin/ai-hook CwdChanged", "timeout": 2}]}
+    ]
 # Windows parity: give every Claude hook a commandWindows that runs the .ps1 shim via
 # powershell (Claude Code sets CLAUDE_PROJECT_DIR on Windows too; fall back to cwd). The
 # Unix `command` stays the default; hosts pick commandWindows on Windows. Derived from
-# each command's event (last token) so the 19-event dict above stays the single source.
+# each command's event (last token) so the managed dict above stays the single source.
 def _claude_cmd_win(unix_cmd):
     event = unix_cmd.rsplit(" ", 1)[-1]
     return (
@@ -802,6 +949,27 @@ for hook_name, managed_entries in managed.items():
     existing = hooks.get(hook_name) if isinstance(hooks.get(hook_name), list) else []
     cleaned = _strip_code_brain(existing)
     hooks[hook_name] = cleaned + managed_entries
+# A previous install/upgrade may have written a version-gated event
+# (StopFailure/TeammateIdle) that is no longer enabled on this run (e.g. Claude
+# Code was downgraded, or the override env var changed). Strip our own
+# commands from any gated event we are not currently managing, but never
+# touch a foreign/user entry for that event name.
+for _gated_name, _enabled in (
+    ("StopFailure", stopfailure_enabled),
+    ("TeammateIdle", teammateidle_enabled),
+    ("TaskCreated", taskcreated_enabled),
+    ("FileChanged", filechanged_enabled),
+    ("CwdChanged", cwdchanged_enabled),
+):
+    if _enabled or _gated_name not in hooks:
+        continue
+    _existing = hooks.get(_gated_name)
+    if isinstance(_existing, list):
+        _kept = _strip_code_brain(_existing)
+        if _kept:
+            hooks[_gated_name] = _kept
+        else:
+            del hooks[_gated_name]
 # Env keys the runtime needs in order for the Stop-hook guards to do anything at all.
 # Before this, the source kit's .claude/settings.json carried env.AI_LOOP_CONTINUATION=1 but
 # the installer only ever merged `hooks`, so consumer settings ended up with the Stop hook
@@ -823,46 +991,107 @@ if not dst.exists() or dst.read_text(encoding="utf-8") != _rendered:
 PY
 }
 
+# Detects the local Codex CLI version as "MAJOR.MINOR.PATCH" (best-effort).
+# Used only to gate hook events whose support varies by installed Codex CLI
+# version (see merge_codex_hooks_json). Prints nothing and returns non-zero
+# when the version cannot be determined — callers must treat that as "unknown"
+# and fail closed (i.e. do not enable version-gated events).
+detect_codex_cli_version() {
+  local override="${AI_CODEX_CLI_VERSION_OVERRIDE:-}"
+  if [[ -n "$override" ]]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+  command -v codex >/dev/null 2>&1 || return 1
+  local raw
+  raw="$(codex --version 2>/dev/null | head -1)" || return 1
+  # Observed formats: "codex-cli 0.147.0", "codex 0.147.0".
+  [[ "$raw" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Compares two "MAJOR.MINOR.PATCH" version strings. Prints -1/0/1 to stdout
+# (a < b / a == b / a > b). Missing/non-numeric components are treated as 0,
+# matching semver comparison for release versions (no pre-release suffixes
+# are expected from `codex --version`).
+compare_versions() {
+  local a="$1" b="$2"
+  local -a av bv
+  IFS='.' read -r -a av <<<"$a"
+  IFS='.' read -r -a bv <<<"$b"
+  local i
+  for i in 0 1 2; do
+    local ai="${av[$i]:-0}" bi="${bv[$i]:-0}"
+    ai="${ai//[!0-9]/}"; bi="${bi//[!0-9]/}"
+    ai="${ai:-0}"; bi="${bi:-0}"
+    if ((10#$ai > 10#$bi)); then printf '1\n'; return 0; fi
+    if ((10#$ai < 10#$bi)); then printf '%s\n' "-1"; return 0; fi
+  done
+  printf '0\n'
+}
+
+# True (rc 0) when the locally detected Codex CLI version is >= $1. Fails
+# closed: if the version cannot be detected at all, returns non-zero so
+# callers gate the feature OFF rather than assume support.
+codex_cli_version_at_least() {
+  local required="$1" detected
+  detected="$(detect_codex_cli_version)" || return 1
+  [[ "$(compare_versions "$detected" "$required")" != "-1" ]]
+}
+
 merge_codex_hooks_json() {
   local dst="$TARGET_ROOT/.codex/hooks.json"
-  py - "$dst" <<'PY'
+  # SessionEnd shipped as a stable Codex hooks.json event ahead of the hooks
+  # engine's GA (codex-rs/hooks/src/lib.rs HOOK_EVENT_NAMES; verified 2026-08-29
+  # against upstream codex-rs and the installed local CLI, matcher "other",
+  # 1s default / 3s max timeout). Gate on a conservative floor version anyway:
+  # a fresh Codex CLI install with hooks support at all is >= 0.117.0, and any
+  # host below that silently ignores unknown hooks.json keys rather than
+  # failing, so the gate is a hygiene/log-noise guard, not a hard requirement.
+  local session_end_enabled="0"
+  if codex_cli_version_at_least "0.117.0"; then
+    session_end_enabled="1"
+  fi
+  # `Interrupt` shipped as a stable Codex hooks.json event in the rust-v0.150.0
+  # release ("New Interrupt hooks can run commands or MCP handlers when an
+  # active top-level turn is interrupted", GitHub release notes, verified
+  # 2026-08-29 against https://github.com/openai/codex/releases/tag/rust-v0.150.0
+  # — this superseded an earlier finding that it was upstream-main-only/alpha;
+  # rust-v0.150.0 is a tagged stable release, not an alpha). Gate on that floor
+  # version so hosts below it (which do not recognize the event) never receive
+  # it; a host below 0.150.0 silently ignores unknown hooks.json keys rather
+  # than failing, so this is a hygiene/log-noise guard, not a hard requirement.
+  # AI_CODEX_HOOK_INTERRUPT=0 remains an explicit escape hatch to force this
+  # off even on a detected-supporting version (e.g. a host that ships 0.150.0+
+  # but has a known-bad Interrupt handler); it cannot force Interrupt ON when
+  # the detected/overridden version is below the floor — version detection
+  # failing must never enable a hook event the local Codex CLI may not support.
+  local interrupt_enabled="0"
+  if codex_cli_version_at_least "0.150.0"; then
+    interrupt_enabled="1"
+  fi
+  case "${AI_CODEX_HOOK_INTERRUPT:-}" in
+    0|false|FALSE|no|NO|off|OFF) interrupt_enabled="0" ;;
+  esac
+  py - "$dst" "$session_end_enabled" "$interrupt_enabled" "$SOURCE_ROOT/scripts" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 dst = Path(sys.argv[1])
+session_end_enabled = sys.argv[2] == "1"
+interrupt_enabled = sys.argv[3] == "1"
+contract_dir = Path(sys.argv[4])
+sys.path.insert(0, str(contract_dir))
+from codex_hook_contract import contains_code_brain_command, managed_codex_hooks as render_managed_hooks
 
-def cmd(event):
-    return 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; "$ROOT/.ai/bin/ai-hook" ' + event
+# One stdlib-only contract is shared with the trust helper. This prevents the
+# installer render and post-install semantic trust validation from drifting.
+managed_codex_hooks = render_managed_hooks(
+    session_end_enabled=session_end_enabled,
+    interrupt_enabled=interrupt_enabled,
+)
 
-def cmd_win(event):
-    return (
-        'powershell -NoProfile -Command "$ROOT = (git rev-parse --show-toplevel 2>$null); '
-        'if (-not $ROOT) { $ROOT = (Get-Location).Path }; '
-        '& \\"$ROOT/.ai/bin/ai-hook.ps1\\" ' + event + '"'
-    )
-
-def H(event, matcher=None, msg=None):
-    handler = {"type": "command", "command": cmd(event), "commandWindows": cmd_win(event)}
-    if msg:
-        handler["statusMessage"] = msg
-    entry = {"hooks": [handler]}
-    if matcher is not None:
-        entry["matcher"] = matcher
-    return [entry]
-
-managed_codex_hooks = {
-    "PreToolUse": H("PreToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|run_command", msg="Checking Code Brain command routing"),
-    "PostToolUse": H("PostToolUse", matcher="Bash|Shell|exec_command|functions.exec_command|apply_patch|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|run_command|replace_file_content|multi_replace_file_content|write_to_file|view_file|grep_search|list_dir", msg="Recording Code Brain tool result"),
-    "SessionStart": H("SessionStart", matcher="startup|resume|clear|compact", msg="Loading Code Brain session context"),
-    "UserPromptSubmit": H("UserPromptSubmit", msg="Loading Code Brain prompt context"),
-    "Stop": H("Stop", msg="Recording Code Brain stop event"),
-    "SubagentStart": H("SubagentStart", msg="Loading Code Brain subagent context"),
-    "SubagentStop": H("SubagentStop", msg="Recording Code Brain subagent stop"),
-    "PreCompact": H("PreCompact", msg="Saving Code Brain compact snapshot"),
-    "PostCompact": H("PostCompact", msg="Recording Code Brain compact completion"),
-    "PermissionRequest": H("PermissionRequest", matcher="Bash|Shell|exec_command|functions.exec_command|run_command|ask_permission", msg="Checking Code Brain approval policy"),
-}
 if dst.exists():
     try:
         existing_payload = json.loads(dst.read_text(encoding="utf-8"))
@@ -881,31 +1110,121 @@ if not isinstance(existing_hooks, dict):
 payload = {"hooks": existing_hooks}
 hooks = payload["hooks"]
 
-def _has_code_brain_command(hook_value):
-    if isinstance(hook_value, dict):
-        cmd = hook_value.get("command")
-        if isinstance(cmd, str) and ".ai/bin/ai-hook" in cmd:
-            return True
-        for handler in hook_value.get("hooks", []) or []:
-            if isinstance(handler, dict):
-                cmd = handler.get("command")
-                if isinstance(cmd, str) and ".ai/bin/ai-hook" in cmd:
-                    return True
-    return False
-
 for name, managed_entries in managed_codex_hooks.items():
     existing = hooks.get(name)
     if isinstance(existing, list):
-        kept = [e for e in existing if not _has_code_brain_command(e)]
+        kept = [e for e in existing if not contains_code_brain_command(e)]
     else:
         # Legacy: a single object value (older buggy install). Replace entirely.
         kept = []
     hooks[name] = kept + managed_entries
+# A previous install may have written a version-gated event (SessionEnd/Interrupt)
+# that is no longer enabled on this run (e.g. AI_CODEX_HOOK_INTERRUPT unset after
+# being set, or a downgraded Codex CLI). Strip our own commands from any gated
+# event we are not currently managing, but never touch a foreign/user entry for
+# that event name.
+for gated_name, enabled in (("SessionEnd", session_end_enabled), ("Interrupt", interrupt_enabled)):
+    if enabled or gated_name not in hooks:
+        continue
+    existing = hooks.get(gated_name)
+    if isinstance(existing, list):
+        kept = [e for e in existing if not contains_code_brain_command(e)]
+        if kept:
+            hooks[gated_name] = kept
+        else:
+            del hooks[gated_name]
 rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 if not dst.exists() or dst.read_text(encoding="utf-8") != rendered:
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(rendered, encoding="utf-8")
 PY
+}
+
+auto_trust_codex_hooks() {
+  local auto_trust="${AI_CODEX_HOOK_AUTO_TRUST:-}"
+  if [[ -z "$auto_trust" ]]; then
+    if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" || -n "${GITLAB_CI:-}" || -n "${AI_CI:-}" ]]; then
+      auto_trust="0"
+    else
+      auto_trust="1"
+    fi
+  fi
+  case "$auto_trust" in
+    1|true|TRUE|yes|YES|on|ON) ;;
+    0|false|FALSE|no|NO|off|OFF) return 0 ;;
+    *)
+      echo "install-into: AI_CODEX_HOOK_AUTO_TRUST must be a boolean value" >&2
+      return 2
+      ;;
+  esac
+
+  local policy="${AI_CODEX_HOOK_TRUST_POLICY:-}"
+  local fallback_managed_target="0"
+  if [[ -z "$policy" ]]; then
+    local config_home="${XDG_CONFIG_HOME:-}"
+    if [[ -z "$config_home" ]]; then
+      [[ -n "${HOME:-}" ]] && config_home="$HOME/.config"
+    fi
+    if [[ -n "$config_home" ]]; then
+      local default_policy="$config_home/code-brain/codex-hook-trust.json"
+      if [[ -f "$default_policy" || -L "$default_policy" ]]; then
+        policy="$default_policy"
+        fallback_managed_target="1"
+      fi
+    fi
+  fi
+  if [[ -n "${AI_CODEX_HOOK_TRUST_POLICY:-}" && ! -f "$policy" && ! -L "$policy" ]]; then
+    return 0
+  fi
+
+  local helper="$SOURCE_ROOT/scripts/trust-codex-hooks.py"
+  if [[ ! -f "$helper" ]]; then
+    echo "install-into: Codex hook trust helper is missing: $helper" >&2
+    return 1
+  fi
+  if [[ -n "$policy" ]]; then
+    local -a trust_args=(--cwd "$TARGET_ROOT" --policy "$policy")
+    if [[ "$fallback_managed_target" == "1" ]]; then
+      trust_args+=(--fallback-managed-target)
+    fi
+    if ! py "$helper" "${trust_args[@]}"; then
+      echo "install-into: managed files committed, but Codex hook trust failed" >&2
+      return 1
+    fi
+  elif ! py "$helper" --cwd "$TARGET_ROOT" --trust-managed-target; then
+    echo "install-into: managed files committed, but default Codex hook trust failed" >&2
+    return 1
+  fi
+}
+
+remove_codex_hook_trust_before_uninstall() {
+  local enabled="${AI_CODEX_HOOK_AUTO_TRUST:-}"
+  if [[ -z "$enabled" ]]; then
+    if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" || -n "${GITLAB_CI:-}" || -n "${AI_CI:-}" ]]; then
+      enabled="0"
+    else
+      enabled="1"
+    fi
+  fi
+  case "$enabled" in
+    1|true|TRUE|yes|YES|on|ON) ;;
+    0|false|FALSE|no|NO|off|OFF) return 0 ;;
+    *)
+      echo "install-into: AI_CODEX_HOOK_AUTO_TRUST must be a boolean value" >&2
+      return 2
+      ;;
+  esac
+  local helper="$SOURCE_ROOT/scripts/trust-codex-hooks.py"
+  if [[ ! -f "$helper" ]]; then
+    echo "install-into: Codex hook trust helper missing; uninstall will leave prior hash state" >&2
+    return 0
+  fi
+  # Removing trust before filesystem mutation is fail-safe: if the later
+  # transaction rolls back, the still-installed hooks merely require review.
+  # Project trust and every foreign/global hook hash remain untouched.
+  if ! py "$helper" --cwd "$TARGET_ROOT" --remove-managed-target; then
+    echo "install-into: could not remove managed Codex hook hashes; continuing uninstall" >&2
+  fi
 }
 
 merge_antigravity_mcp_json() {
@@ -979,12 +1298,17 @@ def handlers(event: str, timeout: int):
 # treated as deny, hard-stalling the worker). Code Brain's PreToolUse therefore broke agy
 # rather than protecting it. PostToolUse (redaction/recording) and Stop (memory refresh) work
 # fine. Pre-execution risk for agy workers is covered by the loopd dispatch approval-gate.
+# Timeout ceilings match the doctor's managed-command-hook policy
+# (_check_code_brain_command_hooks in .ai/runtime/src/ai_core/doctor.py,
+# verified 2026-08-29): "Stop" is in its hot-path set (<=5s); PostToolUse and
+# PreInvocation are not (<=2s, observation/baseline-capture only, no
+# user-visible turn is waiting on them).
 code_brain_spec = {
     "PreToolUse": None,
-    "PostToolUse": matchers("PostToolUse", 15),
-    "PreInvocation": handlers("PreInvocation", 15),
+    "PostToolUse": matchers("PostToolUse", 2),
+    "PreInvocation": handlers("PreInvocation", 2),
     "PostInvocation": None,
-    "Stop": handlers("Stop", 20),
+    "Stop": handlers("Stop", 5),
 }
 
 if dst.exists():
@@ -1013,6 +1337,183 @@ if not dst.exists() or dst.read_text(encoding="utf-8") != rendered:
 PY
 }
 
+
+# Kiro-owned lifecycle hooks: .kiro/hooks/code-brain.json, v1 standalone hook
+# file schema (read by Kiro CLI 3.0 early-access `--v3` and Kiro IDE 1.0+; the
+# default CLI 2.x engine does not read this directory at all — verified
+# 2026-08-29 against kiro.dev/docs/cli/hooks/ and the CLI 3.0 migration
+# guide). Writing this file is therefore inert on an unmigrated 2.x install —
+# a forward-compatible seed, not a behavior change.
+#
+# Filename/shape must match .ai/runtime/src/ai_core/doctor.py's
+# check_hook_capabilities, which is the authoritative contract this function
+# is verified against (that module is owned by another worker and is
+# read-only here): fixed path .kiro/hooks/code-brain.json, top-level
+# {"version":"v1","hooks":[{name,description,trigger,action:{type,command},
+# timeout,enabled}, ...]}, with timeout a TOP-LEVEL field on each hook row
+# (sibling of trigger/action/enabled), not inside action and not
+# `timeout_ms`.
+#
+# Scope decision (deliberately conservative):
+#   - Writes ONLY .kiro/hooks/code-brain.json (fixed name, never renamed
+#     across installs so upgrades find and rewrite the same file). Every
+#     other file under .kiro/hooks/ is left completely untouched — this repo
+#     already has a live user-authored hook there
+#     (continuous-improvement-continuation.json) that must never be read,
+#     merged into, or overwritten.
+#   - Does NOT touch .kiro/agents/*.json (CLI 2.x embedded-hook format). No
+#     agent config exists in a fresh target, and additively splicing a
+#     `hooks` block into a user's hand-authored agent JSON is a materially
+#     different (structural, non-file-scoped) merge than anything else this
+#     installer does; the official CLI 3.0 migration path is `kiro-cli agent
+#     migrate`/`/upgrade-agent`, which already owns that conversion.
+#
+# Five triggers are wired, matching doctor's expected active set exactly:
+# SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop.
+#   - PreToolUse CAN actually block: with AI_HOOK_AGENT=kiro set,
+#     hook_exit_code() (.ai/runtime/src/ai_core/hooks.py, verified
+#     2026-08-29) returns exit code 1 for a "block" decision on PreToolUse/
+#     UserPromptSubmit for the kiro agent, and Kiro's official Shell Command
+#     action contract (kiro.dev/docs/hooks/actions/, verified 2026-08-29)
+#     states that exit code 2 from a PreToolUse hook blocks that
+#     tool invocation (same for UserPromptSubmit blocking the prompt). This
+#     is NOT observe-only — do not describe it that way in this file's
+#     comments or in status text.
+#   - Stop is pure observation/advisory, with NO block path at all: unlike
+#     PreToolUse/UserPromptSubmit, hook_exit_code() never maps a kiro Stop
+#     "block" decision to a non-zero exit status (it only special-cases
+#     PreToolUse/UserPromptSubmit/PreTaskExec for the kiro agent), so a
+#     non-zero exit from this Stop command has no documented Kiro effect on
+#     whether the session actually stops. Do not claim this hook can force,
+#     request, or otherwise influence continuation — it is recorded/observed
+#     only.
+#   - SessionStart/UserPromptSubmit inject additionalContext: Kiro's Shell
+#     Command action contract states that exit code 0 stdout is added to the
+#     agent's context, and kiro_wire_output() (.ai/runtime/src/ai_core/
+#     hooks.py) only emits text for these two triggers when the upstream
+#     response actually carries an additionalContext value — so wiring them
+#     is safe (no-op stdout when there is nothing to inject).
+#   - PostToolUse is observe/record only (no block path exists for it on any
+#     host in this installer).
+#   - AI_HOOK_AGENT=kiro is set explicitly on every command: normalize_agent()
+#     only infers "kiro" from an explicit `agent` payload field or from
+#     KIRO_CLI/KIRO_HOME env vars, and Kiro's own documented stdin payload
+#     (hook_event_name/cwd/session_id/tool_name/...) carries none of those —
+#     so without this override a real Kiro payload would normalize to
+#     "unknown" and get Codex's JSON wire projection instead of Kiro's plain
+#     stdout/exit-code contract.
+#   - matcher is a TOP-LEVEL field on the hook row (sibling of trigger/
+#     action/timeout/enabled), NOT nested inside action — per the official
+#     schema (kiro.dev/docs/hooks/ field reference and the CLI 3.0 migration
+#     guide's own examples, both verified 2026-08-21: every sample row shows
+#     {"trigger":...,"matcher":...,"action":{...},"timeout":...}). The
+#     `matcher` field is OPTIONAL and an omitted matcher means always-match
+#     (per Kiro's official docs, updated 2026-08-21). PreToolUse and
+#     PostToolUse therefore omit `matcher` entirely rather than passing the
+#     bare literal "*": the installed Kiro App's v2 hook engine
+#     (kiro.kiro-agent/dist/extension.js, verified 2026-08-29 against the
+#     locally installed Kiro.app) compiles any non-empty matcher string
+#     directly with JavaScript's `new RegExp(matcher)` — the bare literal
+#     "*" is invalid regex syntax ("Nothing to repeat") and a hook whose
+#     matcher fails to compile never matches any tool call again (silent,
+#     permanent no-op for PreToolUse/PostToolUse, which are toolName-scoped
+#     triggers there). Omitting the field avoids that failure mode entirely
+#     and matches doctor's kiro PreToolUse/PostToolUse check
+#     (_check_code_brain_command_hooks in .ai/runtime/src/ai_core/doctor.py,
+#     owned by another worker and read-only here), which now requires the
+#     matcher be omitted for these two events.
+#   - Windows parity: the command itself branches on AI_INSTALL_TARGET_WINDOWS
+#     to invoke ai-hook.ps1 via powershell (Kiro's v1 schema has no separate
+#     commandWindows field the way Codex/Claude/Antigravity hooks.json do —
+#     there is exactly one `action.command` string per row).
+#   - Timeout tiers: PreToolUse/Stop are hot-path (<=5s, matching doctor's
+#     hot_path set which includes both by name); SessionStart/
+#     UserPromptSubmit/PostToolUse are observation/context-injection only
+#     (<=2s).
+merge_kiro_hooks() {
+  local dst="$TARGET_ROOT/.kiro/hooks/code-brain.json"
+  py - "$dst" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+dst = Path(sys.argv[1])
+target_windows = os.environ.get("AI_INSTALL_TARGET_WINDOWS", "").lower() in {"1", "true", "yes", "on"}
+
+def cmd(event: str) -> str:
+    if target_windows:
+        return (
+            'powershell -NoProfile -Command "$ROOT = (git rev-parse --show-toplevel 2>$null); '
+            'if (-not $ROOT) { $ROOT = (Get-Location).Path }; '
+            '$env:AI_HOOK_AGENT = \'kiro\'; '
+            '& \"$ROOT/.ai/bin/ai-hook.ps1\" ' + event + '"'
+        )
+    return (
+        'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
+        f'AI_HOOK_AGENT=kiro "$ROOT/.ai/bin/ai-hook" {event}'
+    )
+
+def hook_row(name, description, trigger, timeout, matcher=None):
+    # `matcher` is a TOP-LEVEL field on the hook row (sibling of trigger/action/timeout/
+    # enabled), never nested inside action — see the merge_kiro_hooks() docstring above for
+    # the official schema citation.
+    row = {
+        "name": name,
+        "description": description,
+        "trigger": trigger,
+        "action": {"type": "command", "command": cmd(trigger)},
+        "timeout": timeout,
+        "enabled": True,
+    }
+    if matcher is not None:
+        row["matcher"] = matcher
+    return row
+
+payload = {
+    "version": "v1",
+    "hooks": [
+        hook_row(
+            "code-brain-session-start",
+            "Load Code Brain session context at the start of a Kiro session.",
+            "SessionStart",
+            2,
+        ),
+        hook_row(
+            "code-brain-user-prompt-submit",
+            "Load Code Brain prompt context before the model sees the submitted prompt.",
+            "UserPromptSubmit",
+            2,
+        ),
+        hook_row(
+            "code-brain-pre-tool-use",
+            "Check Code Brain command routing before a tool runs; a block decision denies the tool call (non-zero exit).",
+            "PreToolUse",
+            5,
+        ),
+        hook_row(
+            "code-brain-post-tool-use",
+            "Record Code Brain tool-result context after a tool runs.",
+            "PostToolUse",
+            2,
+        ),
+        hook_row(
+            "code-brain-stop",
+            "Advisory continuation feedback at end of turn (Kiro's Stop trigger cannot hard-block).",
+            "Stop",
+            5,
+        ),
+    ],
+}
+
+rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+if not dst.exists() or dst.read_text(encoding="utf-8") != rendered:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(rendered, encoding="utf-8")
+PY
+}
+
+
 ensure_persistent_scaffold() {
   mkdir -p \
     "$TARGET_ROOT/.ai/generated" \
@@ -1028,17 +1529,21 @@ ensure_persistent_scaffold() {
 
 prune_orphans() {
   # Remove CB-managed command/prompt/skill files that a PRIOR install recorded but the current
-  # version no longer ships (e.g. retired cb-loop*/cb-pool prompts). Manifest-gated: only files
-  # the previous install-manifest listed are eligible, so user-authored files (never in the
-  # manifest) are never touched. Runs before the copy/manifest rewrite. Fail-soft.
+  # version no longer ships (e.g. retired cb-loop*/cb-pool prompts). Also migrate the historical
+  # installer bug that treated the source repo's .ai/outputs artifacts as managed runtime files.
+  # Both paths are previous-manifest-gated, so target-created output files are never touched.
+  # Runs before the copy/manifest rewrite and inside the rollback transaction. Fail-soft.
   local manifest; manifest="$(manifest_path)"
   [[ -f "$manifest" ]] || return 0
   local newlist; newlist="$(mktemp)" || return 0
   managed_files >"$newlist" 2>/dev/null
-  py - "$TARGET_ROOT" "$manifest" "$newlist" <<'PY'
-import json, sys
+  py - "$TARGET_ROOT" "$SOURCE_ROOT" "$manifest" "$newlist" <<'PY'
+import json, subprocess, sys
 from pathlib import Path
-target = Path(sys.argv[1]); manifest = Path(sys.argv[2]); newlist = Path(sys.argv[3])
+target = Path(sys.argv[1]).resolve()
+source = Path(sys.argv[2]).resolve()
+manifest = Path(sys.argv[3])
+newlist = Path(sys.argv[4])
 new_managed = {ln.strip() for ln in newlist.read_text(encoding="utf-8").splitlines() if ln.strip()}
 # Safety: if the source list came back empty (git/listing failure), prune NOTHING — never
 # let an empty "currently shipped" set delete every managed file.
@@ -1092,6 +1597,77 @@ for rel in sorted(set(candidates)):
             pass
 if removed:
     print("pruned " + str(len(removed)) + " orphan command(s): " + ", ".join(sorted(removed)), file=sys.stderr)
+
+# Old installers accidentally copied every source-side report into every target, then recorded
+# those copies in the install manifest. Remove only those prior-manifest-owned paths. Never scan
+# the target output tree, and never clean the source repository itself: both rules protect genuine
+# project artifacts while making one upgrade remove the propagation leak.
+removed_outputs: list[Path] = []
+removed_output_bytes = 0
+if target != source:
+    tracked_outputs: set[str] | None = None
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", str(target), "ls-files", "-z", "--", ".ai/outputs"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if tracked.returncode == 0:
+            tracked_outputs = {
+                entry.decode("utf-8", errors="surrogateescape")
+                for entry in tracked.stdout.split(b"\0")
+                if entry
+            }
+    except OSError:
+        tracked_outputs = None
+
+    for rel in sorted(prev_set):
+        if (
+            tracked_outputs is None
+            or not rel.startswith(".ai/outputs/")
+            or rel == ".ai/outputs/.gitkeep"
+            or rel in new_managed
+            or rel in tracked_outputs
+        ):
+            continue
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            continue
+        path = target / rel_path
+        try:
+            path.parent.resolve(strict=False).relative_to(target)
+        except (OSError, ValueError):
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            removed_outputs.append(path)
+            removed_output_bytes += size
+        except OSError:
+            continue
+
+    output_root = target / ".ai" / "outputs"
+    parents = {
+        parent
+        for path in removed_outputs
+        for parent in path.parents
+        if parent != output_root and output_root in parent.parents
+    }
+    for directory in sorted(parents, key=lambda item: len(item.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+if removed_outputs:
+    print(
+        f"pruned {len(removed_outputs)} retired managed output artifact(s) "
+        f"({removed_output_bytes} bytes)",
+        file=sys.stderr,
+    )
 PY
   rm -f "$newlist"
 }
@@ -1196,6 +1772,7 @@ PY
       ".claude/settings.json" \
       ".agents/mcp_config.json" \
       ".agents/hooks.json" \
+      ".kiro/hooks/code-brain.json" \
       ".gitignore" \
       "AGENTS.md" \
       "CLAUDE.md" \
@@ -1547,6 +2124,7 @@ install_or_upgrade_apply() {
   merge_codex_hooks_json
   merge_antigravity_mcp_json
   merge_antigravity_hooks_json
+  merge_kiro_hooks
   configure_project
   ensure_persistent_scaffold
   write_bootstrap
@@ -1644,6 +2222,10 @@ install_or_upgrade_apply() {
   # session start below runs the complete doctor checks after rebuilding the
   # code and audit indexes, so avoid separate CLI startup and doctor scans.
   $_run_as env AI_BOOTSTRAP_LOW_MEMORY=1 ./bootstrap-code-brain.sh --skip-doctor --skip-render --low-memory
+  # Reconcile the disposable episodic index during every public install/upgrade. This also
+  # rebases stale watermarks left by legacy lossy audit folding while preserving a history-gap
+  # receipt; current raw audit files remain untouched.
+  $_run_as .ai/bin/ai memory episodic build --json >/dev/null
   local -a _session_args=(session start --agent operator --rebuild auto --repair-audit-index --render-manifest)
   case "${AI_INSTALL_STRICT:-0}" in
     1|true|TRUE|yes|YES|on|ON)
@@ -1667,6 +2249,9 @@ install_or_upgrade() {
   trap - ERR INT TERM
   rm -rf "$_INSTALL_TXN_DIR"
   _INSTALL_TXN_DIR=""
+  # Trust is user-global external state, so update it only after the target
+  # transaction is fully committed and cannot be rolled back underneath it.
+  auto_trust_codex_hooks
 }
 
 uninstall_apply() {
@@ -1851,6 +2436,13 @@ if codex_hooks.exists():
             codex_hooks.write_text(json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         else:
             codex_hooks.unlink()
+# Kiro uses one Code Brain-owned standalone file rather than merging rows into
+# a shared manifest. Remove that exact file only; every sibling user hook is
+# preserved. Without this, uninstall leaves five commands pointing at the
+# now-removed .ai/bin/ai-hook shim.
+kiro_hooks = root / ".kiro" / "hooks" / "code-brain.json"
+if kiro_hooks.is_file() or kiro_hooks.is_symlink():
+    kiro_hooks.unlink()
 manifest.unlink(missing_ok=True)
 for rel in (".ai", ".githooks"):
     path = root / rel
@@ -1864,7 +2456,7 @@ for rel in (".ai", ".githooks"):
             path.rmdir()
         except OSError:
             pass
-for rel in (".claude/commands", ".codex/prompts", ".agents/skills", ".agents"):
+for rel in (".claude/commands", ".codex/prompts", ".agents/skills", ".agents", ".kiro/hooks"):
     path = root / rel
     if path.exists() and path.is_dir() and not any(path.iterdir()):
         path.rmdir()
@@ -1887,6 +2479,7 @@ uninstall() {
   trap 'rollback_install_on_error 130; exit 130' INT
   trap 'rollback_install_on_error 143; exit 143' TERM
   prepare_runtime_transaction
+  remove_codex_hook_trust_before_uninstall
   uninstall_apply
   if [[ "$(git -C "$TARGET_ROOT" config --get core.hooksPath || true)" == ".githooks" ]]; then
     git -C "$TARGET_ROOT" config --unset-all core.hooksPath

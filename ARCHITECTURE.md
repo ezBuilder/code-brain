@@ -26,7 +26,7 @@ Architecture snapshot for the Code Brain runtime. ai_core source, scripts, and G
           ▼                     ▼                          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                     .ai/bin/ shim layer (bash/ps1)                          │
-│  ai-hook  →  uv run ai hook              (sync, hot path, ≤200ms target)    │
+│  ai-hook  →  venv python -m ai_core.cli   (sync, hot path, ≤200ms target)    │
 │  ai-mcp   →  uv run ai-mcp serve-stdio   (long-lived JSON-RPC)              │
 │  ai      →  uv run ai <cmd>              (operator CLI)                     │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -41,7 +41,7 @@ Architecture snapshot for the Code Brain runtime. ai_core source, scripts, and G
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
 │  │  hooks.py    │  │ mcp_server.py│  │   cli.py     │  │  doctor.py   │    │
 │  │ handle_hook  │  │ handle_req   │  │ argparse     │  │ run_checks() │    │
-│  │ ≤200ms SLO   │  │ JSON-RPC 2.0 │  │ +reject_ci   │  │ 34 checks    │    │
+│  │ ≤200ms SLO   │  │ JSON-RPC 2.0 │  │ +reject_ci   │  │ 37 checks    │    │
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘    │
 │         │                 │                 │                 │            │
 │  ┌──────┴─────────────────┴─────────────────┴─────────────────┴───────┐    │
@@ -60,18 +60,18 @@ Architecture snapshot for the Code Brain runtime. ai_core source, scripts, and G
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-<!-- code-brain-contract: doctor-check-count=34 -->
+<!-- code-brain-contract: doctor-check-count=37 -->
 
-## 2. Hook hot-path (Claude/Codex 공통)
+## 2. Hook hot-path (Claude/Codex/Antigravity/Kiro)
 
 ```
-Claude/Codex agent fires event (e.g. UserPromptSubmit)
+Agent fires event (e.g. UserPromptSubmit/PreInvocation)
          │
          │ JSON payload → STDIN
          ▼
 .ai/bin/ai-hook                                   ← bash shim
          │
-         │ exec uv run ai hook
+         │ exec .ai/runtime/.venv Python directly; uv only bootstraps a missing venv
          ▼
 cli.py "hook" handler
          │
@@ -99,7 +99,7 @@ hooks.handle_hook(root, hook_name, payload)
 INVARIANTS:
   • elapsed_ms ≤ 200ms (hot_path_slo doctor check)
   • redact_value 적용 (secret 패턴 + 절대 경로 마스킹)
-  • 네트워크 호출 0 (AGENTS.md hard constraint)
+  • 네트워크 호출/네트워크 자식 spawn 0 (AGENTS.md hard constraint)
   • CI 환경: write 0 (CI fast-path 분기)
 ```
 
@@ -181,12 +181,23 @@ INVARIANTS:
 불가라 삭제 보류"일 뿐 사용자 결정이 아니므로, 이를 pin으로 묶으면 비-git
 워크스페이스에서 한도 검사가 통째로 무력화된다.
 
+단, `.ai/memory/episodic`과 `.ai/memory/audit-rollups`는 raw audit로 재생성되는 명시적
+파생 루트다. 비-git 환경에서도 이 두 루트만 `undetermined` 삭제를 허용하되, git 추적,
+tracked-source 참조, `.keep` pin은 항상 우선한다. 일반 `.ai/tmp`/`.ai/outputs`의 확인 불가
+파일은 계속 보존한다.
+
 ```
                     삭제 보류   cap 산정
 pinned              O          제외
 undetermined        O          포함
 그 외               X          포함
 ```
+
+Raw audit은 기본적으로 git-ignore된 로컬 비공개 데이터다. 설치기는 이를 소비 프로젝트로
+복사하지 않는다. 명시적 `ai memory sync --private-remote-confirmed`만 audit transaction lock
+안에서 전체 segment+current 세트를 force-stage하며, `.ai/.gitattributes`는 audit JSONL의
+union merge를 금지한다. 첫/중간 segment 누락이나 orphan marker는 doctor/runtime/repair/sync
+전부에서 hard fail이고, 자동 relink 대신 원본 복구만 허용한다.
 
 ### 2.4 Stop 훅은 트랜스크립트를 인라인 스캔하지 않는다
 
@@ -200,6 +211,7 @@ undetermined        O          포함
 판정한다. 따라서 인라인 경로는 TTL 캐시 읽기로 바꾸고, 스캔은 분리 자식이 채운다.
 
 ```
+AI_PROMPT_GROWTH=1 일 때만:
 Stop ──▶ prompt_growth.tick()
            └─ _output_tokens()  ← 캐시 히트 or 0. 절대 스캔 안 함
 Stop ──▶ _spawn_tokens_cache_refresh()   ← DETACHED, 쿨다운 3600s
@@ -208,7 +220,9 @@ Stop ──▶ _spawn_tokens_cache_refresh()   ← DETACHED, 쿨다운 3600s
                      └─ .ai/cache/prompt_growth_tokens.json  (TTL 3600s)
 ```
 
-캐시가 차갑거나 낡거나 깨졌으면 0을 반환한다 — 기존 fail-soft 경로와 동일하다.
+기본값은 `AI_PROMPT_GROWTH=0`이며 `tick`, 토큰 캐시 refresh, learned-rule 주입이 모두
+정지한다. opt-in 상태에서 캐시가 차갑거나 낡거나 깨졌으면 0을 반환한다 — 기존 fail-soft
+경로와 동일하다.
 규칙이 졸업하려면 `RATCHET_WINDOW` 턴이 필요하므로 시간 단위 staleness는 어떤 결과도
 바꾸지 못한다.
 
@@ -315,11 +329,20 @@ completion_guard.guard_directive()
 | --- | --- | --- |
 | Claude / Codex | `{"decision":"block","reason":...}` | `{"continue":true}` |
 | Antigravity 2.0 / CLI 1.1.x | `{"decision":"continue","reason":...}` | `{"decision":"stop"}` |
+| Kiro IDE / CLI v3 | advisory stdout only; Stop cannot hard-block | advisory stdout or empty output |
 
 Antigravity Stop 설정 역시 matcher-group이 아닌 **direct handler list**여야 한다. `doctor`가
 이 shape과 `.ai/bin/ai-hook` command를 강제한다. `_STOP_LIKE_HOOKS`로 Stop/SubagentStop을
 묶는 이유는 Claude/Codex의 SubagentStop이 Stop과 같은 decision 계약을 쓰고,
 서브에이전트의 조기 종료도 같은 결함이기 때문이다.
+
+Claude의 `TaskCompleted`/`TeammateIdle` 품질 게이트는 미완료 증거가 있으면 exit 2와 stderr로
+차단한다. Kiro는 `PreToolUse`/`UserPromptSubmit`의 non-zero exit만 차단 계약이 있고 Stop은
+관측 전용이다. Codex `SessionEnd`와 `Interrupt`는 각각 CLI 0.117/0.150 이상에서만 설치된다.
+모든 관리 command hook은 명시적 2초(관측) 또는 5초(핫패스) 제한을 가지며 Codex
+`SessionStart`/`SubagentStart`/`UserPromptSubmit`만 5000/5000/2500-token
+`additionalContextLimit`를 가진다. `doctor`는 호스트 버전별 expected/active/disabled surface,
+matcher, timeout, context-limit을 함께 검증한다.
 
 보장 범위는 정직하게 제한한다. **정의된 증거 클래스에서는 동일 입력이 host별로 동일한
 continue/stop 결정을 내리는 결정 등가성을 golden test로 100% 고정**한다. 탐지 재현율은 관측 가능한
@@ -415,9 +438,14 @@ queue 디렉터리:
 ```
                      SOURCE OF TRUTH (tracked in git)
                      ─────────────────────────────────
-  .ai/AGENTS.md ─────render.py──▶ AGENTS.md (shim)
+  .ai/AGENTS.md ─────render.py──▶ AGENTS.md (canonical seed)
                               ──▶ CLAUDE.md (shim)
                               ──▶ .ai/generated/manifest.json (sha 추적)
+
+  decisions/todos/resume/plans ─agents_md.py─▶ AGENTS.md managed durable block
+  Codex: current fingerprint면 static/durable 중복 주입 생략 + volatile/opt-in auxiliary만 hook
+  Claude: AGENTS.md를 읽지 않으므로 full SessionStart hook
+  Antigravity: SessionStart 주입이 없어 AGENTS.md managed block 사용
 
   .ai/config.yaml  →  config.load_config(root)  →  runtime 전역
   .ai/trust/machines/*.pub.toml  →  machine_id_hash 산정 입력
@@ -425,8 +453,11 @@ queue 디렉터리:
 
                      WORKER WRITES (single-writer invariant)
                      ──────────────────────────────────────
-  .ai/memory/audit/*.jsonl     ← memory.append_audit (hash-chain prev_sha)
+  .ai/memory/audit/*.jsonl     ← lossless 64MB segments + current (per-file prev_sha)
   .ai/memory/audit-index.jsonl ← doctor.check_audit_index 검증
+  .ai/memory/audit-rollups/    ← 비권위적·재생성 가능 날짜/action sidecar
+  .ai/memory/episodic/audit/   ← fanout 로그 피라미드 + 200B hook cache
+  .ai/memory/episodic-tombstones/ ← 권위적 forget 표식; derived cap 회수 제외
   .ai/memory/events/...        ← hooks.handle_hook (local 모드만)
   .ai/memory/queue/...         ← scheduler enqueue/lease/complete/fail
   .ai/memory/decisions.jsonl   ← 의사결정 로그
@@ -445,7 +476,6 @@ queue 디렉터리:
   .ai/cache/uv/                ← uv 의존성 캐시
   .ai/cache/diagnostics/       ← redacted bundle zip
   .ai/cache/upgrade/           ← rollback backup
-  .ai/cache/remote-memory/     ← optional Cloudflare remote-memory pull cache
 
                      RELEASE ARTIFACTS (dist/, gitignored)
                      ────────────────────────────────────
@@ -483,17 +513,16 @@ make release-gate  →  ./scripts/release-gate.sh
    ├─ artifact-tamper-check.sh     (변조 감지)
    ├─ rollback-drill.sh             ★Round 76: upgrade plan→apply→rollback round-trip
    ├─ dep-advisory.sh               ★Round 80: uvx pip-audit advisory only
-   ├─ ai doctor --strict --json     (17 checks)
+   ├─ ai doctor --strict --json     (37 checks)
    ├─ ai report status --json       (release_ready & artifacts.all_current)
    └─ git status --short empty?     (tree clean invariant)
             │
             └─▶ "release gate ok"
 
-doctor checks (현재):
-  layout, config, gitattributes, sqlite_features, manifest, trust, jsonl,
-  audit_index, hot_path_slo, secret_scan, redaction_self_test,
-  bootstrap_preflight, diagnostics, worker_lock, queue_lease_recovery,
-  queue_age, audit_chain   ← 17개
+doctor checks (현재 36개; JSON 출력이 최종 권위):
+  layout/config/manifest/trust/index/storage/generated-artifact 계약,
+  audit_index + audit_chain + episodic_memory 무결성,
+  hot_path_slo/secret_scan/redaction/worker/queue/release 운영 안전성
 
 GitHub Actions (.github/workflows/release-gate.yml):
   jobs:
@@ -525,6 +554,8 @@ GitHub Actions (.github/workflows/release-gate.yml):
 │ Queue mutation   │ queue_lock fcntl LOCK_EX        │ contention block     │
 │ Lease auth       │ ipc.validate_envelope token/sha │ UNAUTHORIZED         │
 │ Audit tampering  │ memory.append_audit prev_sha    │ doctor audit_chain   │
+│ Segment lineage  │ path/file/line/byte SHA links   │ doctor audit_chain   │
+│ Episodic index   │ sealed-prefix digest + receipt  │ doctor episodic_memory│
 │ Summary schema   │ report.assert_summary_schema    │ ValueError → fail    │
 │ Cross-OS parity  │ scripts/summary-parity.py       │ exit 1/2             │
 │ Dep CVE          │ scripts/dep-advisory.sh         │ advisory only (0)    │

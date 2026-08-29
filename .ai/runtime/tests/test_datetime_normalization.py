@@ -153,12 +153,10 @@ def test_build_context_renders_over_offsetless_store(tmp_path: Path) -> None:
     assert "offset-less decision" in context
 
 
-def test_audit_rotation_failsoft_on_null_empty_and_garbage_ts(
+def test_audit_segmentation_preserves_null_empty_and_garbage_ts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(memory, "_AUDIT_MAX_BYTES", 2_000)
-    monkeypatch.setattr(memory, "_AUDIT_KEEP_BYTES", 1_000)
-    monkeypatch.setattr(memory, "_AUDIT_KEEP_LINES", 16)
     monkeypatch.setattr(memory, "_AUDIT_LINE_MAX_BYTES", 400)
 
     bad_rows = [
@@ -175,17 +173,23 @@ def test_audit_rotation_failsoft_on_null_empty_and_garbage_ts(
     _private_file(path, "".join(json.dumps(r) + "\n" for r in [*filler, *bad_rows]))
     assert path.stat().st_size > 2_000
 
-    # This append trips rotation; the rebuild loop walks the bad rows and used to
-    # abort the whole rotation with ValueError("Invalid isoformat string: 'None'").
+    # This append seals the oversized file byte-for-byte; malformed timestamps
+    # are raw evidence and must neither be parsed nor discarded.
     memory.append_audit(tmp_path, action="after.rotate", category="t", payload={})
 
     assert path.stat().st_size <= 2_000
-    rows = [json.loads(line) for line in path.read_text().splitlines()]
-    assert rows[0]["action"] == "audit.storage_rotated"
+    rows = [
+        json.loads(line)
+        for audit_file in memory.all_audit_files(tmp_path)
+        for line in audit_file.read_text().splitlines()
+    ]
+    assert any(row["action"] == "audit.segment_started" for row in rows)
     assert rows[-1]["action"] == "after.rotate"
     kept_actions = {r["action"] for r in rows}
     assert {"bad.null", "bad.empty", "bad.garbage", "bad.naive"} <= kept_actions
-    assert doctor.check_audit_chain(tmp_path).ok is True
+    chain = doctor.check_audit_chain(tmp_path)
+    assert chain.ok is True
+    assert "legacy_unverifiable" in chain.detail
 
 
 def test_loop_is_expired_failsoft_for_naive_bounds() -> None:

@@ -27,6 +27,165 @@ _ASSIGNMENT_VALUE_CHARS = frozenset(
 _UNICODE_IGNORECASE_EXTRAS = frozenset("İıſK")
 
 
+# Words that may appear in a documentation placeholder. Membership here is not
+# sufficient on its own: a placeholder must also contain a marker below, so
+# descriptive nouns like "password" or "prod" cannot form an exemption by
+# themselves.
+_PLACEHOLDER_WORDS = frozenset(
+    {
+        "a",
+        "account",
+        "actual",
+        "add",
+        "an",
+        "api",
+        "app",
+        "change",
+        "changeme",
+        "client",
+        "credential",
+        "credentials",
+        "demo",
+        "dev",
+        "development",
+        "dummy",
+        "email",
+        "empty",
+        "enter",
+        "example",
+        "fake",
+        "goes",
+        "here",
+        "hidden",
+        "id",
+        "insert",
+        "key",
+        "keys",
+        "local",
+        "masked",
+        "my",
+        "name",
+        "none",
+        "null",
+        "omitted",
+        "optional",
+        "org",
+        "own",
+        "passphrase",
+        "password",
+        "passwords",
+        "placeholder",
+        "prod",
+        "production",
+        "project",
+        "put",
+        "real",
+        "redacted",
+        "replace",
+        "required",
+        "sample",
+        "secret",
+        "secrets",
+        "server",
+        "set",
+        "some",
+        "specific",
+        "staging",
+        "team",
+        "test",
+        "the",
+        "todo",
+        "token",
+        "tokens",
+        "unset",
+        "user",
+        "username",
+        "value",
+        "with",
+        "xxx",
+        "xxxx",
+        "your",
+        "yours",
+    }
+)
+
+# A placeholder must declare itself. These segments mean "substitute your own"
+# or "this is not a real value", which no operator writes inside an actual
+# credential. Without one of them the value stays classified as a possible
+# secret, so a weak-but-real credential built from ordinary words is still
+# reported instead of being silently exempted.
+_PLACEHOLDER_MARKERS = frozenset(
+    {
+        "change",
+        "changeme",
+        "demo",
+        "dummy",
+        "empty",
+        "enter",
+        "example",
+        "fake",
+        "goes",
+        "here",
+        "hidden",
+        "insert",
+        "masked",
+        "none",
+        "null",
+        "omitted",
+        "optional",
+        "placeholder",
+        "put",
+        "redacted",
+        "replace",
+        "sample",
+        "specific",
+        "test",
+        "todo",
+        "unset",
+        "xxx",
+        "xxxx",
+        "your",
+        "yours",
+    }
+)
+
+
+def _is_word_placeholder(candidate: str) -> bool:
+    """True when a value declares itself a documentation placeholder.
+
+    Three conditions must all hold, and each removes a different way a real
+    credential could slip through:
+
+    1. No entropy. The value is single-case with no digits and no symbols
+       besides `-`/`_`. Real credentials mix case, carry digits, or use other
+       symbols.
+    2. Known vocabulary. Every `-`/`_` segment is an English word from
+       `_PLACEHOLDER_WORDS`, and there are at least two segments. One
+       unrecognized segment keeps the value classified as a possible secret.
+    3. Declared intent. At least one segment is a `_PLACEHOLDER_MARKERS` word.
+       That is what separates a substitute-me placeholder from a weak real
+       password assembled out of the same descriptive nouns.
+    """
+    if not candidate:
+        return False
+    if not (candidate.islower() or candidate.isupper()):
+        return False
+    lowered_candidate = candidate.lower()
+    if any(character.isdigit() for character in lowered_candidate):
+        return False
+    normalized = lowered_candidate.replace("_", "-").strip("-")
+    if not normalized:
+        return False
+    segments = [segment for segment in normalized.split("-") if segment]
+    if len(segments) < 2:
+        return False
+    if not all(segment.isalpha() for segment in segments):
+        return False
+    if not all(segment in _PLACEHOLDER_WORDS for segment in segments):
+        return False
+    return any(segment in _PLACEHOLDER_MARKERS for segment in segments)
+
+
 def _contains_assignment_secret(value: str, lowered: str) -> bool:
     length = len(value)
     for term in _ASSIGNMENT_TERMS:
@@ -66,7 +225,23 @@ def _contains_assignment_secret(value: str, lowered: str) -> bool:
                 )
             )
             repeated_placeholder = quoted and len(set(candidate)) <= 1
-            if len(candidate) >= 20 and not identifier_expression and not repeated_placeholder:
+            # Documentation placeholders describe the *shape* of a credential
+            # instead of carrying one: a build guide that documents an Apple
+            # app-specific password env var, or an API key placeholder telling
+            # the reader to substitute their own, is built from self-describing
+            # English hyphen/underscore words. A strict doctor must not fail a repo
+            # for documenting its own environment variables. Real credentials
+            # of the same length carry entropy: digits, mixed case, or symbols
+            # outside `-`/`_`, none of which a placeholder word has. Apple's
+            # actual format (`abcd-efgh-ijkl-mnop`) is unaffected because this
+            # generic assignment rule only fires at >=20 characters.
+            word_placeholder = _is_word_placeholder(candidate)
+            if (
+                len(candidate) >= 20
+                and not identifier_expression
+                and not repeated_placeholder
+                and not word_placeholder
+            ):
                 return True
             offset = found + 1
     return False

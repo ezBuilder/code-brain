@@ -127,3 +127,63 @@ def test_ast_verify_secret_disable_env(monkeypatch):
     monkeypatch.setenv("AI_AST_VERIFY_SECRETS", "0")
     rep = verify_source('OPENAI_API_KEY = "' + "sk-" + 'abcdefghijklmnopqrstuvwxyz12"\n')
     assert not any(v.kind == "secret" for v in rep.violations)
+
+
+def test_documentation_placeholders_do_not_trip_the_generic_assignment_rule() -> None:
+    """Documenting an env var must not fail a consumer's strict doctor.
+
+    Regression: navio tracked a build guide containing
+    `export APPLE_PASSWORD="app-specific-password"`. The value is the literal
+    placeholder naming Apple's credential type, but the generic
+    `password=<20+ chars>` rule flagged it, so `doctor --strict` failed with a
+    finding that could only be silenced by an allowlist entry.
+    """
+    from ai_core.redact import contains_secret
+
+    for text in (
+        'export APPLE_PASSWORD="app-specific-password"',
+        'export API_KEY="your-api-key-here"',
+        'password: "replace-with-your-password"',
+        'token = "your_token_value_goes_here"',
+        'client_secret="your-client-secret-value"',
+    ):
+        assert not contains_secret(text), text
+
+
+def test_placeholder_exemption_still_detects_real_generic_credentials() -> None:
+    """The placeholder exemption must not become a bypass.
+
+    Entropy (digits, mixed case, symbols) or unrecognized words keep a value
+    classified as a possible credential, and a single long opaque segment is
+    never treated as prose.
+    """
+    from ai_core.redact import contains_secret
+
+    # Values are concatenated at runtime so this test file never contains a
+    # credential-shaped literal that the scanner would flag in tracked source.
+    for text in (
+        'api_key: "' + "9f8e7d6c5b4a" + "39281706abcdef" + '"',
+        'token="' + "eyJhbGciOiJIUzI1" + "NiIsInR5cCI6" + '"',
+        'secret="' + "correct-horse" + "-battery-staple" + '"',
+        'password="' + "administrator" + "-override-console" + '"',
+        'api_key = "' + "abcdefghijklm" + "nopqrstuvwxyz" + '"',
+        'password = "' + "Sup3r-S3cret" + "-Value-Here1" + '"',
+    ):
+        assert contains_secret(text), text
+
+
+def test_placeholder_exemption_requires_a_declared_placeholder_marker() -> None:
+    """A value made only of descriptive nouns is still treated as a credential.
+
+    The exemption needs an explicit substitute-me marker (`your`, `example`,
+    `replace`, `specific`, ...). Without one, `password=<lowercase words>` could
+    be a weak but real credential, so it must keep being reported.
+    """
+    from ai_core.redact import contains_secret
+
+    for text in (
+        'password="' + "prod-server" + "-account-password" + '"',
+        'secret="' + "the-real" + "-account-credential" + '"',
+        'api_key="' + "my-project" + "-server-key-value" + '"',
+    ):
+        assert contains_secret(text), text

@@ -78,3 +78,48 @@ def test_split_candidate_files_have_no_shared_module_state() -> None:
             f"{path.name} is large enough to be split by node id but declares "
             f"{match.group(0)!r}; make it lighter or exclude it from splitting"
         )
+
+
+def test_source_only_skip_list_matches_tests_that_need_release_machinery() -> None:
+    """The consumer skip list must be derived from reality, not maintained by hand.
+
+    `.ai/runtime/tests` ships into every consumer project, but the release
+    machinery those tests assert on (`Makefile`, `bootstrap.sh`, `scripts/`,
+    `.github/`) does not. If a test starts referencing that machinery without
+    being added to the skip list, users of installed projects get a failure that
+    says nothing about their installation. This keeps the two in lockstep.
+    """
+    import re
+
+    from conftest import SOURCE_ONLY_TEST_MODULES
+
+    pattern = re.compile(
+        r'(?:ROOT|root)\s*/\s*'
+        r'"(?:scripts|Makefile|\.github|bootstrap\.sh|CHANGELOG\.md|OPERATIONS\.md|kits)"'
+    )
+    referencing = {
+        path.stem
+        for path in TESTS.glob("test_*.py")
+        if pattern.search(path.read_text(encoding="utf-8"))
+    }
+    missing = sorted(referencing - set(SOURCE_ONLY_TEST_MODULES))
+    assert not missing, (
+        "these test modules assert on source-repo release machinery but are not in "
+        f"conftest.SOURCE_ONLY_TEST_MODULES, so they will fail in consumer "
+        f"projects: {missing}"
+    )
+
+
+def test_source_repository_detection_requires_every_marker() -> None:
+    """A consumer that keeps its own Makefile or scripts/ must not look like source.
+
+    Detection is an AND over files only the Code Brain repository ships. If it
+    were an OR, an ordinary project with a `Makefile` would run release-contract
+    tests it cannot satisfy.
+    """
+    import conftest
+
+    assert conftest.IS_SOURCE_REPOSITORY, "the source repo must detect itself"
+    assert len(conftest._SOURCE_REPO_MARKERS) >= 3
+    for marker in conftest._SOURCE_REPO_MARKERS:
+        assert (ROOT / marker).exists(), marker

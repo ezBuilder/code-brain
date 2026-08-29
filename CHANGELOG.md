@@ -4,6 +4,12 @@ All notable Code Brain changes are recorded here.
 
 ## Unreleased
 
+## 0.9.2 - 2026-08-29
+
+### Fixed
+
+- The installed test suite now passes in consumer projects. `.ai/runtime/tests` ships into every install, but the source repository's release machinery (`Makefile`, `bootstrap.sh`, `scripts/`, `.github/`, `OPERATIONS.md`, `kits/`) does not, so 12 modules asserting on that machinery failed or aborted collection in an installed project — 18 failures plus a collection error that said nothing about the user's installation, and `test_cli` alone burned over 15 minutes doing it. The runtime now detects the source repository by files a consumer never receives and skips exactly those modules elsewhere, with `collect_ignore` for the module that fails at import time. A lockstep test derives the list from actual source-path references, so a new release-contract test cannot silently reintroduce the failure.
+
 ## 0.9.1 - 2026-08-29
 
 ### Changed

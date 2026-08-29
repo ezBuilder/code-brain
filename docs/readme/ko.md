@@ -88,8 +88,8 @@ curl -fsSL https://raw.githubusercontent.com/ezBuilder/code-brain/main/scripts/u
 에이전트 세션에서는 `/cb-upgrade`를 실행하고 새 세션을 엽니다. 특정 ref 고정:
 
 ```bash
-.ai/bin/ai upgrade latest --ref v0.9.1 --json
-CODE_BRAIN_REF=v0.9.1 bash scripts/upgrade-from-github.sh /path/to/project
+.ai/bin/ai upgrade latest --ref v0.9.2 --json
+CODE_BRAIN_REF=v0.9.2 bash scripts/upgrade-from-github.sh /path/to/project
 ```
 
 업그레이드는 항상 명시적입니다. `SessionStart` 훅과 MCP 핫 패스는 네트워크를 사용하지 않습니다.

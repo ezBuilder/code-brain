@@ -92,8 +92,8 @@ From inside an agent session, run `/cb-upgrade`, then start a new session.
 Pin a ref:
 
 ```bash
-.ai/bin/ai upgrade latest --ref v0.9.1 --json
-CODE_BRAIN_REF=v0.9.1 bash scripts/upgrade-from-github.sh /path/to/project
+.ai/bin/ai upgrade latest --ref v0.9.2 --json
+CODE_BRAIN_REF=v0.9.2 bash scripts/upgrade-from-github.sh /path/to/project
 ```
 
 Upgrades are always explicit: `SessionStart` hooks and MCP hot paths do not call the network.

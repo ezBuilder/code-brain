@@ -4,6 +4,16 @@ All notable Code Brain changes are recorded here.
 
 ## Unreleased
 
+## 0.9.1 - 2026-08-29
+
+### Changed
+
+- `make test` and the release gate now run the suite as parallel per-file shards (`scripts/test-sharded.py`, standard library only, no new dependency), and the gate no longer executes the same suite twice. A full local run drops from about 7m40s to about 3m40s wall time, and the gate stops paying for a duplicate serial pass. `make test-serial` keeps the single-process path. Shards split by file, or by node id only for files proven free of module/session fixtures and ordering marks, and that invariant is asserted by a test.
+
+### Fixed
+
+- `secret_scan` no longer reports self-describing documentation placeholders as credentials. Documenting an environment variable such as an Apple app-specific password or an API key that tells the reader to substitute their own previously failed `doctor --strict` for the repository that documented it, with no fix except an allowlist entry. An exemption now requires all three of: no entropy (single case, no digits, no symbols beyond `-`/`_`), every segment being a known placeholder word, and at least one explicit substitute-me marker. Values built only from descriptive nouns, and anything carrying digits, mixed case, or an unrecognized segment, are still reported.
+
 ## 0.9.0 - 2026-08-29
 
 ### Added

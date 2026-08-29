@@ -24,6 +24,7 @@ All notable Code Brain changes are recorded here.
 
 ### Fixed
 
+- `scripts/install-check.sh` now waits for the detached children its `SessionStart` hook registers before removing the extraction directory, so a passing archive check can no longer fail the release gate with a `Directory not empty` cleanup race.
 - The git-less filesystem baseline no longer presents runtime scratch as tracked source. Exported tarballs, release smoke copies, and consumer checkouts without `.git` previously walked `.ai/tmp` and `.ai/outputs`, so third-party fixtures downloaded into scratch could fail `secret_scan` and strict doctor with findings that do not exist in tracked source.
 - The completion guard's shell mutation parser now strips heredoc bodies and tokenizes redirections, so Dart `=>`, Kotlin `->`, and comparison operators inside commands no longer register as write targets and produce false `cb-guard[verification]` stop refusals.
 - Large source files no longer disappear silently from code search or symbol/call graphs, and source byte metrics no longer double-count derived windows or symbol chunks.

@@ -26,7 +26,13 @@ trap 'rm -f "$PACKAGE_OUTPUT" "$REPORT_OUTPUT"' EXIT
 ./scripts/preflight.sh --check-only >/dev/null
 ./scripts/lockfile-check.sh >/dev/null
 ./scripts/lint.sh
-./bootstrap.sh
+# The gate owns the full suite explicitly (sharded, ~2m instead of ~8m serial) and
+# then runs bootstrap for its render/doctor/venv contract only. Previously
+# bootstrap re-ran the SAME 2,615 tests serially inside the gate, which was the
+# single largest cost of a release. AI_BOOTSTRAP_SKIP_TESTS is bootstrap's own
+# documented switch; the suite is not skipped, it moved one line up.
+uv run --project .ai/runtime python scripts/test-sharded.py
+AI_BOOTSTRAP_SKIP_TESTS=1 ./bootstrap.sh
 ./scripts/smoke.sh
 ./scripts/docs-check.sh
 ./scripts/package.sh >"$PACKAGE_OUTPUT"

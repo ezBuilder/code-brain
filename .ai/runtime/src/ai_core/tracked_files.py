@@ -47,10 +47,29 @@ FILESYSTEM_BASELINE_SKIP_DIRS = {
     ".nox",
 }
 
+# Git-less workspaces (release smoke copies, exported tarballs, consumer checkouts
+# without .git) fall back to a filesystem walk. That walk must still approximate a
+# *tracked* baseline, so it has to skip the runtime-owned scratch roots that are
+# gitignored by contract. Omitting them let third-party fixtures downloaded into
+# `.ai/tmp` (e.g. an upstream clone used for hook research) reach `secret_scan`,
+# which then failed strict doctor with findings that do not exist in tracked
+# source and cannot be remediated by editing the repository. These prefixes mirror
+# `search.SKIP_PATH_PREFIXES` plus `.ai/.gitignore`.
 FILESYSTEM_BASELINE_SKIP_PREFIXES = (
     ".ai/cache/",
     ".ai/memory/",
+    ".ai/tmp/",
+    ".ai/outputs/",
+    ".ai/eval/",
+    ".ai/skills/",
+    ".ai/tools/",
+    ".ai/precall_rules/",
+    ".ai/agents_catalog/",
+    ".ai/autoresearch/raw/",
     ".ai/runtime/.venv/",
+    ".ai/runtime/.venv.code-brain-rollback/",
+    ".ai/runtime/state/",
+    ".codebrain/",
     ".chatgpt2codex/",
 )
 

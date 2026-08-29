@@ -285,3 +285,45 @@ def test_hardlinked_tracked_cache_forces_git_refresh_without_modifying_external(
     assert calls["git"] == 1
     assert external.read_text(encoding="utf-8") == content
     assert cache.stat().st_ino != external.stat().st_ino
+
+
+def test_filesystem_baseline_excludes_gitignored_runtime_scratch(tmp_path: Path) -> None:
+    """A git-less workspace must not present runtime scratch as tracked source.
+
+    Regression: `.ai/tmp` held an upstream third-party clone used for hook research.
+    The release smoke copy strips `.git`, so the filesystem baseline walked that
+    scratch tree and `secret_scan` flagged upstream test fixtures, failing strict
+    doctor (exit 10) with findings absent from tracked source.
+    """
+    repo = tmp_path / "detached"
+    (repo / ".ai" / "tmp" / "upstream-clone" / "core").mkdir(parents=True)
+    (repo / ".ai" / "outputs").mkdir(parents=True)
+    (repo / ".ai" / "runtime" / "src").mkdir(parents=True)
+    (repo / "src").mkdir()
+
+    real_source = repo / "src" / "app.py"
+    real_source.write_text("value = 1\n", encoding="utf-8")
+    runtime_source = repo / ".ai" / "runtime" / "src" / "core.py"
+    runtime_source.write_text("value = 2\n", encoding="utf-8")
+    scratch = repo / ".ai" / "tmp" / "upstream-clone" / "core" / "fixture.rs"
+    # Built at runtime so this test file never contains a literal that the
+    # secret scanner would flag in tracked source.
+    scratch.write_text("let key = \"AKIA\" + \"IOSFODNN7EXAMPLE\";\n", encoding="utf-8")
+    report = repo / ".ai" / "outputs" / "report.json"
+    report.write_text("{}\n", encoding="utf-8")
+
+    baseline = tracked.tracked_files(repo)
+
+    assert baseline.source == "filesystem"
+    assert real_source in baseline
+    assert runtime_source in baseline, "product source under .ai/runtime stays in the baseline"
+    assert scratch not in baseline
+    assert report not in baseline
+
+
+def test_filesystem_baseline_skip_prefixes_cover_search_scratch_roots() -> None:
+    """Scratch roots excluded from indexing must also be excluded from the baseline."""
+    from ai_core.search import SKIP_PATH_PREFIXES
+
+    for prefix in SKIP_PATH_PREFIXES:
+        assert prefix in tracked.FILESYSTEM_BASELINE_SKIP_PREFIXES, prefix

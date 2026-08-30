@@ -20,7 +20,8 @@ py() {
 }
 PACKAGE_OUTPUT="$(mktemp)"
 REPORT_OUTPUT="$(mktemp)"
-trap 'rm -f "$PACKAGE_OUTPUT" "$REPORT_OUTPUT"' EXIT
+SLO_OUTPUT="$(mktemp)"
+trap 'rm -f "$PACKAGE_OUTPUT" "$REPORT_OUTPUT" "$SLO_OUTPUT"' EXIT
 
 ./scripts/env-check.sh >/dev/null
 ./scripts/preflight.sh --check-only >/dev/null
@@ -60,6 +61,26 @@ PY
 ./scripts/bootstrap-idempotency.sh >/dev/null
 ./scripts/dep-advisory.sh >/dev/null
 uv run --project .ai/runtime ai doctor --strict --json >/dev/null
+uv run --project .ai/runtime ai obs slo --iterations 10 --json >"$SLO_OUTPUT"
+py - "$SLO_OUTPUT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("ok") is not True:
+    entrypoint = payload.get("entrypoint", {})
+    print(
+        "release gate failed: hook SLO exceeded "
+        f"(in_process_p95_ms={payload.get('p95_ms')}, "
+        f"entrypoint_steady_ms={entrypoint.get('steady_ms')}, "
+        f"entrypoint_p95_ms={entrypoint.get('p95_ms')}, "
+        f"entrypoint_target_ms={entrypoint.get('target_ms')}, "
+        f"entrypoint_gross_ceiling_ms={entrypoint.get('gross_ceiling_ms')})",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
 uv run --project .ai/runtime ai report status --json >"$REPORT_OUTPUT"
 mkdir -p dist
 uv run --project .ai/runtime ai report release-gate-summary --git-sha "$(git rev-parse HEAD)" --json >dist/release-gate.summary.json

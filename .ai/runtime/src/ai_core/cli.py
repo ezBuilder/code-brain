@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
 from pathlib import Path
 
-from . import __version__
-from .config import load_config
-from .doctor import as_payload, run_checks
 from .hooks import (
     handle_hook,
     hook_exit_code,
@@ -16,20 +12,17 @@ from .hooks import (
     hook_wire_output,
     read_payload,
 )
-from .inbox import decide, list_approvals, request_approval
-from .memory import append_audit, append_event, rebuild_audit_index
-from .obs import diagnostics, health_summary, metrics, prune_diagnostics, search_report, slo_bench, usage_report, write_log
 from .paths import find_repo_root
 from .policy import CONFIG_INVALID, GENERIC_ERROR, MANIFEST_DRIFT, OK, PERMISSION_DENIED, PolicyDenied, USAGE_ERROR, WORKER_UNAVAILABLE, reject_ci_write
-from .render import render
-from .search import CONTEXT_PACK_DEFAULT_REPRESENTATION, CONTEXT_PACK_REPRESENTATIONS, context_pack, query, rebuild
-from .secrets_store import status as secrets_status
-from .trust import init_machine, list_machines, revoke_machine
 
 RUNTIME_PROTOCOL_VERSION = 1
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser():
+    import argparse
+
+    from .search import CONTEXT_PACK_DEFAULT_REPRESENTATION, CONTEXT_PACK_REPRESENTATIONS
+
     parser = argparse.ArgumentParser(
         prog="ai",
         description="Code Brain repo-local AI agent infrastructure CLI.",
@@ -778,7 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--representation",
         choices=CONTEXT_PACK_REPRESENTATIONS,
         default=CONTEXT_PACK_DEFAULT_REPRESENTATION,
-        help="기본 v2 graph/PPR pack; legacy는 명시적 롤백 호환",
+        help="기본 legacy lexical pack; v2/skeleton/refs-only graph pack은 명시적 opt-in",
     )
     context_pack_parser.add_argument("--json", action="store_true", dest="command_json")
     context_prove = context_sub.add_parser("prove", help="A/B proof for legacy versus graph/PPR retrieval")
@@ -899,6 +892,68 @@ def emit(payload: object, *, as_json: bool) -> None:
         _write(str(payload))
 
 
+def _fast_hook_args(argv: list[str]) -> tuple[str | None, bool, bool] | None:
+    """Parse only the tiny hook command shape; defer everything else to argparse."""
+
+    tokens = list(argv)
+    as_json = False
+    ci = False
+    while tokens and tokens[0] in {"--json", "--ci"}:
+        option = tokens.pop(0)
+        # Preserve the established hook contract: only the hook subcommand's
+        # ``--json`` requests the raw payload; global ``--json`` still uses wire output.
+        ci = ci or option == "--ci"
+    if not tokens or tokens.pop(0) != "hook":
+        return None
+    if "--json" in tokens:
+        tokens.remove("--json")
+        as_json = True
+    if any(token.startswith("-") for token in tokens) or len(tokens) > 1:
+        return None
+    return (tokens[0] if tokens else None), as_json, ci
+
+
+def _run_hook_fast(hook_name: str | None, *, as_json: bool, ci: bool) -> int:
+    """Run the per-tool hook without importing or constructing the full CLI."""
+
+    try:
+        if ci:
+            os.environ["AI_CI"] = "1"
+        root = find_repo_root()
+        request_payload = read_payload()
+        payload = handle_hook(root, hook_name, request_payload)
+        if as_json:
+            emit(payload, as_json=True)
+            return OK
+        wire = hook_wire_output(payload, request_payload)
+        stderr = hook_stderr(payload, request_payload)
+        if stderr:
+            print(stderr, file=sys.stderr)
+        if isinstance(wire, dict):
+            emit(wire, as_json=True)
+        elif isinstance(wire, str) and wire:
+            print(wire)
+        return hook_exit_code(payload, request_payload)
+    except PolicyDenied as exc:
+        emit(
+            {
+                "ok": False,
+                "error": "CI_READ_ONLY",
+                "command": exc.command,
+                "exit_code": PERMISSION_DENIED,
+            },
+            as_json=True,
+        )
+        return PERMISSION_DENIED
+    except Exception as exc:
+        error = {"ok": False, "error": str(exc)}
+        metadata = getattr(exc, "metadata", None)
+        if isinstance(metadata, dict):
+            error.update(metadata)
+        emit(error, as_json=True)
+        return GENERIC_ERROR
+
+
 def _read_loop_text(root: Path, *, text: str | None, file_path: str | None, stdin_fallback: bool = False) -> str:
     if text is not None:
         return text
@@ -919,8 +974,34 @@ def _read_loop_text(root: Path, *, text: str | None, file_path: str | None, stdi
 
 def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    hook_args = _fast_hook_args(raw_argv)
+    if hook_args is not None:
+        hook_name, as_json, ci = hook_args
+        return _run_hook_fast(hook_name, as_json=as_json, ci=ci)
+
+    from . import __version__
+    from .config import load_config
+    from .doctor import as_payload, run_checks
+    from .inbox import decide, list_approvals, request_approval
+    from .memory import append_audit, append_event, rebuild_audit_index
+    from .obs import (
+        diagnostics,
+        health_summary,
+        metrics,
+        prune_diagnostics,
+        search_report,
+        slo_bench,
+        usage_report,
+        write_log,
+    )
+    from .render import render
+    from .search import context_pack, query, rebuild
+    from .secrets_store import status as secrets_status
+    from .trust import init_machine, list_machines, revoke_machine
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     as_json = bool(args.json or getattr(args, "command_json", False))
     try:
         if args.ci:

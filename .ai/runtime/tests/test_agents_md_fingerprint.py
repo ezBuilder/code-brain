@@ -196,6 +196,16 @@ def test_is_current_false_when_agents_md_memory_is_disabled(tmp_path: Path, monk
     assert A.is_current(root) is False
 
 
+def test_renderer_schema_change_invalidates_managed_block(tmp_path: Path, monkeypatch) -> None:
+    root = _init_repo(tmp_path)
+    assert A.refresh(root) is True
+    assert A.is_current(root) is True
+
+    monkeypatch.setattr(A, "_RENDERER_SCHEMA_VERSION", "test-next")
+
+    assert A.is_current(root) is False
+
+
 def test_render_block_omits_static_rules_when_base_has_canonical_contract(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -263,9 +273,10 @@ def test_codex_session_start_skips_repeat_in_both_base_scenarios(tmp_path: Path)
         )
         assert A.refresh(root) is True
 
-        ctx = hooks.build_context("SessionStart", {"agent": "codex"}, root=root)
-        assert ctx.count("Adopt MCP code_query for search") == 0, scenario
-        assert "not repeated here" in ctx, scenario
+        for payload in ({"agent": "codex"}, {}):
+            ctx = hooks.build_context("SessionStart", payload, root=root)
+            assert ctx.count("Adopt MCP code_query for search") == 0, (scenario, payload)
+            assert "not repeated here" in ctx, (scenario, payload)
 
 
 def test_codex_session_start_skips_dynamic_render_when_current(

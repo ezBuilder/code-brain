@@ -17,6 +17,22 @@ def _file(tmp_path: Path, text: str = "safe\n") -> Path:
     return path
 
 
+def test_scan_uses_source_language_for_swift_type_annotations(tmp_path: Path) -> None:
+    annotation = "let to" + "ken: ScanCancellation" + "Token\n"
+    swift = tmp_path / "src" / "Surface.swift"
+    config = tmp_path / "config.yaml"
+    swift.parent.mkdir(parents=True)
+    swift.write_text(annotation, encoding="utf-8")
+    config.write_text(annotation, encoding="utf-8")
+
+    assert scan_state.scan_paths(
+        tmp_path,
+        [swift, config],
+        incremental=False,
+        update_state=False,
+    ) == ["config.yaml"]
+
+
 def test_incremental_scan_reuses_unchanged_file_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

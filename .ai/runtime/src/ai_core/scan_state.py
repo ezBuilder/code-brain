@@ -13,6 +13,7 @@ from .private_write import atomic_write_private_text, read_root_confined_text
 from .redact import SECRET_MATCHER_VERSION, SECRET_PATTERNS, contains_secret
 
 SCAN_STATE_SCHEMA = 3
+_DEFAULT_CONTAINS_SECRET = contains_secret
 
 
 def _matcher_implementation_digest() -> str:
@@ -178,7 +179,11 @@ def _scan_stable(path: Path) -> tuple[bool, dict[str, object] | None, str]:
             )
         except (OSError, UnicodeDecodeError):
             return False, None, "unreadable"
-        hit = contains_secret(text)
+        hit = (
+            contains_secret(text, source_path=path)
+            if contains_secret is _DEFAULT_CONTAINS_SECRET
+            else contains_secret(text)
+        )
         after = _path_state(path)
         if after is not None and after == before:
             return hit, after, "stable"

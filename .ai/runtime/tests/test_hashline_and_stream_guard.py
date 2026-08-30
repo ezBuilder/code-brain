@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[3]
 PYTHON = sys.executable
 sys.path.insert(0, str(ROOT / ".ai" / "runtime" / "src"))
 
+from ai_core.stream_guard import evaluate_hook_payload, scan_text  # noqa: E402
+
 
 def run_ai(*args: str, stdin: str | None = None, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
@@ -79,6 +81,136 @@ def test_stream_guard_scan_blocks_secret_path() -> None:
     payload = json.loads(result.stdout)
     assert payload["ok"] is False
     assert payload["matches"][0]["id"] == "credential_path"
+
+
+def test_stream_guard_blocks_nested_relative_and_key_paths() -> None:
+    dot_env = "." + "env"
+    id_key = "id_" + "rsa"
+    credentials = "credentials" + ".json"
+    key_suffix = "." + "p8"
+    examples = (
+        f"cat config/{dot_env}.production",
+        f"cat ./{dot_env}",
+        f"dd if={dot_env} of=/tmp/synthetic-copy",
+        f"cat AuthKey_SAMPLE{key_suffix}",
+        f"cat secrets/{id_key}",
+        f"cat app/{credentials}",
+    )
+    for command in examples:
+        scan = scan_text(command, scope="tool")
+        assert scan["ok"] is False, command
+        assert scan["matches"][0]["id"] == "credential_path", command
+
+
+def test_stream_guard_allows_prompt_to_discuss_credential_filename() -> None:
+    dot_env = "." + "env"
+    scan = scan_text(f"Explain why agents must not read {dot_env} files.", scope="prompt")
+    assert scan["ok"] is True
+
+
+def test_stream_guard_allows_patch_fixture_content_but_checks_patch_target() -> None:
+    dot_env = "." + "env"
+    fixture_patch = (
+        "*** Begin Patch\n"
+        "*** Update File: tests/test_guard.py\n"
+        "@@\n"
+        f"+example = 'cat {dot_env}'\n"
+        "*** End Patch"
+    )
+    fixture_scan = evaluate_hook_payload(
+        "PreToolUse",
+        {"tool_name": "functions.apply_patch", "tool_input": {"patch": fixture_patch}},
+    )
+    assert fixture_scan["ok"] is True
+
+    sensitive_target_patch = (
+        "*** Begin Patch\n"
+        f"*** Update File: config/{dot_env}\n"
+        "@@\n"
+        "+placeholder=true\n"
+        "*** End Patch"
+    )
+    target_scan = evaluate_hook_payload(
+        "PreToolUse",
+        {"tool_name": "apply_patch", "tool_input": {"patch": sensitive_target_patch}},
+    )
+    assert target_scan["ok"] is False
+    assert target_scan["matches"][0]["id"] == "credential_path"
+
+
+def test_stream_guard_scans_host_path_aliases_and_nested_edit_paths() -> None:
+    dot_env = "." + "env"
+    examples = (
+        ("Read", {"absolute_path": f"/repo/{dot_env}"}),
+        ("Read", {"paths": [f"/repo/{dot_env}"]}),
+        ("Edit", {"filePath": f"/repo/{dot_env}"}),
+        ("Edit", {"source_path": f"/repo/{dot_env}"}),
+        ("MultiEdit", {"edits": [{"TargetFile": f"config/{dot_env}.local"}]}),
+        ("Read", f"/repo/{dot_env}"),
+        ("Read", {"unrecognized_target": f"/repo/{dot_env}"}),
+    )
+    for tool_name, tool_input in examples:
+        scan = evaluate_hook_payload(
+            "PreToolUse",
+            {"tool_name": tool_name, "tool_input": tool_input},
+        )
+        assert scan["ok"] is False, (tool_name, tool_input)
+        assert scan["matches"][0]["id"] == "credential_path"
+
+
+def test_stream_guard_does_not_scan_structured_write_fixture_body_as_a_path() -> None:
+    dot_env = "." + "env"
+    scan = evaluate_hook_payload(
+        "PreToolUse",
+        {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "tests/fixture.txt",
+                "content": f"synthetic example: cat {dot_env}",
+            },
+        },
+    )
+    assert scan["ok"] is True
+
+
+def test_stream_guard_conservatively_blocks_credential_fixture_inside_tool_heredoc() -> None:
+    dot_env = "." + "env"
+    id_key = "id_" + "rsa"
+    command = (
+        "python3 - <<'PY'\n"
+        f"examples = ['cat {dot_env}', 'cat nested/{id_key}']\n"
+        "print(len(examples))\n"
+        "PY"
+    )
+    scan = evaluate_hook_payload(
+        "PreToolUse",
+        {"tool_name": "Bash", "tool_input": {"command": command}},
+    )
+    assert scan["ok"] is False
+
+
+def test_stream_guard_blocks_real_private_key_header_variants_in_write_body() -> None:
+    headers = (
+        "-----BEGIN " + "PRIVATE KEY-----",
+        "-----BEGIN " + "RSA PRIVATE KEY-----",
+        "-----BEGIN " + "DSA PRIVATE KEY-----",
+        "-----BEGIN " + "EC PRIVATE KEY-----",
+        "-----BEGIN " + "OPENSSH PRIVATE KEY-----",
+        "-----BEGIN " + "ENCRYPTED PRIVATE KEY-----",
+    )
+    for header in headers:
+        scan = evaluate_hook_payload(
+            "PreToolUse",
+            {
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": "notes.txt",
+                    "content": header + "\nSYNTHETIC-FIXTURE\n",
+                },
+            },
+        )
+        assert scan["ok"] is False, header
+        assert any(match["id"] == "private_key_literal" for match in scan["matches"])
 
 
 def test_stream_guard_pretooluse_blocks_read_env() -> None:

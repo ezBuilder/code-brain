@@ -231,7 +231,7 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                     "type": "string",
                     "enum": list(CONTEXT_PACK_REPRESENTATIONS),
                     "default": CONTEXT_PACK_DEFAULT_REPRESENTATION,
-                    "description": "legacy|v2|skeleton|refs-only; v2 graph/PPR가 기본 활성화.",
+                    "description": "legacy lexical이 기본; v2/skeleton/refs-only graph pack은 명시적 opt-in.",
                 },
                 "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"},
             },

@@ -1718,6 +1718,9 @@ def check_episodic_memory(root: Path, *, lightweight: bool = False) -> Check:
 # Windows portability job unsets CI/GITHUB_ACTIONS, so an is_ci()-conditional relax
 # would silently not apply there and the gate would flake again.
 SLO_GATE_HEADROOM = 3
+# Process launch is materially noisier than in-process work under sharded CI. A 4x
+# coarse gate still catches a user-visible one-second regression at the 250ms target.
+ENTRYPOINT_SLO_GATE_HEADROOM = 4
 
 
 def check_hot_path_slo(
@@ -1747,17 +1750,65 @@ def check_hot_path_slo(
         if session_start_ms is not None
         else best_elapsed_ms("SessionStart", 5)
     )
+    if sample_baseline:
+        try:
+            from .obs import hook_entrypoint_latency
 
+            entrypoint = hook_entrypoint_latency(root)
+        except Exception:
+            entrypoint = {
+                "ok": True,
+                "measured": False,
+                "reason": "measurement_failed_soft",
+                "scope": "end_to_end",
+                "hook": "SessionStart",
+                "best_ms": None,
+                "p95_ms": None,
+                "target_ms": None,
+            }
+    else:
+        entrypoint = {
+            "ok": True,
+            "measured": False,
+            "reason": "deferred_lightweight",
+            "scope": "end_to_end",
+            "hook": "SessionStart",
+            "best_ms": None,
+            "p95_ms": None,
+            "target_ms": None,
+        }
+
+    entrypoint_p95 = entrypoint.get("p95_ms") if entrypoint.get("measured") else None
+    entrypoint_target = entrypoint.get("target_ms")
+    entrypoint_gate_ms = (
+        int(entrypoint_target) * ENTRYPOINT_SLO_GATE_HEADROOM
+        if isinstance(entrypoint_target, (int, float))
+        else None
+    )
+    entrypoint_ok = (
+        entrypoint_p95 is None
+        or entrypoint_gate_ms is None
+        or int(entrypoint_p95) <= entrypoint_gate_ms
+    )
     ok = (
         (p95 is None or p95 <= HOT_PATH_TARGET_MS * SLO_GATE_HEADROOM)
         and start_ms <= SESSION_START_TARGET_MS * SLO_GATE_HEADROOM
+        and entrypoint_ok
     )
     return Check(
         "hot_path_slo",
         ok,
-        f"p95_ms={p95 if p95 is not None else 'deferred'}, target_ms={HOT_PATH_TARGET_MS}, "
+        f"p95_ms={p95 if p95 is not None else 'deferred'}, p95_scope=in_process, "
+        f"target_ms={HOT_PATH_TARGET_MS}, "
         f"session_start_ms={start_ms}, "
-        f"session_start_target_ms={SESSION_START_TARGET_MS}",
+        f"session_start_target_ms={SESSION_START_TARGET_MS}, "
+        f"entrypoint_p95_ms={entrypoint.get('p95_ms') if entrypoint.get('measured') else 'unmeasured'}, "
+        f"entrypoint_best_ms={entrypoint.get('best_ms') if entrypoint.get('measured') else 'unmeasured'}, "
+        f"entrypoint_scope={entrypoint.get('scope') or 'end_to_end'}, "
+        f"entrypoint_hook={entrypoint.get('hook') or 'SessionStart'}, "
+        f"entrypoint_target_ms={entrypoint.get('target_ms')}, "
+        f"entrypoint_gate_ms={entrypoint_gate_ms}, "
+        f"entrypoint_reason={entrypoint.get('reason') or 'unknown'}",
     )
 
 

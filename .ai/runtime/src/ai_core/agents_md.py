@@ -107,6 +107,9 @@ _HEADING = "## Code Brain Memory"
 # or re-rendering the body (see module docstring: "Currentness is a FINGERPRINT...").
 _FP_PREFIX = "<!-- CODE-BRAIN:MEMORY:FP:"
 _FP_SUFFIX = " -->"
+# Bump whenever render semantics change without a durable input-file change. This
+# invalidates installed managed blocks once, so stale prompt material is refreshed.
+_RENDERER_SCHEMA_VERSION = "3"
 # Bounded, explicitly declared list of the files/directories the static rules and the
 # DURABLE dynamic sections in ``hooks._build_dynamic_sections`` actually read from, relative
 # to repo root. Deliberately excludes anything git-derived (see module docstring point 2)
@@ -226,7 +229,7 @@ def fingerprint(root: Path) -> str:
     worktree ``.git``-as-file, unbounded ``git status`` cost, and self-reference all ruled
     it out). Two calls against an unchanged durable state (no memory-file write, no resume
     snapshot, no plan change, no relevant env change) always return the same value."""
-    parts = _stat_signature(root) + [_env_signature()]
+    parts = [f"renderer={_RENDERER_SCHEMA_VERSION}", *_stat_signature(root), _env_signature()]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 

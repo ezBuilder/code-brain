@@ -116,7 +116,7 @@ def test_pretooluse_find_blocks() -> None:
     assert cmd in suggestion
 
 
-def test_pretooluse_with_pipe_head_blocks() -> None:
+def test_pretooluse_with_pipe_head_allows() -> None:
     result = run_hook(
         "PreToolUse",
         {
@@ -126,8 +126,40 @@ def test_pretooluse_with_pipe_head_blocks() -> None:
         },
     )
     payload = _parse_ok(result)
+    assert payload.get("decision") != "block"
+    assert payload.get("precall", {}).get("action") == "allow"
+
+
+def test_pretooluse_bounded_pipe_does_not_hide_broad_sibling() -> None:
+    result = run_hook(
+        "PreToolUse",
+        {
+            "agent": "codex",
+            "tool_name": "functions.exec_command",
+            "tool_input": {
+                "command": "grep -rn x src | head -5 && grep -rn secret /"
+            },
+        },
+    )
+    payload = _parse_ok(result)
     assert payload.get("decision") == "block"
     assert payload.get("precall", {}).get("binary") == "grep"
+
+
+def test_pretooluse_rg_explicit_file_target_allows() -> None:
+    result = run_hook(
+        "PreToolUse",
+        {
+            "agent": "codex",
+            "tool_name": "functions.exec_command",
+            "tool_input": {
+                "command": "rg -n '^def should_intercept' .ai/runtime/src/ai_core/precall.py"
+            },
+        },
+    )
+    payload = _parse_ok(result)
+    assert payload.get("decision") != "block"
+    assert payload.get("precall", {}).get("reason") == "rg_explicit_file_target"
 
 
 def test_pretooluse_non_bash_tool_allows() -> None:
@@ -415,7 +447,5 @@ def test_pretooluse_antigravity_run_command_rewrites() -> None:
     assert hso.get("permissionDecision") == "allow"
     updated = hso.get("updatedInput")
     assert isinstance(updated, dict)
-    assert updated.get("CommandLine") == ".ai/bin/ai exec run -- rg pattern"
-    assert updated.get("command") == ".ai/bin/ai exec run -- rg pattern"
-
-
+    assert updated.get("CommandLine") == ".ai/bin/ai exec run -- bash -lc 'rg pattern'"
+    assert updated.get("command") == ".ai/bin/ai exec run -- bash -lc 'rg pattern'"

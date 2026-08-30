@@ -1399,7 +1399,8 @@ def test_context_pack_and_mcp_once(tmp_path: Path) -> None:
     assert context_result.returncode == 0, context_result.stdout + context_result.stderr
     context_payload = json.loads(context_result.stdout)
     assert context_payload["additionalContext"]
-    assert context_payload["representation"] == "v2"
+    assert "representation" not in context_payload
+    assert "graph_context" not in context_payload
     proof_result = run_ai("context", "prove", "manifest", "--repeats", "2", "--json", cwd=repo)
     assert proof_result.returncode == 0, proof_result.stdout + proof_result.stderr
     proof = json.loads(proof_result.stdout)

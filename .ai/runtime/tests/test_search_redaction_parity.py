@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,6 +110,109 @@ def test_generic_assignment_matcher_ignores_identifiers_and_repeated_test_placeh
     assert contains_secret("pass" + 'word = "' + high_signal + '"') is True
 
 
+def test_generic_assignment_matcher_preserves_code_type_annotations() -> None:
+    safe_annotations = (
+        "private var activeScan" + "Token: ScanCancellation" + "Token?",
+        "func run(to" + "ken: ScanCancellation" + "Token)",
+        "let activeTo" + "ken: ScanCancellation" + "Token",
+        "let to" + "ken: ScanCancellation" + "Token",
+        "symName: '+[Thing decryptionPass" + "word:veryLongSelectorType:]'",
+    )
+
+    for text in safe_annotations:
+        assert contains_secret(text, source_path=Path("Example.swift")) is False
+        assert redact_text(text, source_path=Path("Example.swift")) == text
+
+    bare_binding = "let to" + "ken: ScanCancellation" + "Token"
+    assert contains_secret(bare_binding) is True
+    assert contains_secret(bare_binding, source_path=Path("config.yaml")) is True
+    assert redact_text(bare_binding, source_path=Path("config.yaml")) != bare_binding
+
+    opaque_value = "AbcdefghijklmnopqrSTUV"
+    unsafe_config = "to" + "ken: " + opaque_value
+    assert contains_secret(unsafe_config) is True
+    assert redact_text(unsafe_config) != unsafe_config
+
+    selector_shaped_config = "dbPass" + "word: veryLongSelectorType:"
+    assert contains_secret(selector_shaped_config) is True
+    assert redact_text(selector_shaped_config) != selector_shaped_config
+
+    declaration_shaped_config = "let api" + "key: MyLongSecretValueAbc"
+    assert contains_secret(declaration_shaped_config) is True
+    assert redact_text(declaration_shaped_config) != declaration_shaped_config
+
+    cross_line_paren_config = (
+        "# rotate quarterly (see runbook\n" + "api_to" + "ken: MyLongSecretValueAbc\n"
+    )
+    assert contains_secret(cross_line_paren_config) is True
+    assert redact_text(cross_line_paren_config) != cross_line_paren_config
+
+    cross_line_selector_config = (
+        "# symbol example +[Thing method:]\n" + "db_pass" + "word: MyLongSecretValueAbc:5432\n"
+    )
+    assert contains_secret(cross_line_selector_config) is True
+    assert redact_text(cross_line_selector_config) != cross_line_selector_config
+
+
+def test_search_preserves_swift_type_annotations(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    config = repo / ".ai" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("project_name: swift-parity\n", encoding="utf-8")
+    source = repo / "src" / "TypeSurface.swift"
+    source.parent.mkdir(parents=True)
+    annotation = "let to" + "ken: ScanCancellation" + "Token"
+    source.write_text("// SwiftTypeMarker\n" + annotation + "\n", encoding="utf-8")
+
+    rebuild(repo)
+    visible = query(repo, "ScanCancellationToken")
+    serialized = json.dumps(visible, sort_keys=True)
+
+    assert visible["results"]
+    assert annotation in serialized
+    assert "[REDACTED]" not in serialized
+
+
+def test_redactor_orders_multiple_generic_assignment_spans() -> None:
+    first = "AbcdefghijklmnoPQRSTUV123"
+    second = "ZyxwvutsrqponmlKJIHGF987"
+    source = "prefix pass" + f'word="{first}" middle to' + f'ken="{second}" suffix'
+
+    redacted = redact_text(source)
+
+    assert redacted == "prefix [REDACTED] middle [REDACTED] suffix"
+    assert first not in redacted
+    assert second not in redacted
+    assert contains_secret(redacted) is False
+
+
+def test_redactor_merges_overlapping_generic_assignment_spans() -> None:
+    fixture_value = "AbcdefghijklmnoPQRSTUV123"
+    source = "pass" + "word=sec" + f"ret={fixture_value}"
+
+    redacted = redact_text(source)
+
+    assert redacted == "[REDACTED]"
+    assert fixture_value not in redacted
+    assert contains_secret(redacted) is False
+
+
+def test_redactor_conservatively_scrubs_assignment_like_identifiers() -> None:
+    fixture_value = "AbcdefghijklmnopqrsT"
+    sources = (
+        "sec" + f"ret={fixture_value}.tail",
+        "to" + f"ken={fixture_value};",
+        "api" + f"key={fixture_value},",
+    )
+
+    for source in sources:
+        assert contains_secret(source) is False
+        redacted = redact_text(source)
+        assert "[REDACTED]" in redacted
+        assert fixture_value not in redacted
+        assert contains_secret(redacted) is False
+
+
 def test_search_index_and_snippets_never_reintroduce_detected_values(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     config = repo / ".ai" / "config.yaml"
@@ -145,3 +249,38 @@ def test_search_index_and_snippets_never_reintroduce_detected_values(tmp_path: P
         assert case.value not in fallback_results
         assert case.needle not in fallback_results
         assert "[REDACTED]" in fallback_results
+
+
+def test_function_chunks_never_store_unredacted_assignments(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    config = repo / ".ai" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("project_name: function-redaction\n", encoding="utf-8")
+    source = repo / "src" / "worker.py"
+    source.parent.mkdir(parents=True)
+    fixture_value = _body("function", 28)
+    source.write_text(
+        "def FunctionRedactionMarker():\n"
+        + "    api_"
+        + f'key = "{fixture_value}"\n'
+        + "    return True\n",
+        encoding="utf-8",
+    )
+
+    rebuild(repo)
+    visible = query(repo, "FunctionRedactionMarker")
+    serialized = json.dumps(visible, sort_keys=True)
+    with sqlite3.connect(repo / ".ai" / "cache" / "code.sqlite") as conn:
+        function_rows = conn.execute(
+            "select id from chunks where path like ?",
+            ("src/worker.py:%",),
+        ).fetchall()
+        leaked_rows = conn.execute(
+            "select rowid from chunks_fts where chunks_fts match ?",
+            (fixture_value,),
+        ).fetchall()
+
+    assert visible["results"]
+    assert fixture_value not in serialized
+    assert function_rows
+    assert leaked_rows == []

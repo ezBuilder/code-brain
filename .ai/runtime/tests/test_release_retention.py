@@ -89,3 +89,5 @@ def test_package_and_release_gate_wire_retention_contract() -> None:
     assert "release_retention_plan" in package
     assert "release_retention_plan" in gate
     assert 'plan["clean"]' in gate
+    assert "ai obs slo --iterations 10 --json" in gate
+    assert 'payload.get("ok") is not True' in gate

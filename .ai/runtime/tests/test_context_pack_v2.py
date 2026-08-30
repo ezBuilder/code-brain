@@ -40,18 +40,24 @@ def _build_repo(tmp_path: Path) -> Path:
     return root
 
 
-def test_v2_is_default_and_legacy_remains_explicit_rollback(tmp_path: Path) -> None:
+def test_legacy_is_default_and_v2_graph_pack_stays_explicit_opt_in(tmp_path: Path) -> None:
     root = _build_repo(tmp_path)
 
     default = search_mod.context_pack(root, "alpha", limit=5)
+    explicit_legacy = search_mod.context_pack(root, "alpha", limit=5, representation="legacy")
     explicit_v2 = search_mod.context_pack(root, "alpha", limit=5, representation="v2")
-    legacy = search_mod.context_pack(root, "alpha", limit=5, representation="legacy")
 
-    assert explicit_v2 == default
-    assert default["representation"] == "v2"
-    assert default["graph_context"]["ranking_applied"] is True
-    assert "context_pack_version" not in legacy
-    assert "graph_context" not in legacy
+    # The cheap lexical pack is what an unspecified caller pays for.
+    assert search_mod.CONTEXT_PACK_DEFAULT_REPRESENTATION == "legacy"
+    assert explicit_legacy == default
+    assert "context_pack_version" not in default
+    assert "graph_context" not in default
+    assert "context_receipt" not in default
+
+    # The richer graph pack is unchanged, just no longer implicit.
+    assert explicit_v2["representation"] == "v2"
+    assert explicit_v2["context_pack_version"] == 2
+    assert explicit_v2["graph_context"]["ranking_applied"] is True
 
 
 def test_v2_adds_bounded_graph_and_span_contract_without_reranking(tmp_path: Path) -> None:
@@ -119,13 +125,13 @@ def _file_snapshot(root: Path) -> dict[str, tuple[int, str]]:
     return snapshot
 
 
-def test_default_context_pack_repetition_does_not_grow_or_mutate_files(tmp_path: Path) -> None:
+def test_v2_context_pack_repetition_does_not_grow_or_mutate_files(tmp_path: Path) -> None:
     root = _build_repo(tmp_path)
-    warm = search_mod.context_pack(root, "alpha", limit=10)
+    warm = search_mod.context_pack(root, "alpha", limit=10, representation="v2")
     before = _file_snapshot(root)
 
     for _ in range(50):
-        payload = search_mod.context_pack(root, "alpha", limit=10)
+        payload = search_mod.context_pack(root, "alpha", limit=10, representation="v2")
         assert payload["representation"] == "v2"
         assert payload["graph_context"]["ranking_parameters"]["max_nodes"] == 2_048
         assert len(payload["additionalContext"].encode("utf-8")) <= payload["context_budget"]["max_bytes"]
@@ -180,7 +186,7 @@ def test_mcp_schema_and_dispatch_expose_opt_in_representation(
     tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "context_pack")
     representation = tool["inputSchema"]["properties"]["representation"]
     assert representation["enum"] == ["legacy", "v2", "skeleton", "refs-only"]
-    assert representation["default"] == "v2"
+    assert representation["default"] == "legacy"
 
     captured: dict[str, object] = {}
 
@@ -202,4 +208,4 @@ def test_mcp_schema_and_dispatch_expose_opt_in_representation(
 
     captured.clear()
     mcp_server._dispatch_tool(tmp_path, "context_pack", {"query": "alpha"})
-    assert captured["representation"] == "v2"
+    assert captured["representation"] == "legacy"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 PATTERNS = [
@@ -19,7 +20,7 @@ PATTERNS = [
 ]
 
 SECRET_PATTERNS = PATTERNS[:8]
-SECRET_MATCHER_VERSION = 2
+SECRET_MATCHER_VERSION = 4
 _ASSIGNMENT_TERMS = ("apikey", "api_key", "api-key", "secret", "token", "password")
 _ASSIGNMENT_VALUE_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./+=-"
@@ -186,8 +187,66 @@ def _is_word_placeholder(candidate: str) -> bool:
     return any(segment in _PLACEHOLDER_MARKERS for segment in segments)
 
 
-def _contains_assignment_secret(value: str, lowered: str) -> bool:
+def _looks_like_code_type_annotation(
+    value: str,
+    *,
+    term: str,
+    term_start: int,
+    separator: str,
+    candidate: str,
+    candidate_end: int,
+    quoted: bool,
+    source_path: str | Path | None,
+) -> bool:
+    """Recognize typed declarations/selectors without exempting config values."""
+    if quoted or separator != ":" or not candidate.isascii() or not candidate.isalpha():
+        return False
+    if candidate.isupper() or candidate.islower():
+        return False
+
+    previous = value[term_start - 1] if term_start else ""
+    following = value[candidate_end] if candidate_end < len(value) else ""
+    prefix = value[max(0, term_start - 256) : term_start]
+    line_prefix = prefix.rsplit("\n", 1)[-1].rsplit("\r", 1)[-1]
+    line_suffix = value[candidate_end : candidate_end + 256].split("\n", 1)[0].split("\r", 1)[0]
+    objc_method = any(marker in line_prefix for marker in ("+[", "-[")) and "]" in line_suffix
+    objc_selector = "@selector(" in line_prefix and ")" in line_suffix
+    selector_context = (
+        previous.isalnum()
+        and following == ":"
+        and (objc_method or objc_selector)
+    )
+    if selector_context:
+        return True
+    if not candidate[0].isupper():
+        return False
+
+    swift_source = source_path is not None and Path(source_path).suffix.casefold() == ".swift"
+    parameter_context = swift_source and (
+        re.search(r"\b(?:func|init|subscript)\b[^()]*\([^()]*$", line_prefix) is not None
+    )
+    embedded_binding = previous.isalnum() and (
+        re.search(r"\b(?:let|var)\s+[A-Za-z_][A-Za-z0-9_]*$", line_prefix) is not None
+    )
+    bare_binding = (
+        candidate.casefold().endswith(term.casefold())
+        and re.search(r"\b(?:let|var)\s*$", line_prefix) is not None
+        and re.fullmatch(r"[?!]?\s*(?://.*)?", line_suffix) is not None
+    )
+    binding_context = swift_source and (embedded_binding or bare_binding)
+    declaration_context = parameter_context or binding_context
+    return declaration_context and "=" not in line_suffix
+
+
+def _assignment_secret_spans(
+    value: str,
+    lowered: str,
+    *,
+    preserve_identifiers: bool = True,
+    source_path: str | Path | None = None,
+) -> list[tuple[int, int]]:
     length = len(value)
+    spans: list[tuple[int, int]] = []
     for term in _ASSIGNMENT_TERMS:
         offset = 0
         while True:
@@ -200,10 +259,12 @@ def _contains_assignment_secret(value: str, lowered: str) -> bool:
             if cursor >= length or value[cursor] not in {":", "="}:
                 offset = found + 1
                 continue
+            separator = value[cursor]
             cursor += 1
             while cursor < length and value[cursor].isspace():
                 cursor += 1
             quoted = cursor < length and value[cursor] in {"'", '"'}
+            quote = value[cursor] if quoted else ""
             if quoted:
                 cursor += 1
             start = cursor
@@ -236,24 +297,44 @@ def _contains_assignment_secret(value: str, lowered: str) -> bool:
             # actual format (`abcd-efgh-ijkl-mnop`) is unaffected because this
             # generic assignment rule only fires at >=20 characters.
             word_placeholder = _is_word_placeholder(candidate)
+            code_type_annotation = _looks_like_code_type_annotation(
+                value,
+                term=term,
+                term_start=found,
+                separator=separator,
+                candidate=candidate,
+                candidate_end=cursor,
+                quoted=quoted,
+                source_path=source_path,
+            )
             if (
                 len(candidate) >= 20
-                and not identifier_expression
+                and not (preserve_identifiers and identifier_expression)
                 and not repeated_placeholder
                 and not word_placeholder
+                and not code_type_annotation
             ):
-                return True
+                end = cursor + (1 if quoted and cursor < length and value[cursor] == quote else 0)
+                spans.append((found, end))
             offset = found + 1
-    return False
+    return spans
 
 
-def contains_secret(value: str) -> bool:
+def _contains_assignment_secret(
+    value: str,
+    lowered: str,
+    *,
+    source_path: str | Path | None = None,
+) -> bool:
+    return bool(_assignment_secret_spans(value, lowered, source_path=source_path))
+
+
+def contains_secret(value: str, *, source_path: str | Path | None = None) -> bool:
     """Existence-only secret scan with necessary-prefix prefilters.
 
-    Each branch still delegates the final decision to the original compiled
-    regex. The cheap literal checks are necessary conditions, so this is
-    semantically identical to ``any(pattern.search(value) ...)`` while avoiding
-    eight full-text regex passes for ordinary source files.
+    Prefix-specific branches delegate to compiled patterns. The generic
+    assignment branch additionally excludes bounded placeholders and code
+    identifiers so tracked fixtures and type annotations do not become findings.
     """
     if "AKIA" in value and SECRET_PATTERNS[0].search(value):
         return True
@@ -291,7 +372,7 @@ def contains_secret(value: str) -> bool:
     )
     if assignment_candidate or needs_unicode_fallback:
         if (
-            _contains_assignment_secret(value, lowered)
+            _contains_assignment_secret(value, lowered, source_path=source_path)
             if not needs_unicode_fallback
             else SECRET_PATTERNS[6].search(value) is not None
         ):
@@ -302,18 +383,42 @@ def contains_secret(value: str) -> bool:
     return False
 
 
-def redact_text(value: str) -> str:
+def redact_text(value: str, *, source_path: str | Path | None = None) -> str:
     redacted = value
-    for pattern in PATTERNS:
+    for pattern in PATTERNS[:6]:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    needs_unicode_fallback = not redacted.isascii() and any(
+        character in redacted for character in _UNICODE_IGNORECASE_EXTRAS
+    )
+    if needs_unicode_fallback:
+        redacted = SECRET_PATTERNS[6].sub("[REDACTED]", redacted)
+    else:
+        spans = sorted(
+            _assignment_secret_spans(
+                redacted,
+                redacted.lower(),
+                preserve_identifiers=False,
+                source_path=source_path,
+            )
+        )
+        merged: list[tuple[int, int]] = []
+        for start, end in spans:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        for start, end in reversed(merged):
+            redacted = redacted[:start] + "[REDACTED]" + redacted[end:]
+    for pattern in PATTERNS[7:]:
         redacted = pattern.sub("[REDACTED]", redacted)
     return redacted
 
 
-def redact_value(value: Any) -> Any:
+def redact_value(value: Any, *, source_path: str | Path | None = None) -> Any:
     if isinstance(value, str):
-        return redact_text(value)
+        return redact_text(value, source_path=source_path)
     if isinstance(value, list):
-        return [redact_value(item) for item in value]
+        return [redact_value(item, source_path=source_path) for item in value]
     if isinstance(value, dict):
-        return {key: redact_value(item) for key, item in value.items()}
+        return {key: redact_value(item, source_path=source_path) for key, item in value.items()}
     return value

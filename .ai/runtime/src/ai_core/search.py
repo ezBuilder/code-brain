@@ -48,7 +48,12 @@ SEARCH_RESULT_DEFAULT = 5
 SEARCH_RESULT_MAX = 100
 SEARCH_DENSE_CANDIDATE_MAX = SEARCH_RESULT_MAX * 8
 CONTEXT_PACK_REPRESENTATIONS = ("legacy", "v2", "skeleton", "refs-only")
-CONTEXT_PACK_DEFAULT_REPRESENTATION = "v2"
+# Default is the cheap lexical pack. The v2/PPR graph pack stays fully supported but is
+# opt-in: measured A/B over real commit-retrospective queries showed the graph append
+# changed zero rankings (lexical order is never mutated) while adding per-query graph
+# work, so paying for it on every default call is not justified. Callers that want the
+# richer shape ask for it explicitly (`representation="v2" | "skeleton" | "refs-only"`).
+CONTEXT_PACK_DEFAULT_REPRESENTATION = "legacy"
 CONTEXT_PACK_GRAPH_MAX_RESULTS = 20
 RG_OUTPUT_MAX_BYTES = 256 * 1024
 RG_OUTPUT_MAX_EVENTS = 512
@@ -258,10 +263,11 @@ _PRIVATE_KEY_END_RE = re.compile(r"-----END [^-\n]{0,80}PRIVATE KEY-----", re.IG
 class _StreamingRedactor:
     """Apply the existing redaction policy without retaining a whole source."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, source_path: Path | None = None) -> None:
         self._buffer = ""
         self._private_block = False
         self._private_newlines = 0
+        self._source_path = source_path
 
     def feed(self, text: str) -> list[str]:
         if text:
@@ -298,7 +304,7 @@ class _StreamingRedactor:
             if begin is not None:
                 prefix = self._buffer[: begin.start()]
                 if prefix:
-                    output.append(str(redact_value(prefix)))
+                    output.append(str(redact_value(prefix, source_path=self._source_path)))
                 # ``prefix`` was already emitted, so only count newlines in
                 # the private-key marker itself. Counting the whole prefix
                 # would shift every later graph span by the lines seen in
@@ -310,7 +316,7 @@ class _StreamingRedactor:
 
             if final:
                 if self._buffer:
-                    output.append(str(redact_value(self._buffer)))
+                    output.append(str(redact_value(self._buffer, source_path=self._source_path)))
                     self._buffer = ""
                 return output
 
@@ -324,7 +330,9 @@ class _StreamingRedactor:
                 safe_cut = marker
             if safe_cut <= 0:
                 return output
-            output.append(str(redact_value(self._buffer[:safe_cut])))
+            output.append(
+                str(redact_value(self._buffer[:safe_cut], source_path=self._source_path))
+            )
             self._buffer = self._buffer[safe_cut:]
 
 
@@ -413,7 +421,7 @@ def _iter_redacted_text_pieces(
     reject_group_other_writable: bool = False,
 ) -> Iterator[str]:
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
-    redactor = _StreamingRedactor()
+    redactor = _StreamingRedactor(source_path=path)
     for raw in iter_root_confined_bytes(
         path,
         root=root,
@@ -1041,7 +1049,7 @@ def _rebuild_incremental_inner(root: Path, *, paths: set[str] | None = None) -> 
                 continue
             content, source_state = loaded
             seen.add(rel)
-            redacted = redact_value(content)
+            redacted = redact_value(content, source_path=path)
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
             if existing_pair is not None and existing_pair[1] == digest:
                 _upsert_file_state(conn, rel, path, digest, state=source_state)
@@ -1477,7 +1485,7 @@ def _rebuild_inner(root: Path) -> dict[str, Any]:
                 skipped_count += 1
                 continue
             content, source_state = loaded
-            redacted = redact_value(content)
+            redacted = redact_value(content, source_path=path)
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
             summary = summarize(redacted)
             cursor = conn.execute("insert into chunks(path, sha256, summary) values (?, ?, ?)", (rel, digest, summary))
@@ -1645,7 +1653,7 @@ def _insert_function_chunks(
 
     for func in func_chunks:
         qualname = func["qualname"]
-        chunk_text = func["text"]
+        chunk_text = str(redact_value(func["text"], source_path=Path(path)))
         start_line = func["start_line"]
         end_line = func["end_line"]
         kind = func["kind"]
@@ -2476,7 +2484,7 @@ def _rejected_query_payload(text: str, reason: str) -> dict[str, Any]:
 def _redacted_rg_preview(root: Path, rel_path: str, lineno: int, preview: str) -> str:
     """Redact one rg preview after multiline secret blocks were skipped in rg."""
     raw_preview = preview.strip()
-    direct = str(redact_value(raw_preview))
+    direct = str(redact_value(raw_preview, source_path=Path(rel_path)))
     if direct != raw_preview:
         return direct
     if "PRIVATE KEY-----" in raw_preview and (
@@ -3707,7 +3715,7 @@ def index_hash_status(
                 changed.add(rel)
                 continue
             content, source_state = loaded
-            redacted = str(redact_value(content))
+            redacted = str(redact_value(content, source_path=path))
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
         if digest != expected:
             changed.add(rel)
@@ -4612,7 +4620,7 @@ def snippet_from_file(root: Path, rel_path: str, query_text: str, *, fallback: s
     if loaded is None:
         return f"[stale index: source unavailable; run ai index rebuild] {fallback}"
     content, _source_state = loaded
-    redacted = str(redact_value(content))
+    redacted = str(redact_value(content, source_path=path))
     if expected_sha:
         current_sha = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
         if current_sha != expected_sha:

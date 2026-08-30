@@ -155,17 +155,22 @@ def test_context_pack_compact_removes_duplicate_results_graph_and_receipt(
     payload = _context_payload()
     monkeypatch.setattr(m, "context_pack", lambda *_args, **_kwargs: deepcopy(payload))
 
-    compact = m._dispatch_tool(tmp_path, "context_pack", {"query": "needle"})
+    compact = m._dispatch_tool(
+        tmp_path,
+        "context_pack",
+        {"query": "needle", "representation": "v2"},
+    )
 
     assert compact == {
         "ok": True,
         "context": payload["additionalContext"],
         "refs": ["src/service.py:10-14#run"],
+        "representation": "v2",
     }
     assert m._dispatch_tool(
         tmp_path,
         "context_pack",
-        {"query": "needle", "detail": "full"},
+        {"query": "needle", "representation": "v2", "detail": "full"},
     ) == payload
 
 
@@ -200,7 +205,10 @@ def test_compact_tools_call_uses_one_minified_representation(
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {"name": "context_pack", "arguments": {"query": "needle"}},
+        "params": {
+            "name": "context_pack",
+            "arguments": {"query": "needle", "representation": "v2"},
+        },
     }
 
     compact_response = m.handle_request(tmp_path, deepcopy(base))
@@ -216,6 +224,7 @@ def test_compact_tools_call_uses_one_minified_representation(
         "ok": True,
         "context": payload["additionalContext"],
         "refs": ["src/service.py:10-14#run"],
+        "representation": "v2",
     }
     assert '": "' not in compact_text
     assert full_response["result"]["structuredContent"] == payload

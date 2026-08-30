@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import platform
+import subprocess
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -12,7 +14,11 @@ from typing import Any
 from . import __version__
 from .doctor import as_payload
 from .memory import all_audit_files, append_jsonl, read_state_text
-from .private_write import atomic_write_private_bytes, atomic_write_private_text
+from .private_write import (
+    atomic_write_private_bytes,
+    atomic_write_private_text,
+    validate_root_confined_regular_file,
+)
 from .redact import redact_value
 from .storage_lifecycle import prune_diagnostics_files, prune_logs
 
@@ -683,6 +689,141 @@ def release_artifact_summary(root: Path) -> dict[str, Any]:
     }
 
 
+# `handle_hook` measures itself with perf_counter INSIDE an already-running interpreter, so
+# its elapsed_ms excludes everything the host actually waits for: the shell shim, interpreter
+# startup and module import. That is why an in-process sample can report 0ms while the real
+# per-tool-call cost is tens of milliseconds. This measures the managed hook entrypoint the
+# host really executes, end to end.
+#
+# Bounded and deterministic by construction:
+#   - fixed sample count; median gates steady-state cost, while a gross ceiling catches stalls
+#     and nearest-rank p95/best are retained for diagnosis
+#   - per-sample timeout, so a wedged shim cannot hang doctor
+#   - `dry` payload -> hooks take the fast path: no event persistence, no detached spawns
+#   - real SessionStart hook with `dry=true`, so context cost is included without side effects
+#   - only the pre-provisioned venv interpreter; the `uv run` fallback would resolve the
+#     project (and may hit the network), which is neither bounded nor allowed here
+#   - never invokes `ai doctor`, so doctor cannot recurse into itself
+HOOK_ENTRYPOINT_SAMPLES = 3
+HOOK_ENTRYPOINT_TIMEOUT_SECONDS = 5.0
+HOOK_ENTRYPOINT_TARGET_MS = 250
+HOOK_ENTRYPOINT_GROSS_CEILING_MS = HOOK_ENTRYPOINT_TARGET_MS * 4
+HOOK_ENTRYPOINT_HOOK_NAME = "SessionStart"
+
+
+def _hook_entrypoint_command(root: Path) -> tuple[list[str], str | None]:
+    """Resolve the managed shim + venv interpreter, or explain why it is unmeasurable."""
+
+    if os.name == "nt":
+        # The Windows entrypoint is a PowerShell shim whose host-side startup cost depends on
+        # the caller's execution policy. Measuring it here would report policy, not Code Brain.
+        return [], "windows_shim_unmeasured"
+    shim = root / ".ai" / "bin" / "ai-hook"
+    venv_python = root / ".ai" / "runtime" / ".venv" / "bin" / "python"
+    try:
+        validate_root_confined_regular_file(shim, root=root, max_bytes=64 * 1024)
+    except (OSError, ValueError):
+        return [], "shim_unavailable"
+    if not os.access(shim, os.X_OK):
+        return [], "shim_not_executable"
+    if not os.access(venv_python, os.X_OK):
+        # Without the venv the shim falls back to `uv run`, which resolves the project.
+        return [], "managed_interpreter_unavailable"
+    return [str(shim), HOOK_ENTRYPOINT_HOOK_NAME, "--json"], None
+
+
+def hook_entrypoint_latency(root: Path, *, samples: int = HOOK_ENTRYPOINT_SAMPLES) -> dict[str, Any]:
+    """End-to-end latency of the real managed hook entrypoint, including process startup."""
+
+    root = Path(root).resolve()
+    samples = max(1, min(int(samples), HOOK_ENTRYPOINT_SAMPLES))
+    command, reason = _hook_entrypoint_command(root)
+    if reason is not None:
+        return {
+            "ok": True,
+            "measured": False,
+            "reason": reason,
+            "scope": "end_to_end",
+            "hook": HOOK_ENTRYPOINT_HOOK_NAME,
+            "best_ms": None,
+            "steady_ms": None,
+            "p95_ms": None,
+            "samples_ms": [],
+            "target_ms": HOOK_ENTRYPOINT_TARGET_MS,
+            "gross_ceiling_ms": HOOK_ENTRYPOINT_GROSS_CEILING_MS,
+        }
+    request = json.dumps({"agent": "codex", "dry": True}, separators=(",", ":"))
+    environment = os.environ.copy()
+    # The shim intentionally prefers host-provided project variables. Override them
+    # here so a doctor running in a worktree measures the root it was asked to check.
+    environment["CLAUDE_PROJECT_DIR"] = str(root)
+    environment["CODEX_PROJECT_DIR"] = str(root)
+    elapsed: list[int] = []
+    for _ in range(samples):
+        started = time.perf_counter()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=root,
+                input=request,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                timeout=HOOK_ENTRYPOINT_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return {
+                "ok": True,
+                "measured": False,
+                "reason": "entrypoint_failed",
+                "scope": "end_to_end",
+                "hook": HOOK_ENTRYPOINT_HOOK_NAME,
+                "best_ms": None,
+                "steady_ms": None,
+                "p95_ms": None,
+                "samples_ms": elapsed,
+                "target_ms": HOOK_ENTRYPOINT_TARGET_MS,
+                "gross_ceiling_ms": HOOK_ENTRYPOINT_GROSS_CEILING_MS,
+            }
+        measured_ms = int((time.perf_counter() - started) * 1000)
+        if completed.returncode != 0:
+            return {
+                "ok": True,
+                "measured": False,
+                "reason": f"exit_{completed.returncode}",
+                "scope": "end_to_end",
+                "hook": HOOK_ENTRYPOINT_HOOK_NAME,
+                "best_ms": None,
+                "steady_ms": None,
+                "p95_ms": None,
+                "samples_ms": elapsed,
+                "target_ms": HOOK_ENTRYPOINT_TARGET_MS,
+                "gross_ceiling_ms": HOOK_ENTRYPOINT_GROSS_CEILING_MS,
+            }
+        elapsed.append(measured_ms)
+    best_ms = min(elapsed)
+    steady_ms = sorted(elapsed)[len(elapsed) // 2]
+    p95_ms = max(elapsed)  # nearest-rank p95 for the bounded 1-3 sample set
+    return {
+        "ok": (
+            steady_ms <= HOOK_ENTRYPOINT_TARGET_MS
+            and p95_ms <= HOOK_ENTRYPOINT_GROSS_CEILING_MS
+        ),
+        "measured": True,
+        "reason": "measured",
+        "scope": "end_to_end",
+        "hook": HOOK_ENTRYPOINT_HOOK_NAME,
+        "best_ms": best_ms,
+        "steady_ms": steady_ms,
+        "p95_ms": p95_ms,
+        "samples_ms": elapsed,
+        "target_ms": HOOK_ENTRYPOINT_TARGET_MS,
+        "gross_ceiling_ms": HOOK_ENTRYPOINT_GROSS_CEILING_MS,
+    }
+
+
 def slo_bench(root: Path, iterations: int = 10) -> dict[str, Any]:
     from .hooks import handle_hook
 
@@ -691,7 +832,18 @@ def slo_bench(root: Path, iterations: int = 10) -> dict[str, Any]:
         result = handle_hook(root, "SLOBaseline", {"agent": "bench", "dry": True})
         elapsed.append(int(result["elapsed_ms"]))
     p95 = sorted(elapsed)[max(0, int(len(elapsed) * 0.95) - 1)] if elapsed else 0
-    return {"ok": p95 <= 200, "iterations": iterations, "p95_ms": p95, "target_ms": 200, "samples_ms": elapsed}
+    entrypoint = hook_entrypoint_latency(root)
+    return {
+        "ok": p95 <= 200 and bool(entrypoint["ok"]),
+        "iterations": iterations,
+        "p95_ms": p95,
+        # In-process only: excludes shell/interpreter startup. Read `entrypoint` for the
+        # latency a host actually pays per hook invocation.
+        "p95_scope": "in_process",
+        "target_ms": 200,
+        "samples_ms": elapsed,
+        "entrypoint": entrypoint,
+    }
 
 
 def diagnostics(

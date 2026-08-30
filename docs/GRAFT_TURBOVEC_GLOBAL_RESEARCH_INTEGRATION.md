@@ -1,6 +1,6 @@
 # Graft × TurboVec × Semantica × 전세계 연구자료 기반 Code Brain 적용·검증서
 
-> **상태:** bounded graph/PPR 기본 활성화 + 검증 및 후속 gate 명세
+> **상태:** legacy 기본 + bounded graph/PPR 명시 활성화·검증 및 후속 gate 명세
 >
 > **검토일:** 2026-08-22 (Asia/Seoul)
 >
@@ -63,9 +63,9 @@ query
 ```
 
 
-### 0.1 2026-08-22 실제 반영 상태
+### 0.1 2026-08-22 구현, 2026-08-30 기본값 조정
 
-아래는 설계가 아니라 현재 작업트리에 구현된 범위다. 기본 호출은 `v2` graph/PPR이며 `representation=legacy`가 명시적 무그래프 롤백 경로다.
+아래는 설계가 아니라 현재 작업트리에 구현된 범위다. 기본 호출은 저비용 `legacy`이며, graph/PPR은 `representation=v2|skeleton|refs-only`를 명시한 호출에서만 활성화된다.
 
 | 항목 | 상태 | 실제 표면 |
 |---|---|---|
@@ -75,16 +75,16 @@ query
 | stale source suppression | **반영** | hash mismatch면 snippet·summary를 억제하고 `[STALE_SOURCE]` 표시 |
 | canonical context receipt | **반영** | query·source body 없이 policy/generation/path/span만 canonical JSON SHA-256으로 결속 |
 | graph 표현 축소 | **반영** | full/skeleton/refs-only와 64 KiB cap |
-| bounded personalized graph rank | **기본 활성화** | 이미 bounded된 one-hop call graph에 stdlib-only PPR 적용; 2 hops/2,048 nodes/1,600 edges/25 iterations 상한 |
+| bounded personalized graph rank | **명시 활성화** | 이미 bounded된 one-hop call graph에 stdlib-only PPR 적용; 2 hops/2,048 nodes/1,600 edges/25 iterations 상한 |
 | line/span 품질 gate | **반영** | production `context_pack v2` 임시 인덱스를 file/exact/overlap/rank-weighted coverage로 평가하며 `make eval` 7번째 축으로 강제 |
 | TurboVec | **보류** | stable ID/manifest/allowlist/float32 shadow/Recall·p95 gate와 실제 병목 증거가 생길 때만 도입 |
 | Semantica package | **거부** | 패키지·무거운 의존성·범용 graph/reasoning stack은 설치하지 않고 provenance 의미만 흡수 |
 
-**정직한 한계:** 이 구현은 Code Brain을 외부 벤치마크상 세계 1위로 증명한 것이 아니다. 현재 증명한 것은 legacy 롤백, exact-span 경로, source trust, bounded context/PPR, deterministic receipt, 반복 호출 무증가 계약, production eval contract다. 세계 1위 주장은 고정 corpus의 Recall/MRR/nDCG/line coverage와 p95를 경쟁 기준선에 대해 반복 측정한 뒤에만 가능하다.
+**정직한 한계:** 이 구현은 Code Brain을 외부 벤치마크상 세계 1위로 증명한 것이 아니다. 현재 증명한 것은 legacy 기본 경로, explicit graph opt-in, exact-span 경로, source trust, bounded context/PPR, deterministic receipt, 반복 호출 무증가 계약, production eval contract다. 세계 1위 주장은 고정 corpus의 Recall/MRR/nDCG/line coverage와 p95를 경쟁 기준선에 대해 반복 측정한 뒤에만 가능하다.
 
-### 0.2 기본 활성화·workspace 전파 증거
+### 0.2 초기 v2 활성화·workspace 전파 증거
 
-2026-08-22 현재 기본 `context_pack`을 `v2`로 전환하고, 이미 상한이 적용된 one-hop call graph 후보에 PPR를 연결했다. PPR는 query마다 메모리에서만 계산하며 파일·네트워크·optional package를 사용하지 않는다.
+2026-08-22에는 기본 `context_pack`을 `v2`로 전환하고 one-hop call graph 후보에 PPR를 연결했다. 2026-08-30 실저장소 A/B에서 순위 개선 없이 지연만 증가함을 확인해 기본값은 `legacy`로 복귀시켰다. PPR 자체는 explicit graph 호출에서 메모리로만 계산하며 파일·네트워크·optional package를 사용하지 않는다.
 
 ```text
 max_hops=2
@@ -105,8 +105,8 @@ result limit <= 100
 검증 결과:
 
 - source: 현재 non-CLI runtime `1880 passed, 5 skipped`; proof/activation/installer/CLI focused `160 passed`; 직전 full-suite snapshot은 `2033 passed, 5 skipped, 18 failed`(모두 기존 global-kit strict-doctor fixture); `make eval` `31/31`; lint 통과. docs check는 모든 선행 문서 검사를 통과한 뒤 동일 strict-doctor 실패로 종료한다.
-- source live: warm-up 후 기본 `context_pack` 50회에서 receipt 1개, retrieval 파일 목록·크기·SHA-256 무변경, 4,083/4,096 bytes.
-- 12개 consumer: 전부 index rebuild 성공, 기본 v2/policy/bounds 확인, 5회 receipt 동일, SQLite/generation 파일 무변경, context budget 준수.
+- source live: 당시 기본이던 v2 `context_pack`을 warm-up 후 50회 실행해 receipt 1개, retrieval 파일 목록·크기·SHA-256 무변경, 4,083/4,096 bytes를 확인했다.
+- 12개 consumer: 전부 index rebuild 성공, 당시 기본 v2 policy/bounds 확인, 5회 receipt 동일, SQLite/generation 파일 무변경, context budget 준수.
 - 전파 전후 모든 consumer의 branch·HEAD·Code Brain 외 status와 기존 `.ai/eval/` byte snapshot이 동일했다.
 
 | consumer | index files | graph/PPR live | branch 보존 |
@@ -521,7 +521,7 @@ MIT license라 패턴 참고 자체는 가능하지만, 라이선스 허용은 a
 
 | 현재 파일 | 이미 있는 계약 | 이번 문서에서의 변경 방향 |
 |---|---|---|
-| `.ai/runtime/src/ai_core/search.py` | BM25 query, function chunk/span, dirty/hash auto-refresh, `context_pack` budget | v2·graph/PPR·canonical receipt를 기본 활성화; explicit legacy rollback 유지 |
+| `.ai/runtime/src/ai_core/search.py` | BM25 query, function chunk/span, dirty/hash auto-refresh, `context_pack` budget | legacy 기본 경로 유지; v2·graph/PPR·canonical receipt를 explicit opt-in으로 제공 |
 | `.ai/runtime/src/ai_core/graph_context.py` | caller/callee/related symbol, schema v2, full/skeleton/refs-only, 64 KiB, source hash/generation/stale suppression | typed multi-language relation과 resolved target 품질을 후속 확장 |
 | `.ai/runtime/src/ai_core/codegraph.py` | Python AST symbol/call, BFS path, reverse blast radius, architecture summary | relation·confidence·scope·generation을 일반화; 기존 Python 결과는 byte-compatible 유지 |
 | `.ai/runtime/src/ai_core/autoresearch/dense.py` | ONNX MiniLM, 384-dim float32 blob, 50K-token gate, derived rebuild | float32 baseline을 보존하고 `DenseIndex` adapter 뒤에 TurboVec을 추가 |
@@ -532,7 +532,7 @@ MIT license라 패턴 참고 자체는 가능하지만, 라이선스 허용은 a
 
 ### 6.1 닫힌 gap과 남은 gap
 
-**이번 구현으로 닫힌 것:** 기본 context-pack v2, bounded one-hop PPR, skeleton/refs-only, exact function span 노출, graph source generation/hash trust, stale evidence 억제, typed provenance, canonical no-query receipt, read-path SQLite 무변경 fast path, production line/span eval 및 `make eval` 연결.
+**이번 구현으로 닫힌 것:** legacy 기본 context pack과 explicit graph/PPR opt-in, bounded one-hop PPR, skeleton/refs-only, exact function span 노출, graph source generation/hash trust, stale evidence 억제, typed provenance, canonical no-query receipt, read-path SQLite 무변경 fast path, production line/span eval 및 `make eval` 연결.
 
 **남은 것:**
 
@@ -548,7 +548,7 @@ MIT license라 패턴 참고 자체는 가능하지만, 라이선스 허용은 a
 
 ### 7.1 실제 `context_pack` v2 payload
 
-기본 호출은 `representation=v2` payload를 반환한다. 기존 payload가 필요한 소비자는 `representation=legacy`를 명시한다.
+기본 호출은 저비용 `representation=legacy` payload를 반환한다. graph/PPR 문맥이 필요한 소비자만 `representation=v2`를 명시한다.
 
 ```json
 {
@@ -605,8 +605,8 @@ MIT license라 패턴 참고 자체는 가능하지만, 라이선스 허용은 a
 
 규칙:
 
-- `v2`가 default이며 기존 lexical results/snippet을 유지하고 graph context만 bounded append한다.
-- `legacy`는 새 graph/receipt 필드가 없는 명시적 롤백 경로다.
+- `legacy`가 default이며 graph/receipt 생성 비용을 지불하지 않는다.
+- `v2`는 기존 lexical results/snippet을 유지하고 graph context만 bounded append하는 명시적 opt-in 경로다.
 - `skeleton`/`refs-only`는 lexical source body를 path/span 중심으로 바꾼다.
 - graph가 실패해도 lexical 결과는 유지하며 ranking을 변경하지 않는다.
 - stale graph source의 snippet·summary는 억제한다.
@@ -690,14 +690,14 @@ PPR alpha = 0.25
 
 ### Phase 0 — 계약·관측만 추가
 
-목표: 먼저 측정 가능한 구조를 만든 뒤, bounded PPR를 기본 활성화한다.
+목표: 먼저 측정 가능한 구조를 만든 뒤, bounded PPR를 명시적 opt-in으로 제공한다.
 
 | 대상 | 작업 | 상태 |
 |---|---|---|
-| `search.py` | v2 기본, legacy rollback, trace·receipt·exact function span | **완료** |
+| `search.py` | legacy 기본, explicit v2, trace·receipt·exact function span | **완료** |
 | `graph_context.py` | schema/provenance/hash/generation/stale/full·skeleton·refs-only | **완료** |
 | `.ai/evals/` | production query→qrels→path/span 평가 | **완료**, 최소 fixture 3개 |
-| config/API | dependency·network 없이 v2 기본 + explicit legacy rollback | **완료** |
+| config/API | dependency·network 없이 legacy 기본 + explicit graph opt-in | **완료** |
 
 ### Phase 1 — Graft형 graph context v1
 
@@ -706,7 +706,7 @@ PPR alpha = 0.25
 | `codegraph.py` | relation/confidence/source span/generation을 DB schema로 일반화 | **후속**; 현재 output envelope에서 우선 제공 |
 | `graph_context.py` | skeleton/refs-only, bounded context | **완료** |
 | `graph_context.py` | ego graph/repo map | **후속** |
-| `graph_rank.py` | deterministic bounded PPR | **완료·기본 연결**, bounded one-hop 후보에만 적용 |
+| `graph_rank.py` | deterministic bounded PPR | **완료·명시 연결**, bounded one-hop 후보에만 적용 |
 | `search.py` | graph context를 lexical ranking 비변경으로 결합 | **완료** |
 | CLI/MCP | `context_pack` representation enum·dispatch | **완료** |
 
@@ -808,12 +808,12 @@ BM25/graph/dense/RRF contribution ratio
 
 아래는 첫 gate의 **시작값**이며, 실제 Code Brain held-out 결과로 조정한다.
 
-1. explicit legacy에서 기존 targeted payload가 유지되고, default/explicit v2가 동일하다.
+1. default/explicit legacy가 동일하고 기존 targeted payload가 유지되며, explicit v2 계약도 유지된다.
 2. graph mode가 BM25-only 대비 line coverage를 낮추지 않고, token budget을 초과하지 않는다.
 3. TurboVec `Recall@20`이 float32 baseline 대비 절대 2 percentage point 이상 떨어지지 않는다. 떨어지면 enable하지 않는다.
 4. filtered search는 모든 fixture에서 허용 ID 밖 결과 0건, padding 0건이다.
 5. sidecar corruption/truncation/crash recovery fixture가 old-generation fallback으로 종료된다.
-6. warm-up 뒤 기본 `context_pack` 50회 반복에서 파일 목록·크기·SHA-256이 변하지 않는다.
+6. warm-up 뒤 explicit v2 `context_pack` 50회 반복에서 파일 목록·크기·SHA-256이 변하지 않는다.
 6. 5회 반복의 median뿐 아니라 최악 run의 p95와 실패율도 기록한다.
 7. vendor/paper 수치는 위 gate를 대신할 수 없다.
 
@@ -848,7 +848,7 @@ CODEBRAIN_CONTEXT_MODE=full|skeleton|refs-only
 CODEBRAIN_CONTEXT_SHADOW=0|1
 ```
 
-graph/PPR의 실제 기본값은 `context_pack` v2다. `representation=legacy`가 즉시 롤백 경로다. TurboVec은 계속 default-off이며 shadow는 결과를 바꾸지 않는다.
+2026-08-30 실저장소 커밋 회고 50건 A/B에서 v2의 lexical 순위 개선이 0건이고 기본 호출 지연만 늘어, 실제 기본값은 `context_pack` legacy로 내렸다. graph/PPR은 `representation=v2` 이상을 명시한 호출만 사용한다. TurboVec은 계속 default-off이며 shadow는 결과를 바꾸지 않는다.
 
 ### 10.2 신뢰 경계
 
@@ -861,7 +861,7 @@ graph/PPR의 실제 기본값은 `context_pack` v2다. `representation=legacy`�
 ### 10.3 rollback
 
 1. `CODEBRAIN_CONTEXT_DENSE=off`로 TurboVec을 즉시 끈다.
-2. 호출별 `representation=legacy`로 graph/PPR를 즉시 끈다.
+2. `representation`을 생략하거나 `legacy`를 명시해 graph/PPR를 끈다.
 3. SQLite source/FTS/codegraph는 유지한다.
 4. sidecar는 active generation flip 없이 orphan으로 남기고 maintenance에서만 삭제한다.
 5. rollback 후에도 `retrieval_policy`, `freshness`, `dense_status`, `graph_status`를 audit에 남겨 원인을 추적한다.
@@ -879,7 +879,7 @@ graph/PPR의 실제 기본값은 `context_pack` v2다. `representation=legacy`�
 
 ### 첫 구현 wave
 
-- [x] `context_pack` v2 기본과 backward-compatible explicit legacy rollback
+- [x] `context_pack` legacy 기본과 backward-compatible explicit v2 graph opt-in
 - [x] graph evidence kind/confidence/generation/hash/invalidation
 - [x] skeleton/refs-only와 bounded graph append
 - [x] bounded deterministic PPR 엔진
@@ -900,7 +900,7 @@ graph/PPR의 실제 기본값은 `context_pack` v2다. `representation=legacy`�
 
 ### enable 전
 
-- [x] default/explicit v2 parity와 explicit legacy rollback targeted test
+- [x] default/explicit legacy parity와 explicit v2 opt-in targeted test
 - [ ] 대규모 held-out graph ablation
 - [ ] float32 vs TurboVec recall
 - [x] production line/span 결과 5회 반복 동일성

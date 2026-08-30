@@ -4,6 +4,16 @@ All notable Code Brain changes are recorded here.
 
 ## Unreleased
 
+### Changed
+
+- Default `context_pack` calls now use the lower-cost legacy lexical representation; graph/PPR representations remain available through explicit `v2`, `skeleton`, or `refs-only` selection. The CLI hook path also defers general-command imports and parsing, doctor reports a bounded end-to-end SessionStart entrypoint measurement, and the release gate now rejects sustained or gross hook-latency regressions with an outlier-tolerant end-to-end gate instead of accepting only an in-process proxy.
+- Native broad-search routing now permits only demonstrably bounded pipelines and exact `rg` file targets, while compound siblings, shell groups/substitutions, pass-through pagers, oversized caps, and dotted directories remain intercepted. Session context removes duplicate snapshot/live memory and injects only actionable high-confidence lessons.
+
+### Fixed
+
+- Secret redaction now merges assignment spans deterministically, applies path-aware source handling, redacts function-level FTS chunks, invalidates stale scan caches when matcher code changes, and preserves verified Swift type annotations without weakening config-file scanning.
+- Pre-tool stream guarding now recognizes nested credential paths and host-specific path aliases, blocks real RSA/DSA/EC/OpenSSH/encrypted private-key headers in write bodies, checks patch targets instead of harmless fixture bodies, and keeps destructive-command and credential-path rules at the executable tool boundary.
+
 ## 0.9.2 - 2026-08-29
 
 ### Fixed

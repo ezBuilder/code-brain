@@ -2559,13 +2559,30 @@ def _lessons_context(root: Path, hook_name: str) -> str:
         items = score_lessons(root, include_stale=False).get("items", [])
     except Exception:
         return ""
-    items = [i for i in items if float(i.get("confidence", 0) or 0) >= 0.3][:3]
-    if not items:
+    rendered: list[tuple[dict[str, Any], str]] = []
+    for item in items:
+        if float(item.get("confidence", 0) or 0) < 0.5:
+            continue
+        # Global prompt injection is reserved for an actionable cause/fix. Bare
+        # commands and aggregate counters (for example an acceptance-command count)
+        # remain available through query-specific recall but add no durable guidance.
+        body = str(item.get("fix") or item.get("cause") or item.get("failure") or "").strip()
+        words = body.split()
+        looks_like_counter = bool(
+            words
+            and words[0].isdigit()
+            and words[-1].lower() in {"commands", "cases", "tests", "failures", "items"}
+        )
+        if len(body) < 20 or len(words) < 3 or looks_like_counter:
+            continue
+        rendered.append((item, body[:120]))
+        if len(rendered) == 3:
+            break
+    if not rendered:
         return ""
     lines = ["Lessons (distilled from past runs — apply; call lessons_recall for query-specific recall):"]
-    for it in items:
+    for it, body in rendered:
         conf = it.get("confidence")
-        body = str(it.get("fix") or it.get("failure") or it.get("cause") or it.get("command") or "")[:120]
         kind = str(it.get("kind") or "")
         lines.append(f"  - ({conf}) {body}" + (f" [{kind}]" if kind else ""))
     return "\n".join(lines)
@@ -2758,6 +2775,24 @@ def _build_dynamic_sections(
     meaningful as a currentness signal across hosts/turns.
     """
     sections: list[str] = []
+    try:
+        from .memory import read_decisions_for_surface
+
+        plain_decisions, live_failures = read_decisions_for_surface(root, limit=DECISIONS_TAIL)
+    except Exception:
+        plain_decisions, live_failures = (
+            _read_jsonl_tail(root / ".ai" / "memory" / "decisions.jsonl", DECISIONS_TAIL), [])
+    todos = _read_jsonl_open_todos(root / ".ai" / "memory" / "todos.jsonl", TODOS_LIMIT)
+    session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
+    current_decision_texts = {
+        str(entry.get("decision") or entry.get("summary") or entry.get("text") or "")[:160]
+        for entry in plain_decisions
+    }
+    current_todo_texts = {
+        str(entry.get("title") or entry.get("text") or entry.get("summary") or "")[:160]
+        for entry in todos
+    }
+    current_session_lines = {line.strip() for line in session_tail.splitlines() if line.strip()}
     if hook_name == "SessionStart":
         sections.append(_session_harness_context(root))
     if hook_name == "UserPromptSubmit":
@@ -2816,7 +2851,7 @@ def _build_dynamic_sections(
                 if entry.get("kind") == "failure" and str(entry.get("status", "observed")) in {"stale", "refuted"}:
                     continue
                 text = str(entry.get("decision") or entry.get("summary") or entry.get("text") or "")[:160]
-                if not text:
+                if not text or text in current_decision_texts:
                     continue
                 if entry.get("kind") == "failure":
                     lines.append(f"  failure (re-testable, not a permanent ban): {text}")
@@ -2824,25 +2859,22 @@ def _build_dynamic_sections(
                     lines.append(f"  decision: {text}")
             for entry in (prior.get("todos_open") or [])[-3:]:
                 text = str(entry.get("title") or entry.get("text") or entry.get("summary") or "")[:160]
-                if text:
+                if text and text not in current_todo_texts:
                     lines.append(f"  open todo: {text}")
             actions = prior.get("audit_tail_actions") or []
             if actions:
                 lines.append(f"  recent actions: {', '.join(str(a) for a in actions[-5:])}")
             prior_tail = str(prior.get("session_tail") or "")
-            tail_lines = [line for line in prior_tail.splitlines() if line.strip()][-PRIOR_SESSION_TAIL_LINES:]
+            tail_lines = [
+                line
+                for line in prior_tail.splitlines()
+                if line.strip() and line.strip() not in current_session_lines
+            ][-PRIOR_SESSION_TAIL_LINES:]
             if tail_lines:
                 lines.append("  session tail:")
                 for line in tail_lines:
                     lines.append(f"    {line[:220]}")
             sections.append("\n".join(lines))
-    try:
-        from .memory import read_decisions_for_surface
-
-        plain_decisions, live_failures = read_decisions_for_surface(root, limit=DECISIONS_TAIL)
-    except Exception:
-        plain_decisions, live_failures = (
-            _read_jsonl_tail(root / ".ai" / "memory" / "decisions.jsonl", DECISIONS_TAIL), [])
     if plain_decisions:
         lines = ["decisions:"]
         for entry in plain_decisions:
@@ -2862,7 +2894,6 @@ def _build_dynamic_sections(
         if extra > 0:
             flines.append(f"  (+{extra} older re-testable findings — query memory for detail)")
         sections.append("\n".join(flines))
-    todos = _read_jsonl_open_todos(root / ".ai" / "memory" / "todos.jsonl", TODOS_LIMIT)
     if todos:
         lines = ["todos:"]
         for entry in todos:
@@ -2872,7 +2903,6 @@ def _build_dynamic_sections(
         sections.append("\n".join(lines))
     if include_auxiliary:
         sections.extend(_build_auxiliary_sections(hook_name, payload, root))
-    session_tail = _read_text_tail(root / ".ai" / "memory" / "session-current.md", SESSION_TAIL_LINES)
     if session_tail:
         sections.append("session tail:\n" + session_tail)
     learned = _learned_prompt_context(root)
@@ -2921,7 +2951,11 @@ def build_context(hook_name: str, payload: dict[str, Any], *, root: Path | None 
     # they are appended unconditionally below regardless of currentness, since that state
     # changes far more often than memory files and going stale here would hide real drift.
     skip_static_and_durable = False
-    if agent == "codex" and hook_name == "SessionStart":
+    # Current Codex app hooks may omit both an agent field and CODEX_* environment
+    # variables. Treat that otherwise-unidentifiable SessionStart as Codex only when
+    # a current managed AGENTS.md block proves the same durable body is already
+    # available. Known hosts retain their explicit behavior.
+    if agent in {"codex", "unknown"} and hook_name == "SessionStart":
         try:
             from . import agents_md as _agents_md
 

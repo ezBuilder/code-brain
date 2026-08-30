@@ -182,6 +182,26 @@ path.write_text(text.replace("Release Notes", "Release Log", 1), encoding="utf-8
 PY
 }
 
+tamper_release_notes_body_resigned() {
+  local dir="$1"
+  py - "$dir/dist/$PREFIX.release-notes.md" "$dir/dist/$PREFIX.provenance.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+notes_path = pathlib.Path(sys.argv[1])
+provenance_path = pathlib.Path(sys.argv[2])
+notes = notes_path.read_text(encoding="utf-8")
+start = notes.index("## Problems and fixes")
+end = notes.index("\n## Recent Commits", start)
+notes_path.write_text(notes[:start] + "## Problems and fixes\n" + notes[end:], encoding="utf-8")
+provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+provenance["subjects"][notes_path.name] = hashlib.sha256(notes_path.read_bytes()).hexdigest()
+provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
 tamper_release_notes_git_head() {
   local dir="$1"
   py - "$dir/dist/$PREFIX.release-notes.md" <<'PY'
@@ -373,6 +393,7 @@ expect_install_check_failure missing_provenance tamper_missing_provenance
 expect_install_check_failure dirty_provenance tamper_dirty_provenance
 expect_install_check_failure metadata_version tamper_metadata_version
 expect_install_check_failure release_notes tamper_release_notes
+expect_install_check_failure release_notes_body_resigned tamper_release_notes_body_resigned
 expect_install_check_failure release_notes_git_head tamper_release_notes_git_head
 expect_install_check_failure release_notes_git_status tamper_release_notes_git_status
 expect_install_check_failure missing_release_notes tamper_missing_release_notes

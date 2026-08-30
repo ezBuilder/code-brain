@@ -4,8 +4,11 @@ All notable Code Brain changes are recorded here.
 
 ## Unreleased
 
+## 0.9.3 - 2026-08-30
+
 ### Changed
 
+- Release packaging now hashes each tracked member while streaming it into the deterministic archive instead of reopening and fully decompressing the finished archive, hashes the archive in bounded chunks instead of loading it all into memory, and uses deterministic gzip level 6 rather than the slower level 9 default. Generated release notes now embed the matching changelog section under an enforced problems-and-fixes heading, and artifact verification requires that body to match the packaged changelog exactly, preventing empty or substituted issue-and-resolution summaries even if provenance is recomputed.
 - Default `context_pack` calls now use the lower-cost legacy lexical representation; graph/PPR representations remain available through explicit `v2`, `skeleton`, or `refs-only` selection. The CLI hook path also defers general-command imports and parsing, doctor reports a bounded end-to-end SessionStart entrypoint measurement, and the release gate now rejects sustained or gross hook-latency regressions with an outlier-tolerant end-to-end gate instead of accepting only an in-process proxy.
 - Native broad-search routing now permits only demonstrably bounded pipelines and exact `rg` file targets, while compound siblings, shell groups/substitutions, pass-through pagers, oversized caps, and dotted directories remain intercepted. Session context removes duplicate snapshot/live memory and injects only actionable high-confidence lessons.
 

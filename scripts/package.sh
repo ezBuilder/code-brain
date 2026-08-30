@@ -51,6 +51,7 @@ import hashlib
 import gzip
 import pathlib
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -91,6 +92,27 @@ def archive_name(path: pathlib.Path) -> str:
     return pathlib.PurePosixPath(package_root, path.as_posix()).as_posix()
 
 
+class HashingReader:
+    """Hash a member while tarfile streams it into the archive."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self.handle.read(size)
+        self.digest.update(data)
+        return data
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def normalized_info(path: pathlib.Path, arcname: str) -> tarfile.TarInfo:
     source = root / path
     info = tarfile.TarInfo(arcname)
@@ -112,7 +134,7 @@ def normalized_info(path: pathlib.Path, arcname: str) -> tarfile.TarInfo:
     return info
 
 
-def build_archive() -> None:
+def build_archive() -> list[dict[str, object]]:
     # Release exactly the Git index, never the ambient checkout. `rglob()` previously swept
     # ignored runtime memory, .ai/tmp, local Claude settings and generated AGENTS.md session
     # context into public archives even though `git status` was clean. Besides leaking private
@@ -139,8 +161,9 @@ def build_archive() -> None:
         if parent != pathlib.Path(".")
     }
     members = sorted(directories | set(tracked), key=lambda item: item.as_posix())
+    files: list[dict[str, object]] = []
     with archive.open("wb") as raw:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=6, mtime=0) as gz:
             with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
                 root_info = tarfile.TarInfo(package_root)
                 root_info.type = tarfile.DIRTYPE
@@ -155,29 +178,24 @@ def build_archive() -> None:
                     if (root / path).is_dir():
                         tar.addfile(normalized_info(path, archive_name(path)))
                     else:
+                        info = normalized_info(path, archive_name(path))
                         with (root / path).open("rb") as handle:
-                            tar.addfile(normalized_info(path, archive_name(path)), handle)
+                            hashing_reader = HashingReader(handle)
+                            tar.addfile(info, hashing_reader)
+                        files.append(
+                            {
+                                "path": info.name,
+                                "mode": oct(info.mode),
+                                "size": info.size,
+                                "sha256": hashing_reader.digest.hexdigest(),
+                            }
+                        )
+    return files
 
 
-build_archive()
-archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+files = build_archive()
+archive_digest = sha256_file(archive)
 archive.with_suffix(archive.suffix + ".sha256").write_text(f"{archive_digest}  {archive.name}\n", encoding="utf-8")
-
-files = []
-with tarfile.open(archive, "r:gz") as tar:
-    for member in sorted((m for m in tar.getmembers() if m.isfile()), key=lambda item: item.name):
-        extracted = tar.extractfile(member)
-        if extracted is None:
-            raise SystemExit(f"cannot read archive member: {member.name}")
-        data = extracted.read()
-        files.append(
-            {
-                "path": member.name,
-                "mode": oct(member.mode),
-                "size": member.size,
-                "sha256": hashlib.sha256(data).hexdigest(),
-            }
-        )
 
 manifest = {
     "schema_version": 1,
@@ -238,6 +256,32 @@ git_head = git_output("rev-parse", "--short=12", "HEAD")
 git_status = git_output("status", "--short") or ""
 commits = git_output("log", "--oneline", "--decorate", "-12") or ""
 
+
+def changelog_release_body() -> str:
+    lines = (root / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+    release_heading = re.compile(r"^## (\d+\.\d+\.\d+) - \d{4}-\d{2}-\d{2}$")
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if (match := release_heading.fullmatch(line)) and match.group(1) == version
+    ]
+    if not starts:
+        raise SystemExit(f"CHANGELOG.md has no release section for {version}")
+    if len(starts) != 1:
+        raise SystemExit(f"CHANGELOG.md has duplicate release sections for {version}")
+    start = starts[0] + 1
+    end = next(
+        (index for index in range(start, len(lines)) if release_heading.fullmatch(lines[index])),
+        len(lines),
+    )
+    body = "\n".join(lines[start:end]).strip()
+    if not body:
+        raise SystemExit(f"CHANGELOG.md release section for {version} is empty")
+    return body
+
+
+release_changes = changelog_release_body()
+
 release_notes = "\n".join(
     [
         f"# Code Brain {version} Release Notes",
@@ -255,6 +299,10 @@ release_notes = "\n".join(
         f"- SBOM: `{sbom_path.name}`",
         f"- SBOM SHA-256: `{sbom_digest}`",
         f"- Provenance: `{provenance_path.name}`",
+        "",
+        "## Problems and fixes",
+        "",
+        release_changes,
         "",
         "## Recent Commits",
         "",

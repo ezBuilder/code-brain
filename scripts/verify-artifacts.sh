@@ -42,6 +42,7 @@ py - "$ARCHIVE" "$SHA_FILE" "$MANIFEST" "$SBOM" "$PROVENANCE" "$RELEASE_NOTES" "
 import hashlib
 import json
 import pathlib
+import re
 import sys
 import tarfile
 import tomllib
@@ -68,6 +69,27 @@ def load_json(path: pathlib.Path) -> dict:
     return payload
 
 
+def changelog_release_body(path: pathlib.Path, version: str) -> str:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    release_heading = re.compile(r"^## (\d+\.\d+\.\d+) - \d{4}-\d{2}-\d{2}$")
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if (match := release_heading.fullmatch(line)) and match.group(1) == version
+    ]
+    if len(starts) != 1:
+        raise SystemExit(f"archive CHANGELOG release section count mismatch for {version}")
+    start = starts[0] + 1
+    end = next(
+        (index for index in range(start, len(lines)) if release_heading.fullmatch(lines[index])),
+        len(lines),
+    )
+    body = "\n".join(lines[start:end]).strip()
+    if not body:
+        raise SystemExit(f"archive CHANGELOG release section is empty for {version}")
+    return body
+
+
 if not sha_file.is_file():
     raise SystemExit(f"artifact missing: {sha_file}")
 expected_archive_sha = sha_file.read_text(encoding="utf-8").split()[0]
@@ -91,6 +113,8 @@ with tarfile.open(archive, "r:gz") as tar:
         raise SystemExit(f"archive must contain exactly one package root, got: {sorted(roots)}")
     if roots != {expected_root}:
         raise SystemExit(f"archive root mismatch: expected {expected_root}, got {next(iter(roots))}")
+    archive_files = sorted(member.name for member in members if member.isfile())
+    archive_file_info = {member.name: member for member in members if member.isfile()}
     tar.extractall(tmp)
 
 pkg_name = next(iter(roots))
@@ -113,6 +137,11 @@ if manifest.get("archive_sha256") != actual_archive_sha:
 files = manifest.get("files")
 if not isinstance(files, list) or manifest.get("file_count") != len(files):
     raise SystemExit("manifest file_count mismatch")
+if any(not isinstance(item, dict) or not isinstance(item.get("path"), str) for item in files):
+    raise SystemExit("manifest file entry is invalid")
+manifest_files = [item["path"] for item in files]
+if manifest_files != archive_files:
+    raise SystemExit("manifest file list does not exactly match archive files")
 for item in files:
     path = pathlib.PurePosixPath(item["path"])
     try:
@@ -124,7 +153,10 @@ for item in files:
         raise SystemExit(f"manifest file missing after extract: {path}")
     if sha256(target) != item["sha256"]:
         raise SystemExit(f"manifest file checksum mismatch: {path}")
-    if target.stat().st_size != item["size"]:
+    member = archive_file_info[item["path"]]
+    if item.get("mode") != oct(member.mode):
+        raise SystemExit(f"manifest file mode mismatch: {path}")
+    if target.stat().st_size != item["size"] or member.size != item["size"]:
         raise SystemExit(f"manifest file size mismatch: {path}")
 
 sbom = load_json(sbom_path)
@@ -183,11 +215,24 @@ required_notes = [
     manifest_path.name,
     sbom_path.name,
     provenance_path.name,
+    "## Problems and fixes",
     "./scripts/release-gate.sh",
 ]
 for needle in required_notes:
     if needle not in release_notes:
         raise SystemExit(f"release notes missing required text: {needle}")
+problems_heading = "## Problems and fixes"
+recent_heading = "\n## Recent Commits"
+if release_notes.count(problems_heading) != 1:
+    raise SystemExit("release notes problems-and-fixes heading count mismatch")
+problems_start = release_notes.index(problems_heading) + len(problems_heading)
+problems_end = release_notes.find(recent_heading, problems_start)
+if problems_end < 0:
+    raise SystemExit("release notes recent-commits boundary missing")
+actual_changes = release_notes[problems_start:problems_end].strip()
+expected_changes = changelog_release_body(pkg_dir / "CHANGELOG.md", version)
+if actual_changes != expected_changes:
+    raise SystemExit("release notes problems-and-fixes body does not match CHANGELOG")
 
 print(
     json.dumps(

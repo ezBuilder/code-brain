@@ -3046,11 +3046,20 @@ def test_reproducibility_release_gate_integration_invariants() -> None:
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     docs_check = (ROOT / "scripts" / "docs-check.sh").read_text(encoding="utf-8")
     assert "gzip.GzipFile" in package_script
+    assert "compresslevel=6" in package_script
     assert "mtime=0" in package_script
     assert "tarfile.PAX_FORMAT" in package_script
     assert "uid = 0" in package_script
     assert "gid = 0" in package_script
     assert "DIST_OVERRIDE" in package_script
+    assert "class HashingReader" in package_script
+    assert 'tarfile.open(archive, "r:gz")' not in package_script
+    assert "archive.read_bytes()" not in package_script
+    assert '"## Problems and fixes"' in package_script
+    verifier = (ROOT / "scripts" / "verify-artifacts.sh").read_text(encoding="utf-8")
+    assert "manifest file list does not exactly match archive files" in verifier
+    assert "release notes problems-and-fixes body does not match CHANGELOG" in verifier
+    assert "release_notes_body_resigned" in (ROOT / "scripts" / "artifact-tamper-check.sh").read_text(encoding="utf-8")
     assert "reproducibility drift" in repro_script
     assert "./scripts/reproducibility-check.sh \"$ARCHIVE\" >/dev/null" in release_gate
     assert "reproducibility-check:" in makefile
